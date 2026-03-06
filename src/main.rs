@@ -207,6 +207,106 @@ fn thread_writer(
     }
 }
 
+// The thread differ function.
+fn thread_differ(
+    thread_id: u64,
+    file1: (&File, &File), // (direct, nodirect)
+    file2: (&File, &File), // (direct, nodirect)
+    num_threads: u64,
+    block_size: u64,
+    qd: usize,
+    io_uring: &mut IoUring,
+    total_size: u64,
+    mismatch: Arc<AtomicU64>,
+) {
+    let mut buffers1 = Vec::new();
+    let mut buffers2 = Vec::new();
+    for _ in 0..qd {
+        let mut allocation1 = vec![0u8; (block_size as usize) + 8192];
+        let data_ptr1 = (allocation1.as_mut_ptr() as usize + 4096) & !4095;
+        let buffer1 = unsafe { std::slice::from_raw_parts_mut(data_ptr1 as *mut u8, block_size as usize) };
+        buffers1.push((buffer1, allocation1));
+
+        let mut allocation2 = vec![0u8; (block_size as usize) + 8192];
+        let data_ptr2 = (allocation2.as_mut_ptr() as usize + 4096) & !4095;
+        let buffer2 = unsafe { std::slice::from_raw_parts_mut(data_ptr2 as *mut u8, block_size as usize) };
+        buffers2.push((buffer2, allocation2));
+    }
+
+    let mut inflight = 0;
+    let mut next_offset = thread_id * block_size;
+    let mut buffer_offsets = vec![0u64; qd];
+
+    for i in 0..qd {
+        if next_offset >= total_size { break; }
+        buffer_offsets[i] = next_offset;
+        let len = (total_size - next_offset).min(block_size);
+        let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
+        let f1_fd = if is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
+        let f2_fd = if is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
+        unsafe {
+            let mut sqe1 = io_uring.prepare_sqe().unwrap();
+            sqe1.prep_read(f1_fd, &mut buffers1[i].0[..len as usize], next_offset);
+            sqe1.set_user_data((i as u64) | (1u64 << 32));
+
+            let mut sqe2 = io_uring.prepare_sqe().unwrap();
+            sqe2.prep_read(f2_fd, &mut buffers2[i].0[..len as usize], next_offset);
+            sqe2.set_user_data((i as u64) | (2u64 << 32));
+        }
+        next_offset += num_threads * block_size;
+        inflight += 2;
+    }
+    io_uring.submit_sqes().unwrap();
+
+    let mut ready = vec![0u8; qd];
+
+    while inflight > 0 {
+        let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
+        let user_data = cq.user_data();
+        let idx = (user_data & 0xFFFFFFFF) as usize;
+        let file_num = (user_data >> 32) as u8;
+        cq.result().expect("IO failed");
+        inflight -= 1;
+        ready[idx] |= file_num;
+
+        if ready[idx] == 3 {
+            let len = (total_size - buffer_offsets[idx]).min(block_size) as usize;
+            if buffers1[idx].0[..len] != buffers2[idx].0[..len] {
+                for j in 0..len {
+                    if buffers1[idx].0[j] != buffers2[idx].0[j] {
+                        let absolute_offset = buffer_offsets[idx] + j as u64;
+                        println!("Mismatch at offset {}: {:02x} != {:02x}", absolute_offset, buffers1[idx].0[j], buffers2[idx].0[j]);
+                        mismatch.compare_exchange(0, absolute_offset + 1, Ordering::SeqCst, Ordering::SeqCst).ok();
+                        break;
+                    }
+                }
+            }
+            ready[idx] = 0;
+
+            if next_offset < total_size && mismatch.load(Ordering::Relaxed) == 0 {
+                buffer_offsets[idx] = next_offset;
+                let len = (total_size - next_offset).min(block_size);
+                let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
+                let f1_fd = if is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
+                let f2_fd = if is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
+                unsafe {
+                    let mut sqe1 = io_uring.prepare_sqe().unwrap();
+                    sqe1.prep_read(f1_fd, &mut buffers1[idx].0[..len as usize], next_offset);
+                    sqe1.set_user_data((idx as u64) | (1u64 << 32));
+
+                    let mut sqe2 = io_uring.prepare_sqe().unwrap();
+                    sqe2.prep_read(f2_fd, &mut buffers2[idx].0[..len as usize], next_offset);
+                    sqe2.set_user_data((idx as u64) | (2u64 << 32));
+                }
+                io_uring.submit_sqes().unwrap();
+                next_offset += num_threads * block_size;
+                inflight += 2;
+            }
+        }
+        if mismatch.load(Ordering::Relaxed) != 0 && inflight == 0 { break; }
+    }
+}
+
 // Read through the entire file with num_threads threads, each 
 // reading block_size bytes at a time in an interleaved fashion.
 // E.g.
@@ -311,6 +411,44 @@ fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_size
     write_count.load(Ordering::SeqCst)
 }
 
+fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool) -> u64 {
+    let mut f1 = File::open(file1).unwrap();
+    let s1 = f1.seek(SeekFrom::End(0)).unwrap();
+    let mut f2 = File::open(file2).unwrap();
+    let s2 = f2.seek(SeekFrom::End(0)).unwrap();
+
+    if s1 != s2 {
+        println!("Files have different sizes: {} != {}", s1, s2);
+        return 1;
+    }
+
+    let mismatch = Arc::new(AtomicU64::new(0));
+    let mut threads = vec![];
+    for thread_id in 0..num_threads {
+        let mismatch = mismatch.clone();
+        let f1_name = file1.to_string();
+        let f2_name = file2.to_string();
+        threads.push(std::thread::spawn(move || {
+            let f1_nodir = File::open(&f1_name).unwrap();
+            let f1_dir = if direct_io {
+                OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f1_name).unwrap()
+            } else {
+                File::open(&f1_name).unwrap()
+            };
+            let f2_nodir = File::open(&f2_name).unwrap();
+            let f2_dir = if direct_io {
+                OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f2_name).unwrap()
+            } else {
+                File::open(&f2_name).unwrap()
+            };
+            let mut io_uring = IoUring::new(1024).unwrap();
+            thread_differ(thread_id, (&f1_dir, &f1_nodir), (&f2_dir, &f2_nodir), num_threads, block_size, qd, &mut io_uring, s1, mismatch);
+        }));
+    }
+    for thread in threads { thread.join().unwrap(); }
+    mismatch.load(Ordering::SeqCst)
+}
+
 // Use a stochastic hill climber to find the best-performing parameters for the given IO function.
 // Takes in start_params and scaling factors to convert them to use with the IO function.
 // The optimizer nudges the parameters by a small integer amount, and the scaling factors are
@@ -374,6 +512,7 @@ fn main() {
         println!("USAGE: {} read [--direct] [-n iterations] [pattern] <filename>", args[0]);
         println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} copy [--direct] [-n iterations] <source> <target>", args[0]);
+        println!("USAGE: {} diff [--direct] <file1> <file2>", args[0]);
         return;
     }
 
@@ -382,6 +521,7 @@ fn main() {
     let mut source = None;
     let mut pattern = "";
     let mut filename = "";
+    let mut _filename2 = "";
     let mut iterations = if mode == "read" { 1000 } else { 1 };
     
     let mut i = 2;
@@ -393,11 +533,13 @@ fn main() {
             if i < args.len() {
                 iterations = args[i].parse().expect("Invalid number of iterations");
             }
-        } else if mode == "copy" {
+        } else if mode == "copy" || mode == "diff" {
             if source.is_none() {
                 source = Some(args[i].as_str());
-            } else {
+            } else if filename == "" {
                 filename = args[i].as_str();
+            } else {
+                _filename2 = args[i].as_str();
             }
         } else {
             if mode == "read" && pattern == "" && i == args.len() - 1 && args.len() > 3 {
@@ -418,7 +560,7 @@ fn main() {
 
     let mut num_threads = 32;
     let mut block_size = 384 * 1024;
-    let mut qd = 1;
+    let mut qd: usize = 1;
     let mut bsf = 4;
 
     if direct_io {
@@ -430,13 +572,20 @@ fn main() {
 
     if mode == "read" {
         println!("Opening file {} for reading", filename);
-        run_optimizer("Read", vec![num_threads, block_size / bsf / 1024, qd], vec![1, bsf * 1024, 1], iterations, |p| {
+        run_optimizer("Read", vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
     } else if mode == "write" || mode == "copy" {
         println!("Opening file {} for writing", filename);
-        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd], vec![1, bsf * 1024, 1], iterations, |p| {
+        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
             write_file(source, filename, p[0], p[1], p[2] as usize, direct_io)
         });
+    } else if mode == "diff" {
+        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, direct_io);
+        if res == 0 {
+            println!("Files are identical");
+        } else {
+            std::process::exit(1);
+        }
     }
 }
