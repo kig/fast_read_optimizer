@@ -356,7 +356,7 @@ fn read_file(pattern: &str, filename: &str, num_threads: u64, block_size: u64, q
     if !pattern.is_empty() {
         all_matches.sort();
         for m in all_matches {
-            println!("Found pattern at {}", m);
+            println!("{}:{}", m, pattern);
         }
     }
     read_count.load(Ordering::SeqCst)
@@ -552,7 +552,7 @@ fn main() {
     let mut pattern = "";
     let mut filename = "";
     let mut _filename2 = "";
-    let mut iterations = if mode == "read" || mode == "grep" { 1000 } else { 1 };
+    let mut iterations = if mode == "read" { 1000 } else { 1 };
     
     let mut i = 2;
     while i < args.len() {
