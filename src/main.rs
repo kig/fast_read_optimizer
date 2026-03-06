@@ -474,7 +474,8 @@ fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: u
     let cpu_time_used = start.elapsed().as_secs_f64();
     let count = processed_count.load(Ordering::SeqCst);
     if verbose {
-        eprintln!("Diff {} bytes in {:.4} s, {:.1} GB/s", count, cpu_time_used, count as f64 / cpu_time_used / 1e9);
+        let total_bytes = count * 2;
+        eprintln!("Diff {} bytes in {:.4} s, {:.1} GB/s", count, cpu_time_used, total_bytes as f64 / cpu_time_used / 1e9);
     }
     
     mismatch.load(Ordering::SeqCst)
