@@ -72,8 +72,8 @@ fn main() {
         });
     } else if mode == "diff" || mode == "dual-read-bench" {
         if verbose { eprintln!("Opening files for {}", mode); }
-        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, direct_io, verbose, mode == "dual-read-bench");
-        if res == 0 { if verbose { eprintln!("Files are identical"); } }
+        let res = diff_files(source.unwrap(), filename, 32, 384*1024, 2, direct_io, verbose, mode == "dual-read-bench");
+        if res == 0 && mode == "diff" { if verbose { eprintln!("Files are identical"); } }
         else if mode == "diff" { std::process::exit(1); }
     }
 }
