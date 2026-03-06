@@ -25,7 +25,8 @@ fn thread_reader(
     file: &mut File,
     io_uring: &mut IoUring,
     read_count: Arc<AtomicU64>,
-) {
+) -> Vec<u64> {
+    let mut matches = Vec::new();
     // Allocate buffers for the data.
     let mut buffers = Vec::new();
     for _ in 0..qd {
@@ -57,6 +58,9 @@ fn thread_reader(
         block_num += 1;
         inflight += 1;
     }
+    
+    if inflight == 0 { return matches; }
+    
     io_uring.submit_sqes().unwrap();
 
     let search = TwoWaySearcher::new(pattern.as_bytes());
@@ -76,7 +80,7 @@ fn thread_reader(
                 while search_idx < (result as usize) {
                     match search.search_in(&buf[search_idx..]) {
                         Some(idx) => {
-                            println!("Found pattern at {}", offset + block_id * num_threads * block_size + search_idx as u64 + idx as u64);
+                            matches.push(offset + block_id * num_threads * block_size + search_idx as u64 + idx as u64);
                             search_idx += idx + pattern.len();
                         }
                         None => break,
@@ -100,7 +104,7 @@ fn thread_reader(
         }
         // If we're at the end of the file, and all reads have completed, return.
         if inflight == 0 {
-            return;
+            return matches;
         }
     }
 }
@@ -158,6 +162,9 @@ fn thread_writer(
         next_offset += num_threads * block_size;
         inflight += 1;
     }
+    
+    if inflight == 0 { return; }
+    
     io_uring.submit_sqes().unwrap();
 
     while inflight > 0 {
@@ -218,6 +225,7 @@ fn thread_differ(
     io_uring: &mut IoUring,
     total_size: u64,
     mismatch: Arc<AtomicU64>,
+    processed_count: Arc<AtomicU64>,
 ) {
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
@@ -256,6 +264,9 @@ fn thread_differ(
         next_offset += num_threads * block_size;
         inflight += 2;
     }
+    
+    if inflight == 0 { return; }
+    
     io_uring.submit_sqes().unwrap();
 
     let mut ready = vec![0u8; qd];
@@ -271,6 +282,7 @@ fn thread_differ(
 
         if ready[idx] == 3 {
             let len = (total_size - buffer_offsets[idx]).min(block_size) as usize;
+            processed_count.fetch_add(len as u64, Ordering::SeqCst);
             if buffers1[idx].0[..len] != buffers2[idx].0[..len] {
                 for j in 0..len {
                     if buffers1[idx].0[j] != buffers2[idx].0[j] {
@@ -334,10 +346,19 @@ fn read_file(pattern: &str, filename: &str, num_threads: u64, block_size: u64, q
                 File::open(&filename).unwrap()
             };
             let mut io_uring = IoUring::new(1024).unwrap();
-            thread_reader(thread_id, pattern, num_threads, block_size, qd, &mut file, &mut io_uring, read_count);
+            thread_reader(thread_id, pattern, num_threads, block_size, qd, &mut file, &mut io_uring, read_count)
         }));
     }
-    for thread in threads { thread.join().unwrap(); }
+    let mut all_matches = Vec::new();
+    for thread in threads {
+        all_matches.extend(thread.join().unwrap());
+    }
+    if !pattern.is_empty() {
+        all_matches.sort();
+        for m in all_matches {
+            println!("Found pattern at {}", m);
+        }
+    }
     read_count.load(Ordering::SeqCst)
 }
 
@@ -423,9 +444,12 @@ fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: u
     }
 
     let mismatch = Arc::new(AtomicU64::new(0));
+    let processed_count = Arc::new(AtomicU64::new(0));
+    let start = std::time::Instant::now();
     let mut threads = vec![];
     for thread_id in 0..num_threads {
         let mismatch = mismatch.clone();
+        let processed_count = processed_count.clone();
         let f1_name = file1.to_string();
         let f2_name = file2.to_string();
         threads.push(std::thread::spawn(move || {
@@ -442,10 +466,15 @@ fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: u
                 File::open(&f2_name).unwrap()
             };
             let mut io_uring = IoUring::new(1024).unwrap();
-            thread_differ(thread_id, (&f1_dir, &f1_nodir), (&f2_dir, &f2_nodir), num_threads, block_size, qd, &mut io_uring, s1, mismatch);
+            thread_differ(thread_id, (&f1_dir, &f1_nodir), (&f2_dir, &f2_nodir), num_threads, block_size, qd, &mut io_uring, s1, mismatch, processed_count);
         }));
     }
     for thread in threads { thread.join().unwrap(); }
+    
+    let cpu_time_used = start.elapsed().as_secs_f64();
+    let count = processed_count.load(Ordering::SeqCst);
+    println!("Diff {} bytes in {:.4} s, {:.1} GB/s", count, cpu_time_used, count as f64 / cpu_time_used / 1e9);
+    
     mismatch.load(Ordering::SeqCst)
 }
 
@@ -509,7 +538,8 @@ fn run_optimizer<F>(
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "--help" {
-        println!("USAGE: {} read [--direct] [-n iterations] [pattern] <filename>", args[0]);
+        println!("USAGE: {} grep [--direct] [-n iterations] <pattern> <filename>", args[0]);
+        println!("USAGE: {} read [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} copy [--direct] [-n iterations] <source> <target>", args[0]);
         println!("USAGE: {} diff [--direct] <file1> <file2>", args[0]);
@@ -522,7 +552,7 @@ fn main() {
     let mut pattern = "";
     let mut filename = "";
     let mut _filename2 = "";
-    let mut iterations = if mode == "read" { 1000 } else { 1 };
+    let mut iterations = if mode == "read" || mode == "grep" { 1000 } else { 1 };
     
     let mut i = 2;
     while i < args.len() {
@@ -541,14 +571,14 @@ fn main() {
             } else {
                 _filename2 = args[i].as_str();
             }
-        } else {
-            if mode == "read" && pattern == "" && i == args.len() - 1 && args.len() > 3 {
-                 filename = args[i].as_str();
-            } else if mode == "read" && i == args.len() - 2 {
-                 pattern = args[i].as_str();
+        } else if mode == "grep" {
+            if pattern == "" {
+                pattern = args[i].as_str();
             } else {
                 filename = args[i].as_str();
             }
+        } else {
+            filename = args[i].as_str();
         }
         i += 1;
     }
@@ -570,13 +600,13 @@ fn main() {
         bsf = 256;
     }
 
-    if mode == "read" {
-        println!("Opening file {} for reading", filename);
-        run_optimizer("Read", vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
+    if mode == "grep" || mode == "read" {
+        println!("Opening file {} for {}", filename, mode);
+        run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
     } else if mode == "write" || mode == "copy" {
-        println!("Opening file {} for writing", filename);
+        println!("Opening file {} for {}", filename, mode);
         run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
             write_file(source, filename, p[0], p[1], p[2] as usize, direct_io)
         });
