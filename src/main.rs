@@ -263,6 +263,12 @@ fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_size
         f.seek(SeekFrom::End(0)).unwrap()
     };
 
+    // Ensure target file exists and has the correct size
+    {
+        let f = OpenOptions::new().write(true).create(true).open(filename).unwrap();
+        f.set_len(total_size).unwrap();
+    }
+
     for thread_id in 0..num_threads {
         let write_count = write_count.clone();
         let filename = filename.to_string();
@@ -366,11 +372,12 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "--help" {
         println!("USAGE: {} read [--direct] [-n iterations] [pattern] <filename>", args[0]);
-        println!("USAGE: {} write [--direct] [-n iterations] [--source <source>] <filename>", args[0]);
+        println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
+        println!("USAGE: {} copy [--direct] [-n iterations] <source> <target>", args[0]);
         return;
     }
 
-    let mode = &args[1];
+    let mode = args[1].as_str();
     let mut direct_io = false;
     let mut source = None;
     let mut pattern = "";
@@ -386,18 +393,19 @@ fn main() {
             if i < args.len() {
                 iterations = args[i].parse().expect("Invalid number of iterations");
             }
-        } else if args[i] == "--source" {
-            i += 1;
-            if i < args.len() {
-                source = Some(&args[i]);
+        } else if mode == "copy" {
+            if source.is_none() {
+                source = Some(args[i].as_str());
+            } else {
+                filename = args[i].as_str();
             }
         } else {
             if mode == "read" && pattern == "" && i == args.len() - 1 && args.len() > 3 {
-                 filename = &args[i];
+                 filename = args[i].as_str();
             } else if mode == "read" && i == args.len() - 2 {
-                 pattern = &args[i];
+                 pattern = args[i].as_str();
             } else {
-                filename = &args[i];
+                filename = args[i].as_str();
             }
         }
         i += 1;
@@ -425,10 +433,10 @@ fn main() {
         run_optimizer("Read", vec![num_threads, block_size / bsf / 1024, qd], vec![1, bsf * 1024, 1], iterations, |p| {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
-    } else if mode == "write" {
+    } else if mode == "write" || mode == "copy" {
         println!("Opening file {} for writing", filename);
-        run_optimizer("Write", vec![num_threads, block_size / bsf / 1024, qd], vec![1, bsf * 1024, 1], iterations, |p| {
-            write_file(source.map(|s| s.as_str()), filename, p[0], p[1], p[2] as usize, direct_io)
+        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd], vec![1, bsf * 1024, 1], iterations, |p| {
+            write_file(source, filename, p[0], p[1], p[2] as usize, direct_io)
         });
     }
 }
