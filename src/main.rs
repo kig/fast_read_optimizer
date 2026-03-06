@@ -432,14 +432,14 @@ fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_size
     write_count.load(Ordering::SeqCst)
 }
 
-fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool) -> u64 {
+fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool, verbose: bool) -> u64 {
     let mut f1 = File::open(file1).unwrap();
     let s1 = f1.seek(SeekFrom::End(0)).unwrap();
     let mut f2 = File::open(file2).unwrap();
     let s2 = f2.seek(SeekFrom::End(0)).unwrap();
 
     if s1 != s2 {
-        println!("Files have different sizes: {} != {}", s1, s2);
+        if verbose { eprintln!("Files have different sizes: {} != {}", s1, s2); }
         return 1;
     }
 
@@ -473,7 +473,9 @@ fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: u
     
     let cpu_time_used = start.elapsed().as_secs_f64();
     let count = processed_count.load(Ordering::SeqCst);
-    println!("Diff {} bytes in {:.4} s, {:.1} GB/s", count, cpu_time_used, count as f64 / cpu_time_used / 1e9);
+    if verbose {
+        eprintln!("Diff {} bytes in {:.4} s, {:.1} GB/s", count, cpu_time_used, count as f64 / cpu_time_used / 1e9);
+    }
     
     mismatch.load(Ordering::SeqCst)
 }
@@ -487,6 +489,7 @@ fn run_optimizer<F>(
     start_params: Vec<u64>,
     param_scaling_factors: Vec<u64>,
     num_iterations: usize,
+    verbose: bool,
     mut op: F
 ) where F: FnMut(&[u64]) -> u64 {
     let mut rng = rand::thread_rng();
@@ -528,9 +531,20 @@ fn run_optimizer<F>(
 
         if cpu_time_used < fastest_time || num_iterations == 1 {
             if cpu_time_used < fastest_time { fastest_time = cpu_time_used; }
-            println!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}",
-                name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9,
-                scaled_params[0], scaled_params[1] / 1024, scaled_params[2]);
+            if verbose {
+                eprintln!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}",
+                    name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9,
+                    scaled_params[0], scaled_params[1] / 1024, scaled_params[2]);
+            } else if num_iterations > 1 {
+                // For optimizer mode, we still want to see the progress on stdout or stderr?
+                // The prompt said "stderr and behind --verbose in grep, diff, copy".
+                // 'read' is the optimizer mode. Let's keep 'read' output on stdout for now as it's the primary purpose.
+                // Re-reading: "Output the speed measurements and 'Opening file...' to stderr and put them behind --verbose / -v flag in grep, diff and copy modes."
+                // This implies 'read' (optimizer) might still want its output.
+                println!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}",
+                    name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9,
+                    scaled_params[0], scaled_params[1] / 1024, scaled_params[2]);
+            }
         }
     }
 }
@@ -538,26 +552,30 @@ fn run_optimizer<F>(
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "--help" {
-        println!("USAGE: {} grep [--direct] [-n iterations] <pattern> <filename>", args[0]);
+        println!("USAGE: {} grep [--direct] [-v] [-n iterations] <pattern> <filename>", args[0]);
         println!("USAGE: {} read [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
-        println!("USAGE: {} copy [--direct] [-n iterations] <source> <target>", args[0]);
-        println!("USAGE: {} diff [--direct] <file1> <file2>", args[0]);
+        println!("USAGE: {} copy [--direct] [-v] [-n iterations] <source> <target>", args[0]);
+        println!("USAGE: {} diff [--direct] [-v] <file1> <file2>", args[0]);
         return;
     }
 
     let mode = args[1].as_str();
     let mut direct_io = false;
+    let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
     let mut filename = "";
     let mut _filename2 = "";
-    let mut iterations = if mode == "read" { 1000 } else { 1 };
+    let mut iterations = if mode == "read" || mode == "grep" { 1000 } else { 1 };
+    if mode == "grep" || mode == "copy" { iterations = 1; }
     
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--direct" {
             direct_io = true;
+        } else if args[i] == "-v" || args[i] == "--verbose" {
+            verbose = true;
         } else if args[i] == "-n" {
             i += 1;
             if i < args.len() {
@@ -601,19 +619,20 @@ fn main() {
     }
 
     if mode == "grep" || mode == "read" {
-        println!("Opening file {} for {}", filename, mode);
-        run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
+        if verbose || mode == "read" { eprintln!("Opening file {} for {}", filename, mode); }
+        run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "read", |p| {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
     } else if mode == "write" || mode == "copy" {
-        println!("Opening file {} for {}", filename, mode);
-        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, |p| {
+        if verbose || mode == "write" { eprintln!("Opening file {} for {}", filename, mode); }
+        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "write", |p| {
             write_file(source, filename, p[0], p[1], p[2] as usize, direct_io)
         });
     } else if mode == "diff" {
-        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, direct_io);
+        if verbose { eprintln!("Opening files for diff"); }
+        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, direct_io, verbose);
         if res == 0 {
-            println!("Files are identical");
+            if verbose { eprintln!("Files are identical"); }
         } else {
             std::process::exit(1);
         }
