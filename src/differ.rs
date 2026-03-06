@@ -22,7 +22,7 @@ fn thread_differ(
 ) {
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
-    for _ in 0..(qd * 2) {
+    for _ in 0..qd {
         let mut a1 = vec![0u8; (block_size as usize) + 8192];
         let p1 = (a1.as_mut_ptr() as usize + 4096) & !4095;
         buffers1.push((unsafe { std::slice::from_raw_parts_mut(p1 as *mut u8, block_size as usize) }, a1));
@@ -34,38 +34,34 @@ fn thread_differ(
 
     let mut inflight = 0;
     let mut next_offset = thread_id * block_size;
-    let mut buffer_offsets = vec![0u64; qd * 2];
-    
-    // Maintain a list of free buffer indices
-    let mut free_buffers: Vec<usize> = (0..qd*2).collect();
+    let mut buffer_offsets = vec![0u64; qd];
 
     // Initial fill up to qd pairs
-    for _ in 0..qd {
+    for i in 0..qd {
         if next_offset >= total_size { break; }
-        let idx = free_buffers.pop().unwrap();
-        buffer_offsets[idx] = next_offset;
+        buffer_offsets[i] = next_offset;
         let len = (total_size - next_offset).min(block_size);
         let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
         let f1_fd = if is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
         let f2_fd = if is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
         unsafe {
             let mut sqe1 = io_uring.prepare_sqe().unwrap();
-            sqe1.prep_read(f1_fd, &mut buffers1[idx].0[..len as usize], next_offset);
-            sqe1.set_user_data((idx as u64) | (1u64 << 32));
+            sqe1.prep_read(f1_fd, &mut buffers1[i].0[..len as usize], next_offset);
+            sqe1.set_user_data((i as u64) | (1u64 << 32));
 
             let mut sqe2 = io_uring.prepare_sqe().unwrap();
-            sqe2.prep_read(f2_fd, &mut buffers2[idx].0[..len as usize], next_offset);
-            sqe2.set_user_data((idx as u64) | (2u64 << 32));
+            sqe2.prep_read(f2_fd, &mut buffers2[i].0[..len as usize], next_offset);
+            sqe2.set_user_data((i as u64) | (2u64 << 32));
         }
         next_offset += num_threads * block_size;
-        inflight += 2;
+        inflight += 1; // 1 represents a pair
     }
     
     if inflight == 0 { return; }
     io_uring.submit_sqes().unwrap();
 
-    let mut ready1 = vec![false; qd * 2];
-    let mut ready2 = vec![false; qd * 2];
+    let mut ready1 = vec![false; qd];
+    let mut ready2 = vec![false; qd];
 
     while inflight > 0 && mismatch.load(Ordering::Relaxed) == 0 {
         let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
@@ -73,7 +69,6 @@ fn thread_differ(
         let idx = (ud & 0xFFFFFFFF) as usize;
         let file_num = (ud >> 32) as u8;
         cq.result().expect("IO failed");
-        inflight -= 1;
         if file_num == 1 { ready1[idx] = true; } else { ready2[idx] = true; }
 
         while io_uring.cq_ready() > 0 {
@@ -82,7 +77,6 @@ fn thread_differ(
             let idx = (ud & 0xFFFFFFFF) as usize;
             let file_num = (ud >> 32) as u8;
             cq.result().expect("IO failed");
-            inflight -= 1;
             if file_num == 1 { ready1[idx] = true; } else { ready2[idx] = true; }
         }
 
@@ -91,7 +85,6 @@ fn thread_differ(
                 let off = buffer_offsets[i];
                 let len = (total_size - off).min(block_size) as usize;
                 
-                // 1. Perform comparison FIRST to avoid data race with next read
                 if !bench_only {
                     if buffers1[i].0[..len] != buffers2[i].0[..len] {
                         for j in 0..len {
@@ -108,29 +101,26 @@ fn thread_differ(
                 processed_count.fetch_add(len as u64, Ordering::SeqCst);
                 ready1[i] = false;
                 ready2[i] = false;
-                free_buffers.push(i);
 
-                // 2. Submit the next read
-                if next_offset < total_size && mismatch.load(Ordering::Relaxed) == 0 && (inflight / 2) < qd {
-                    if let Some(next_idx) = free_buffers.pop() {
-                        buffer_offsets[next_idx] = next_offset;
-                        let next_len = (total_size - next_offset).min(block_size);
-                        let is_aligned = (next_offset % 4096 == 0) && (next_len == block_size);
-                        let f1_fd = if is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
-                        let f2_fd = if is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
-                        unsafe {
-                            let mut sqe1 = io_uring.prepare_sqe().unwrap();
-                            sqe1.prep_read(f1_fd, &mut buffers1[next_idx].0[..next_len as usize], next_offset);
-                            sqe1.set_user_data((next_idx as u64) | (1u64 << 32));
+                if next_offset < total_size && mismatch.load(Ordering::Relaxed) == 0 {
+                    buffer_offsets[i] = next_offset;
+                    let next_len = (total_size - next_offset).min(block_size);
+                    let is_aligned = (next_offset % 4096 == 0) && (next_len == block_size);
+                    let f1_fd = if is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
+                    let f2_fd = if is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
+                    unsafe {
+                        let mut sqe1 = io_uring.prepare_sqe().unwrap();
+                        sqe1.prep_read(f1_fd, &mut buffers1[i].0[..next_len as usize], next_offset);
+                        sqe1.set_user_data((i as u64) | (1u64 << 32));
 
-                            let mut sqe2 = io_uring.prepare_sqe().unwrap();
-                            sqe2.prep_read(f2_fd, &mut buffers2[next_idx].0[..next_len as usize], next_offset);
-                            sqe2.set_user_data((next_idx as u64) | (2u64 << 32));
-                        }
-                        io_uring.submit_sqes().unwrap();
-                        next_offset += num_threads * block_size;
-                        inflight += 2;
+                        let mut sqe2 = io_uring.prepare_sqe().unwrap();
+                        sqe2.prep_read(f2_fd, &mut buffers2[i].0[..next_len as usize], next_offset);
+                        sqe2.set_user_data((i as u64) | (2u64 << 32));
                     }
+                    io_uring.submit_sqes().unwrap();
+                    next_offset += num_threads * block_size;
+                } else {
+                    inflight -= 1;
                 }
             }
         }
