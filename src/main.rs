@@ -1,3 +1,6 @@
+/*
+    We're using io_uring for this.
+*/
 use iou::IoUring;
 use rand::Rng;
 use std::env;
@@ -9,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use memmem::{Searcher, TwoWaySearcher};
 
+// The thread reader function.
+// This is the function that is run by each thread.
+// It reads the file in block_size chunks, starting at thread_id*block_size offset.
+// The chunks are spaced num_threads*block_size apart.
 fn thread_reader(
     thread_id: u64,
     pattern: String,
@@ -19,6 +26,7 @@ fn thread_reader(
     io_uring: &mut IoUring,
     read_count: Arc<AtomicU64>,
 ) {
+    // Allocate buffers for the data.
     let mut buffers = Vec::new();
     for _ in 0..qd {
         let mut allocation = vec![0u8; (block_size as usize) + 8192];
@@ -26,11 +34,18 @@ fn thread_reader(
         let buffer = unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u8, block_size as usize) };
         buffers.push((buffer, allocation));
     }
+    // Get the file size.
     let file_size = file.seek(SeekFrom::End(0)).unwrap();
+    // The current offset.
     let offset = thread_id * block_size;
+    // The current block number.
     let mut block_num = 0;
     let mut inflight = 0;
 
+    // Queue the first qd reads.
+    // After a read completes, replace it with the next read and update read_count.
+    // When we reach EOF, stop queuing reads and wait for remaining reads to complete, and return.
+    // This allows us to read the entire file in parallel.
     for _ in 0..qd {
         let current_offset = offset + (block_num as u64) * num_threads * block_size;
         if current_offset >= file_size { break; }
@@ -46,9 +61,12 @@ fn thread_reader(
 
     let search = TwoWaySearcher::new(pattern.as_bytes());
 
-    while inflight > 0 {
+    loop {
+        // Wait for a read to complete.
         let cq = io_uring.wait_for_cqe().unwrap();
+        // Get the block number for the read that completed.
         let block_id = cq.user_data() as u64;
+        // Update the read count.
         let result = cq.result().unwrap();
         if result > 0 {
             read_count.fetch_add(result as u64, Ordering::SeqCst);
@@ -66,6 +84,8 @@ fn thread_reader(
                 }
             }
         }
+            
+        // If we're not at the end of the file, queue the next read.
         inflight -= 1;
         let next_offset = offset + (block_num as u64) * num_threads * block_size;
         if next_offset < file_size {
@@ -78,9 +98,16 @@ fn thread_reader(
             block_num += 1;
             inflight += 1;
         }
+        // If we're at the end of the file, and all reads have completed, return.
+        if inflight == 0 {
+            return;
+        }
     }
 }
 
+// The thread writer function.
+// This function writes to a file in block_size chunks, starting at thread_id*block_size offset.
+// If a source_file is provided, it reads from it first.
 fn thread_writer(
     thread_id: u64,
     source_file: Option<(&File, &File)>, // (direct, nodirect)
@@ -180,7 +207,20 @@ fn thread_writer(
     }
 }
 
+// Read through the entire file with num_threads threads, each 
+// reading block_size bytes at a time in an interleaved fashion.
+// E.g.
+// thread 0 reads block_size bytes at locations i*num_threads*block_size + 0*block_size
+// thread 1 reads block_size bytes at locations i*num_threads*block_size + 1*block_size
+// thread 2 reads block_size bytes at locations i*num_threads*block_size + 2*block_size
+// etc.
+//
+// The function returns the total number of bytes read by all the threads.
+//
 fn read_file(pattern: &str, filename: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool) -> u64 {
+    // Create num_threads threads and a shared read count.
+    // Call thread_reader on each thread.
+    // Join the threads after they're done and return the read count.
     let mut threads = vec![];
     let read_count = Arc::new(AtomicU64::new(0));
     for thread_id in 0..num_threads {
@@ -201,6 +241,8 @@ fn read_file(pattern: &str, filename: &str, num_threads: u64, block_size: u64, q
     read_count.load(Ordering::SeqCst)
 }
 
+// Write through the entire file with num_threads threads, each
+// writing block_size bytes at a time in an interleaved fashion.
 fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool) -> u64 {
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
@@ -263,6 +305,10 @@ fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_size
     write_count.load(Ordering::SeqCst)
 }
 
+// Use a stochastic hill climber to find the best-performing parameters for the given IO function.
+// Takes in start_params and scaling factors to convert them to use with the IO function.
+// The optimizer nudges the parameters by a small integer amount, and the scaling factors are
+// used to go from block_size = 3 -> block_size = 3 * 1024 * 1024
 fn run_optimizer<F>(
     name: &str,
     start_params: Vec<u64>,
