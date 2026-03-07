@@ -1,5 +1,6 @@
 use std::env;
 
+mod common;
 mod optimizer;
 mod reader;
 mod writer;

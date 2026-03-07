@@ -6,6 +6,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use crate::common::PageAligned;
 
 fn thread_differ(
     thread_id: u64,
@@ -25,13 +26,14 @@ fn thread_differ(
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
     for _ in 0..(qd * 2) {
-        let mut a1 = vec![0u8; (block_size as usize) + 8192];
-        let p1 = (a1.as_mut_ptr() as usize + 4096) & !4095;
-        buffers1.push((unsafe { std::slice::from_raw_parts_mut(p1 as *mut u8, block_size as usize) }, a1));
+        let num_pages = (block_size as usize + 4095) / 4096;
+        let mut a1 = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
+        let p1 = a1.as_mut_ptr() as *mut u8;
+        buffers1.push((unsafe { std::slice::from_raw_parts_mut(p1, block_size as usize) }, a1));
 
-        let mut a2 = vec![0u8; (block_size as usize) + 8192];
-        let p2 = (a2.as_mut_ptr() as usize + 4096) & !4095;
-        buffers2.push((unsafe { std::slice::from_raw_parts_mut(p2 as *mut u8, block_size as usize) }, a2));
+        let mut a2 = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
+        let p2 = a2.as_mut_ptr() as *mut u8;
+        buffers2.push((unsafe { std::slice::from_raw_parts_mut(p2, block_size as usize) }, a2));
     }
 
     let mut inflight = 0;

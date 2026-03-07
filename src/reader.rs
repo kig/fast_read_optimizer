@@ -6,6 +6,7 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use memchr::memmem::Finder;
+use crate::common::PageAligned;
 
 // The thread reader function.
 fn thread_reader(
@@ -21,9 +22,10 @@ fn thread_reader(
     let mut matches = Vec::new();
     let mut buffers = Vec::new();
     for _ in 0..qd {
-        let mut allocation = vec![0u8; (block_size as usize) + 8192];
-        let data_ptr = (allocation.as_mut_ptr() as usize + 4096) & !4095;
-        let buffer = unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u8, block_size as usize) };
+        let num_pages = (block_size as usize + 4095) / 4096;
+        let mut allocation = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
+        let ptr = allocation.as_mut_ptr() as *mut u8;
+        let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, block_size as usize) };
         buffers.push((buffer, allocation));
     }
     let file_size = file.seek(SeekFrom::End(0)).unwrap();
