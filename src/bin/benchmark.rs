@@ -1,10 +1,38 @@
 use std::process::Command;
 use std::env;
 
+#[derive(Clone)]
+enum CacheState {
+    None,
+    Cold,
+    Hot,
+}
+
 struct TestCase {
     name: &'static str,
     args: Vec<String>,
     target: f64,
+    cache_state: CacheState,
+    files_to_prep: Vec<String>,
+}
+
+fn evict_cache(path: &str) {
+    if let Ok(file) = std::fs::File::open(path) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+}
+
+fn pre_cache(path: &str) {
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        while let Ok(n) = file.read(&mut buf) {
+            if n == 0 { break; }
+        }
+    }
 }
 
 fn main() {
@@ -20,76 +48,134 @@ fn main() {
             name: "bench-diff (memory)",
             args: vec!["bench-diff".into()],
             target: 30.0,
+            cache_state: CacheState::None,
+            files_to_prep: vec![],
         },
         TestCase {
             name: "write (direct)",
             args: vec!["write".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), target_file_dir.clone()],
-            target: 4.5,
+            target: 3.5,
+            cache_state: CacheState::None,
+            files_to_prep: vec![],
         },
         TestCase {
             name: "write (page cache)",
             args: vec!["write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
-            target: 2.0, // Can be fast, but keeping conservative
+            target: 2.0,
+            cache_state: CacheState::None,
+            files_to_prep: vec![],
         },
         TestCase {
             name: "read (direct)",
             args: vec!["read".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone()],
             target: 23.0,
+            cache_state: CacheState::Cold, // Direct I/O usually implies we want to test bypassing cache
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
-            name: "read (page cache)",
+            name: "read (page cache, cold)",
             args: vec!["read".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone()],
-            target: 10.0,
+            target: 3.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
+            name: "read (page cache, hot)",
+            args: vec!["read".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone()],
+            target: 20.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
             name: "copy (direct)",
             args: vec!["copy".into(), "--force-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_dir.clone()],
             target: 4.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
-            name: "copy (page cache)",
+            name: "copy (page cache, cold)",
             args: vec!["copy".into(), "--no-direct-io".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
             target: 0.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "diff (direct)",
             args: vec!["diff".into(), "--force-direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
             target: 14.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
-            name: "diff (page cache)",
+            name: "diff (page cache, cold)",
+            args: vec!["diff".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            target: 6.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "diff (page cache, hot)",
             args: vec!["diff".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 10.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "dual-read-bench (direct)",
             args: vec!["dual-read-bench".into(), "--force-direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
             target: 23.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
-            name: "dual-read-bench (page cache)",
+            name: "dual-read-bench (page cache, cold)",
+            args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            target: 6.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "dual-read-bench (page cache, hot)",
             args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 10.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "grep (direct)",
             args: vec!["grep".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), "needle".into(), source_file.clone()],
             target: 14.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
-            name: "grep (page cache)",
+            name: "grep (page cache, cold)",
+            args: vec!["grep".into(), "-v".into(), "-n".into(), "1".into(), "needle".into(), source_file.clone()],
+            target: 3.5,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
+            name: "grep (page cache, hot)",
             args: vec!["grep".into(), "-v".into(), "-n".into(), "1".into(), "needle".into(), source_file.clone()],
             target: 20.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
             name: "bench-mmap-write",
             args: vec!["bench-mmap-write".into(), target_file_cache.clone()],
             target: 0.7,
+            cache_state: CacheState::None,
+            files_to_prep: vec![],
         },
         TestCase {
             name: "bench-write",
             args: vec!["bench-write".into(), target_file_cache.clone()],
             target: 0.5,
+            cache_state: CacheState::None,
+            files_to_prep: vec![],
         }
     ];
 
@@ -103,10 +189,20 @@ fn main() {
         let _ = f.set_len(4 * 1024 * 1024 * 1024);
     }
 
-    println!("{:<25} | {:<12} | {:<12} | {:<10}", "Benchmark", "Speed (GB/s)", "Target", "Status");
-    println!("{:-<25}-|-{:-<12}-|-{:-<12}-|-{:-<10}", "", "", "", "");
+    println!("{:<35} | {:<12} | {:<12} | {:<10}", "Benchmark", "Speed (GB/s)", "Target", "Status");
+    println!("{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<10}", "", "", "", "");
 
     for t in tests {
+        match t.cache_state {
+            CacheState::Cold => {
+                for f in &t.files_to_prep { evict_cache(f); }
+            }
+            CacheState::Hot => {
+                for f in &t.files_to_prep { pre_cache(f); }
+            }
+            CacheState::None => {}
+        }
+
         let output = Command::new(&fro_exe)
             .args(&t.args)
             .output()
@@ -137,7 +233,7 @@ fn main() {
             "PASS"
         };
 
-        println!("{:<25} | {:<12.2} | {:<12.2} | {}", t.name, speed, t.target, status);
+        println!("{:<35} | {:<12.2} | {:<12.2} | {}", t.name, speed, t.target, status);
         
         if speed == 0.0 {
             println!("--- Output ---\n{}", combined);
