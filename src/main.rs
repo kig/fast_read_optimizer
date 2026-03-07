@@ -21,6 +21,7 @@ fn main() {
         println!("USAGE: {} dual-read-bench [--direct] [-v] <file1> <file2>", args[0]);
         println!("USAGE: {} bench-diff", args[0]);
         println!("USAGE: {} bench-mmap-write <filename>", args[0]);
+        println!("USAGE: {} bench-write <filename>", args[0]);
         return;
     }
     let mode = args[1].as_str();
@@ -32,7 +33,7 @@ fn main() {
     let mut _filename2 = "";
     let mut iterations = if mode == "read" || mode == "grep" { 1000 } else { 1 };
     if mode == "grep" || mode == "copy" || mode == "diff" || mode == "dual-read-bench" { iterations = 1; }
-
+    
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--direct" { direct_io = true; }
@@ -55,6 +56,11 @@ fn main() {
     if mode == "bench-mmap-write" {
         if filename == "" { println!("Filename missing"); return; }
         writer::bench_mmap_write(filename);
+        return;
+    }
+    if mode == "bench-write" {
+        if filename == "" { println!("Filename missing"); return; }
+        writer::bench_write(filename);
         return;
     }
 

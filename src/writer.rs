@@ -171,18 +171,27 @@ pub fn bench_mmap_write(filename: &str) {
         panic!("mmap failed");
     }
 
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
-
+    let num_threads = 16;
     let start = std::time::Instant::now();
     
-    // Fill with some data
-    let mut rng = rand::thread_rng();
-    let mut block = vec![0u8; 1024 * 1024];
-    rng.fill(&mut block[..]);
+    let mut threads = vec![];
+    let chunk_size = size / num_threads;
 
-    for i in 0..(size / block.len()) {
-        slice[i * block.len()..(i + 1) * block.len()].copy_from_slice(&block);
+    for t in 0..num_threads {
+        let thread_ptr_addr = unsafe { ptr.add(t * chunk_size) as usize };
+        threads.push(std::thread::spawn(move || {
+            let slice = unsafe { std::slice::from_raw_parts_mut(thread_ptr_addr as *mut u8, chunk_size) };
+            let mut rng = rand::thread_rng();
+            let mut block = vec![0u8; 1024 * 1024];
+            rng.fill(&mut block[..]);
+            
+            for i in 0..(chunk_size / block.len()) {
+                slice[i * block.len()..(i + 1) * block.len()].copy_from_slice(&block);
+            }
+        }));
     }
+
+    for t in threads { t.join().unwrap(); }
 
     // Ensure data is written to disk
     unsafe {
@@ -190,9 +199,33 @@ pub fn bench_mmap_write(filename: &str) {
     }
 
     let dur = start.elapsed().as_secs_f64();
-    println!("Mmap write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
+    println!("Parallel Mmap write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
 
     unsafe {
         libc::munmap(ptr, size);
     }
+}
+
+pub fn bench_write(filename: &str) {
+    use std::io::Write;
+    let size = 1024 * 1024 * 1024; // 1 GB
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(filename)
+        .unwrap();
+
+    let mut block = vec![0u8; 1024 * 1024];
+    rand::thread_rng().fill(&mut block[..]);
+
+    let start = std::time::Instant::now();
+    
+    for _ in 0..(size / block.len()) {
+        f.write_all(&block).unwrap();
+    }
+
+    f.sync_all().unwrap();
+
+    let dur = start.elapsed().as_secs_f64();
+    println!("Standard write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
 }
