@@ -1,11 +1,13 @@
 use std::env;
 
+mod config;
 mod common;
 mod optimizer;
 mod reader;
 mod writer;
 mod differ;
 
+use config::AppConfig;
 use optimizer::run_optimizer;
 use reader::read_file;
 use writer::write_file;
@@ -69,33 +71,54 @@ fn main() {
     }
 
     if filename == "" { println!("Filename missing"); return; }
-    let mut num_threads = 32;
-    let mut block_size = 384 * 1024;
-    let mut qd: usize = 1;
-    let mut bsf = 4;
-    if direct_io {
-        num_threads = 16;
-        block_size = 3 * 1024 * 1024;
-        qd = 2;
-        bsf = 256;
-    } else if mode == "diff" || mode == "dual-read-bench" {
-        num_threads = 4; // tuned for page cache diff
-    }
+
+    let mut config = AppConfig::load("fast_read_optimizer.json");
+    let actual_direct = if force_direct { true } else if no_direct { false } else { direct_io };
+    let params = config.get_params(mode, actual_direct);
     
+    let num_threads = params.num_threads;
+    let qd = params.qd;
+    // We reverse the scaling factor logic here since run_optimizer multiplies by bsf*1024
+    let bsf = if actual_direct { 256 } else { 4 };
+    let base_block_size = params.block_size / (bsf * 1024);
+
     if mode == "grep" || mode == "read" {
         if verbose || mode == "read" { eprintln!("Opening file {} for {}", filename, mode); }
-        run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "read", |p| {
+        let best_params = run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, base_block_size, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "read", |p| {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
+        if iterations > 1 {
+            config.update_params(mode, direct_io, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.save("fast_read_optimizer.json");
+        }
     } else if mode == "write" || mode == "copy" {
         if verbose || mode == "write" { eprintln!("Opening file {} for {}", filename, mode); }
-        run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "write", |p| {
+        let best_params = run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, base_block_size, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "write", |p| {
             write_file(source, filename, p[0], p[1], p[2] as usize, force_direct, no_direct)
         });
+        if iterations > 1 {
+            let direct = if force_direct { true } else if no_direct { false } else { direct_io };
+            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.save("fast_read_optimizer.json");
+        }
     } else if mode == "diff" || mode == "dual-read-bench" {
         if verbose { eprintln!("Opening files for {}", mode); }
-        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, force_direct, no_direct, verbose, mode == "dual-read-bench");
-        if res == 0 && mode == "diff" { if verbose { eprintln!("Files are identical"); } }
-        else if mode == "diff" { std::process::exit(1); }
+        let bench_only = mode == "dual-read-bench";
+        let best_params = run_optimizer(if bench_only { "Dual-read" } else { "Diff" }, vec![num_threads, base_block_size, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose, |p| {
+            let res = diff_files(source.unwrap(), filename, p[0], p[1], p[2] as usize, force_direct, no_direct, false, bench_only);
+            if res != 0 && mode == "diff" && iterations == 1 { std::process::exit(1); }
+            // For the optimizer, diff_files returns the mismatch count or 0.
+            // But run_optimizer expects the count of *processed bytes* to calculate GB/s!
+            // Wait, diff_files currently returns `mismatch.load()`.
+            // We need diff_files to return `processed_count` or we can just pass the total_size.
+            // Wait, run_optimizer takes the returned `u64` and uses it as `count` for GB/s.
+            let size = std::fs::File::open(filename).unwrap().metadata().unwrap().len();
+            size * 2
+        });
+        if iterations > 1 {
+            let direct = if force_direct { true } else if no_direct { false } else { direct_io };
+            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.save("fast_read_optimizer.json");
+        }
     }
 }

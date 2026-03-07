@@ -11,12 +11,14 @@ pub fn run_optimizer<F>(
     num_iterations: usize,
     verbose: bool,
     mut op: F
-) where F: FnMut(&[u64]) -> u64 {
+) -> Vec<u64> where F: FnMut(&[u64]) -> u64 {
     let mut rng = rand::thread_rng();
     let mut fastest_time = 1e9;
     let mut fastest_time_decayed = fastest_time;
     let mut optimize_params = start_params.clone();
     let mut best_params = optimize_params.clone();
+    let mut best_scaled_params = vec![0u64; optimize_params.len()];
+    
     let mut iterations_since_last_fastest_found = 0;
     for _i in 0..num_iterations {
         let start = std::time::Instant::now();
@@ -41,9 +43,23 @@ pub fn run_optimizer<F>(
             iterations_since_last_fastest_found = 0;
         }
         if cpu_time_used < fastest_time || num_iterations == 1 {
-            if cpu_time_used < fastest_time { fastest_time = cpu_time_used; }
+            if cpu_time_used < fastest_time { 
+                fastest_time = cpu_time_used; 
+                best_scaled_params = scaled_params.clone();
+            }
             if verbose { eprintln!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params[0], scaled_params[1] / 1024, scaled_params[2]); }
             else if num_iterations > 1 { println!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params[0], scaled_params[1] / 1024, scaled_params[2]); }
         }
+    }
+    
+    if num_iterations == 1 {
+        // If 1 iteration, the scaled_params from the single run is best
+        let mut scaled_params = vec![0u64; optimize_params.len()];
+        for j in 0..optimize_params.len() {
+            scaled_params[j] = optimize_params[j] * param_scaling_factors[j];
+        }
+        scaled_params
+    } else {
+        best_scaled_params
     }
 }
