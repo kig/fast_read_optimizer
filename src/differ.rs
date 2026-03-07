@@ -89,59 +89,82 @@ fn thread_differ(
         inflight -= 1;
         if file_num == 1 { ready1[idx] = true; } else { ready2[idx] = true; }
 
-        if ready1[idx] && ready2[idx] {
-            let off = buffer_offsets[idx];
-            let len = (total_size - off).min(block_size) as usize;
-            
-            if !bench_only {
-                if buffers1[idx].0[..len] != buffers2[idx].0[..len] {
-                    for j in 0..len {
-                        if buffers1[idx].0[j] != buffers2[idx].0[j] {
-                            let absolute_offset = off + j as u64;
-                            println!("Mismatch at offset {}: {:02x} != {:02x}", absolute_offset, buffers1[idx].0[j], buffers2[idx].0[j]);
-                            mismatch.compare_exchange(0, absolute_offset + 1, Ordering::SeqCst, Ordering::SeqCst).ok();
-                            break;
+        let mut ready_indices = vec![idx];
+
+        while io_uring.cq_ready() > 0 {
+            let cq = io_uring.peek_for_cqe().unwrap();
+            let ud = cq.user_data();
+            let idx2 = (ud & 0xFFFFFFFF) as usize;
+            let file_num = (ud >> 40) as u8;
+            cq.result().expect("IO failed");
+            inflight -= 1;
+            if file_num == 1 { ready1[idx2] = true; } else { ready2[idx2] = true; }
+            if !ready_indices.contains(&idx2) {
+                ready_indices.push(idx2);
+            }
+        }
+
+        for &idx in &ready_indices {
+            if ready1[idx] && ready2[idx] {
+                let off = buffer_offsets[idx];
+                let len = (total_size - off).min(block_size) as usize;
+                
+                if !bench_only {
+                    if buffers1[idx].0[..len] != buffers2[idx].0[..len] {
+                        for j in 0..len {
+                            if buffers1[idx].0[j] != buffers2[idx].0[j] {
+                                let absolute_offset = off + j as u64;
+                                println!("Mismatch at offset {}: {:02x} != {:02x}", absolute_offset, buffers1[idx].0[j], buffers2[idx].0[j]);
+                                mismatch.compare_exchange(0, absolute_offset + 1, Ordering::SeqCst, Ordering::SeqCst).ok();
+                                break;
+                            }
                         }
                     }
                 }
+                
+                processed_count.fetch_add(len as u64, Ordering::Relaxed);
+                ready1[idx] = false;
+                ready2[idx] = false;
+                free_buffers.push(idx);
             }
-            
-            processed_count.fetch_add(len as u64, Ordering::SeqCst);
-            ready1[idx] = false;
-            ready2[idx] = false;
-            free_buffers.push(idx);
+        }
 
-            if next_offset < total_size && mismatch.load(Ordering::Relaxed) == 0 && (inflight / 2) < qd {
-                if let Some(next_idx) = free_buffers.pop() {
-                    buffer_offsets[next_idx] = next_offset;
-                    let next_len = (total_size - next_offset).min(block_size);
-                    
-                    let use_direct = if no_direct {
-                        false
-                    } else if force_direct {
-                        true
-                    } else {
-                        !crate::writer::is_range_in_page_cache(file1.1, next_offset, next_len as usize) || 
-                        !crate::writer::is_range_in_page_cache(file2.1, next_offset, next_len as usize)
-                    };
+        let mut submitted = false;
+        while next_offset < total_size && mismatch.load(Ordering::Relaxed) == 0 && (inflight / 2) < qd {
+            if let Some(next_idx) = free_buffers.pop() {
+                buffer_offsets[next_idx] = next_offset;
+                let next_len = (total_size - next_offset).min(block_size);
+                
+                let use_direct = if no_direct {
+                    false
+                } else if force_direct {
+                    true
+                } else {
+                    !crate::writer::is_range_in_page_cache(file1.1, next_offset, next_len as usize) || 
+                    !crate::writer::is_range_in_page_cache(file2.1, next_offset, next_len as usize)
+                };
 
-                    let is_aligned = (next_offset % 4096 == 0) && (next_len == block_size);
-                    let f1_fd = if use_direct && is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
-                    let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
-                    unsafe {
-                        let mut sqe1 = io_uring.prepare_sqe().unwrap();
-                        sqe1.prep_read(f1_fd, &mut buffers1[next_idx].0[..next_len as usize], next_offset);
-                        sqe1.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
+                let is_aligned = (next_offset % 4096 == 0) && (next_len == block_size);
+                let f1_fd = if use_direct && is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
+                let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
+                unsafe {
+                    let mut sqe1 = io_uring.prepare_sqe().unwrap();
+                    sqe1.prep_read(f1_fd, &mut buffers1[next_idx].0[..next_len as usize], next_offset);
+                    sqe1.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
 
-                        let mut sqe2 = io_uring.prepare_sqe().unwrap();
-                        sqe2.prep_read(f2_fd, &mut buffers2[next_idx].0[..next_len as usize], next_offset);
-                        sqe2.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
-                    }
-                    io_uring.submit_sqes().unwrap();
-                    next_offset += num_threads * block_size;
-                    inflight += 2;
+                    let mut sqe2 = io_uring.prepare_sqe().unwrap();
+                    sqe2.prep_read(f2_fd, &mut buffers2[next_idx].0[..next_len as usize], next_offset);
+                    sqe2.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
                 }
+                submitted = true;
+                next_offset += num_threads * block_size;
+                inflight += 2;
+            } else {
+                break;
             }
+        }
+        if submitted {
+            io_uring.submit_sqes().unwrap();
         }
     }
 }

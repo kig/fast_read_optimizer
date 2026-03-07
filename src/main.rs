@@ -77,7 +77,10 @@ fn main() {
         block_size = 3 * 1024 * 1024;
         qd = 2;
         bsf = 256;
+    } else if mode == "diff" || mode == "dual-read-bench" {
+        num_threads = 4; // tuned for page cache diff
     }
+    
     if mode == "grep" || mode == "read" {
         if verbose || mode == "read" { eprintln!("Opening file {} for {}", filename, mode); }
         run_optimizer(if mode == "grep" { "Grep" } else { "Read" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "read", |p| {

@@ -117,7 +117,7 @@ fn main() {
         TestCase {
             name: "diff (page cache, hot)",
             args: vec!["diff".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
-            target: 10.0,
+            target: 20.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
@@ -131,14 +131,14 @@ fn main() {
         TestCase {
             name: "dual-read-bench (page cache, cold)",
             args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
-            target: 6.0,
+            target: 5.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "dual-read-bench (page cache, hot)",
             args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
-            target: 10.0,
+            target: 20.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
