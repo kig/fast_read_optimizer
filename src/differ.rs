@@ -85,6 +85,7 @@ fn thread_differ(
                 let off = buffer_offsets[i];
                 let len = (total_size - off).min(block_size) as usize;
                 
+                // 1. Perform comparison FIRST to avoid data race with next read
                 if !bench_only {
                     if buffers1[i].0[..len] != buffers2[i].0[..len] {
                         for j in 0..len {
