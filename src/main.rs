@@ -16,16 +16,18 @@ fn main() {
         println!("USAGE: {} grep [--direct] [-v] [-n iterations] <pattern> <filename>", args[0]);
         println!("USAGE: {} read [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
-        println!("USAGE: {} copy [--no-direct-io] [-v] [-n iterations] <source> <target>", args[0]);
-        println!("USAGE: {} diff [--direct] [-v] <file1> <file2>", args[0]);
-        println!("USAGE: {} dual-read-bench [--direct] [-v] <file1> <file2>", args[0]);
+        println!("USAGE: {} copy [--no-direct-io] [--force-direct] [-v] [-n iterations] <source> <target>", args[0]);
+        println!("USAGE: {} diff [--no-direct-io] [--force-direct] [-v] <file1> <file2>", args[0]);
+        println!("USAGE: {} dual-read-bench [--no-direct-io] [--force-direct] [-v] <file1> <file2>", args[0]);
         println!("USAGE: {} bench-diff", args[0]);
         println!("USAGE: {} bench-mmap-write <filename>", args[0]);
         println!("USAGE: {} bench-write <filename>", args[0]);
         return;
     }
     let mode = args[1].as_str();
-    let mut direct_io = if mode == "copy" { true } else { false };
+    let mut direct_io = if mode == "copy" || mode == "diff" || mode == "dual-read-bench" { true } else { false };
+    let mut force_direct = false;
+    let mut no_direct = false;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -37,7 +39,8 @@ fn main() {
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--direct" { direct_io = true; }
-        else if args[i] == "--no-direct-io" { direct_io = false; }
+        else if args[i] == "--force-direct" { force_direct = true; }
+        else if args[i] == "--no-direct-io" { no_direct = true; }
         else if args[i] == "-v" || args[i] == "--verbose" { verbose = true; }
         else if args[i] == "-n" {
             i += 1;
@@ -83,11 +86,11 @@ fn main() {
     } else if mode == "write" || mode == "copy" {
         if verbose || mode == "write" { eprintln!("Opening file {} for {}", filename, mode); }
         run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, block_size / bsf / 1024, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "write", |p| {
-            write_file(source, filename, p[0], p[1], p[2] as usize, direct_io)
+            write_file(source, filename, p[0], p[1], p[2] as usize, force_direct, no_direct)
         });
     } else if mode == "diff" || mode == "dual-read-bench" {
         if verbose { eprintln!("Opening files for {}", mode); }
-        let res = diff_files(source.unwrap(), filename, 32, 384*1024, 2, direct_io, verbose, mode == "dual-read-bench");
+        let res = diff_files(source.unwrap(), filename, num_threads, block_size, qd, force_direct, no_direct, verbose, mode == "dual-read-bench");
         if res == 0 && mode == "diff" { if verbose { eprintln!("Files are identical"); } }
         else if mode == "diff" { std::process::exit(1); }
     }
