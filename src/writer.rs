@@ -144,3 +144,55 @@ pub fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_
     for thread in threads { thread.join().unwrap(); }
     write_count.load(Ordering::SeqCst)
 }
+
+pub fn bench_mmap_write(filename: &str) {
+    let size = 1024 * 1024 * 1024; // 1 GB
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(filename)
+        .unwrap();
+    f.set_len(size as u64).unwrap();
+    let fd = f.as_raw_fd();
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+
+    if ptr == libc::MAP_FAILED {
+        panic!("mmap failed");
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
+
+    let start = std::time::Instant::now();
+    
+    // Fill with some data
+    let mut rng = rand::thread_rng();
+    let mut block = vec![0u8; 1024 * 1024];
+    rng.fill(&mut block[..]);
+
+    for i in 0..(size / block.len()) {
+        slice[i * block.len()..(i + 1) * block.len()].copy_from_slice(&block);
+    }
+
+    // Ensure data is written to disk
+    unsafe {
+        libc::msync(ptr, size, libc::MS_SYNC);
+    }
+
+    let dur = start.elapsed().as_secs_f64();
+    println!("Mmap write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
+
+    unsafe {
+        libc::munmap(ptr, size);
+    }
+}

@@ -16,24 +16,27 @@ fn main() {
         println!("USAGE: {} grep [--direct] [-v] [-n iterations] <pattern> <filename>", args[0]);
         println!("USAGE: {} read [--direct] [-n iterations] <filename>", args[0]);
         println!("USAGE: {} write [--direct] [-n iterations] <filename>", args[0]);
-        println!("USAGE: {} copy [--direct] [-v] [-n iterations] <source> <target>", args[0]);
+        println!("USAGE: {} copy [--no-direct-io] [-v] [-n iterations] <source> <target>", args[0]);
         println!("USAGE: {} diff [--direct] [-v] <file1> <file2>", args[0]);
         println!("USAGE: {} dual-read-bench [--direct] [-v] <file1> <file2>", args[0]);
         println!("USAGE: {} bench-diff", args[0]);
+        println!("USAGE: {} bench-mmap-write <filename>", args[0]);
         return;
     }
     let mode = args[1].as_str();
-    let mut direct_io = false;
+    let mut direct_io = if mode == "copy" { true } else { false };
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
     let mut filename = "";
     let mut _filename2 = "";
     let mut iterations = if mode == "read" || mode == "grep" { 1000 } else { 1 };
-    if mode == "grep" || mode == "copy" { iterations = 1; }
+    if mode == "grep" || mode == "copy" || mode == "diff" || mode == "dual-read-bench" { iterations = 1; }
+
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--direct" { direct_io = true; }
+        else if args[i] == "--no-direct-io" { direct_io = false; }
         else if args[i] == "-v" || args[i] == "--verbose" { verbose = true; }
         else if args[i] == "-n" {
             i += 1;
@@ -49,6 +52,12 @@ fn main() {
         i += 1;
     }
     if mode == "bench-diff" { bench_diff_memory(16, 1024 * 1024); return; }
+    if mode == "bench-mmap-write" {
+        if filename == "" { println!("Filename missing"); return; }
+        writer::bench_mmap_write(filename);
+        return;
+    }
+
     if filename == "" { println!("Filename missing"); return; }
     let mut num_threads = 32;
     let mut block_size = 384 * 1024;
