@@ -88,7 +88,7 @@ fn main() {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, direct_io)
         });
         if iterations > 1 {
-            config.update_params(mode, direct_io, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.update_params(mode, direct_io, config::IOParams { num_threads: best_params[0], block_size: best_params[1], qd: best_params[2] as usize });
             config.save("fast_read_optimizer.json");
         }
     } else if mode == "write" || mode == "copy" {
@@ -98,7 +98,7 @@ fn main() {
         });
         if iterations > 1 {
             let direct = if force_direct { true } else if no_direct { false } else { direct_io };
-            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1], qd: best_params[2] as usize });
             config.save("fast_read_optimizer.json");
         }
     } else if mode == "diff" || mode == "dual-read-bench" {
@@ -117,7 +117,7 @@ fn main() {
         });
         if iterations > 1 {
             let direct = if force_direct { true } else if no_direct { false } else { direct_io };
-            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1] * bsf * 1024, qd: best_params[2] as usize });
+            config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1], qd: best_params[2] as usize });
             config.save("fast_read_optimizer.json");
         }
     }

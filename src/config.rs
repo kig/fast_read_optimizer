@@ -27,7 +27,7 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let default_direct = IOParams { num_threads: 18, block_size: 768 * 1024, qd: 2 };
+        let default_direct = IOParams { num_threads: 16, block_size: 3 * 1024 * 1024, qd: 2 };
         let default_cache = IOParams { num_threads: 12, block_size: 128 * 1024, qd: 1 };
         
         let default_mode = ModeConfig {
