@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use crate::common::PageAligned;
+use crate::common::AlignedBuffer;
 
 pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
@@ -57,12 +57,9 @@ fn thread_writer(
 ) {
     let mut buffers = Vec::new();
     for _ in 0..qd {
-        let num_pages = (block_size as usize + 4095) / 4096;
-        let mut allocation = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
-        let ptr = allocation.as_mut_ptr() as *mut u8;
-        let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, block_size as usize) };
-        if let Some(rb) = random_block { buffer.copy_from_slice(rb); }
-        buffers.push((buffer, allocation));
+        let mut buffer = AlignedBuffer::new(block_size as usize);
+        if let Some(rb) = random_block { buffer.as_mut_slice().copy_from_slice(rb); }
+        buffers.push(buffer);
     }
 
     let mut inflight = 0;
@@ -91,14 +88,14 @@ fn thread_writer(
             let fd = if use_direct && is_aligned { src_dir.as_raw_fd() } else { src_nodir.as_raw_fd() };
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
-                sqe.prep_read(fd, &mut buffers[i].0[..len as usize], next_offset);
+                sqe.prep_read(fd, &mut buffers[i].as_mut_slice()[..len as usize], next_offset);
                 sqe.set_user_data((i as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
             }
         } else {
             let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
-                sqe.prep_write(fd, &buffers[i].0[..len as usize], next_offset);
+                sqe.prep_write(fd, &buffers[i].as_slice()[..len as usize], next_offset);
                 sqe.set_user_data((i as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
             }
         }
@@ -122,7 +119,7 @@ fn thread_writer(
             let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
-                sqe.prep_write(fd, &buffers[idx].0[..result as usize], buffer_offsets[idx]);
+                sqe.prep_write(fd, &buffers[idx].as_slice()[..result as usize], buffer_offsets[idx]);
                 sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
             }
             io_uring.submit_sqes().unwrap();
@@ -150,14 +147,14 @@ fn thread_writer(
                     let fd = if use_direct && is_aligned { src_dir.as_raw_fd() } else { src_nodir.as_raw_fd() };
                     unsafe {
                         let mut sqe = io_uring.prepare_sqe().unwrap();
-                        sqe.prep_read(fd, &mut buffers[idx].0[..len as usize], next_offset);
+                        sqe.prep_read(fd, &mut buffers[idx].as_mut_slice()[..len as usize], next_offset);
                         sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
                     }
                 } else {
                     let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
                     unsafe {
                         let mut sqe = io_uring.prepare_sqe().unwrap();
-                        sqe.prep_write(fd, &buffers[idx].0[..len as usize], next_offset);
+                        sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], next_offset);
                         sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
                     }
                 }

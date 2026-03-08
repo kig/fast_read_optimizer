@@ -6,7 +6,7 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use memchr::memmem::Finder;
-use crate::common::PageAligned;
+use crate::common::AlignedBuffer;
 
 // The thread reader function.
 fn thread_reader(
@@ -22,11 +22,7 @@ fn thread_reader(
     let mut matches = Vec::new();
     let mut buffers = Vec::new();
     for _ in 0..qd {
-        let num_pages = (block_size as usize + 4095) / 4096;
-        let mut allocation = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
-        let ptr = allocation.as_mut_ptr() as *mut u8;
-        let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, block_size as usize) };
-        buffers.push((buffer, allocation));
+        buffers.push(AlignedBuffer::new(block_size as usize));
     }
     let file_size = file.seek(SeekFrom::End(0)).unwrap();
     let offset = thread_id * block_size;
@@ -38,7 +34,7 @@ fn thread_reader(
         if current_offset >= file_size { break; }
         unsafe {
             let mut sqe = io_uring.prepare_sqe().unwrap();
-            sqe.prep_read(file.as_raw_fd(), &mut buffers[block_num % qd].0[..], current_offset);
+            sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), current_offset);
             sqe.set_user_data(block_num as u64);
         }
         block_num += 1;
@@ -52,29 +48,37 @@ fn thread_reader(
 
     loop {
         let cq = io_uring.wait_for_cqe().unwrap();
-        let block_id = cq.user_data() as u64;
-        let result = cq.result().unwrap();
-        if result > 0 {
-            read_count.fetch_add(result as u64, Ordering::SeqCst);
-            if !pattern.is_empty() {
-                let buf = &buffers[block_id as usize % qd].0;
-                for idx in finder.find_iter(&buf[..result as usize]) {
-                    matches.push(offset + block_id * num_threads * block_size + idx as u64);
+        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
+
+        while io_uring.cq_ready() > 0 {
+            let cq = io_uring.peek_for_cqe().unwrap();
+            ready.push((cq.user_data() as u64, cq.result().unwrap()));
+        }
+
+        for (block_id, result) in ready {
+            if result > 0 {
+                read_count.fetch_add(result as u64, Ordering::Relaxed);
+                if !pattern.is_empty() {
+                    let buf = buffers[block_id as usize % qd].as_slice();
+                    for idx in finder.find_iter(&buf[..result as usize]) {
+                        matches.push(offset + block_id * num_threads * block_size + idx as u64);
+                    }
                 }
             }
-        }
-        inflight -= 1;
-        let next_offset = offset + (block_num as u64) * num_threads * block_size;
-        if next_offset < file_size {
-            unsafe {
-                let mut sqe = io_uring.prepare_sqe().unwrap();
-                sqe.prep_read(file.as_raw_fd(), &mut buffers[block_num % qd].0[..], next_offset);
-                sqe.set_user_data(block_num as u64);
+            inflight -= 1;
+            
+            let next_offset = offset + (block_num as u64) * num_threads * block_size;
+            if next_offset < file_size {
+                unsafe {
+                    let mut sqe = io_uring.prepare_sqe().unwrap();
+                    sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), next_offset);
+                    sqe.set_user_data(block_num as u64);
+                }
+                block_num += 1;
+                inflight += 1;
             }
-            io_uring.submit_sqes().unwrap();
-            block_num += 1;
-            inflight += 1;
         }
+        io_uring.submit_sqes().unwrap();
         if inflight == 0 { return matches; }
     }
 }

@@ -94,7 +94,7 @@ fn main() {
     } else if mode == "write" || mode == "copy" {
         if verbose || mode == "write" { eprintln!("Opening file {} for {}", filename, mode); }
         let best_params = run_optimizer(if mode == "copy" { "Copy" } else { "Write" }, vec![num_threads, base_block_size, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose || mode == "write", |p| {
-            write_file(source, filename, p[0], p[1], p[2] as usize, force_direct, no_direct)
+            write_file(source, filename, p[0], p[1], p[2] as usize, actual_direct, no_direct)
         });
         if iterations > 1 {
             let direct = if force_direct { true } else if no_direct { false } else { direct_io };
@@ -105,7 +105,7 @@ fn main() {
         if verbose { eprintln!("Opening files for {}", mode); }
         let bench_only = mode == "dual-read-bench";
         let best_params = run_optimizer(if bench_only { "Dual-read" } else { "Diff" }, vec![num_threads, base_block_size, qd as u64], vec![1, bsf * 1024, 1], iterations, verbose, |p| {
-            let res = diff_files(source.unwrap(), filename, p[0], p[1], p[2] as usize, force_direct, no_direct, false, bench_only);
+            let res = diff_files(source.unwrap(), filename, p[0], p[1], p[2] as usize, actual_direct, no_direct, false, bench_only);
             if res != 0 && mode == "diff" && iterations == 1 { std::process::exit(1); }
             // For the optimizer, diff_files returns the mismatch count or 0.
             // But run_optimizer expects the count of *processed bytes* to calculate GB/s!

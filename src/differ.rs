@@ -6,7 +6,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use crate::common::PageAligned;
+use crate::common::AlignedBuffer;
 
 fn thread_differ(
     thread_id: u64,
@@ -26,16 +26,9 @@ fn thread_differ(
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
     for _ in 0..(qd * 2) {
-        let num_pages = (block_size as usize + 4095) / 4096;
-        let mut a1 = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
-        let p1 = a1.as_mut_ptr() as *mut u8;
-        buffers1.push((unsafe { std::slice::from_raw_parts_mut(p1, block_size as usize) }, a1));
-
-        let mut a2 = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
-        let p2 = a2.as_mut_ptr() as *mut u8;
-        buffers2.push((unsafe { std::slice::from_raw_parts_mut(p2, block_size as usize) }, a2));
+        buffers1.push(AlignedBuffer::new(block_size as usize));
+        buffers2.push(AlignedBuffer::new(block_size as usize));
     }
-
     let mut inflight = 0;
     let mut next_offset = thread_id * block_size;
     let mut buffer_offsets = vec![0u64; qd * 2];
@@ -64,11 +57,11 @@ fn thread_differ(
         let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
         unsafe {
             let mut sqe1 = io_uring.prepare_sqe().unwrap();
-            sqe1.prep_read(f1_fd, &mut buffers1[idx].0[..len as usize], next_offset);
+            sqe1.prep_read(f1_fd, &mut buffers1[idx].as_mut_slice()[..len as usize], next_offset);
             sqe1.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
 
             let mut sqe2 = io_uring.prepare_sqe().unwrap();
-            sqe2.prep_read(f2_fd, &mut buffers2[idx].0[..len as usize], next_offset);
+            sqe2.prep_read(f2_fd, &mut buffers2[idx].as_mut_slice()[..len as usize], next_offset);
             sqe2.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
         }
         next_offset += num_threads * block_size;
@@ -112,11 +105,11 @@ fn thread_differ(
                 let len = (total_size - off).min(block_size) as usize;
                 
                 if !bench_only {
-                    if buffers1[idx].0[..len] != buffers2[idx].0[..len] {
+                    if buffers1[idx].as_slice()[..len] != buffers2[idx].as_slice()[..len] {
                         for j in 0..len {
-                            if buffers1[idx].0[j] != buffers2[idx].0[j] {
+                            if buffers1[idx].as_slice()[j] != buffers2[idx].as_slice()[j] {
                                 let absolute_offset = off + j as u64;
-                                println!("Mismatch at offset {}: {:02x} != {:02x}", absolute_offset, buffers1[idx].0[j], buffers2[idx].0[j]);
+                                println!("Mismatch at offset {}: {:02x} != {:02x}", absolute_offset, buffers1[idx].as_slice()[j], buffers2[idx].as_slice()[j]);
                                 mismatch.compare_exchange(0, absolute_offset + 1, Ordering::SeqCst, Ordering::SeqCst).ok();
                                 break;
                             }
@@ -151,11 +144,11 @@ fn thread_differ(
                 let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
                 unsafe {
                     let mut sqe1 = io_uring.prepare_sqe().unwrap();
-                    sqe1.prep_read(f1_fd, &mut buffers1[next_idx].0[..next_len as usize], next_offset);
+                    sqe1.prep_read(f1_fd, &mut buffers1[next_idx].as_mut_slice()[..next_len as usize], next_offset);
                     sqe1.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
 
                     let mut sqe2 = io_uring.prepare_sqe().unwrap();
-                    sqe2.prep_read(f2_fd, &mut buffers2[next_idx].0[..next_len as usize], next_offset);
+                    sqe2.prep_read(f2_fd, &mut buffers2[next_idx].as_mut_slice()[..next_len as usize], next_offset);
                     sqe2.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
                 }
                 submitted = true;
