@@ -166,7 +166,7 @@ pub fn diff_files(
     let mut threads = vec![];
 
     let file_cached = Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
-    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
+    let use_direct = (!file_cached) && io_mode != IOMode::PageCache;
 
     let num_threads = if use_direct { num_threads_d } else { num_threads_p };
     let block_size = if use_direct { block_size_d } else { block_size_p };

@@ -41,6 +41,7 @@ pub fn is_first_page_resident(file_path: &str) -> Result<bool, String> {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
     let offset_aligned = (offset / page_size as u64) * page_size as u64;

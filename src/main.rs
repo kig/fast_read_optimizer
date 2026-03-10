@@ -13,8 +13,6 @@ use optimizer::run_optimizer;
 use reader::read_file;
 use writer::write_file;
 use differ::{diff_files, bench_diff_memory};
-use std::fs::{File};
-use std::io::{Seek, SeekFrom};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -127,10 +125,8 @@ fn main() {
                 io_mode, io_mode_write
             )
         } else if mode == "diff" || mode == "dual-read-bench" {
-            let mut f1_check = File::open(source.unwrap()).unwrap();
-            let s1 = f1_check.seek(SeekFrom::End(0)).unwrap();
-            let mut f2_check = File::open(filename).unwrap();
-            let s2 = f2_check.seek(SeekFrom::End(0)).unwrap();
+            let s1 = std::fs::metadata(source.unwrap()).expect("Could not read file 1").len();
+            let s2 = std::fs::metadata(filename).expect("Could not read file 2").len();
             if s1 != s2 {
                 if verbose { eprintln!("Files have different sizes: {} != {}", s1, s2); }
                 if mode == "diff" { exit_code = 1; }
