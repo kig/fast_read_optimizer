@@ -208,11 +208,15 @@ fn main() {
     ];
 
 
-    let _ = Command::new("cargo")
+    let build_output = Command::new("cargo")
             .args(["build", "--release"])
             .output()
             .unwrap_or_else(|e| panic!("Failed to compile: {}", e));
 
+    let out_str = String::from_utf8_lossy(&build_output.stdout);
+    let err_str = String::from_utf8_lossy(&build_output.stderr);
+    let combined = format!("{}\n{}", out_str, err_str);
+    println!("{}", combined);
 
     let mut regressions = false;
 

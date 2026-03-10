@@ -4,6 +4,7 @@
 pub struct PageAligned(pub [u8; 4096]);
 
 pub struct AlignedBuffer {
+    #[allow(dead_code)]
     allocation: Box<[PageAligned]>,
     ptr: *mut u8,
     len: usize,
@@ -30,3 +31,6 @@ impl AlignedBuffer {
 // Memory is owned by Box, dropping AlignedBuffer drops the Box normally.
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
+
+#[derive(PartialEq)]
+pub enum IOMode { Auto, Direct, PageCache, }
