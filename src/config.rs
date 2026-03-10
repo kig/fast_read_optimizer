@@ -28,11 +28,18 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         let default_direct = IOParams { num_threads: 16, block_size: 3 * 1024 * 1024, qd: 2 };
-        let default_cache = IOParams { num_threads: 12, block_size: 128 * 1024, qd: 1 };
+        let default_cache = IOParams { num_threads: 31, block_size: 128 * 1024, qd: 1 };
+        let default_write_direct = IOParams { num_threads: 4, block_size: 256 * 1024, qd: 3 };
+        let default_write = IOParams { num_threads: 4, block_size: 1024 * 1024, qd: 2 };
         
         let default_mode = ModeConfig {
             direct: default_direct.clone(),
             page_cache: default_cache.clone(),
+        };
+
+        let default_write_mode = ModeConfig {
+            direct: default_write_direct.clone(),
+            page_cache: default_write.clone(),
         };
 
         // Custom defaults based on previous tuning
@@ -41,8 +48,8 @@ impl Default for AppConfig {
         
         AppConfig {
             read: default_mode.clone(),
-            write: default_mode.clone(),
-            copy: default_mode.clone(),
+            write: default_write_mode.clone(),
+            copy: default_write_mode.clone(),
             grep: default_mode.clone(),
             diff: ModeConfig { direct: default_direct.clone(), page_cache: diff_cache.clone() },
             dual_read_bench: ModeConfig { direct: default_direct.clone(), page_cache: diff_cache.clone() },

@@ -1,12 +1,25 @@
 use iou::IoUring;
 use rand::Rng;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use crate::common::AlignedBuffer;
+use crate::common::{AlignedBuffer, IOMode};
+use crate::mincore::{is_first_page_resident};
+
+
+/*
+diff (direct)                       | 6.20         | 14.50        | REGRESSION                                                                                                        
+diff (page cache, cold)             | 4.40         | 3.50         | PASS
+diff (page cache, hot)              | 29.90        | 40.00        | REGRESSION
+diff (auto, hot)                    | 6.00         | 40.00        | REGRESSION                                                                                                        
+
+dual-read-bench (direct)            | 6.40         | 23.00        | REGRESSION                                                                                                        
+dual-read-bench (page cache, cold)  | 4.40         | 3.50         | PASS
+dual-read-bench (page cache, hot)   | 31.80        | 40.00        | REGRESSION
+dual-read-bench (auto, hot)         | 6.20         | 40.00        | REGRESSION                                                                                                        
+*/
 
 fn thread_differ(
     thread_id: u64,
@@ -18,10 +31,8 @@ fn thread_differ(
     io_uring: &mut IoUring,
     total_size: u64,
     mismatch: Arc<AtomicU64>,
-    processed_count: Arc<AtomicU64>,
     bench_only: bool,
-    force_direct: bool,
-    no_direct: bool,
+    use_direct: bool,
 ) {
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
@@ -43,26 +54,17 @@ fn thread_differ(
         buffer_offsets[idx] = next_offset;
         let len = (total_size - next_offset).min(block_size);
         
-        let use_direct = if no_direct {
-            false
-        } else if force_direct {
-            true
-        } else {
-            !crate::writer::is_range_in_page_cache(file1.1, next_offset, len as usize) || 
-            !crate::writer::is_range_in_page_cache(file2.1, next_offset, len as usize)
-        };
-
         let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
         let f1_fd = if use_direct && is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
         let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
         unsafe {
             let mut sqe1 = io_uring.prepare_sqe().unwrap();
             sqe1.prep_read(f1_fd, &mut buffers1[idx].as_mut_slice()[..len as usize], next_offset);
-            sqe1.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
+            sqe1.set_user_data((idx as u64) | (1u64 << 40));
 
             let mut sqe2 = io_uring.prepare_sqe().unwrap();
             sqe2.prep_read(f2_fd, &mut buffers2[idx].as_mut_slice()[..len as usize], next_offset);
-            sqe2.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
+            sqe2.set_user_data((idx as u64) | (2u64 << 40));
         }
         next_offset += num_threads * block_size;
         inflight += 2;
@@ -78,7 +80,6 @@ fn thread_differ(
         let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
         let ud = cq.user_data();
         let idx = (ud & 0xFFFFFFFF) as usize;
-        let _use_direct_finished = ((ud >> 32) & 0xFF) != 0;
         let file_num = (ud >> 40) as u8;
         cq.result().expect("IO failed");
         inflight -= 1;
@@ -117,7 +118,6 @@ fn thread_differ(
                     }
                 }
                 
-                processed_count.fetch_add(len as u64, Ordering::Relaxed);
                 ready1[idx] = false;
                 ready2[idx] = false;
                 free_buffers.push(idx);
@@ -130,26 +130,17 @@ fn thread_differ(
                 buffer_offsets[next_idx] = next_offset;
                 let next_len = (total_size - next_offset).min(block_size);
                 
-                let use_direct = if no_direct {
-                    false
-                } else if force_direct {
-                    true
-                } else {
-                    !crate::writer::is_range_in_page_cache(file1.1, next_offset, next_len as usize) || 
-                    !crate::writer::is_range_in_page_cache(file2.1, next_offset, next_len as usize)
-                };
-
                 let is_aligned = (next_offset % 4096 == 0) && (next_len == block_size);
                 let f1_fd = if use_direct && is_aligned { file1.0.as_raw_fd() } else { file1.1.as_raw_fd() };
                 let f2_fd = if use_direct && is_aligned { file2.0.as_raw_fd() } else { file2.1.as_raw_fd() };
                 unsafe {
                     let mut sqe1 = io_uring.prepare_sqe().unwrap();
                     sqe1.prep_read(f1_fd, &mut buffers1[next_idx].as_mut_slice()[..next_len as usize], next_offset);
-                    sqe1.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
+                    sqe1.set_user_data((next_idx as u64) | (1u64 << 40));
 
                     let mut sqe2 = io_uring.prepare_sqe().unwrap();
                     sqe2.prep_read(f2_fd, &mut buffers2[next_idx].as_mut_slice()[..next_len as usize], next_offset);
-                    sqe2.set_user_data((next_idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
+                    sqe2.set_user_data((next_idx as u64) | (2u64 << 40));
                 }
                 submitted = true;
                 next_offset += num_threads * block_size;
@@ -164,44 +155,46 @@ fn thread_differ(
     }
 }
 
-pub fn diff_files(file1: &str, file2: &str, num_threads: u64, block_size: u64, qd: usize, force_direct: bool, no_direct: bool, verbose: bool, bench_only: bool) -> u64 {
-    let mut f1_check = File::open(file1).unwrap();
-    let s1 = f1_check.seek(SeekFrom::End(0)).unwrap();
-    let mut f2_check = File::open(file2).unwrap();
-    let s2 = f2_check.seek(SeekFrom::End(0)).unwrap();
-    if s1 != s2 {
-        if verbose { eprintln!("Files have different sizes: {} != {}", s1, s2); }
-        return 1;
-    }
-
+pub fn diff_files(
+    file1: &str, file2: &str,
+    num_threads_p: u64, block_size_p: u64, qd_p: usize, 
+    num_threads_d: u64, block_size_d: u64, qd_d: usize, 
+    io_mode: IOMode, 
+    bench_only: bool
+) -> u64 {
     let mismatch = Arc::new(AtomicU64::new(0));
-    let processed_count = Arc::new(AtomicU64::new(0));
-    let start = std::time::Instant::now();
     let mut threads = vec![];
-    
+
+    let file_cached = Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
+    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
+
+    let num_threads = if use_direct { num_threads_d } else { num_threads_p };
+    let block_size = if use_direct { block_size_d } else { block_size_p };
+    let qd = if use_direct { qd_d } else { qd_p };
+
+    let s1 = std::fs::metadata(file1).expect("Could not open file 1").len();
+    let s2 = std::fs::metadata(file2).expect("Could not open file 2").len();
+    let file_size = std::cmp::min(s1, s2);
+        
     for thread_id in 0..num_threads {
         let mismatch = mismatch.clone();
-        let processed_count = processed_count.clone();
         let f1_name = file1.to_string();
         let f2_name = file2.to_string();
         threads.push(std::thread::spawn(move || {
-            let f1_nodir = File::open(&f1_name).unwrap();
-            let f1_dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f1_name).unwrap();
-            let f2_nodir = File::open(&f2_name).unwrap();
-            let f2_dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f2_name).unwrap();
+            let f1_pagecache = File::open(&f1_name).unwrap();
+            let f1_direct = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f1_name).unwrap();
+            let f2_pagecache = File::open(&f2_name).unwrap();
+            let f2_direct = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&f2_name).unwrap();
             let mut io_uring = IoUring::new(1024).unwrap();
-            thread_differ(thread_id, (&f1_dir, &f1_nodir), (&f2_dir, &f2_nodir), num_threads, block_size, qd, &mut io_uring, s1, mismatch, processed_count, bench_only, force_direct, no_direct);
+            thread_differ(
+                thread_id, (&f1_direct, &f1_pagecache), (&f2_direct, &f2_pagecache), 
+                num_threads, block_size, qd, 
+                &mut io_uring, file_size, mismatch, bench_only, use_direct);
         }));
     }
     
     for thread in threads { thread.join().unwrap(); }
     
-    let cpu_time_used = start.elapsed().as_secs_f64();
-    let count = processed_count.load(Ordering::SeqCst);
-    if verbose {
-        let total_bytes = count * 2;
-        eprintln!("{} {} bytes in {:.4} s, {:.1} GB/s", if bench_only { "Dual-read" } else { "Diff" }, count, cpu_time_used, total_bytes as f64 / cpu_time_used / 1e9);
-    }
     mismatch.load(Ordering::SeqCst)
 }
 

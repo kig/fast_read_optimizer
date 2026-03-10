@@ -1,0 +1,74 @@
+{
+  "read": {
+    "direct": {
+      "num_threads": 14,
+      "block_size": 524288,
+      "qd": 4
+    },
+    "page_cache": {
+      "num_threads": 32,
+      "block_size": 131072,
+      "qd": 1
+    }
+  },
+  "write": {
+    "direct": {
+      "num_threads": 4,
+      "block_size": 262144,
+      "qd": 3
+    },
+    "page_cache": {
+      "num_threads": 1,
+      "block_size": 8388608,
+      "qd": 8
+    }
+  },
+  "copy": {
+    "direct": {
+      "num_threads": 4,
+      "block_size": 262144,
+      "qd": 3
+    },
+    "page_cache": {
+      "num_threads": 1,
+      "block_size": 8388608,
+      "qd": 8
+    }
+  },
+  "grep": {
+    "direct": {
+      "num_threads": 14,
+      "block_size": 524288,
+      "qd": 4
+    },
+    "page_cache": {
+      "num_threads": 32,
+      "block_size": 131072,
+      "qd": 1
+    }
+  },
+  "diff": {
+    "direct": {
+      "num_threads": 14,
+      "block_size": 524288,
+      "qd": 4
+    },
+    "page_cache": {
+      "num_threads": 32,
+      "block_size": 131072,
+      "qd": 1
+    }
+  },
+  "dual_read_bench": {
+    "direct": {
+      "num_threads": 14,
+      "block_size": 524288,
+      "qd": 4
+    },
+    "page_cache": {
+      "num_threads": 32,
+      "block_size": 131072,
+      "qd": 1
+    }
+  }
+}

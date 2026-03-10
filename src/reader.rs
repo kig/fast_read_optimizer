@@ -6,7 +6,8 @@ use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use memchr::memmem::Finder;
-use crate::common::AlignedBuffer;
+use crate::common::{AlignedBuffer, IOMode};
+use crate::mincore::{is_first_page_resident};
 
 // The thread reader function.
 fn thread_reader(
@@ -83,9 +84,25 @@ fn thread_reader(
     }
 }
 
-pub fn read_file(pattern: &str, filename: &str, num_threads: u64, block_size: u64, qd: usize, direct_io: bool) -> u64 {
+pub fn read_file(
+    pattern: &str, filename: &str,
+    num_threads_p: u64, block_size_p: u64, qd_p: usize, 
+    num_threads_d: u64, block_size_d: u64, qd_d: usize, 
+    io_mode: IOMode
+) -> u64 {
     let mut threads = vec![];
     let read_count = Arc::new(AtomicU64::new(0));
+
+    let file_cached = match is_first_page_resident(filename) { 
+        Ok(true) => true && io_mode != IOMode::Direct, 
+        _ => false || io_mode == IOMode::PageCache
+    };
+    let direct_io = (!file_cached) || io_mode == IOMode::Direct;
+
+    let num_threads = if direct_io { num_threads_d } else { num_threads_p };
+    let block_size = if direct_io { block_size_d } else { block_size_p };
+    let qd = if direct_io { qd_d } else { qd_p };
+    
     for thread_id in 0..num_threads {
         let read_count = read_count.clone();
         let filename = filename.to_string();

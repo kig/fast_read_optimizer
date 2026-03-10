@@ -1,5 +1,4 @@
 /target
-fast_read_optimizer.json
 a.out
 *_annotate.txt
-
+*.swp

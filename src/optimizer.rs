@@ -47,8 +47,8 @@ pub fn run_optimizer<F>(
                 fastest_time = cpu_time_used; 
                 best_scaled_params = scaled_params.clone();
             }
-            if verbose { eprintln!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params[0], scaled_params[1] / 1024, scaled_params[2]); }
-            else if num_iterations > 1 { println!("{} {} bytes in {:.4} s, {:.1} GB/s, t={} bs={}, qd={}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params[0], scaled_params[1] / 1024, scaled_params[2]); }
+            if verbose { eprintln!("{} {} bytes in {:.4} s, {:.1} GB/s, {:?}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params); }
+            else if num_iterations > 1 { println!("{} {} bytes in {:.4} s, {:.1} GB/s, {:?}", name, count, cpu_time_used, count as f64 / cpu_time_used / 1e9, scaled_params); }
         }
     }
     

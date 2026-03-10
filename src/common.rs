@@ -32,5 +32,5 @@ impl AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone)]
 pub enum IOMode { Auto, Direct, PageCache, }

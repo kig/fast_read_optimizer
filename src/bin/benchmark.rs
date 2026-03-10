@@ -33,6 +33,13 @@ fn pre_cache(path: &str) {
             if n == 0 { break; }
         }
     }
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        while let Ok(n) = file.read(&mut buf) {
+            if n == 0 { break; }
+        }
+    }
 }
 
 fn main() {
@@ -53,17 +60,38 @@ fn main() {
         },
         TestCase {
             name: "write (direct)",
-            args: vec!["write".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), target_file_dir.clone()],
-            target: 3.5,
-            cache_state: CacheState::None,
-            files_to_prep: vec![],
+            args: vec!["write".into(), "--direct-write".into(), "-v".into(), "-n".into(), "1".into(), target_file_dir.clone()],
+            target: 10.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![target_file_dir.clone()],
         },
         TestCase {
-            name: "write (page cache)",
+            name: "write (page cache, cold)",
+            args: vec!["write".into(), "--no-direct-write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
+            target: 10.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![target_file_dir.clone()],
+        },
+        TestCase {
+            name: "write (page cache, hot)",
+            args: vec!["write".into(), "--no-direct-write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
+            target: 10.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![target_file_dir.clone()],
+        },
+        TestCase {
+            name: "write (auto, cold)",
             args: vec!["write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
-            target: 2.0,
-            cache_state: CacheState::None,
-            files_to_prep: vec![],
+            target: 10.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![target_file_dir.clone()],
+        },
+        TestCase {
+            name: "write (auto, hot)",
+            args: vec!["write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
+            target: 10.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![target_file_dir.clone()],
         },
         TestCase {
             name: "read (direct)",
@@ -96,15 +124,36 @@ fn main() {
         TestCase {
             name: "copy (direct)",
             args: vec!["copy".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_dir.clone()],
-            target: 4.5,
-            cache_state: CacheState::None,
-            files_to_prep: vec![],
+            target: 6.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
             name: "copy (page cache, cold)",
             args: vec!["copy".into(), "--no-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
             target: 0.5,
             cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (hot cache R, direct W)",
+            args: vec!["copy".into(), "--no-direct".into(), "--direct-write".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
+            target: 10.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
+            name: "copy (auto, cold)",
+            args: vec!["copy".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
+            target: 6.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (auto, hot)",
+            args: vec!["copy".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
+            target: 10.0,
+            cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
