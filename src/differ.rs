@@ -9,18 +9,6 @@ use crate::common::{AlignedBuffer, IOMode};
 use crate::mincore::{is_first_page_resident};
 
 
-/*
-diff (direct)                       | 6.20         | 14.50        | REGRESSION                                                                                                        
-diff (page cache, cold)             | 4.40         | 3.50         | PASS
-diff (page cache, hot)              | 29.90        | 40.00        | REGRESSION
-diff (auto, hot)                    | 6.00         | 40.00        | REGRESSION                                                                                                        
-
-dual-read-bench (direct)            | 6.40         | 23.00        | REGRESSION                                                                                                        
-dual-read-bench (page cache, cold)  | 4.40         | 3.50         | PASS
-dual-read-bench (page cache, hot)   | 31.80        | 40.00        | REGRESSION
-dual-read-bench (auto, hot)         | 6.20         | 40.00        | REGRESSION                                                                                                        
-*/
-
 fn thread_differ(
     thread_id: u64,
     file1: (&File, &File),
@@ -152,6 +140,7 @@ fn thread_differ(
         if submitted {
             io_uring.submit_sqes().unwrap();
         }
+
     }
 }
 
@@ -166,7 +155,7 @@ pub fn diff_files(
     let mut threads = vec![];
 
     let file_cached = Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
-    let use_direct = (!file_cached) && io_mode != IOMode::PageCache;
+    let use_direct = ((!file_cached) && io_mode == IOMode::Auto) || io_mode == IOMode::Direct;
 
     let num_threads = if use_direct { num_threads_d } else { num_threads_p };
     let block_size = if use_direct { block_size_d } else { block_size_p };

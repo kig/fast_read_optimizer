@@ -1,1 +1,1 @@
-perf stat -e cache-misses,cache-references,L1-dcache-load-misses,L1-dcache-loads,cycles,instructions ./target/release/fast_read_optimizer dual-read-bench --direct -n 1 -v /data/repos/sadtalker/checkpoints.tar.gz /data/repos/sadtalker/checkpoints.tar.gz
+perf stat -e cache-misses,cache-references,L1-dcache-load-misses,L1-dcache-loads,cycles,instructions ./target/release/fast_read_optimizer dual-read-bench --direct -n 1 -v /data/repos/sadtalker/checkpoints.tar.gz /data/repos/sadtalker/checkpoints.tar.gz.e
