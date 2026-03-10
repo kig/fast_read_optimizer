@@ -5,7 +5,41 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use crate::common::{AlignedBuffer, MmapCache, ACTIVE_PAGE_CACHE_READS};
+use crate::common::AlignedBuffer;
+
+pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    let offset_aligned = (offset / page_size as u64) * page_size as u64;
+    let offset_diff = offset - offset_aligned;
+    let len_aligned = (len + offset_diff as usize + page_size - 1) / page_size * page_size;
+
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len_aligned,
+            libc::PROT_NONE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            offset_aligned as i64,
+        );
+
+        if ptr == libc::MAP_FAILED {
+            return false;
+        }
+
+        let num_pages = len_aligned / page_size;
+        let mut vec = vec![0u8; num_pages];
+        let res = libc::mincore(ptr, len_aligned, vec.as_mut_ptr());
+        libc::munmap(ptr, len_aligned);
+
+        if res != 0 {
+            return false;
+        }
+
+        // Check if all pages in the range are resident
+        vec.iter().all(|&b| (b & 1) != 0)
+    }
+}
 
 fn thread_writer(
     thread_id: u64,
@@ -20,7 +54,6 @@ fn thread_writer(
     total_size: u64,
     force_direct: bool,
     no_direct: bool,
-    mmap_cache: Option<Arc<MmapCache>>,
 ) {
     let mut buffers = Vec::new();
     for _ in 0..qd {
@@ -38,32 +71,17 @@ fn thread_writer(
         buffer_offsets[i] = next_offset;
         let len = (total_size - next_offset).min(block_size);
         
-        let is_hot = if no_direct {
-            true
-        } else if force_direct {
-            false
-        } else {
-            if let Some(m) = mmap_cache.as_ref() {
-                m.is_range_in_page_cache(next_offset, len as usize)
-            } else {
-                false
-            }
-        };
-
         let use_direct = if no_direct {
             false
         } else if force_direct {
             true
         } else {
-            !is_hot
-        };
-
-        if is_hot {
-            while ACTIVE_PAGE_CACHE_READS.fetch_add(1, Ordering::SeqCst) >= 4 {
-                ACTIVE_PAGE_CACHE_READS.fetch_sub(1, Ordering::SeqCst);
-                std::thread::yield_now();
+            if let Some((_, src_nodir)) = source_file {
+                !is_range_in_page_cache(src_nodir, next_offset, len as usize)
+            } else {
+                true
             }
-        }
+        };
 
         let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
         if let Some((src_dir, src_nodir)) = source_file.as_ref() {
@@ -71,15 +89,14 @@ fn thread_writer(
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
                 sqe.prep_read(fd, &mut buffers[i].as_mut_slice()[..len as usize], next_offset);
-                let was_page_cache = if is_hot { 1u64 } else { 0u64 };
-                sqe.set_user_data((i as u64) | (was_page_cache << 40) | (1u64 << 48));
+                sqe.set_user_data((i as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
             }
         } else {
             let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
                 sqe.prep_write(fd, &buffers[i].as_slice()[..len as usize], next_offset);
-                sqe.set_user_data((i as u64) | (2u64 << 48));
+                sqe.set_user_data((i as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
             }
         }
         next_offset += num_threads * block_size;
@@ -92,58 +109,38 @@ fn thread_writer(
         let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
         let user_data = cq.user_data();
         let idx = (user_data & 0xFFFFFFFF) as usize;
-        let was_page_cache = ((user_data >> 40) & 0xFF) != 0;
-        let state = (user_data >> 48) as u8;
+        let use_direct = ((user_data >> 32) & 0xFF) != 0;
+        let state = (user_data >> 40) as u8;
         let result = cq.result().expect("IO failed");
-
-        if was_page_cache {
-            ACTIVE_PAGE_CACHE_READS.fetch_sub(1, Ordering::SeqCst);
-        }
 
         if state == 1 { // Read finished
             let len = result as u64;
             let is_aligned = (buffer_offsets[idx] % 4096 == 0) && (len % 4096 == 0);
-            // Default write mode for copy is Direct
-            let fd = if !no_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
+            let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
             unsafe {
                 let mut sqe = io_uring.prepare_sqe().unwrap();
                 sqe.prep_write(fd, &buffers[idx].as_slice()[..result as usize], buffer_offsets[idx]);
-                sqe.set_user_data((idx as u64) | (2u64 << 48));
+                sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
             }
             io_uring.submit_sqes().unwrap();
         } else { // Write finished
-            write_count.fetch_add(result as u64, Ordering::Relaxed);
+            write_count.fetch_add(result as u64, Ordering::SeqCst);
             inflight -= 1;
             if next_offset < total_size {
                 buffer_offsets[idx] = next_offset;
                 let len = (total_size - next_offset).min(block_size);
                 
-                let is_hot = if no_direct {
-                    true
-                } else if force_direct {
-                    false
-                } else {
-                    if let Some(m) = mmap_cache.as_ref() {
-                        m.is_range_in_page_cache(next_offset, len as usize)
-                    } else {
-                        false
-                    }
-                };
-
                 let use_direct = if no_direct {
                     false
                 } else if force_direct {
                     true
                 } else {
-                    !is_hot
-                };
-
-                if is_hot {
-                    while ACTIVE_PAGE_CACHE_READS.fetch_add(1, Ordering::SeqCst) >= 4 {
-                        ACTIVE_PAGE_CACHE_READS.fetch_sub(1, Ordering::SeqCst);
-                        std::thread::yield_now();
+                    if let Some((_, src_nodir)) = source_file {
+                        !is_range_in_page_cache(src_nodir, next_offset, len as usize)
+                    } else {
+                        true
                     }
-                }
+                };
 
                 let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
                 if let Some((src_dir, src_nodir)) = source_file.as_ref() {
@@ -151,15 +148,14 @@ fn thread_writer(
                     unsafe {
                         let mut sqe = io_uring.prepare_sqe().unwrap();
                         sqe.prep_read(fd, &mut buffers[idx].as_mut_slice()[..len as usize], next_offset);
-                        let was_page_cache = if is_hot { 1u64 } else { 0u64 };
-                        sqe.set_user_data((idx as u64) | (was_page_cache << 40) | (1u64 << 48));
+                        sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (1u64 << 40));
                     }
                 } else {
                     let fd = if use_direct && is_aligned { dest_file.0.as_raw_fd() } else { dest_file.1.as_raw_fd() };
                     unsafe {
                         let mut sqe = io_uring.prepare_sqe().unwrap();
                         sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], next_offset);
-                        sqe.set_user_data((idx as u64) | (2u64 << 48));
+                        sqe.set_user_data((idx as u64) | ((if use_direct { 1u64 } else { 0u64 }) << 32) | (2u64 << 40));
                     }
                 }
                 io_uring.submit_sqes().unwrap();
@@ -178,21 +174,12 @@ pub fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_
         rand::thread_rng().fill(&mut block[..]);
         Some(Arc::new(block))
     } else { None };
-    
     let total_size = if let Some(s) = source {
         let f = File::open(s).unwrap();
         f.metadata().unwrap().len()
     } else {
-        // For write-bench, we use a fixed 4GB or existing size
         let f = File::open(filename).unwrap();
         f.metadata().unwrap().len()
-    };
-
-    let mmap_cache = if let Some(s) = source {
-        let f = File::open(s).unwrap();
-        Some(Arc::new(MmapCache::new(&f)))
-    } else {
-        None
     };
     
     // Ensure target file exists and has the correct size, and PRE-ALLOCATE blocks.
@@ -209,7 +196,6 @@ pub fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_
         let filename = filename.to_string();
         let source = source.map(|s| s.to_string());
         let random_block = random_block.clone();
-        let mmap_cache = mmap_cache.clone();
         threads.push(std::thread::spawn(move || {
             let dest_file_nodir = OpenOptions::new().write(true).open(&filename).unwrap();
             let dest_file_dir = OpenOptions::new().write(true).custom_flags(libc::O_DIRECT).open(&filename).unwrap();
@@ -232,12 +218,11 @@ pub fn write_file(source: Option<&str>, filename: &str, num_threads: u64, block_
                 total_size,
                 force_direct,
                 no_direct,
-                mmap_cache,
             );
         }));
     }
     for thread in threads { thread.join().unwrap(); }
-    write_count.load(Ordering::Relaxed)
+    write_count.load(Ordering::SeqCst)
 }
 
 pub fn bench_mmap_write(filename: &str) {

@@ -40,8 +40,8 @@ fn main() {
     fro_exe.set_file_name("fast_read_optimizer");
 
     let source_file = "/data/repos/sadtalker/checkpoints.tar.gz".to_string();
-    let target_file_dir = "/data/repos/sadtalker/benchmark-target-dir.tmp".to_string();
-    let target_file_cache = "/data/repos/sadtalker/benchmark-target-cache.tmp".to_string();
+    let target_file_dir = "/data/repos/sadtalker/checkpoints.tar.gz.a".to_string();
+    let target_file_cache = "/data/repos/sadtalker/checkpoints.tar.gz.b".to_string();
 
     let tests = vec![
         TestCase {
@@ -74,7 +74,7 @@ fn main() {
         },
         TestCase {
             name: "read (forced page cache, hot)",
-            args: vec!["read".into(), "--no-direct-io".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone()],
+            args: vec!["read".into(), "--no-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone()],
             target: 30.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
@@ -95,35 +95,35 @@ fn main() {
         },
         TestCase {
             name: "copy (direct)",
-            args: vec!["copy".into(), "--force-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_dir.clone()],
+            args: vec!["copy".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_dir.clone()],
             target: 4.5,
             cache_state: CacheState::None,
             files_to_prep: vec![],
         },
         TestCase {
             name: "copy (page cache, cold)",
-            args: vec!["copy".into(), "--no-direct-io".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
+            args: vec!["copy".into(), "--no-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
             target: 0.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "diff (direct)",
-            args: vec!["diff".into(), "--force-direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
+            args: vec!["diff".into(), "--direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
             target: 14.5,
             cache_state: CacheState::None,
             files_to_prep: vec![],
         },
         TestCase {
             name: "diff (page cache, cold)",
-            args: vec!["diff".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            args: vec!["diff".into(), "--no-direct".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 3.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "diff (page cache, hot)",
-            args: vec!["diff".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            args: vec!["diff".into(), "--no-direct".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 40.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
@@ -137,21 +137,21 @@ fn main() {
         },
         TestCase {
             name: "dual-read-bench (direct)",
-            args: vec!["dual-read-bench".into(), "--force-direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
+            args: vec!["dual-read-bench".into(), "--direct".into(), "-v".into(), source_file.clone(), target_file_dir.clone()],
             target: 23.0,
             cache_state: CacheState::None,
             files_to_prep: vec![],
         },
         TestCase {
             name: "dual-read-bench (page cache, cold)",
-            args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            args: vec!["dual-read-bench".into(), "--no-direct".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 3.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "dual-read-bench (page cache, hot)",
-            args: vec!["dual-read-bench".into(), "--no-direct-io".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
+            args: vec!["dual-read-bench".into(), "--no-direct".into(), "-v".into(), source_file.clone(), target_file_cache.clone()],
             target: 40.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
@@ -172,7 +172,7 @@ fn main() {
         },
         TestCase {
             name: "grep (forced page cache, hot)",
-            args: vec!["grep".into(), "--no-direct-io".into(), "-v".into(), "-n".into(), "1".into(), "needle".into(), source_file.clone()],
+            args: vec!["grep".into(), "--no-direct".into(), "-v".into(), "-n".into(), "1".into(), "needle".into(), source_file.clone()],
             target: 30.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
@@ -207,15 +207,14 @@ fn main() {
         }
     ];
 
-    let mut regressions = false;
 
-    // Create target files with 4GB size so write modes don't panic on missing file
-    if let Ok(f) = std::fs::File::create(&target_file_dir) {
-        let _ = f.set_len(4 * 1024 * 1024 * 1024);
-    }
-    if let Ok(f) = std::fs::File::create(&target_file_cache) {
-        let _ = f.set_len(4 * 1024 * 1024 * 1024);
-    }
+    let _ = Command::new("cargo")
+            .args(["build", "--release"])
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to compile: {}", e));
+
+
+    let mut regressions = false;
 
     println!("{:<35} | {:<12} | {:<12} | {:<10}", "Benchmark", "Speed (GB/s)", "Target", "Status");
     println!("{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<10}", "", "", "", "");
@@ -268,10 +267,6 @@ fn main() {
         }
     }
     
-    // Cleanup temporary files
-    let _ = std::fs::remove_file(target_file_dir);
-    let _ = std::fs::remove_file(target_file_cache);
-
     if regressions {
         println!("\nWARNING: Some benchmarks showed regressions or failed.");
         std::process::exit(1);
