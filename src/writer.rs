@@ -132,7 +132,7 @@ pub fn write_file(
 ) -> u64 {
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
-    let (total_size, file_cached) = if let Some(s) = source {
+    let (total_size, _file_cached) = if let Some(s) = source {
         let file_cached = Ok(true) == is_first_page_resident(s);
         let f = File::open(s).unwrap();
         (f.metadata().unwrap().len(), file_cached)
