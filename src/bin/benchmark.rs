@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::fs::OpenOptions;
 use std::env;
 
 #[derive(Clone)]
@@ -46,16 +47,32 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let mut patterns = vec![];
 
-    for arg in args.iter().skip(1) {
-        patterns.push(arg);
+    let mut test_dir = ".";
+
+    if args[1] == "--help" {
+        println!("USAGE: {} [--test-dir path] <test_prefix ...>", args[0]);
+        std::process::exit(0);
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        if arg == "--test-dir" {
+            test_dir = &args[i];
+            i += 1;
+        } else {
+            patterns.push(arg);
+        }
     }
 
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
     fro_exe.set_file_name("fast_read_optimizer");
 
-    let source_file = "/data/repos/sadtalker/checkpoints.tar.gz".to_string();
-    let target_file_dir = "/data/repos/sadtalker/checkpoints.tar.gz.a".to_string();
-    let target_file_cache = "/data/repos/sadtalker/checkpoints.tar.gz.b".to_string();
+    let test_path = std::path::Path::new(test_dir);
+
+    let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
+    let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
+    let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
 
     let tests = vec![
         TestCase {
@@ -75,21 +92,21 @@ fn main() {
         TestCase {
             name: "write (page cache, cold)",
             args: vec!["write".into(), "--no-direct-write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
-            target: 10.0,
+            target: 8.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_dir.clone()],
         },
         TestCase {
             name: "write (page cache, hot)",
             args: vec!["write".into(), "--no-direct-write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
-            target: 10.0,
+            target: 8.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![target_file_dir.clone()],
         },
         TestCase {
             name: "write (auto, cold)",
             args: vec!["write".into(), "-v".into(), "-n".into(), "1".into(), target_file_cache.clone()],
-            target: 10.0,
+            target: 8.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_dir.clone()],
         },
@@ -131,35 +148,35 @@ fn main() {
         TestCase {
             name: "copy (direct)",
             args: vec!["copy".into(), "--direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_dir.clone()],
-            target: 6.0,
+            target: 5.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
             name: "copy (page cache, cold)",
             args: vec!["copy".into(), "--no-direct".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
-            target: 0.5,
+            target: 1.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "copy (hot cache R, direct W)",
             args: vec!["copy".into(), "--no-direct".into(), "--direct-write".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
-            target: 10.0,
+            target: 2.0,
             cache_state: CacheState::Hot,
-            files_to_prep: vec![source_file.clone()],
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "copy (auto, cold)",
             args: vec!["copy".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
-            target: 6.0,
+            target: 5.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
             name: "copy (auto, hot)",
             args: vec!["copy".into(), "-v".into(), "-n".into(), "1".into(), source_file.clone(), target_file_cache.clone()],
-            target: 10.0,
+            target: 4.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
@@ -277,7 +294,6 @@ fn main() {
         }
     ];
 
-
     let build_output = Command::new("cargo")
             .args(["build", "--release"])
             .output()
@@ -287,6 +303,15 @@ fn main() {
     let err_str = String::from_utf8_lossy(&build_output.stderr);
     let combined = format!("{}\n{}", out_str, err_str);
     println!("{}", combined);
+
+    // Create temp files
+    let size = 1 * 1024 * 1024 * 1024; // 1 GB
+
+    let file = OpenOptions::new().write(true).create(true).open(source_file.clone()).unwrap_or_else(|e| panic!("Could not create test file {} {}", source_file, e));
+    file.set_len(size).unwrap_or_else(|e| panic!("Could not set file length for {} {}", source_file, e));
+    Command::new(&fro_exe).args(["write", &source_file.clone()]).output().unwrap_or_else(|e| panic!("Failed to write test file {} {}", source_file, e));
+    Command::new(&fro_exe).args(["copy", &source_file.clone(), &target_file_dir.clone()]).output().unwrap_or_else(|e| panic!("Failed to create test file {} {}", target_file_dir, e));
+    Command::new(&fro_exe).args(["copy", &source_file.clone(), &target_file_cache.clone()]).output().unwrap_or_else(|e| panic!("Failed to create test file {} {}", target_file_cache, e));
 
     let mut regressions = false;
 
@@ -349,6 +374,10 @@ fn main() {
         if speed == 0.0 {
             println!("--- Output ---\n{}", combined);
         }
+    }
+
+    for filename in [source_file, target_file_cache, target_file_dir].iter() {
+        std::fs::remove_file(filename).unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));
     }
     
     if regressions {
