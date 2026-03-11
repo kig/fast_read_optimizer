@@ -23,7 +23,7 @@ fn thread_reader(
     let mut matches = Vec::new();
     let mut buffers = Vec::new();
     for _ in 0..qd {
-        buffers.push(AlignedBuffer::new(block_size as usize));
+        buffers.push(AlignedBuffer::new((block_size+(((pattern.len()/4096+1)*4096) as u64)) as usize));
     }
     let file_size = file.seek(SeekFrom::End(0)).unwrap();
     let offset = thread_id * block_size;

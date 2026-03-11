@@ -49,7 +49,7 @@ fn main() {
 
     let mut test_dir = ".";
 
-    if args[1] == "--help" {
+    if args.len() > 1 && args[1] == "--help" {
         println!("USAGE: {} [--test-dir path] <test_prefix ...>", args[0]);
         std::process::exit(0);
     }
@@ -66,7 +66,7 @@ fn main() {
     }
 
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
-    fro_exe.set_file_name("fast_read_optimizer");
+    fro_exe.set_file_name("fro");
 
     let test_path = std::path::Path::new(test_dir);
 

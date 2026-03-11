@@ -83,7 +83,7 @@ fn main() {
 
     if filename == "" { println!("Filename missing"); return; }
 
-    let mut config = AppConfig::load("fast_read_optimizer.json");
+    let mut config = AppConfig::load("fro.json");
 
     let params_page_cache = config.get_params(mode, false);
     let params_direct = config.get_params(mode, true);
@@ -161,7 +161,10 @@ fn main() {
 
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
-        config.update_params(mode, direct, config::IOParams { num_threads: best_params[0], block_size: best_params[1], qd: best_params[2] as usize });
-        config.save("fast_read_optimizer.json");
+        let off = if direct { 3 } else { 0 };
+        config.update_params(mode, direct, config::IOParams {
+            num_threads: best_params[off+0], block_size: best_params[off+1], qd: best_params[off+2] as usize
+        });
+        config.save("fro.json");
     }
 }
