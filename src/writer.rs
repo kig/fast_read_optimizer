@@ -142,10 +142,7 @@ pub fn write_file(
     };
 
     let direct_write = io_mode_write != IOMode::PageCache;
-    let write_flags = if direct_write { libc::O_DIRECT } else { 0 };
-
-    let direct_read = io_mode_read == IOMode::Direct || (!file_cached);
-    let read_flags = if direct_read { libc::O_DIRECT } else { 0 };
+    let direct_read = io_mode_read == IOMode::Direct || io_mode_read == IOMode::Auto;
 
     let num_threads = if direct_write { num_threads_d } else { num_threads_p };
     let block_size = if direct_write { block_size_d } else { block_size_p };
@@ -175,10 +172,10 @@ pub fn write_file(
         let random_block = random_block.clone();
         threads.push(std::thread::spawn(move || {
             let dest_file_nodir = OpenOptions::new().write(true).open(&filename).unwrap();
-            let dest_file_dir = OpenOptions::new().write(true).custom_flags(write_flags).open(&filename).unwrap();
+            let dest_file_dir = OpenOptions::new().write(true).custom_flags(libc::O_DIRECT).open(&filename).unwrap();
             let source_files = source.map(|s| {
                 let s_nodir = File::open(&s).unwrap();
-                let s_dir = OpenOptions::new().read(true).custom_flags(read_flags).open(&s).unwrap();
+                let s_dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&s).unwrap();
                 (s_dir, s_nodir)
             });
             let mut io_uring = IoUring::new(1024).unwrap();
