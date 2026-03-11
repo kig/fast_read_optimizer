@@ -43,6 +43,13 @@ fn pre_cache(path: &str) {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut patterns = vec![];
+
+    for arg in args.iter().skip(1) {
+        patterns.push(arg);
+    }
+
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
     fro_exe.set_file_name("fast_read_optimizer");
 
@@ -287,6 +294,16 @@ fn main() {
     println!("{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<10}", "", "", "", "");
 
     for t in tests {
+        if patterns.len() > 0 {
+            let mut pattern_found = false;
+            for p in patterns.iter() {
+                if t.name.starts_with(*p) {
+                    pattern_found = true;
+                    break;
+                }
+            }
+            if !pattern_found { continue; }
+        }
         match t.cache_state {
             CacheState::Cold => {
                 for f in &t.files_to_prep { evict_cache(f); }
