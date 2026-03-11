@@ -17,13 +17,15 @@ fn thread_reader(
     block_size: u64,
     qd: usize,
     file: &mut File,
+    file_direct: &mut File,
     io_uring: &mut IoUring,
     read_count: Arc<AtomicU64>,
+    use_direct: bool,
 ) -> Vec<u64> {
     let mut matches = Vec::new();
     let mut buffers = Vec::new();
     for _ in 0..qd {
-        buffers.push(AlignedBuffer::new((block_size+(((pattern.len()/4096+1)*4096) as u64)) as usize));
+        buffers.push(AlignedBuffer::new(block_size as usize));
     }
     let file_size = file.seek(SeekFrom::End(0)).unwrap();
     let offset = thread_id * block_size;
@@ -33,9 +35,14 @@ fn thread_reader(
     for _ in 0..qd {
         let current_offset = offset + (block_num as u64) * num_threads * block_size;
         if current_offset >= file_size { break; }
+        let direct = use_direct && (current_offset % 4096 == 0) && ((current_offset + (buffers[0].as_slice() .len() as u64)) <= file_size);
         unsafe {
             let mut sqe = io_uring.prepare_sqe().unwrap();
-            sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), current_offset);
+            if direct {
+                sqe.prep_read(file_direct.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), current_offset);
+            } else {
+                sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), current_offset);
+            }
             sqe.set_user_data(block_num as u64);
         }
         block_num += 1;
@@ -60,8 +67,8 @@ fn thread_reader(
             if result > 0 {
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
                 if !pattern.is_empty() {
-                    let buf = buffers[block_id as usize % qd].as_slice();
-                    for idx in finder.find_iter(&buf[..result as usize]) {
+                    let buf = &buffers[block_id as usize % qd].as_slice()[..std::cmp::min(result as usize, (block_size as usize)+pattern.len())];
+                    for idx in finder.find_iter(buf) {
                         matches.push(offset + block_id * num_threads * block_size + idx as u64);
                     }
                 }
@@ -70,9 +77,14 @@ fn thread_reader(
             
             let next_offset = offset + (block_num as u64) * num_threads * block_size;
             if next_offset < file_size {
+                let direct = use_direct && (next_offset % 4096 == 0) && (next_offset + (buffers[0].as_slice().len() as u64) <= file_size);
                 unsafe {
                     let mut sqe = io_uring.prepare_sqe().unwrap();
-                    sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), next_offset);
+                    if direct {
+                        sqe.prep_read(file_direct.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), next_offset);
+                    } else {
+                        sqe.prep_read(file.as_raw_fd(), buffers[block_num % qd].as_mut_slice(), next_offset);
+                    }
                     sqe.set_user_data(block_num as u64);
                 }
                 block_num += 1;
@@ -97,21 +109,21 @@ pub fn read_file(
         Ok(true) => true && io_mode != IOMode::Direct, 
         _ => false || io_mode == IOMode::PageCache
     };
-    let direct_io = (!file_cached) || io_mode == IOMode::Direct;
+    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
 
-    let num_threads = if direct_io { num_threads_d } else { num_threads_p };
-    let block_size = if direct_io { block_size_d } else { block_size_p };
-    let qd = if direct_io { qd_d } else { qd_p };
+    let num_threads = if use_direct { num_threads_d } else { num_threads_p };
+    let block_size = if use_direct { block_size_d } else { block_size_p };
+    let qd = if use_direct { qd_d } else { qd_p };
     
     for thread_id in 0..num_threads {
         let read_count = read_count.clone();
         let filename = filename.to_string();
         let pattern = pattern.to_string();
         threads.push(std::thread::spawn(move || {
-            let mut file = if direct_io { OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&filename).unwrap() }
-            else { File::open(&filename).unwrap() };
+            let mut file = File::open(&filename).unwrap();
+            let mut file_direct = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&filename).unwrap();
             let mut io_uring = IoUring::new(1024).unwrap();
-            thread_reader(thread_id, pattern, num_threads, block_size, qd, &mut file, &mut io_uring, read_count)
+            thread_reader(thread_id, pattern, num_threads, block_size, qd, &mut file, &mut file_direct, &mut io_uring, read_count, use_direct)
         }));
     }
     let mut all_matches = Vec::new();

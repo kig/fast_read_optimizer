@@ -1,73 +1,73 @@
 {
   "read": {
     "direct": {
-      "num_threads": 26,
-      "block_size": 262144,
-      "qd": 4
+      "num_threads": 16,
+      "block_size": 3145728,
+      "qd": 2
     },
     "page_cache": {
-      "num_threads": 32,
-      "block_size": 159744,
+      "num_threads": 31,
+      "block_size": 131072,
       "qd": 1
     }
   },
   "write": {
     "direct": {
-      "num_threads": 1,
-      "block_size": 8388608,
-      "qd": 8
+      "num_threads": 4,
+      "block_size": 262144,
+      "qd": 3
     },
     "page_cache": {
-      "num_threads": 1,
-      "block_size": 8392704,
-      "qd": 7
+      "num_threads": 4,
+      "block_size": 1048576,
+      "qd": 2
     }
   },
   "copy": {
     "direct": {
-      "num_threads": 1,
-      "block_size": 8384512,
-      "qd": 7
+      "num_threads": 4,
+      "block_size": 262144,
+      "qd": 3
     },
     "page_cache": {
-      "num_threads": 1,
-      "block_size": 8392704,
-      "qd": 6
+      "num_threads": 4,
+      "block_size": 1048576,
+      "qd": 2
     }
   },
   "grep": {
     "direct": {
-      "num_threads": 33,
-      "block_size": 126976,
-      "qd": 1
+      "num_threads": 5,
+      "block_size": 3145728,
+      "qd": 3
     },
     "page_cache": {
-      "num_threads": 32,
-      "block_size": 106496,
+      "num_threads": 31,
+      "block_size": 131072,
       "qd": 1
     }
   },
   "diff": {
     "direct": {
-      "num_threads": 33,
-      "block_size": 126976,
+      "num_threads": 16,
+      "block_size": 3145728,
       "qd": 2
     },
     "page_cache": {
-      "num_threads": 32,
-      "block_size": 122880,
+      "num_threads": 4,
+      "block_size": 131072,
       "qd": 1
     }
   },
   "dual_read_bench": {
     "direct": {
-      "num_threads": 36,
-      "block_size": 143360,
-      "qd": 6
+      "num_threads": 16,
+      "block_size": 3145728,
+      "qd": 2
     },
     "page_cache": {
-      "num_threads": 29,
-      "block_size": 139264,
+      "num_threads": 4,
+      "block_size": 131072,
       "qd": 1
     }
   }
