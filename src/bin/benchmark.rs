@@ -305,7 +305,7 @@ fn main() {
     println!("{}", combined);
 
     // Create temp files
-    let size = 1 * 1024 * 1024 * 1024; // 1 GB
+    let size = 4 * 1024 * 1024 * 1024; // 4 GB
 
     let file = OpenOptions::new().write(true).create(true).open(source_file.clone()).unwrap_or_else(|e| panic!("Could not create test file {} {}", source_file, e));
     file.set_len(size).unwrap_or_else(|e| panic!("Could not set file length for {} {}", source_file, e));
