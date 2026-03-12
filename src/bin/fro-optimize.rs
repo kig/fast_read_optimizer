@@ -3,6 +3,53 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct IOParams {
+    num_threads: u64,
+    block_size: u64,
+    qd: usize,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct ModeParams {
+    direct: IOParams,
+    page_cache: IOParams,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct DeviceDbParams {
+    read: ModeParams,
+    grep: ModeParams,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct DeviceDb {
+    version: u32,
+    profiles: Vec<DeviceDbProfile>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct DeviceDbProfile {
+    id: String,
+    #[serde(rename = "match")]
+    m: DeviceDbMatch,
+    params: DeviceDbParams,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+struct DeviceDbMatch {
+    #[serde(default)]
+    fstype: Option<String>,
+    #[serde(default)]
+    dev_kind: Option<String>,
+    #[serde(default)]
+    dev_model_contains: Option<String>,
+    #[serde(default)]
+    md_level: Option<String>,
+}
+
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 struct MountInfoEntry {
     mount_point: String,
@@ -12,6 +59,32 @@ struct MountInfoEntry {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     writable_dir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_serial: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    device_by_id: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    md_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    md_chunk_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    md_members: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_db_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_db_read_direct: Option<IOParams>,
 }
 
 fn is_disk_backed_mount(e: &MountInfoEntry) -> bool {
@@ -205,6 +278,160 @@ fn find_writable_dir_for_mount(mount_point: &Path, home_targets: &[PathBuf]) -> 
     None
 }
 
+fn read_sysfs_trimmed(path: &Path) -> Option<String> {
+    let s = fs::read_to_string(path).ok()?;
+    Some(s.trim().to_string())
+}
+
+fn base_block_name_from_devpath(devpath: &Path) -> Option<String> {
+    let canon = fs::canonicalize(devpath).ok()?;
+    let name = canon.file_name()?.to_string_lossy().to_string();
+
+    let sys = Path::new("/sys/class/block").join(&name);
+    if sys.join("partition").exists() {
+        // Follow to real sysfs path and take parent basename (e.g. nvme0n1p1 -> nvme0n1).
+        let real = fs::read_link(&sys).ok()?;
+        let real_abs = if real.is_absolute() {
+            real
+        } else {
+            Path::new("/sys/class/block").join(real)
+        };
+        let parent = real_abs.parent()?;
+        return Some(parent.file_name()?.to_string_lossy().to_string());
+    }
+
+    Some(name)
+}
+
+fn dev_by_id_for_block_name(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let dir = Path::new("/dev/disk/by-id");
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        let link = match fs::read_link(ent.path()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Resolve ../../nvme0n1 -> /dev/nvme0n1
+        let target = if link.is_absolute() {
+            link
+        } else {
+            dir.join(link)
+        };
+        let canon = match fs::canonicalize(&target) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if canon.file_name().map(|n| n == block).unwrap_or(false) {
+            out.push(name);
+        }
+    }
+
+    out.sort();
+    out
+}
+
+fn fill_device_info(e: &mut MountInfoEntry) {
+    let src = Path::new(&e.mount_source);
+    if !e.mount_source.starts_with("/dev/") {
+        // Non-/dev sources (e.g. zfs datasets) are still useful for signatures, but we can't
+        // reliably map them to a single block device without invoking filesystem-specific tooling.
+        e.device_kind = Some(e.fstype.clone());
+        e.device_name = Some(e.mount_source.clone());
+        e.signature = Some(format!("fstype={};source={}", e.fstype, e.mount_source));
+        return;
+    }
+
+    let base = match base_block_name_from_devpath(src) {
+        Some(b) => b,
+        None => return,
+    };
+
+    e.device_name = Some(base.clone());
+    let kind = if base.starts_with("nvme") {
+        "nvme"
+    } else if base.starts_with("md") {
+        "md"
+    } else if base.starts_with("dm-") {
+        "dm"
+    } else if base.starts_with("sd") {
+        "sd"
+    } else {
+        "block"
+    };
+    e.device_kind = Some(kind.to_string());
+
+    let sys = Path::new("/sys/class/block").join(&base);
+    e.device_model = read_sysfs_trimmed(&sys.join("device/model"));
+    e.device_serial = read_sysfs_trimmed(&sys.join("device/serial"));
+    e.device_by_id = dev_by_id_for_block_name(&base);
+
+    if kind == "md" {
+        e.md_level = read_sysfs_trimmed(&sys.join("md/level"));
+        e.md_chunk_bytes = read_sysfs_trimmed(&sys.join("md/chunk_size")).and_then(|s| s.parse().ok());
+
+        let slaves_dir = sys.join("slaves");
+        if let Ok(rd) = fs::read_dir(slaves_dir) {
+            for ent in rd.flatten() {
+                let slave = ent.file_name().to_string_lossy().to_string();
+                e.md_members.push(slave);
+            }
+        }
+        e.md_members.sort();
+    }
+
+    // Human-readable signature used for device-db matching.
+    let model = e.device_model.clone().unwrap_or_else(|| "unknown".into());
+    let md_level = e.md_level.clone().unwrap_or_else(|| "".into());
+    let sig = match kind {
+        "md" if !md_level.is_empty() => format!("fstype={};dev=md;level={};model={}", e.fstype, md_level, model),
+        _ => format!("fstype={};dev={};model={}", e.fstype, kind, model),
+    };
+    e.signature = Some(sig);
+}
+
+fn load_device_db() -> Option<DeviceDb> {
+    let p = std::env::var("FRO_DEVICE_DB").ok().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("fro-device-db.json"));
+    let data = fs::read_to_string(p).ok()?;
+    let db: DeviceDb = serde_json::from_str(&data).ok()?;
+    if db.version != 1 {
+        return None;
+    }
+    Some(db)
+}
+
+fn device_db_match<'a>(db: &'a DeviceDb, e: &MountInfoEntry) -> Option<&'a DeviceDbProfile> {
+    for p in &db.profiles {
+        if let Some(ref f) = p.m.fstype {
+            if &e.fstype != f {
+                continue;
+            }
+        }
+        if let Some(ref k) = p.m.dev_kind {
+            if e.device_kind.as_deref() != Some(k.as_str()) {
+                continue;
+            }
+        }
+        if let Some(ref ml) = p.m.md_level {
+            if e.md_level.as_deref() != Some(ml.as_str()) {
+                continue;
+            }
+        }
+        if let Some(ref mc) = p.m.dev_model_contains {
+            if !e.device_model.as_deref().unwrap_or("").contains(mc) {
+                continue;
+            }
+        }
+        return Some(p);
+    }
+    None
+}
+
 fn read_mountinfo() -> Vec<MountInfoEntry> {
     let data = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let mut out = Vec::new();
@@ -234,6 +461,17 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             mount_source,
             major_minor,
             writable_dir: None,
+            device_kind: None,
+            device_name: None,
+            device_model: None,
+            device_serial: None,
+            device_by_id: Vec::new(),
+            md_level: None,
+            md_chunk_bytes: None,
+            md_members: Vec::new(),
+            signature: None,
+            device_db_profile: None,
+            device_db_read_direct: None,
         });
     }
 
@@ -254,6 +492,17 @@ mod tests {
                 mount_source: "/dev/nvme0n1p2".into(),
                 major_minor: "259:2".into(),
                 writable_dir: None,
+                device_kind: None,
+                device_name: None,
+                device_model: None,
+                device_serial: None,
+                device_by_id: Vec::new(),
+                md_level: None,
+                md_chunk_bytes: None,
+                md_members: Vec::new(),
+                signature: None,
+                device_db_profile: None,
+                device_db_read_direct: None,
             },
             MountInfoEntry {
                 mount_point: "/run".into(),
@@ -261,6 +510,17 @@ mod tests {
                 mount_source: "tmpfs".into(),
                 major_minor: "0:5".into(),
                 writable_dir: None,
+                device_kind: None,
+                device_name: None,
+                device_model: None,
+                device_serial: None,
+                device_by_id: Vec::new(),
+                md_level: None,
+                md_chunk_bytes: None,
+                md_members: Vec::new(),
+                signature: None,
+                device_db_profile: None,
+                device_db_read_direct: None,
             },
             MountInfoEntry {
                 mount_point: "/snap/core".into(),
@@ -268,6 +528,17 @@ mod tests {
                 mount_source: "/dev/loop0".into(),
                 major_minor: "7:0".into(),
                 writable_dir: None,
+                device_kind: None,
+                device_name: None,
+                device_model: None,
+                device_serial: None,
+                device_by_id: Vec::new(),
+                md_level: None,
+                md_chunk_bytes: None,
+                md_members: Vec::new(),
+                signature: None,
+                device_db_profile: None,
+                device_db_read_direct: None,
             },
             MountInfoEntry {
                 mount_point: "/var/lib/data".into(),
@@ -275,6 +546,17 @@ mod tests {
                 mount_source: "/dev/md0".into(),
                 major_minor: "9:0".into(),
                 writable_dir: None,
+                device_kind: None,
+                device_name: None,
+                device_model: None,
+                device_serial: None,
+                device_by_id: Vec::new(),
+                md_level: None,
+                md_chunk_bytes: None,
+                md_members: Vec::new(),
+                signature: None,
+                device_db_profile: None,
+                device_db_read_direct: None,
             },
         ];
 
@@ -292,8 +574,48 @@ mod tests {
             mount_source: "tank/dataset".into(),
             major_minor: "0:0".into(),
             writable_dir: None,
+            device_kind: None,
+            device_name: None,
+            device_model: None,
+            device_serial: None,
+            device_by_id: Vec::new(),
+            md_level: None,
+            md_chunk_bytes: None,
+            md_members: Vec::new(),
+            signature: None,
+            device_db_profile: None,
+            device_db_read_direct: None,
         };
         assert!(is_disk_backed_mount(&z));
+    }
+
+    #[test]
+    fn device_db_matches_ext4_mdraid0() {
+        let db: DeviceDb = serde_json::from_str(include_str!("../../fro-device-db.json")).unwrap();
+        let mut e = MountInfoEntry {
+            mount_point: "/data".into(),
+            fstype: "ext4".into(),
+            mount_source: "/dev/md127".into(),
+            major_minor: "9:127".into(),
+            writable_dir: None,
+            device_kind: Some("md".into()),
+            device_name: Some("md127".into()),
+            device_model: Some("unknown".into()),
+            device_serial: None,
+            device_by_id: Vec::new(),
+            md_level: Some("raid0".into()),
+            md_chunk_bytes: None,
+            md_members: Vec::new(),
+            signature: Some("fstype=ext4;dev=md;level=raid0;model=unknown".into()),
+            device_db_profile: None,
+            device_db_read_direct: None,
+        };
+
+        let p = device_db_match(&db, &e).unwrap();
+        assert_eq!(p.id, "example-ext4-mdraid0");
+        e.device_db_profile = Some(p.id.clone());
+        e.device_db_read_direct = Some(p.params.read.direct.clone());
+        assert_eq!(e.device_db_read_direct.unwrap().block_size, 3145728);
     }
 }
 
@@ -315,6 +637,7 @@ fn main() {
     if args.len() > 1 && (args[1] == "--list-devices" || args[1] == "--list-devices-all") {
         let all = args[1] == "--list-devices-all";
         let home_targets = collect_home_targets();
+        let db = load_device_db();
 
         let entries = read_mountinfo();
         let mut entries: Vec<_> = if all {
@@ -327,6 +650,14 @@ fn main() {
             let mp = Path::new(&e.mount_point);
             let wd = find_writable_dir_for_mount(mp, &home_targets);
             e.writable_dir = wd.map(|p| p.display().to_string());
+
+            fill_device_info(e);
+            if let Some(ref db) = db {
+                if let Some(p) = device_db_match(db, e) {
+                    e.device_db_profile = Some(p.id.clone());
+                    e.device_db_read_direct = Some(p.params.read.direct.clone());
+                }
+            }
         }
 
         let out = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
