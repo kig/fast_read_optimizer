@@ -2,16 +2,65 @@ use std::process::Command;
 use std::env;
 use std::fs;
 
+#[derive(serde::Serialize)]
+struct MountInfoEntry {
+    mount_point: String,
+    fstype: String,
+    mount_source: String,
+    major_minor: String,
+}
+
+fn read_mountinfo() -> Vec<MountInfoEntry> {
+    let data = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut out = Vec::new();
+    for line in data.lines() {
+        let (lhs, rhs) = match line.split_once(" - ") {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
+        if left_fields.len() < 5 {
+            continue;
+        }
+        let major_minor = left_fields[2].to_string();
+        let mount_point = left_fields[4].to_string();
+
+        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
+        if right_fields.len() < 3 {
+            continue;
+        }
+        let fstype = right_fields[0].to_string();
+        let mount_source = right_fields[1].to_string();
+
+        out.push(MountInfoEntry {
+            mount_point,
+            fstype,
+            mount_source,
+            major_minor,
+        });
+    }
+    out
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut patterns = vec![];
 
     let mut test_dir = ".";
 
-    if args.len() > 1 && args[1] == "--help" {
-        println!("USAGE: {} [--test-dir path] <test_prefix ...>", args[0]);
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
+        println!("USAGE: {} [--list-devices] [--test-dir path] <test_prefix ...>", args[0]);
+        println!("\n--list-devices prints mountpoints + filesystem types from /proc/self/mountinfo as JSON and exits.");
         std::process::exit(0);
     }
+    if args.len() > 1 && args[1] == "--list-devices" {
+        let entries = read_mountinfo();
+        let out = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+        println!("{}", out);
+        return;
+    }
+
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
