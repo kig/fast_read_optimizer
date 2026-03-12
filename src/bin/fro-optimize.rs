@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 struct MountInfoEntry {
@@ -8,6 +9,9 @@ struct MountInfoEntry {
     fstype: String,
     mount_source: String,
     major_minor: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writable_dir: Option<String>,
 }
 
 fn is_disk_backed_mount(e: &MountInfoEntry) -> bool {
@@ -65,12 +69,140 @@ fn is_disk_backed_mount(e: &MountInfoEntry) -> bool {
         return false;
     }
 
-    // Most disk-backed mounts have a /dev/* source; keep others out by default.
+    // Most disk-backed mounts have a /dev/* source, but some (e.g. zfs) don't.
     if e.mount_source.starts_with("/dev/") {
         return true;
     }
 
-    false
+    matches!(fs, "zfs" | "btrfs")
+}
+
+fn is_user_writable_dir(p: &Path) -> bool {
+    if !p.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = match CString::new(p.as_os_str().as_bytes()) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // Best-effort fallback.
+        fs::metadata(p).is_ok()
+    }
+}
+
+fn collect_home_targets() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let home = match std::env::var("HOME").ok() {
+        Some(h) => PathBuf::from(h),
+        None => return out,
+    };
+    out.push(home.clone());
+
+    if let Ok(rd) = fs::read_dir(&home) {
+        for ent in rd.flatten() {
+            if let Ok(ft) = ent.file_type() {
+                if !ft.is_symlink() {
+                    continue;
+                }
+            }
+
+            let link = match fs::read_link(ent.path()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let target = if link.is_absolute() {
+                link
+            } else {
+                home.join(link)
+            };
+            let canon = fs::canonicalize(&target).unwrap_or(target);
+            out.push(canon);
+        }
+    }
+
+    out
+}
+
+fn find_writable_dir_for_mount(mount_point: &Path, home_targets: &[PathBuf]) -> Option<PathBuf> {
+    // 1) Prefer any $HOME symlink targets that land on this mount.
+    for t in home_targets {
+        if t.starts_with(mount_point) && is_user_writable_dir(t) {
+            return Some(t.clone());
+        }
+    }
+
+    // 2) Common shallow candidates.
+    let user = std::env::var("USER").ok();
+    let mut candidates: Vec<PathBuf> = vec![mount_point.to_path_buf()];
+    if let Some(u) = user.as_deref() {
+        candidates.push(mount_point.join(u));
+        candidates.push(mount_point.join("home").join(u));
+        candidates.push(mount_point.join("users").join(u));
+    }
+    candidates.push(mount_point.join("tmp"));
+    candidates.push(mount_point.join("scratch"));
+    candidates.push(mount_point.join("data"));
+
+    for c in candidates {
+        if is_user_writable_dir(&c) {
+            return Some(c);
+        }
+    }
+
+    // 3) Bounded breadth-first search for a writable dir.
+    let max_depth: usize = 4;
+    let max_dirs: usize = 2000;
+    let mut q: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    q.push_back((mount_point.to_path_buf(), 0));
+
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = q.pop_front() {
+        if depth > max_depth {
+            continue;
+        }
+        if seen >= max_dirs {
+            break;
+        }
+        seen += 1;
+
+        if depth > 0 && is_user_writable_dir(&dir) {
+            return Some(dir);
+        }
+
+        let rd = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let ft = match ent.file_type() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let name = ent.file_name();
+            if let Some(s) = name.to_str() {
+                if s.starts_with('.') {
+                    continue;
+                }
+                if s == "proc" || s == "sys" || s == "dev" || s == "run" {
+                    continue;
+                }
+            }
+            q.push_back((ent.path(), depth + 1));
+        }
+    }
+
+    None
 }
 
 fn read_mountinfo() -> Vec<MountInfoEntry> {
@@ -101,6 +233,7 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             fstype,
             mount_source,
             major_minor,
+            writable_dir: None,
         });
     }
 
@@ -120,24 +253,28 @@ mod tests {
                 fstype: "ext4".into(),
                 mount_source: "/dev/nvme0n1p2".into(),
                 major_minor: "259:2".into(),
+                writable_dir: None,
             },
             MountInfoEntry {
                 mount_point: "/run".into(),
                 fstype: "tmpfs".into(),
                 mount_source: "tmpfs".into(),
                 major_minor: "0:5".into(),
+                writable_dir: None,
             },
             MountInfoEntry {
                 mount_point: "/snap/core".into(),
                 fstype: "squashfs".into(),
                 mount_source: "/dev/loop0".into(),
                 major_minor: "7:0".into(),
+                writable_dir: None,
             },
             MountInfoEntry {
                 mount_point: "/var/lib/data".into(),
                 fstype: "xfs".into(),
                 mount_source: "/dev/md0".into(),
                 major_minor: "9:0".into(),
+                writable_dir: None,
             },
         ];
 
@@ -145,6 +282,18 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].mount_point, "/");
         assert_eq!(kept[1].mount_point, "/var/lib/data");
+    }
+
+    #[test]
+    fn list_devices_allows_zfs_without_dev_mount_source() {
+        let z = MountInfoEntry {
+            mount_point: "/tank".into(),
+            fstype: "zfs".into(),
+            mount_source: "tank/dataset".into(),
+            major_minor: "0:0".into(),
+            writable_dir: None,
+        };
+        assert!(is_disk_backed_mount(&z));
     }
 }
 
@@ -165,15 +314,21 @@ fn main() {
     }
     if args.len() > 1 && (args[1] == "--list-devices" || args[1] == "--list-devices-all") {
         let all = args[1] == "--list-devices-all";
+        let home_targets = collect_home_targets();
+
         let entries = read_mountinfo();
-        let entries = if all {
+        let mut entries: Vec<_> = if all {
             entries
         } else {
-            entries
-                .into_iter()
-                .filter(|e| is_disk_backed_mount(e))
-                .collect()
+            entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect()
         };
+
+        for e in entries.iter_mut() {
+            let mp = Path::new(&e.mount_point);
+            let wd = find_writable_dir_for_mount(mp, &home_targets);
+            e.writable_dir = wd.map(|p| p.display().to_string());
+        }
+
         let out = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
         println!("{}", out);
         return;
