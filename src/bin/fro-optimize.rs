@@ -72,6 +72,27 @@ struct MountInfoEntry {
     device_by_id: Vec<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pci_bdf: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pci_numa_node: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pci_local_cpulist: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_current_link_width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_current_link_speed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_max_link_width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_max_link_speed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aer_dev_correctable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aer_dev_nonfatal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aer_dev_fatal: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     md_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     md_chunk_bytes: Option<u64>,
@@ -280,7 +301,43 @@ fn find_writable_dir_for_mount(mount_point: &Path, home_targets: &[PathBuf]) -> 
 
 fn read_sysfs_trimmed(path: &Path) -> Option<String> {
     let s = fs::read_to_string(path).ok()?;
-    Some(s.trim().to_string())
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn is_pci_bdf(s: &str) -> bool {
+    // 0000:00:00.0
+    let b = s.as_bytes();
+    if b.len() != 12 {
+        return false;
+    }
+    let hex = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F');
+    hex(b[0])
+        && hex(b[1])
+        && hex(b[2])
+        && hex(b[3])
+        && b[4] == b':'
+        && hex(b[5])
+        && hex(b[6])
+        && b[7] == b':'
+        && hex(b[8])
+        && hex(b[9])
+        && b[10] == b'.'
+        && matches!(b[11], b'0'..=b'7')
+}
+
+fn pci_bdf_from_sysfs_path(p: &Path) -> Option<String> {
+    for anc in p.ancestors() {
+        let name = anc.file_name()?.to_string_lossy();
+        if is_pci_bdf(&name) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 fn base_block_name_from_devpath(devpath: &Path) -> Option<String> {
@@ -370,6 +427,29 @@ fn fill_device_info(e: &mut MountInfoEntry) {
     e.device_model = read_sysfs_trimmed(&sys.join("device/model"));
     e.device_serial = read_sysfs_trimmed(&sys.join("device/serial"));
     e.device_by_id = dev_by_id_for_block_name(&base);
+
+    // PCIe/NUMA/AER info (best-effort). For partitions, sys/device points at the same parent chain.
+    if let Ok(devlink) = fs::read_link(sys.join("device")) {
+        let devpath = if devlink.is_absolute() {
+            devlink
+        } else {
+            sys.join(devlink)
+        };
+        let devpath = fs::canonicalize(devpath).unwrap_or_else(|_| sys.join("device"));
+        if let Some(bdf) = pci_bdf_from_sysfs_path(&devpath) {
+            e.pci_bdf = Some(bdf.clone());
+            let pcidir = Path::new("/sys/bus/pci/devices").join(&bdf);
+            e.pci_numa_node = read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
+            e.pci_local_cpulist = read_sysfs_trimmed(&pcidir.join("local_cpulist"));
+            e.pcie_current_link_width = read_sysfs_trimmed(&pcidir.join("current_link_width"));
+            e.pcie_current_link_speed = read_sysfs_trimmed(&pcidir.join("current_link_speed"));
+            e.pcie_max_link_width = read_sysfs_trimmed(&pcidir.join("max_link_width"));
+            e.pcie_max_link_speed = read_sysfs_trimmed(&pcidir.join("max_link_speed"));
+            e.aer_dev_correctable = read_sysfs_trimmed(&pcidir.join("aer_dev_correctable"));
+            e.aer_dev_nonfatal = read_sysfs_trimmed(&pcidir.join("aer_dev_nonfatal"));
+            e.aer_dev_fatal = read_sysfs_trimmed(&pcidir.join("aer_dev_fatal"));
+        }
+    }
 
     if kind == "md" {
         e.md_level = read_sysfs_trimmed(&sys.join("md/level"));
@@ -466,6 +546,16 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             device_model: None,
             device_serial: None,
             device_by_id: Vec::new(),
+            pci_bdf: None,
+            pci_numa_node: None,
+            pci_local_cpulist: None,
+            pcie_current_link_width: None,
+            pcie_current_link_speed: None,
+            pcie_max_link_width: None,
+            pcie_max_link_speed: None,
+            aer_dev_correctable: None,
+            aer_dev_nonfatal: None,
+            aer_dev_fatal: None,
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
@@ -497,6 +587,16 @@ mod tests {
                 device_model: None,
                 device_serial: None,
                 device_by_id: Vec::new(),
+                pci_bdf: None,
+                pci_numa_node: None,
+                pci_local_cpulist: None,
+                pcie_current_link_width: None,
+                pcie_current_link_speed: None,
+                pcie_max_link_width: None,
+                pcie_max_link_speed: None,
+                aer_dev_correctable: None,
+                aer_dev_nonfatal: None,
+                aer_dev_fatal: None,
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -515,6 +615,16 @@ mod tests {
                 device_model: None,
                 device_serial: None,
                 device_by_id: Vec::new(),
+                pci_bdf: None,
+                pci_numa_node: None,
+                pci_local_cpulist: None,
+                pcie_current_link_width: None,
+                pcie_current_link_speed: None,
+                pcie_max_link_width: None,
+                pcie_max_link_speed: None,
+                aer_dev_correctable: None,
+                aer_dev_nonfatal: None,
+                aer_dev_fatal: None,
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -533,6 +643,16 @@ mod tests {
                 device_model: None,
                 device_serial: None,
                 device_by_id: Vec::new(),
+                pci_bdf: None,
+                pci_numa_node: None,
+                pci_local_cpulist: None,
+                pcie_current_link_width: None,
+                pcie_current_link_speed: None,
+                pcie_max_link_width: None,
+                pcie_max_link_speed: None,
+                aer_dev_correctable: None,
+                aer_dev_nonfatal: None,
+                aer_dev_fatal: None,
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -551,6 +671,16 @@ mod tests {
                 device_model: None,
                 device_serial: None,
                 device_by_id: Vec::new(),
+                pci_bdf: None,
+                pci_numa_node: None,
+                pci_local_cpulist: None,
+                pcie_current_link_width: None,
+                pcie_current_link_speed: None,
+                pcie_max_link_width: None,
+                pcie_max_link_speed: None,
+                aer_dev_correctable: None,
+                aer_dev_nonfatal: None,
+                aer_dev_fatal: None,
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -579,6 +709,16 @@ mod tests {
             device_model: None,
             device_serial: None,
             device_by_id: Vec::new(),
+            pci_bdf: None,
+            pci_numa_node: None,
+            pci_local_cpulist: None,
+            pcie_current_link_width: None,
+            pcie_current_link_speed: None,
+            pcie_max_link_width: None,
+            pcie_max_link_speed: None,
+            aer_dev_correctable: None,
+            aer_dev_nonfatal: None,
+            aer_dev_fatal: None,
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
@@ -603,6 +743,16 @@ mod tests {
             device_model: Some("unknown".into()),
             device_serial: None,
             device_by_id: Vec::new(),
+            pci_bdf: None,
+            pci_numa_node: None,
+            pci_local_cpulist: None,
+            pcie_current_link_width: None,
+            pcie_current_link_speed: None,
+            pcie_max_link_width: None,
+            pcie_max_link_speed: None,
+            aer_dev_correctable: None,
+            aer_dev_nonfatal: None,
+            aer_dev_fatal: None,
             md_level: Some("raid0".into()),
             md_chunk_bytes: None,
             md_members: Vec::new(),
