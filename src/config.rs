@@ -123,6 +123,9 @@ pub fn default_user_config_path() -> Option<PathBuf> {
 }
 
 pub fn default_system_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("FRO_SYSTEM_CONFIG") {
+        return PathBuf::from(p);
+    }
     PathBuf::from("/etc/fro.json")
 }
 
@@ -325,12 +328,14 @@ mod tests {
         let cfg_path = tmp.join("cfg.json");
 
         let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
         let old_home = set_env_var("HOME", None);
 
         let resolved = resolve_default_config_path();
         assert_eq!(resolved, cfg_path);
 
         restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
         restore_env_var("HOME", old_home);
     }
 
@@ -340,6 +345,7 @@ mod tests {
 
         let home = unique_temp_dir("fro-home");
         let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
         let old_home = set_env_var("HOME", Some(home.to_str().unwrap()));
 
         let resolved = resolve_default_config_path();
@@ -347,6 +353,28 @@ mod tests {
         assert!(resolved.starts_with(&home));
 
         restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
+        restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn resolve_default_config_path_uses_system_when_user_missing_and_system_exists() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let home = unique_temp_dir("fro-home");
+        let tmp = unique_temp_dir("fro-sys");
+        let sys_cfg = tmp.join("fro.json");
+        std::fs::write(&sys_cfg, "{}\n").unwrap();
+
+        let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", Some(sys_cfg.to_str().unwrap()));
+        let old_home = set_env_var("HOME", Some(home.to_str().unwrap()));
+
+        let resolved = resolve_default_config_path();
+        assert_eq!(resolved, sys_cfg);
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
         restore_env_var("HOME", old_home);
     }
 
@@ -358,6 +386,7 @@ mod tests {
         let cfg_path = tmp.join("fro.json");
 
         let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
         let old_home = set_env_var("HOME", None);
 
         let mut loaded = load_config(None);
@@ -395,6 +424,7 @@ mod tests {
         assert_eq!(p1.qd, 7);
 
         restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
         restore_env_var("HOME", old_home);
     }
 
@@ -406,6 +436,7 @@ mod tests {
         let cfg_path = tmp.join("legacy.json");
 
         let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
         let old_home = set_env_var("HOME", None);
 
         let legacy = AppConfig::default();
@@ -434,6 +465,7 @@ mod tests {
         assert_eq!(p.block_size, 123);
 
         restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
         restore_env_var("HOME", old_home);
     }
 }
