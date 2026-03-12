@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::process::Command;
 use std::env;
 use std::fs;
@@ -91,6 +92,15 @@ struct MountInfoEntry {
     aer_dev_nonfatal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     aer_dev_fatal: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zfs_pool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zfs_dataset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zfs_props: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    zpool_vdevs: Vec<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     md_level: Option<String>,
@@ -393,14 +403,95 @@ fn dev_by_id_for_block_name(block: &str) -> Vec<String> {
     out
 }
 
+fn run_cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn parse_zfs_get_props(out: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (k, v) = match line.split_once('\t') {
+            Some(p) => p,
+            None => continue,
+        };
+        let k = k.trim();
+        let v = v.trim();
+        if !k.is_empty() && !v.is_empty() {
+            m.insert(k.to_string(), v.to_string());
+        }
+    }
+    m
+}
+
+fn zfs_get_props(dataset: &str) -> Option<BTreeMap<String, String>> {
+    // Keep this small/structured; callers can always run `zfs get all` themselves.
+    let props = "recordsize,compression,compressratio,atime,sync,primarycache,secondarycache,logbias";
+    let out = run_cmd_stdout("zfs", &["get", "-Hp", "-o", "property,value", props, dataset])?;
+    let m = parse_zfs_get_props(&out);
+    if m.is_empty() {
+        None
+    } else {
+        Some(m)
+    }
+}
+
+fn parse_zpool_status_vdevs(out: &str) -> Vec<String> {
+    let mut vdevs = Vec::new();
+    for line in out.lines() {
+        let t = line.trim_start();
+        let first = t.split_whitespace().next().unwrap_or("");
+        if first.starts_with("/dev/") {
+            vdevs.push(first.to_string());
+        }
+    }
+    vdevs.sort();
+    vdevs.dedup();
+    vdevs
+}
+
+fn zpool_get_vdevs(pool: &str) -> Vec<String> {
+    let out = match run_cmd_stdout("zpool", &["status", "-P", pool]) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    parse_zpool_status_vdevs(&out)
+}
+
 fn fill_device_info(e: &mut MountInfoEntry) {
     let src = Path::new(&e.mount_source);
     if !e.mount_source.starts_with("/dev/") {
-        // Non-/dev sources (e.g. zfs datasets) are still useful for signatures, but we can't
-        // reliably map them to a single block device without invoking filesystem-specific tooling.
+        // Non-/dev sources are still useful, but we generally can't map them to a single block
+        // device without filesystem-specific tooling.
         e.device_kind = Some(e.fstype.clone());
         e.device_name = Some(e.mount_source.clone());
-        e.signature = Some(format!("fstype={};source={}", e.fstype, e.mount_source));
+
+        if e.fstype == "zfs" {
+            e.zfs_dataset = Some(e.mount_source.clone());
+            e.zfs_pool = e.mount_source.split('/').next().map(|s| s.to_string());
+            if let Some(ref ds) = e.zfs_dataset {
+                e.zfs_props = zfs_get_props(ds);
+            }
+            if let Some(ref pool) = e.zfs_pool {
+                e.zpool_vdevs = zpool_get_vdevs(pool);
+            }
+            e.signature = Some(format!("fstype=zfs;dataset={}", e.mount_source));
+        } else {
+            e.signature = Some(format!("fstype={};source={}", e.fstype, e.mount_source));
+        }
         return;
     }
 
@@ -556,6 +647,10 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             aer_dev_correctable: None,
             aer_dev_nonfatal: None,
             aer_dev_fatal: None,
+            zfs_pool: None,
+            zfs_dataset: None,
+            zfs_props: None,
+            zpool_vdevs: Vec::new(),
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
@@ -597,6 +692,10 @@ mod tests {
                 aer_dev_correctable: None,
                 aer_dev_nonfatal: None,
                 aer_dev_fatal: None,
+                zfs_pool: None,
+                zfs_dataset: None,
+                zfs_props: None,
+                zpool_vdevs: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -625,6 +724,10 @@ mod tests {
                 aer_dev_correctable: None,
                 aer_dev_nonfatal: None,
                 aer_dev_fatal: None,
+                zfs_pool: None,
+                zfs_dataset: None,
+                zfs_props: None,
+                zpool_vdevs: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -653,6 +756,10 @@ mod tests {
                 aer_dev_correctable: None,
                 aer_dev_nonfatal: None,
                 aer_dev_fatal: None,
+                zfs_pool: None,
+                zfs_dataset: None,
+                zfs_props: None,
+                zpool_vdevs: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -681,6 +788,10 @@ mod tests {
                 aer_dev_correctable: None,
                 aer_dev_nonfatal: None,
                 aer_dev_fatal: None,
+                zfs_pool: None,
+                zfs_dataset: None,
+                zfs_props: None,
+                zpool_vdevs: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
@@ -719,6 +830,10 @@ mod tests {
             aer_dev_correctable: None,
             aer_dev_nonfatal: None,
             aer_dev_fatal: None,
+            zfs_pool: None,
+            zfs_dataset: None,
+            zfs_props: None,
+            zpool_vdevs: Vec::new(),
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
@@ -753,6 +868,10 @@ mod tests {
             aer_dev_correctable: None,
             aer_dev_nonfatal: None,
             aer_dev_fatal: None,
+            zfs_pool: None,
+            zfs_dataset: None,
+            zfs_props: None,
+            zpool_vdevs: Vec::new(),
             md_level: Some("raid0".into()),
             md_chunk_bytes: None,
             md_members: Vec::new(),
@@ -766,6 +885,32 @@ mod tests {
         e.device_db_profile = Some(p.id.clone());
         e.device_db_read_direct = Some(p.params.read.direct.clone());
         assert_eq!(e.device_db_read_direct.unwrap().block_size, 3145728);
+    }
+
+    #[test]
+    fn parse_zfs_get_props_parses_tab_separated_pairs() {
+        let out = "recordsize\t128K\ncompression\toff\ncompressratio\t1.00x\n";
+        let m = parse_zfs_get_props(out);
+        assert_eq!(m.get("recordsize").unwrap(), "128K");
+        assert_eq!(m.get("compression").unwrap(), "off");
+        assert_eq!(m.get("compressratio").unwrap(), "1.00x");
+    }
+
+    #[test]
+    fn parse_zpool_status_vdevs_extracts_dev_paths() {
+        let out = r#"
+  pool: tank
+ state: ONLINE
+config:
+
+	NAME	STATE	READ	WRITE	CKSUM
+	tank	ONLINE	0	0	0
+	  mirror-0	ONLINE	0	0	0
+	    /dev/disk/by-id/nvme-SAMSUNG_PM1733_ABC	ONLINE	0	0	0
+	    /dev/nvme1n1	ONLINE	0	0	0
+"#;
+        let v = parse_zpool_status_vdevs(out);
+        assert_eq!(v, vec!["/dev/disk/by-id/nvme-SAMSUNG_PM1733_ABC", "/dev/nvme1n1"]);
     }
 }
 

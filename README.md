@@ -302,6 +302,11 @@ Usage:
 # Print all mounts (unfiltered)
 ./target/release/fro-optimize --list-devices-all
 
+# Notes on extra fields:
+# - for /dev-backed mounts, `--list-devices` also includes best-effort block device + mdraid info.
+# - when available via sysfs, it includes PCIe/NUMA/AER fields (BDF, link width/speed, local cpulist, AER counters).
+# - for ZFS mounts, it will (best-effort) call `zfs get` + `zpool status` and include a small `zfs_props` map and `zpool_vdevs`.
+
 # Optimize (writes 4 GiB temp files under --test-dir)
 ./target/release/fro-optimize --test-dir /mnt/nvme read grep diff write copy
 ```
