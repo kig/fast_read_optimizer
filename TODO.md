@@ -15,7 +15,8 @@ Make `fro` “just work” on most systems without manual tuning by:
 
 - `fro` currently loads exactly one config file: `AppConfig::load("fro.json")` in `src/main.rs`.
 - `AppConfig` is a single struct with per-tool configs, and each tool has `{direct, page_cache}` params: `num_threads`, `block_size`, `qd`.
-- `fro-optimize` and `fro-benchmark` create **4 GiB** temp files and run fixed sets of scenarios.
+- `fro-optimize` and `fro-benchmark` currently create **4 GiB** temp files and run fixed sets of scenarios.
+  - Planned: adaptive sizing (v1: wear/space based; v2: probe-based time targeting).
 
 This plan expands config and selection logic without breaking today’s workflow.
 
@@ -268,32 +269,53 @@ When running `fro <cmd> ... <file>`:
   - target total runtime
 - system RAM size (for page-cache “hot” tests)
 
-### Two-phase sizing algorithm
+### Sizing algorithm
+
+#### v1 (simple, low-risk): wear + free-space based
+
+- Inputs:
+  - filesystem size + free space (via `statvfs` on `--test-dir`)
+  - estimated number of full-file writes performed by the selected run
+    - `fro-benchmark` (full suite): ~13× `test_size` writes, plus the small internal micro-benches
+    - `fro-optimize` (full suite): 83× `test_size` writes (setup + optimize loops)
+  - file count (1–3 files, depending on which tests are selected)
+
+- Choose `test_size` as the minimum of:
+  - `--max-test-size` (default: 4GiB for continuity)
+  - a wear cap: `fs_total_bytes * max_drive_writes / num_full_writes`
+    - `--max-drive-writes` is a fraction of total capacity written per run (default should be conservative)
+  - a free-space cap: keep total allocated temp files well below available space
+
+- Also reduce unnecessary writes:
+  - only create the temp files actually required by the selected tests (e.g. `read`-only runs shouldn’t pre-create copy targets).
+
+This version is deterministic and avoids the “probe” phase entirely.
+
+#### v2 (more accurate): probe-based time targeting
 
 1. **Probe phase** (low wear):
-   - Create a small file (e.g., 256 MiB or 1 GiB) on the target mount.
-   - Run `read --direct -n 1` and `write --direct-write -n 1` once to estimate baseline GB/s.
+   - Create a small file (e.g., 256MiB) on the target mount.
+   - Run one `read --direct -n 1` and one `write --direct-write -n 1` to estimate baseline GB/s.
 
 2. **Select size**:
    - Choose `size_for_time = throughput_gbps * target_seconds`.
    - Clamp to `[min_size, max_size]`.
-     - `min_size`: at least e.g. 1 GiB (or 2× total queue depth × block size × threads, whichever is larger).
-     - `max_size`:
-       - ≤ 10% of free space
-       - ≤ (RAM * 0.25) for page-cache “hot” tests (to increase chance of staying hot)
-       - ≤ `wear_budget_bytes / expected_num_writes`
+     - `max_size` additionally capped by wear + free space.
 
-3. **Recompute write budget** for the chosen size and planned number of write/copy iterations.
-   - If over budget, reduce size or reduce iterations (prefer reducing iterations first if you want stable results).
+3. If still over wear budget, reduce size and/or iterations.
 
 ### User controls
 
-Add flags:
+Add flags (for both `fro-benchmark` and `fro-optimize`):
 
-- `--test-size <bytes|GiB>` (force size)
-- `--target-seconds <s>` (controls auto sizing)
-- `--max-write-gib <GiB>` or `--max-drive-writes <fraction>`
-- `--min-size-gib`, `--max-size-gib`
+- `--test-size <bytes|MiB|GiB>` (force size, disables auto sizing)
+- `--max-drive-writes <fraction>`
+  - Maximum total bytes written per run as a fraction of filesystem capacity (DW-style budget).
+- `--min-test-size <...>`, `--max-test-size <...>`
+
+Optional (v2):
+
+- `--target-seconds <s>` (controls probe-based sizing)
 
 All defaults should be conservative.
 
@@ -356,9 +378,11 @@ Let users download a device DB so optimization is usually unnecessary.
 
 ### Phase 5: Adaptive test sizing + wear budget
 
-- [ ] Add probe phase and auto-sizing logic.
-- [ ] Add user flags for budgets and size bounds.
+- [ ] v1: Add deterministic wear/space-based auto sizing logic.
+- [ ] v1: Only create temp files needed by the selected tests to reduce writes.
+- [ ] v1: Add user flags for size and wear budgets.
 - [ ] Update README wear math to reference the adaptive sizing behavior.
+- [ ] v2: Add optional probe phase and time-targeting.
 
 ### Phase 6: Online DB (optional)
 
