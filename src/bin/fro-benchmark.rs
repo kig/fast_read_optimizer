@@ -155,14 +155,17 @@ fn main() {
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         println!(
-            "USAGE: {} [--plan] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
+            "USAGE: {} [--plan] [--skip-build] [--no-fail] [--iters <n>] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
             args[0]
         );
         println!(
             "\nAuto sizing (default): chooses a temp file size based on free space and a wear budget.\n\
              - --plan                  (print suggested test size + write load and exit)\n\
              - --test-size 1GiB         (force fixed size)\n\
-             - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)"
+             - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)\n\
+             - --iters 5               (override internal -n for fro invocations; useful for quick runs/tests)\n\
+             - --skip-build            (do not run `cargo build --release`; assume binaries already built)\n\
+             - --no-fail               (do not exit nonzero on regressions; still prints PASS/REGRESSION)"
         );
         std::process::exit(0);
     }
@@ -172,6 +175,9 @@ fn main() {
     let mut max_test_size: u64 = 1024 * 1024 * 1024;
     let mut max_drive_writes: f64 = 0.05;
     let mut plan = false;
+    let mut iters: u64 = 1;
+    let mut skip_build = false;
+    let mut fail_on_regressions = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -211,6 +217,17 @@ fn main() {
             });
         } else if arg == "--plan" {
             plan = true;
+        } else if arg == "--iters" {
+            let v = &args[i];
+            i += 1;
+            iters = v.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid --iters: {}", v);
+                std::process::exit(2);
+            });
+        } else if arg == "--skip-build" {
+            skip_build = true;
+        } else if arg == "--no-fail" {
+            fail_on_regressions = false;
         } else {
             patterns.push(arg);
         }
@@ -445,7 +462,7 @@ fn main() {
         }
     ];
 
-    if !plan {
+    if !plan && !skip_build {
         let build_output = Command::new("cargo")
             .args(["build", "--release"])
             .output()
@@ -479,6 +496,19 @@ fn main() {
     if selected_tests.is_empty() {
         eprintln!("No benchmarks selected.");
         return;
+    }
+
+    if iters != 1 {
+        for t in &mut selected_tests {
+            let mut j = 0;
+            while j + 1 < t.args.len() {
+                if t.args[j] == "-n" {
+                    t.args[j + 1] = iters.to_string();
+                    break;
+                }
+                j += 1;
+            }
+        }
     }
 
     let mut need_source = false;
@@ -690,7 +720,9 @@ fn main() {
     
     if regressions {
         println!("\nWARNING: Some benchmarks showed regressions or failed.");
-        std::process::exit(1);
+        if fail_on_regressions {
+            std::process::exit(1);
+        }
     } else {
         println!("\nAll benchmarks passed successfully.");
     }

@@ -6,7 +6,13 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("{}-{}-{}", prefix, pid, nanos));
+
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp");
+    std::fs::create_dir_all(&base).unwrap();
+
+    let p = base.join(format!("{}-{}-{}", prefix, pid, nanos));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
