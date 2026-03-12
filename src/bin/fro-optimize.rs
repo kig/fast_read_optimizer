@@ -1323,7 +1323,7 @@ fn main() {
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         println!(
-            "USAGE: {} [--list-devices | --list-devices-all] [--plan] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
+            "USAGE: {} [--list-devices | --list-devices-all] [--all] [-c config.json] [--plan] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
             args[0]
         );
         println!(
@@ -1334,6 +1334,9 @@ fn main() {
         );
         println!("\n--list-devices prints likely disk-backed mountpoints as JSON and exits.");
         println!("--list-devices-all prints all mountpoints from /proc/self/mountinfo as JSON and exits.");
+        println!("--all runs the optimizer for each discovered disk-backed mount (best-effort writable_dir discovery).");
+        println!("--all-dir <path> can be repeated to provide an explicit list of directories to optimize.");
+        println!("--iters <n> overrides the internal -n used for each optimized mode (useful for quick runs/tests).");
         std::process::exit(0);
     }
     if args.len() > 1 && (args[1] == "--list-devices" || args[1] == "--list-devices-all") {
@@ -1372,6 +1375,10 @@ fn main() {
     let mut max_test_size: u64 = 1024 * 1024 * 1024;
     let mut max_drive_writes: f64 = 0.05;
     let mut plan = false;
+    let mut all = false;
+    let mut config_path: Option<&str> = None;
+    let mut all_dirs: Vec<String> = Vec::new();
+    let mut iters_override: Option<u64> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1380,6 +1387,22 @@ fn main() {
         if arg == "--test-dir" {
             test_dir = &args[i];
             i += 1;
+        } else if arg == "-c" || arg == "--config" {
+            config_path = Some(args[i].as_str());
+            i += 1;
+        } else if arg == "-a" || arg == "--all" {
+            all = true;
+        } else if arg == "--all-dir" {
+            all = true;
+            all_dirs.push(args[i].clone());
+            i += 1;
+        } else if arg == "--iters" {
+            let v = &args[i];
+            i += 1;
+            iters_override = Some(v.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid --iters: {}", v);
+                std::process::exit(2);
+            }));
         } else if arg == "--test-size" {
             let v = &args[i];
             i += 1;
@@ -1419,48 +1442,43 @@ fn main() {
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
     fro_exe.set_file_name("fro");
 
-    let test_path = std::path::Path::new(test_dir);
-
-    let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
-    let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
-    let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
-
     macro_rules! argsv {
         ($($s:expr),* $(,)?) => {
             vec![$($s.to_string()),*]
         };
     }
 
-    let configs: Vec<Vec<String>> = vec![
-        argsv!("read", "-s", "--direct", "-n", "100", &source_file),
-        argsv!("read", "-s", "--no-direct", "-n", "100", &source_file),
-        argsv!("grep", "-s", "--direct", "-n", "100", "needle", &source_file),
-        argsv!("grep", "-s", "--no-direct", "-n", "100", "needle", &source_file),
-        argsv!("write", "-s", "--direct", "-n", "20", &target_file_dir),
-        argsv!("write", "-s", "--no-direct", "-n", "20", &target_file_cache),
-        argsv!("copy", "-s", "--direct", "-n", "20", &source_file, &target_file_dir),
-        argsv!("copy", "-s", "--no-direct", "-n", "20", &source_file, &target_file_cache),
-        argsv!("diff", "-s", "--direct", "-n", "100", &source_file, &target_file_dir),
-        argsv!("diff", "-s", "--no-direct", "-n", "100", &source_file, &target_file_cache),
-        argsv!(
-            "dual-read-bench",
-            "-s",
-            "--direct",
-            "-n",
-            "100",
-            &source_file,
-            &target_file_dir
-        ),
-        argsv!(
-            "dual-read-bench",
-            "-s",
-            "--no-direct",
-            "-n",
-            "100",
-            &source_file,
-            &target_file_cache
-        ),
-    ];
+    let read_iters = iters_override.unwrap_or(100).to_string();
+    let write_iters = iters_override.unwrap_or(20).to_string();
+
+    let run_for_dir = |test_dir: &str| {
+        let test_path = std::path::Path::new(test_dir);
+
+        let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
+        let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
+        let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
+
+        let mut configs: Vec<Vec<String>> = vec![
+            argsv!("read", "-s", "--direct", "-n", &read_iters, &source_file),
+            argsv!("read", "-s", "--no-direct", "-n", &read_iters, &source_file),
+            argsv!("grep", "-s", "--direct", "-n", &read_iters, "needle", &source_file),
+            argsv!("grep", "-s", "--no-direct", "-n", &read_iters, "needle", &source_file),
+            argsv!("write", "-s", "--direct", "-n", &write_iters, &target_file_dir),
+            argsv!("write", "-s", "--no-direct", "-n", &write_iters, &target_file_cache),
+            argsv!("copy", "-s", "--direct", "-n", &write_iters, &source_file, &target_file_dir),
+            argsv!("copy", "-s", "--no-direct", "-n", &write_iters, &source_file, &target_file_cache),
+            argsv!("diff", "-s", "--direct", "-n", &read_iters, &source_file, &target_file_dir),
+            argsv!("diff", "-s", "--no-direct", "-n", &read_iters, &source_file, &target_file_cache),
+            argsv!("dual-read-bench", "-s", "--direct", "-n", &read_iters, &source_file, &target_file_dir),
+            argsv!("dual-read-bench", "-s", "--no-direct", "-n", &read_iters, &source_file, &target_file_cache),
+        ];
+
+        if let Some(cfg) = config_path {
+            for c in configs.iter_mut() {
+                c.insert(1, cfg.to_string());
+                c.insert(1, "-c".to_string());
+            }
+        }
 
     let mut selected = Vec::new();
     for cfg in configs {
@@ -1598,8 +1616,13 @@ fn main() {
         if let Ok(f) = fs::File::create(&source_file) {
             let _ = f.set_len(size);
         }
-        let _ = Command::new(&fro_exe)
-            .args(["write", &source_file])
+        let mut cmd = Command::new(&fro_exe);
+        cmd.arg("write");
+        if let Some(cfg) = config_path {
+            cmd.args(["-c", cfg]);
+        }
+        let _ = cmd
+            .arg(&source_file)
             .status()
             .expect("Failed to write fro_bench_tmp_source");
     }
@@ -1608,8 +1631,13 @@ fn main() {
             let _ = f.set_len(size);
         }
         if need_target_dir_matching {
-            let _ = Command::new(&fro_exe)
-                .args(["copy", &source_file, &target_file_dir])
+            let mut cmd = Command::new(&fro_exe);
+            cmd.arg("copy");
+            if let Some(cfg) = config_path {
+                cmd.args(["-c", cfg]);
+            }
+            let _ = cmd
+                .args([&source_file, &target_file_dir])
                 .status()
                 .expect("Failed to prepare fro_bench_tmp_direct");
         }
@@ -1619,8 +1647,13 @@ fn main() {
             let _ = f.set_len(size);
         }
         if need_target_cache_matching {
-            let _ = Command::new(&fro_exe)
-                .args(["copy", &source_file, &target_file_cache])
+            let mut cmd = Command::new(&fro_exe);
+            cmd.arg("copy");
+            if let Some(cfg) = config_path {
+                cmd.args(["-c", cfg]);
+            }
+            let _ = cmd
+                .args([&source_file, &target_file_cache])
                 .status()
                 .expect("Failed to prepare fro_bench_tmp_cache");
         }
@@ -1644,5 +1677,39 @@ fn main() {
     let _ = fs::remove_file(target_file_dir);
     let _ = fs::remove_file(target_file_cache);
 
-    println!("Optimization complete! Results saved to fro.json");
+    let saved_to = config_path.unwrap_or("fro.json");
+    println!("Optimization complete! Results saved to {}", saved_to);
+    };
+
+    if all {
+        let mut dirs: Vec<String> = Vec::new();
+
+        if !all_dirs.is_empty() {
+            dirs.extend(all_dirs);
+        } else {
+            let home_targets = collect_home_targets();
+            let entries = read_mountinfo();
+            for e in entries.into_iter().filter(|e| is_disk_backed_mount(e)) {
+                let mp = Path::new(&e.mount_point);
+                if let Some(wd) = find_writable_dir_for_mount(mp, &home_targets) {
+                    dirs.push(wd.display().to_string());
+                }
+            }
+        }
+
+        dirs.sort();
+        dirs.dedup();
+
+        if dirs.is_empty() {
+            eprintln!("No writable mountpoints found for --all");
+            std::process::exit(2);
+        }
+
+        for d in dirs {
+            println!("=== Optimizing for {} ===", d);
+            run_for_dir(&d);
+        }
+    } else {
+        run_for_dir(test_dir);
+    }
 }

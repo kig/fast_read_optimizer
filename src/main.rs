@@ -89,8 +89,10 @@ fn main() {
 
     let mut config = config::load_config(config_path);
 
-    let params_page_cache = config.get_params(mode, false);
-    let params_direct = config.get_params(mode, true);
+    let context_path = filename;
+
+    let params_page_cache = config.get_params_for_path(mode, false, context_path);
+    let params_direct = config.get_params_for_path(mode, true, context_path);
     
     let num_threads_pc = params_page_cache.num_threads;
     let qd_pc = params_page_cache.qd;
@@ -166,9 +168,16 @@ fn main() {
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
         let off = if direct { 3 } else { 0 };
-        config.update_params(mode, direct, config::IOParams {
-            num_threads: best_params[off+0], block_size: best_params[off+1], qd: best_params[off+2] as usize
-        });
+        config.update_params_for_path(
+            mode,
+            direct,
+            context_path,
+            config::IOParams {
+                num_threads: best_params[off + 0],
+                block_size: best_params[off + 1],
+                qd: best_params[off + 2] as usize,
+            },
+        );
         config.save();
     }
 }

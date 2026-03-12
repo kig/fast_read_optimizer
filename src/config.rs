@@ -79,6 +79,7 @@ pub enum LoadedConfig {
 }
 
 impl LoadedConfig {
+    #[allow(dead_code)]
     pub fn defaults_mut(&mut self) -> &mut AppConfig {
         match self {
             LoadedConfig::Legacy { config, .. } => config,
@@ -94,8 +95,50 @@ impl LoadedConfig {
         cfg.get_params(mode, direct)
     }
 
+    pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
+        let base = self.get_params(mode, direct);
+
+        let (bundle, mountpoint) = match self {
+            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
+            _ => return base,
+        };
+
+        let mp = match mountpoint {
+            Some(mp) => mp,
+            None => return base,
+        };
+
+        let patch = match bundle.mount_overrides.by_mountpoint.get(&mp) {
+            Some(p) => p,
+            None => return base,
+        };
+
+        patch
+            .get_mode_patch(mode)
+            .and_then(|m| if direct { m.direct.clone() } else { m.page_cache.clone() })
+            .unwrap_or(base)
+    }
+
+    #[allow(dead_code)]
     pub fn update_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         self.defaults_mut().update_params(mode, direct, params)
+    }
+
+    pub fn update_params_for_path(&mut self, mode: &str, direct: bool, path: &str, params: IOParams) {
+        match self {
+            LoadedConfig::BundleV1 { bundle, .. } => {
+                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
+                let entry = bundle
+                    .mount_overrides
+                    .by_mountpoint
+                    .entry(mp)
+                    .or_insert_with(AppConfigPatch::default);
+                entry.set_mode_params(mode, direct, params);
+            }
+            LoadedConfig::Legacy { config, .. } => {
+                config.update_params(mode, direct, params);
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -108,6 +151,85 @@ impl LoadedConfig {
             }
         }
     }
+}
+
+impl AppConfigPatch {
+    fn get_mode_patch(&self, mode: &str) -> Option<&ModeConfigPatch> {
+        match mode {
+            "read" => self.read.as_ref(),
+            "write" => self.write.as_ref(),
+            "copy" => self.copy.as_ref(),
+            "grep" => self.grep.as_ref(),
+            "diff" => self.diff.as_ref(),
+            "dual-read-bench" | "dual_read_bench" => self.dual_read_bench.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn set_mode_params(&mut self, mode: &str, direct: bool, params: IOParams) {
+        let m = match mode {
+            "read" => &mut self.read,
+            "write" => &mut self.write,
+            "copy" => &mut self.copy,
+            "grep" => &mut self.grep,
+            "diff" => &mut self.diff,
+            "dual-read-bench" | "dual_read_bench" => &mut self.dual_read_bench,
+            _ => return,
+        };
+
+        let mp = m.get_or_insert_with(ModeConfigPatch::default);
+        if direct {
+            mp.direct = Some(params);
+        } else {
+            mp.page_cache = Some(params);
+        }
+    }
+}
+
+fn mountpoint_for_path(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let path = canonical.to_string_lossy();
+
+    let data = fs::read_to_string("/proc/self/mountinfo").ok()?;
+
+    let mut best: Option<String> = None;
+    let mut best_len = 0usize;
+
+    for line in data.lines() {
+        let (lhs, _) = match line.split_once(" - ") {
+            Some(v) => v,
+            None => continue,
+        };
+        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
+        if left_fields.len() < 5 {
+            continue;
+        }
+
+        let mp = left_fields[4];
+        if !path_starts_with_mount(&path, mp) {
+            continue;
+        }
+        if mp.len() > best_len {
+            best_len = mp.len();
+            best = Some(mp.to_string());
+        }
+    }
+
+    best
+}
+
+fn path_starts_with_mount(path: &str, mount_point: &str) -> bool {
+    if mount_point == "/" {
+        return path.starts_with('/');
+    }
+    if path == mount_point {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix(mount_point) {
+        return rest.starts_with('/');
+    }
+    false
 }
 
 pub fn default_user_config_path() -> Option<PathBuf> {
