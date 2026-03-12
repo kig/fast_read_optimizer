@@ -305,7 +305,8 @@ Usage:
 # Notes on extra fields:
 # - for /dev-backed mounts, `--list-devices` also includes best-effort block device + mdraid info.
 # - when available via sysfs, it includes PCIe/NUMA/AER fields (BDF, link width/speed, local cpulist, AER counters).
-# - for ZFS mounts, it will (best-effort) call `zfs get` + `zpool status` and include a small `zfs_props` map and `zpool_vdevs`.
+# - for ZFS mounts, it will (best-effort) call `zfs get` + `zpool status` and include a small `zfs_props` map plus `zpool_vdevs` and `zpool_vdevs_info` (leaf models/by-id when resolvable).
+# - for mdraid mounts, it includes `md_members` and `md_members_info` (member models/by-id when resolvable).
 
 # Optimize (writes 4 GiB temp files under --test-dir)
 ./target/release/fro-optimize --test-dir /mnt/nvme read grep diff write copy

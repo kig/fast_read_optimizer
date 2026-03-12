@@ -51,6 +51,42 @@ struct DeviceDbMatch {
     md_level: Option<String>,
 }
 
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq, Default)]
+struct DeviceLeafInfo {
+    name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devnode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by_id_path: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    by_id: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pci_bdf: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pci_numa_node: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pci_local_cpulist: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_current_link_width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pcie_current_link_speed: Option<String>,
+
+    // ZFS-only fields (when parsed from `zpool status`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    was: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    vdev_path: Vec<String>,
+}
+
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 struct MountInfoEntry {
     mount_point: String,
@@ -101,6 +137,8 @@ struct MountInfoEntry {
     zfs_props: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     zpool_vdevs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    zpool_vdevs_info: Vec<DeviceLeafInfo>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     md_level: Option<String>,
@@ -108,6 +146,8 @@ struct MountInfoEntry {
     md_chunk_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     md_members: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    md_members_info: Vec<DeviceLeafInfo>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
@@ -403,6 +443,72 @@ fn dev_by_id_for_block_name(block: &str) -> Vec<String> {
     out
 }
 
+fn dev_by_id_for_devnode(devnode: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let canon_dev = match fs::canonicalize(devnode) {
+        Ok(p) => p,
+        Err(_) => return out,
+    };
+    let dev_basename = match canon_dev.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return out,
+    };
+
+    let dir = Path::new("/dev/disk/by-id");
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        let link = match fs::read_link(ent.path()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let target = if link.is_absolute() { link } else { dir.join(link) };
+        let canon = match fs::canonicalize(&target) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if canon
+            .file_name()
+            .map(|n| n == std::ffi::OsStr::new(&dev_basename))
+            .unwrap_or(false)
+        {
+            out.push(name);
+        }
+    }
+
+    out.sort();
+    out
+}
+
+fn enrich_device_leaf_from_devnode(leaf: &mut DeviceLeafInfo, devnode: &Path) {
+    leaf.devnode = Some(devnode.display().to_string());
+    leaf.by_id = dev_by_id_for_devnode(devnode);
+
+    // `model`/`serial` live on the base block device.
+    if let Some(base) = base_block_name_from_devpath(devnode) {
+        let sys = Path::new("/sys/class/block").join(&base);
+        leaf.model = read_sysfs_trimmed(&sys.join("device/model"));
+        leaf.serial = read_sysfs_trimmed(&sys.join("device/serial"));
+
+        if let Ok(devlink) = fs::read_link(sys.join("device")) {
+            let devpath = if devlink.is_absolute() { devlink } else { sys.join(devlink) };
+            let devpath = fs::canonicalize(devpath).unwrap_or_else(|_| sys.join("device"));
+            if let Some(bdf) = pci_bdf_from_sysfs_path(&devpath) {
+                leaf.pci_bdf = Some(bdf.clone());
+                let pcidir = Path::new("/sys/bus/pci/devices").join(&bdf);
+                leaf.pci_numa_node = read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
+                leaf.pci_local_cpulist = read_sysfs_trimmed(&pcidir.join("local_cpulist"));
+                leaf.pcie_current_link_width = read_sysfs_trimmed(&pcidir.join("current_link_width"));
+                leaf.pcie_current_link_speed = read_sysfs_trimmed(&pcidir.join("current_link_speed"));
+            }
+        }
+    }
+}
+
 fn run_cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
@@ -449,26 +555,147 @@ fn zfs_get_props(dataset: &str) -> Option<BTreeMap<String, String>> {
     }
 }
 
-fn parse_zpool_status_vdevs(out: &str) -> Vec<String> {
-    let mut vdevs = Vec::new();
-    for line in out.lines() {
-        let t = line.trim_start();
-        let first = t.split_whitespace().next().unwrap_or("");
-        if first.starts_with("/dev/") {
-            vdevs.push(first.to_string());
-        }
-    }
-    vdevs.sort();
-    vdevs.dedup();
-    vdevs
+fn is_zpool_group_name(name: &str) -> bool {
+    name.starts_with("mirror-")
+        || name.starts_with("raidz")
+        || name == "logs"
+        || name == "log"
+        || name == "cache"
+        || name == "spares"
+        || name.starts_with("spare-")
+        || name == "special"
+        || name.starts_with("replacing")
 }
 
-fn zpool_get_vdevs(pool: &str) -> Vec<String> {
+fn parse_zpool_status_leaves(out: &str) -> Vec<DeviceLeafInfo> {
+    let mut in_config = false;
+    let mut in_table = false;
+
+    let mut pool_name: Option<String> = None;
+    let mut stack: Vec<(usize, String)> = Vec::new(); // (indent, name)
+
+    let mut leaves = Vec::new();
+
+    for line in out.lines() {
+        let t = line.trim();
+        if t == "config:" {
+            in_config = true;
+            continue;
+        }
+        if !in_config {
+            continue;
+        }
+
+        if t.starts_with("errors:") {
+            break;
+        }
+
+        // Table header: NAME STATE READ WRITE CKSUM
+        if t.starts_with("NAME") && t.contains("STATE") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        let mut parts = t.split_whitespace();
+        let name = match parts.next() {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        let state = parts.next().map(|s| s.to_string());
+
+        let was = line.split(" was ").nth(1).map(|s| s.trim().to_string());
+
+        while let Some((last_indent, _)) = stack.last() {
+            if *last_indent >= indent {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+
+        if pool_name.is_none() {
+            pool_name = Some(name.clone());
+            stack.push((indent, name));
+            continue;
+        }
+
+        if is_zpool_group_name(&name) {
+            stack.push((indent, name));
+            continue;
+        }
+
+        let vdev_path: Vec<String> = stack.iter().skip(1).map(|(_, n)| n.clone()).collect();
+
+        leaves.push(DeviceLeafInfo {
+            name,
+            state,
+            was,
+            vdev_path,
+            ..Default::default()
+        });
+    }
+
+    leaves
+}
+
+fn resolve_zpool_leaf_devnode(leaf: &DeviceLeafInfo) -> (Option<String>, Option<PathBuf>) {
+    let candidates = [leaf.was.as_deref(), Some(leaf.name.as_str())];
+
+    for c in candidates.into_iter().flatten() {
+        if c.starts_with("/dev/") {
+            let p = PathBuf::from(c);
+            let by_id_path = if c.starts_with("/dev/disk/by-id/") {
+                Some(c.to_string())
+            } else {
+                None
+            };
+            let devnode = fs::canonicalize(&p).unwrap_or(p);
+            return (by_id_path, Some(devnode));
+        }
+
+        let by_id = Path::new("/dev/disk/by-id").join(c);
+        if by_id.exists() {
+            let devnode = fs::canonicalize(&by_id).unwrap_or(by_id.clone());
+            return (Some(by_id.display().to_string()), Some(devnode));
+        }
+    }
+
+    (None, None)
+}
+
+fn zpool_get_vdevs_and_info(pool: &str) -> (Vec<String>, Vec<DeviceLeafInfo>) {
     let out = match run_cmd_stdout("zpool", &["status", "-P", pool]) {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return (Vec::new(), Vec::new()),
     };
-    parse_zpool_status_vdevs(&out)
+
+    let mut leaves = parse_zpool_status_leaves(&out);
+    for l in leaves.iter_mut() {
+        let (by_id_path, devnode) = resolve_zpool_leaf_devnode(l);
+        l.by_id_path = by_id_path;
+        if let Some(devnode) = devnode {
+            enrich_device_leaf_from_devnode(l, &devnode);
+        }
+    }
+
+    let vdevs: Vec<String> = leaves
+        .iter()
+        .map(|l| {
+            l.by_id_path
+                .clone()
+                .or_else(|| l.devnode.clone())
+                .unwrap_or_else(|| l.name.clone())
+        })
+        .collect();
+
+    (vdevs, leaves)
 }
 
 fn fill_device_info(e: &mut MountInfoEntry) {
@@ -486,9 +713,47 @@ fn fill_device_info(e: &mut MountInfoEntry) {
                 e.zfs_props = zfs_get_props(ds);
             }
             if let Some(ref pool) = e.zfs_pool {
-                e.zpool_vdevs = zpool_get_vdevs(pool);
+                let (vdevs, info) = zpool_get_vdevs_and_info(pool);
+                e.zpool_vdevs = vdevs;
+                e.zpool_vdevs_info = info;
             }
-            e.signature = Some(format!("fstype=zfs;dataset={}", e.mount_source));
+
+            let topo = if e.zpool_vdevs_info.iter().any(|l| l.vdev_path.iter().any(|p| p.starts_with("mirror-"))) {
+                "mirror"
+            } else if e
+                .zpool_vdevs_info
+                .iter()
+                .any(|l| l.vdev_path.iter().any(|p| p.starts_with("raidz")))
+            {
+                "raidz"
+            } else {
+                "stripe"
+            };
+
+            let mut models: Vec<String> = e
+                .zpool_vdevs_info
+                .iter()
+                .filter_map(|l| l.model.clone())
+                .collect();
+            models.sort();
+            models.dedup();
+            let models = models.join(",");
+
+            let mut devs: Vec<String> = e
+                .zpool_vdevs_info
+                .iter()
+                .map(|l| {
+                    let bdf = l.pci_bdf.clone().unwrap_or_else(|| "?".into());
+                    let w = l.pcie_current_link_width.clone().unwrap_or_else(|| "?".into());
+                    let s = l.pcie_current_link_speed.clone().unwrap_or_else(|| "?".into());
+                    format!("{}@{}({}@{})", l.name, bdf, w, s)
+                })
+                .collect();
+            devs.sort();
+            let devs = devs.join(",");
+
+            let pool = e.zfs_pool.clone().unwrap_or_else(|| "unknown".into());
+            e.signature = Some(format!("fstype=zfs;pool={};topology={};models={};devs={}", pool, topo, models, devs));
         } else {
             e.signature = Some(format!("fstype={};source={}", e.fstype, e.mount_source));
         }
@@ -554,13 +819,59 @@ fn fill_device_info(e: &mut MountInfoEntry) {
             }
         }
         e.md_members.sort();
+
+        for member in &e.md_members {
+            let mut leaf = DeviceLeafInfo {
+                name: member.clone(),
+                ..Default::default()
+            };
+            let devnode = Path::new("/dev").join(member);
+            if devnode.exists() {
+                enrich_device_leaf_from_devnode(&mut leaf, &devnode);
+            } else {
+                // Fall back to sysfs-only info.
+                let msys = Path::new("/sys/class/block").join(member);
+                leaf.model = read_sysfs_trimmed(&msys.join("device/model"));
+                leaf.serial = read_sysfs_trimmed(&msys.join("device/serial"));
+                leaf.by_id = dev_by_id_for_block_name(member);
+            }
+            e.md_members_info.push(leaf);
+        }
     }
 
-    // Human-readable signature used for device-db matching.
+    // Human-readable signature used for device-db matching / debugging.
+    // The device-db matcher does NOT parse this today; it matches on structured fields.
     let model = e.device_model.clone().unwrap_or_else(|| "unknown".into());
     let md_level = e.md_level.clone().unwrap_or_else(|| "".into());
     let sig = match kind {
-        "md" if !md_level.is_empty() => format!("fstype={};dev=md;level={};model={}", e.fstype, md_level, model),
+        "md" if !md_level.is_empty() => {
+            let mut models: Vec<String> = e
+                .md_members_info
+                .iter()
+                .filter_map(|l| l.model.clone())
+                .collect();
+            models.sort();
+            models.dedup();
+            let models = models.join(",");
+
+            let mut devs: Vec<String> = e
+                .md_members_info
+                .iter()
+                .map(|l| {
+                    let bdf = l.pci_bdf.clone().unwrap_or_else(|| "?".into());
+                    let w = l.pcie_current_link_width.clone().unwrap_or_else(|| "?".into());
+                    let s = l.pcie_current_link_speed.clone().unwrap_or_else(|| "?".into());
+                    format!("{}@{}({}@{})", l.name, bdf, w, s)
+                })
+                .collect();
+            devs.sort();
+            let devs = devs.join(",");
+
+            format!(
+                "fstype={};dev=md;level={};models={};devs={}",
+                e.fstype, md_level, models, devs
+            )
+        }
         _ => format!("fstype={};dev={};model={}", e.fstype, kind, model),
     };
     e.signature = Some(sig);
@@ -651,9 +962,11 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             zfs_dataset: None,
             zfs_props: None,
             zpool_vdevs: Vec::new(),
+            zpool_vdevs_info: Vec::new(),
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
+            md_members_info: Vec::new(),
             signature: None,
             device_db_profile: None,
             device_db_read_direct: None,
@@ -696,9 +1009,11 @@ mod tests {
                 zfs_dataset: None,
                 zfs_props: None,
                 zpool_vdevs: Vec::new(),
+                zpool_vdevs_info: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
+                md_members_info: Vec::new(),
                 signature: None,
                 device_db_profile: None,
                 device_db_read_direct: None,
@@ -728,9 +1043,11 @@ mod tests {
                 zfs_dataset: None,
                 zfs_props: None,
                 zpool_vdevs: Vec::new(),
+                zpool_vdevs_info: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
+                md_members_info: Vec::new(),
                 signature: None,
                 device_db_profile: None,
                 device_db_read_direct: None,
@@ -760,9 +1077,11 @@ mod tests {
                 zfs_dataset: None,
                 zfs_props: None,
                 zpool_vdevs: Vec::new(),
+                zpool_vdevs_info: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
+                md_members_info: Vec::new(),
                 signature: None,
                 device_db_profile: None,
                 device_db_read_direct: None,
@@ -792,9 +1111,11 @@ mod tests {
                 zfs_dataset: None,
                 zfs_props: None,
                 zpool_vdevs: Vec::new(),
+                zpool_vdevs_info: Vec::new(),
                 md_level: None,
                 md_chunk_bytes: None,
                 md_members: Vec::new(),
+                md_members_info: Vec::new(),
                 signature: None,
                 device_db_profile: None,
                 device_db_read_direct: None,
@@ -834,9 +1155,11 @@ mod tests {
             zfs_dataset: None,
             zfs_props: None,
             zpool_vdevs: Vec::new(),
+            zpool_vdevs_info: Vec::new(),
             md_level: None,
             md_chunk_bytes: None,
             md_members: Vec::new(),
+            md_members_info: Vec::new(),
             signature: None,
             device_db_profile: None,
             device_db_read_direct: None,
@@ -872,9 +1195,11 @@ mod tests {
             zfs_dataset: None,
             zfs_props: None,
             zpool_vdevs: Vec::new(),
+            zpool_vdevs_info: Vec::new(),
             md_level: Some("raid0".into()),
             md_chunk_bytes: None,
             md_members: Vec::new(),
+            md_members_info: Vec::new(),
             signature: Some("fstype=ext4;dev=md;level=raid0;model=unknown".into()),
             device_db_profile: None,
             device_db_read_direct: None,
@@ -897,20 +1222,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_zpool_status_vdevs_extracts_dev_paths() {
+    fn parse_zpool_status_leaves_extracts_vdev_path_and_was() {
         let out = r#"
   pool: tank
- state: ONLINE
+ state: DEGRADED
 config:
 
-	NAME	STATE	READ	WRITE	CKSUM
-	tank	ONLINE	0	0	0
-	  mirror-0	ONLINE	0	0	0
-	    /dev/disk/by-id/nvme-SAMSUNG_PM1733_ABC	ONLINE	0	0	0
-	    /dev/nvme1n1	ONLINE	0	0	0
+        NAME                                        STATE     READ WRITE CKSUM
+        tank                                        DEGRADED     0     0     0
+          mirror-0                                  DEGRADED     0     0     0
+            11842916200294856737                    UNAVAIL      0     0     0  was /dev/disk/by-id/nvme-KCD61LUL7T68_6140A14ST4Z8_1-part2
+            nvme-KCD61LUL7T68_6150A0DXT4Z8_1-part2  ONLINE       0     0     0
+
+errors: No known data errors
 "#;
-        let v = parse_zpool_status_vdevs(out);
-        assert_eq!(v, vec!["/dev/disk/by-id/nvme-SAMSUNG_PM1733_ABC", "/dev/nvme1n1"]);
+        let leaves = parse_zpool_status_leaves(out);
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].vdev_path, vec!["mirror-0"]);
+        assert_eq!(leaves[0].state.as_deref(), Some("UNAVAIL"));
+        assert_eq!(
+            leaves[0].was.as_deref(),
+            Some("/dev/disk/by-id/nvme-KCD61LUL7T68_6140A14ST4Z8_1-part2")
+        );
+        assert_eq!(leaves[1].vdev_path, vec!["mirror-0"]);
+        assert_eq!(leaves[1].state.as_deref(), Some("ONLINE"));
     }
 }
 
