@@ -282,3 +282,158 @@ impl AppConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("{}-{}-{}", prefix, pid, nanos));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn set_env_var(key: &str, value: Option<&str>) -> Option<String> {
+        let old = std::env::var(key).ok();
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        old
+    }
+
+    fn restore_env_var(key: &str, old: Option<String>) {
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn resolve_default_config_path_prefers_fro_config_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let tmp = unique_temp_dir("fro-test");
+        let cfg_path = tmp.join("cfg.json");
+
+        let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+        let old_home = set_env_var("HOME", None);
+
+        let resolved = resolve_default_config_path();
+        assert_eq!(resolved, cfg_path);
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn resolve_default_config_path_defaults_to_user_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let home = unique_temp_dir("fro-home");
+        let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_home = set_env_var("HOME", Some(home.to_str().unwrap()));
+
+        let resolved = resolve_default_config_path();
+        assert!(resolved.ends_with(Path::new(".fro/fro.json")));
+        assert!(resolved.starts_with(&home));
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn load_config_creates_bundle_and_roundtrips_updates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let tmp = unique_temp_dir("fro-test");
+        let cfg_path = tmp.join("fro.json");
+
+        let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+        let old_home = set_env_var("HOME", None);
+
+        let mut loaded = load_config(None);
+        match &loaded {
+            LoadedConfig::BundleV1 { path, bundle } => {
+                assert_eq!(path, &cfg_path);
+                assert_eq!(bundle.version, 1);
+            }
+            _ => panic!("expected bundle v1"),
+        }
+
+        assert!(cfg_path.exists());
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(text.contains("\"version\": 1"));
+        assert!(text.contains("\"defaults\""));
+
+        let p0 = loaded.get_params("read", true);
+        assert_eq!(p0.num_threads, 16);
+
+        loaded.update_params(
+            "read",
+            true,
+            IOParams {
+                num_threads: 99,
+                block_size: 4 * 1024,
+                qd: 7,
+            },
+        );
+        loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        let p1 = reloaded.get_params("read", true);
+        assert_eq!(p1.num_threads, 99);
+        assert_eq!(p1.block_size, 4 * 1024);
+        assert_eq!(p1.qd, 7);
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn load_config_reads_legacy_appconfig() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let tmp = unique_temp_dir("fro-test");
+        let cfg_path = tmp.join("legacy.json");
+
+        let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_home = set_env_var("HOME", None);
+
+        let legacy = AppConfig::default();
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let mut loaded = load_config(Some(cfg_path.to_str().unwrap()));
+        match loaded {
+            LoadedConfig::Legacy { ref path, .. } => assert_eq!(path, &cfg_path),
+            _ => panic!("expected legacy config"),
+        }
+
+        loaded.update_params(
+            "diff",
+            false,
+            IOParams {
+                num_threads: 3,
+                block_size: 123,
+                qd: 1,
+            },
+        );
+        loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        let p = reloaded.get_params("diff", false);
+        assert_eq!(p.num_threads, 3);
+        assert_eq!(p.block_size, 123);
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("HOME", old_home);
+    }
+}
