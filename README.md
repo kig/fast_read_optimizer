@@ -65,7 +65,7 @@ Examples:
 ```bash
 cargo build --release
 
-# Full suite (creates 4 GiB temp files under --test-dir)
+# Full suite (auto-sizes temp files under --test-dir; use --test-size 4GiB to force)
 ./target/release/fro-benchmark --test-dir /mnt/nvme
 
 # Or run a subset by prefix
@@ -283,18 +283,26 @@ Example:
 
 SSD wear note (writes):
 
-- `fro-optimize` hard-codes a **4 GiB** temp file size.
-- A full run (all default configs) writes roughly **332 GiB** of user data:
-  - setup: `write` 4 GiB + `copy` 4 GiB + `copy` 4 GiB = 12 GiB
-  - optimization: 4 GiB × 20 iterations × (`write` direct + `write` page-cache + `copy` direct + `copy` page-cache) = 320 GiB
+- By default, `fro-optimize` **auto-sizes** its temp files based on free space and a wear budget.
+  - Control it with:
+    - `--plan` (print suggested `--test-size` + estimated write load and exit)
+    - `--max-drive-writes <fraction>` (default: `0.05`)
+    - `--test-size <size>` (force a fixed size, e.g. `4GiB`)
+- A full optimizer run does ~**83 full-file writes** of user data (setup + 4 write-heavy modes × 20 iters).
+  - Roughly: `bytes_written ≈ 83 × test_size`
 
 To compare to SSD DWPD, compute `drive_writes = bytes_written / SSD_capacity`.
-For example, on a 1 TB SSD: 332 GiB ≈ **0.33 drive writes** for one `fro-optimize` run (not counting write amplification).
+Example (with a 1GiB test file): `83 × 1GiB ≈ 83GiB` ⇒ on a 1TB SSD that’s ~**0.083 drive writes**.
+
+If you force `--test-size 4GiB`, then `83 × 4GiB ≈ 332GiB` ⇒ on a 1TB SSD that’s ~**0.33 drive writes**.
 
 Usage:
 
 ```bash
 ./target/release/fro-optimize --help
+
+# Print suggested test size + estimated write load (no file creation / no benchmark runs)
+./target/release/fro-optimize --plan --test-dir /mnt/nvme read grep diff write copy
 
 # Print disk-backed mounts (filtered) with a suggested writable directory and a device+fs signature.
 ./target/release/fro-optimize --list-devices
@@ -308,7 +316,7 @@ Usage:
 # - for ZFS mounts, it will (best-effort) call `zfs get` + `zpool status` and include a small `zfs_props` map plus `zpool_vdevs` and `zpool_vdevs_info` (leaf models/by-id when resolvable).
 # - for mdraid mounts, it includes `md_members` and `md_members_info` (member models/by-id when resolvable).
 
-# Optimize (writes 4 GiB temp files under --test-dir)
+# Optimize (auto-sizes temp files under --test-dir; use --test-size 4GiB to force)
 ./target/release/fro-optimize --test-dir /mnt/nvme read grep diff write copy
 ```
 
@@ -329,23 +337,30 @@ Filtering:
 `fro-benchmark` is the closest thing this repo has to an automated test suite:
 
 - Builds release (`cargo build --release`)
-- Creates 4 GiB temp files under `--test-dir` (default `.`)
+- Creates auto-sized temp files under `--test-dir` (default `.`, capped by `--max-drive-writes` and `--max-test-size`)
 - Runs a list of benchmarks across `read`/`grep`/`write`/`copy`/`diff`/`dual-read-bench`
 - Reports PASS/REGRESSION/FAILED based on measured GB/s (allows ~10% variance before flagging a regression)
 
 SSD wear note (writes):
 
-- `fro-benchmark` hard-codes a **4 GiB** temp file size.
-- A full run writes roughly **54 GiB** of user data:
-  - setup: `write` 4 GiB + `copy` 4 GiB + `copy` 4 GiB = 12 GiB
-  - benchmarks: 5× `write` (4 GiB each) + 5× `copy` (4 GiB each) + 2× 1 GiB microbench writes ≈ 42 GiB
+- By default, `fro-benchmark` **auto-sizes** its temp files based on free space and a wear budget.
+  - Control it with:
+    - `--plan` (print suggested `--test-size` + estimated write load and exit)
+    - `--max-drive-writes <fraction>` (default: `0.05`)
+    - `--test-size <size>` (force a fixed size, e.g. `4GiB`)
+- A full run does ~**13 full-file writes** of user data, plus 2× 1GiB microbench writes:
+  - Roughly: `bytes_written ≈ 13 × test_size + 2GiB`
 
-For DWPD comparison: on a 1 TB SSD, 54 GiB ≈ **0.05 drive writes** per full run (not counting write amplification).
+For DWPD comparison: `drive_writes = bytes_written / SSD_capacity` (not counting write amplification).
 
 ### Usage:
 
 ```bash
 ./target/release/fro-benchmark --help
+
+# Print suggested test size + estimated write load (no file creation / no benchmark runs)
+./target/release/fro-benchmark --plan --test-dir /mnt/nvme
+
 ./target/release/fro-benchmark --test-dir /mnt/nvme
 
 # Run only benchmarks whose *benchmark name* starts with this prefix

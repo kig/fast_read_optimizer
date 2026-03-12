@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IOParams {
@@ -79,13 +79,6 @@ pub enum LoadedConfig {
 }
 
 impl LoadedConfig {
-    pub fn path(&self) -> &Path {
-        match self {
-            LoadedConfig::Legacy { path, .. } => path,
-            LoadedConfig::BundleV1 { path, .. } => path,
-        }
-    }
-
     pub fn defaults_mut(&mut self) -> &mut AppConfig {
         match self {
             LoadedConfig::Legacy { config, .. } => config,
@@ -231,18 +224,6 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn load(path: &str) -> Self {
-        if Path::new(path).exists() {
-            let data = fs::read_to_string(path).unwrap_or_default();
-            if let Ok(config) = serde_json::from_str(&data) {
-                return config;
-            }
-        }
-        let default_config = Self::default();
-        default_config.save(path);
-        default_config
-    }
-
     pub fn save(&self, path: &str) {
         if let Ok(data) = serde_json::to_string_pretty(self) {
             let _ = fs::write(path, data);
@@ -289,6 +270,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
