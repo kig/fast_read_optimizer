@@ -114,14 +114,21 @@ Each `fro <command>` run feeds a measurement function into a stochastic hill-cli
   - Default is **1000** for `read`, and **1** for everything else.
 - Use `-n 1` when you want “run once with the current tuned params” instead of searching.
 
-### 3) `fro.json` is the tuned-params config (and is auto-created)
+### 3) Config file (`fro.json`) is auto-created and can be selected
 
-`fro` loads `fro.json` at startup.
+`fro` loads its params config at startup (and will create it if missing).
 
-- If `fro.json` is missing, it will be created with defaults.
-- Parameters are stored per tool (`read`, `grep`, `write`, `copy`, `diff`, `dual_read_bench`) × per mode (`direct` vs `page_cache`).
+Config selection:
 
-To save optimized parameters back into `fro.json`:
+- `-c <path>` / `--config <path>`: use exactly this config file
+- otherwise, default search order:
+  1. `$FRO_CONFIG`
+  2. `~/.fro/fro.json`
+  3. `/etc/fro.json`
+
+The config file contains per-tool params (`read`, `grep`, `write`, `copy`, `diff`, `dual_read_bench`) × per mode (`direct` vs `page_cache`).
+
+To save optimized parameters back into the selected config:
 
 - Use `-s` / `--save` **together with** `--direct` or `--no-direct`.
 - Saving does **not** happen in `--auto` mode.
@@ -143,7 +150,8 @@ Common flags (apply to most commands):
 - `--auto`: auto-select (default)
 - `-n <iterations>`: optimizer iterations
 - `-v`, `--verbose`: more diagnostics
-- `-s`, `--save`: save best params to `fro.json` (only when `--direct` or `--no-direct` is set)
+- `-s`, `--save`: save best params to the selected config (only when `--direct` or `--no-direct` is set)
+- `-c <path>`, `--config <path>`: choose config file (see config search order above)
 
 Write-side flags (only meaningful for `write` / `copy`):
 
@@ -263,9 +271,9 @@ Example:
 - `fro bench-write <filename>`
   - standard `write(2)` loop microbenchmark (creates/extends the file to 1 GiB).
 
-## Tuning: generating `fro.json`
+## Tuning: generating config
 
-### `fro-optimize [--test-dir path] [prefix ...]`
+### `fro-optimize [--list-devices | --list-devices-all] [--test-dir path] [prefix ...]`
 
 `fro-optimize` is a convenience tool that:
 
@@ -287,8 +295,22 @@ Usage:
 
 ```bash
 ./target/release/fro-optimize --help
+
+# Print disk-backed mounts (filtered) with a suggested writable directory and a device+fs signature.
+./target/release/fro-optimize --list-devices
+
+# Print all mounts (unfiltered)
+./target/release/fro-optimize --list-devices-all
+
+# Optimize (writes 4 GiB temp files under --test-dir)
 ./target/release/fro-optimize --test-dir /mnt/nvme read grep diff write copy
 ```
+
+Device-db preview (experimental):
+
+- `fro-optimize --list-devices` computes a `signature` and (if it finds a matching profile) prints `device_db_profile` and `device_db_read_direct`.
+- By default it looks for `./fro-device-db.json` (or override via `$FRO_DEVICE_DB`).
+- `fro-device-db.json` is currently a small in-repo seed file and is not a claim of optimality.
 
 Filtering:
 
