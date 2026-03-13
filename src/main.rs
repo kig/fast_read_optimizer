@@ -9,7 +9,7 @@ mod differ;
 mod mincore;
 
 use optimizer::run_optimizer;
-use reader::read_file;
+use reader::{hash_file_to_replicas, read_file, recover_file_with_copies, verify_file_with_replicas};
 use writer::write_file;
 use differ::{diff_files, bench_diff_memory};
 
@@ -22,6 +22,9 @@ fn main() {
         println!("USAGE: {} copy [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <source> <target>", args[0]);
         println!("USAGE: {} diff [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <file1> <file2>", args[0]);
         println!("USAGE: {} dual-read-bench [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <file1> <file2>", args[0]);
+        println!("USAGE: {} hash [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] [--hash-base path] <filename>", args[0]);
+        println!("USAGE: {} verify [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] [--hash-base path] <filename>", args[0]);
+        println!("USAGE: {} recover [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] [--hash-base path] <target> <copy1> [copy2 ...]", args[0]);
         println!("USAGE: {} bench-diff", args[0]);
         println!("USAGE: {} bench-mmap-write <filename>", args[0]);
         println!("USAGE: {} bench-write <filename>", args[0]);
@@ -35,7 +38,9 @@ fn main() {
     let mut source = None;
     let mut pattern = "";
     let mut filename = "";
-    let mut iterations = if mode == "read" { 1000 } else { 1 };
+    let mut extra_paths: Vec<String> = Vec::new();
+    let mut hash_base: Option<&str> = None;
+    let mut iterations = if mode == "read" || mode == "hash" || mode == "verify" || mode == "recover" { 1000 } else { 1 };
     let mut save_config = false;
     let mut config_path: Option<&str> = None;
     
@@ -44,6 +49,9 @@ fn main() {
         if args[i] == "-c" || args[i] == "--config" {
             i += 1;
             if i < args.len() { config_path = Some(args[i].as_str()); }
+        } else if args[i] == "--hash-base" {
+            i += 1;
+            if i < args.len() { hash_base = Some(args[i].as_str()); }
         } else if args[i] == "--direct" {
             io_mode = common::IOMode::Direct;
             io_mode_write = common::IOMode::Direct;
@@ -67,6 +75,9 @@ fn main() {
         } else if mode == "copy" || mode == "diff" || mode == "dual-read-bench" {
             if source.is_none() { source = Some(args[i].as_str()); }
             else if filename == "" { filename = args[i].as_str(); }
+        } else if mode == "recover" {
+            if filename == "" { filename = args[i].as_str(); }
+            else { extra_paths.push(args[i].clone()); }
         } else if mode == "grep" {
             if pattern == "" { pattern = args[i].as_str(); }
             else { filename = args[i].as_str(); }
@@ -87,12 +98,22 @@ fn main() {
 
     if filename == "" { println!("Filename missing"); return; }
 
+    if mode == "recover" && extra_paths.is_empty() {
+        println!("At least one recovery copy is required");
+        return;
+    }
+
     let mut config = config::load_config(config_path);
+    let config_mode = if mode == "hash" || mode == "verify" || mode == "recover" {
+        "read"
+    } else {
+        mode
+    };
 
     let context_path = filename;
 
-    let params_page_cache = config.get_params_for_path(mode, false, context_path);
-    let params_direct = config.get_params_for_path(mode, true, context_path);
+    let params_page_cache = config.get_params_for_path(config_mode, false, context_path);
+    let params_direct = config.get_params_for_path(config_mode, true, context_path);
     
     let num_threads_pc = params_page_cache.num_threads;
     let qd_pc = params_page_cache.qd;
@@ -108,14 +129,83 @@ fn main() {
     let params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1];
 
     let mode_name = mode;
-    let verbose = verbose || mode == "read" || mode == "write";
+    let verbose = verbose || mode == "read" || mode == "write" || mode == "hash" || mode == "verify" || mode == "recover";
     if verbose { eprintln!("Opening file {} for {}", filename, mode); }    
 
     let mut exit_code = 0;
+    let hash_base_owned = hash_base.map(|s| s.to_string());
+    let extra_paths_owned = extra_paths;
     
     let mode_callback = |p: &[u64]| {
         if mode == "read" || mode == "grep" {
             read_file(pattern, filename, p[0], p[1], p[2] as usize, p[3], p[4], p[5] as usize, io_mode)
+        } else if mode == "hash" {
+            let manifest = hash_file_to_replicas(
+                filename,
+                hash_base_owned.as_deref(),
+                p[0], p[2] as usize,
+                p[3], p[5] as usize,
+                io_mode,
+            ).expect("Failed to hash file");
+            println!(
+                "wrote {} hash blocks ({} bytes each) to {}[0-2].json",
+                manifest.block_hashes.len(),
+                manifest.block_size,
+                hash_base_owned
+                    .as_deref()
+                    .unwrap_or(&reader::default_hash_base(filename))
+            );
+            manifest.bytes_hashed
+        } else if mode == "verify" {
+            let report = verify_file_with_replicas(
+                filename,
+                hash_base_owned.as_deref(),
+                p[0], p[2] as usize,
+                p[3], p[5] as usize,
+                io_mode,
+            ).expect("Failed to verify file");
+            println!(
+                "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
+                report.loaded_manifests,
+                report.ok_blocks,
+                report.bad_blocks.len()
+            );
+            for issue in &report.bad_blocks {
+                println!(
+                    "block {}: {}",
+                    issue.block_index,
+                    issue.decision.status_message()
+                );
+            }
+            if !report.bad_blocks.is_empty() {
+                exit_code = 1;
+            }
+            report.bytes_hashed
+        } else if mode == "recover" {
+            let report = recover_file_with_copies(
+                filename,
+                &extra_paths_owned,
+                hash_base_owned.as_deref(),
+                p[0], p[2] as usize,
+                p[3], p[5] as usize,
+                io_mode,
+            ).expect("Failed to recover file");
+            println!(
+                "recover: repaired_blocks={}, failed_blocks={}",
+                report.repaired_blocks,
+                report.failed_blocks.len()
+            );
+            for issue in &report.failed_blocks {
+                println!(
+                    "block {}: {}",
+                    issue.block_index,
+                    issue.decision.status_message()
+                );
+            }
+            if !report.failed_blocks.is_empty() {
+                exit_code = 1;
+            }
+            report.bytes_hashed
         } else if mode == "write" {
             write_file(
                 source, filename,
@@ -169,7 +259,7 @@ fn main() {
         let direct = io_mode == common::IOMode::Direct;
         let off = if direct { 3 } else { 0 };
         config.update_params_for_path(
-            mode,
+            config_mode,
             direct,
             context_path,
             config::IOParams {
@@ -179,5 +269,9 @@ fn main() {
             },
         );
         config.save();
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }

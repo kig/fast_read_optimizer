@@ -1,6 +1,7 @@
 use iou::IoUring;
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use crate::mincore::{is_first_page_resident};
 
 pub const BLOCK_HASH_SIZE: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHashManifest {
     pub file_size: u64,
     pub block_size: u64,
@@ -24,10 +25,6 @@ pub struct BlockHashManifest {
 impl BlockHashManifest {
     pub fn verify_integrity(&self) -> bool {
         self.hash_of_hashes == hash_hashes(&self.block_hashes)
-    }
-
-    pub fn disk_replicas(&self) -> [u64; 3] {
-        [self.hash_of_hashes; 3]
     }
 }
 
@@ -103,12 +100,77 @@ impl BlockRecoveryDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockVerifyIssue {
+    pub block_index: usize,
+    pub current_hash: u64,
+    pub decision: BlockRecoveryDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub bytes_hashed: u64,
+    pub total_blocks: usize,
+    pub loaded_manifests: usize,
+    pub ok_blocks: usize,
+    pub bad_blocks: Vec<BlockVerifyIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRecoverIssue {
+    pub block_index: usize,
+    pub current_hash: u64,
+    pub decision: BlockRecoveryDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverReport {
+    pub bytes_hashed: u64,
+    pub repaired_blocks: usize,
+    pub failed_blocks: Vec<BlockRecoverIssue>,
+}
+
 fn hash_hashes(values: &[u64]) -> u64 {
     let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u64>());
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     xxh3_64(&bytes)
+}
+
+pub fn default_hash_base(filename: &str) -> String {
+    format!("{}.fro-hash", filename)
+}
+
+fn hash_replica_paths(base: &str) -> [String; 3] {
+    [
+        format!("{}.0.json", base),
+        format!("{}.1.json", base),
+        format!("{}.2.json", base),
+    ]
+}
+
+fn json_error_to_io(err: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+}
+
+pub fn save_manifest_replicas(base: &str, manifest: &BlockHashManifest) -> std::io::Result<()> {
+    let data = serde_json::to_vec_pretty(manifest).map_err(json_error_to_io)?;
+    for path in hash_replica_paths(base) {
+        std::fs::write(path, &data)?;
+    }
+    Ok(())
+}
+
+pub fn load_manifest_replicas(base: &str) -> Vec<Option<BlockHashManifest>> {
+    hash_replica_paths(base)
+        .into_iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|data| serde_json::from_str::<BlockHashManifest>(&data).ok())
+        })
+        .collect()
 }
 
 fn tally_hash_votes(values: &[(u64, BlockHashWitnessKind)]) -> Vec<BlockHashVote> {
@@ -545,6 +607,159 @@ pub fn hash_file_blocks(
     }
 }
 
+pub fn hash_file_to_replicas(
+    filename: &str,
+    hash_base: Option<&str>,
+    num_threads_p: u64, qd_p: usize,
+    num_threads_d: u64, qd_d: usize,
+    io_mode: IOMode,
+) -> std::io::Result<BlockHashManifest> {
+    let manifest = hash_file_blocks(filename, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
+    let base = hash_base
+        .map(str::to_string)
+        .unwrap_or_else(|| default_hash_base(filename));
+    save_manifest_replicas(&base, &manifest)?;
+    Ok(manifest)
+}
+
+pub fn verify_file_with_replicas(
+    filename: &str,
+    hash_base: Option<&str>,
+    num_threads_p: u64, qd_p: usize,
+    num_threads_d: u64, qd_d: usize,
+    io_mode: IOMode,
+) -> std::io::Result<VerifyReport> {
+    let current = hash_file_blocks(filename, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
+    let base = hash_base
+        .map(str::to_string)
+        .unwrap_or_else(|| default_hash_base(filename));
+    let manifests = load_manifest_replicas(&base);
+    let loaded_manifests = manifests.iter().filter(|m| m.is_some()).count();
+    let manifest_refs = manifests.iter().map(|m| m.as_ref()).collect::<Vec<_>>();
+
+    let mut ok_blocks = 0;
+    let mut bad_blocks = Vec::new();
+
+    for (block_index, current_hash) in current.block_hashes.iter().copied().enumerate() {
+        let decision = recover_block_hash(block_index, &[Some(current_hash)], &manifest_refs);
+        let block_ok = decision.elected_hash == Some(current_hash) && decision.repair_source_index == Some(0);
+        if block_ok {
+            ok_blocks += 1;
+        } else {
+            bad_blocks.push(BlockVerifyIssue {
+                block_index,
+                current_hash,
+                decision,
+            });
+        }
+    }
+
+    Ok(VerifyReport {
+        bytes_hashed: current.bytes_hashed,
+        total_blocks: current.block_hashes.len(),
+        loaded_manifests,
+        ok_blocks,
+        bad_blocks,
+    })
+}
+
+fn read_block(path: &str, block_index: usize, file_size: u64) -> std::io::Result<Vec<u8>> {
+    let offset = block_index as u64 * BLOCK_HASH_SIZE;
+    let len = std::cmp::min(BLOCK_HASH_SIZE, file_size.saturating_sub(offset)) as usize;
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_block(path: &str, block_index: usize, data: &[u8]) -> std::io::Result<()> {
+    let offset = block_index as u64 * BLOCK_HASH_SIZE;
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)?;
+    Ok(())
+}
+
+pub fn recover_file_with_copies(
+    target: &str,
+    copies: &[String],
+    hash_base: Option<&str>,
+    num_threads_p: u64, qd_p: usize,
+    num_threads_d: u64, qd_d: usize,
+    io_mode: IOMode,
+) -> std::io::Result<RecoverReport> {
+    let mut files = Vec::with_capacity(1 + copies.len());
+    files.push(target.to_string());
+    files.extend(copies.iter().cloned());
+
+    let manifests_now = files
+        .iter()
+        .map(|path| hash_file_blocks(path, num_threads_p, qd_p, num_threads_d, qd_d, io_mode))
+        .collect::<Vec<_>>();
+
+    let bytes_hashed = manifests_now.iter().map(|manifest| manifest.bytes_hashed).sum();
+    let target_size = manifests_now[0].file_size;
+
+    let mut stored_replicas = Vec::<Option<BlockHashManifest>>::new();
+    for (index, path) in files.iter().enumerate() {
+        let base = if index == 0 {
+            hash_base.map(str::to_string).unwrap_or_else(|| default_hash_base(path))
+        } else {
+            default_hash_base(path)
+        };
+        stored_replicas.extend(load_manifest_replicas(&base));
+    }
+    let stored_refs = stored_replicas.iter().map(|m| m.as_ref()).collect::<Vec<_>>();
+
+    let mut repaired_blocks = 0;
+    let mut failed_blocks = Vec::new();
+
+    for block_index in 0..manifests_now[0].block_hashes.len() {
+        let file_copy_hashes = manifests_now
+            .iter()
+            .map(|manifest| manifest.block_hashes.get(block_index).copied())
+            .collect::<Vec<_>>();
+        let decision = recover_block_hash(block_index, &file_copy_hashes, &stored_refs);
+        let target_hash = file_copy_hashes[0].unwrap();
+
+        if decision.repair_source_index == Some(0) && decision.elected_hash == Some(target_hash) {
+            continue;
+        }
+
+        if let Some(source_index) = decision.repair_source_index {
+            if source_index > 0 {
+                let block = read_block(&files[source_index], block_index, manifests_now[source_index].file_size)?;
+                write_block(target, block_index, &block)?;
+                repaired_blocks += 1;
+                continue;
+            }
+        }
+
+        failed_blocks.push(BlockRecoverIssue {
+            block_index,
+            current_hash: target_hash,
+            decision,
+        });
+    }
+
+    if repaired_blocks > 0 {
+        let updated_manifest = hash_file_blocks(target, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
+        let base = hash_base
+            .map(str::to_string)
+            .unwrap_or_else(|| default_hash_base(target));
+        save_manifest_replicas(&base, &updated_manifest)?;
+    }
+
+    let _ = target_size;
+
+    Ok(RecoverReport {
+        bytes_hashed,
+        repaired_blocks,
+        failed_blocks,
+    })
+}
+
 pub fn read_file(
     pattern: &str, filename: &str,
     num_threads_p: u64, block_size_p: u64, qd_p: usize, 
@@ -663,7 +878,6 @@ mod tests {
             IOMode::PageCache,
         );
 
-        assert_eq!(manifest.disk_replicas(), [manifest.hash_of_hashes; 3]);
         assert!(manifest.verify_integrity());
 
         manifest.hash_of_hashes ^= 1;
