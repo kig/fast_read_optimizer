@@ -1677,7 +1677,9 @@ fn main() {
     let _ = fs::remove_file(target_file_dir);
     let _ = fs::remove_file(target_file_cache);
 
-    let saved_to = config_path.unwrap_or("fro.json");
+    let saved_to = config_path
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| fro::config::resolve_default_config_path().display().to_string());
     println!("Optimization complete! Results saved to {}", saved_to);
     };
 

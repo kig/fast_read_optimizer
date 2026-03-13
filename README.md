@@ -125,6 +125,7 @@ Config selection:
   1. `$FRO_CONFIG`
   2. `~/.fro/fro.json`
   3. `/etc/fro.json`
+- for tests, you can redirect the system location with `FRO_SYSTEM_CONFIG=/path/to/test-system.json`
 
 The config file contains per-tool params (`read`, `grep`, `write`, `copy`, `diff`, `dual_read_bench`) × per mode (`direct` vs `page_cache`).
 
@@ -132,6 +133,14 @@ To save optimized parameters back into the selected config:
 
 - Use `-s` / `--save` **together with** `--direct` or `--no-direct`.
 - Saving does **not** happen in `--auto` mode.
+
+Current selection behavior by command:
+
+- `read`, `grep`, `write`: select params from the target file path
+- `copy`: select params from the **destination** path
+- `diff`, `dual-read-bench`: select params from **file2**
+
+This branch supports per-filesystem selection, but it does **not** yet support separate read-leg vs write-leg tuning when `copy` crosses filesystems, or separate tuning for both sides of `diff`.
 
 ## CLI reference
 
@@ -279,7 +288,7 @@ Example:
 
 1. Creates large temp files under `--test-dir` (default `.`)
 2. Runs `fro <mode> -s ...` for a set of direct + page-cache scenarios
-3. Writes the best params into `fro.json`
+3. Writes the best params into the selected config file
 
 SSD wear note (writes):
 
@@ -318,6 +327,12 @@ Usage:
 
 # Optimize (auto-sizes temp files under --test-dir; use --test-size 4GiB to force)
 ./target/release/fro-optimize --test-dir /mnt/nvme read grep diff write copy
+
+# Optimize all discovered writable mounts into one explicit config bundle
+./target/release/fro-optimize --all -c ./fro-test.json read
+
+# Limit work for smoke / local validation
+./target/release/fro-optimize --test-dir /mnt/nvme --test-size 64MiB --iters 5 read
 ```
 
 Device-db preview (experimental):
@@ -329,6 +344,17 @@ Device-db preview (experimental):
 Filtering:
 
 - Any extra args are treated as **prefix filters** (matching the first word in the `fro` args list that tool runs).
+
+Config target behavior:
+
+- With `-c <path>`, `fro-optimize` writes exactly there.
+- Without `-c`, the underlying `fro -s` runs use the same default resolution as `fro` itself:
+  1. `$FRO_CONFIG`
+  2. `~/.fro/fro.json`
+  3. `/etc/fro.json`
+- There is currently **no dedicated `--global` flag** in `fro-optimize`.
+  - “Local mode” in practice means using an explicit `-c ./something.json` or letting the default user config path win.
+  - “Global/system mode” means letting `/etc/fro.json` win in the default search order, or passing `-c /etc/fro.json`.
 
 ## Performance regression suite
 
@@ -366,8 +392,140 @@ For DWPD comparison: `drive_writes = bytes_written / SSD_capacity` (not counting
 # Run only benchmarks whose *benchmark name* starts with this prefix
 ./target/release/fro-benchmark 'read (auto, hot)'
 ./target/release/fro-benchmark copy
+
+# Bounded smoke run for CI / local validation
+./target/release/fro-benchmark --skip-build --no-fail --iters 5 --test-size 64MiB 'read (forced page cache, hot)'
 ```
 
+
+## Validation workflow
+
+### Is the current `config` branch in good shape to merge?
+
+For the current scope, **yes**:
+
+- `cargo test` is passing, including:
+  - config loader tests
+  - per-mount override tests
+  - `fro-optimize --all` integration coverage
+  - bounded smoke tests that run real optimize/benchmark flows
+- The branch is in good shape to merge **if** the intended scope is:
+  - config bundle loading
+  - per-mount override save/select
+  - `fro-optimize --all`
+  - adaptive sizing / `--plan`
+
+What is **not** implemented yet:
+
+- separate per-filesystem tuning for `copy` read vs write legs
+- separate per-path tuning for both sides of `diff`
+- a dedicated `fro-optimize --global` mode
+
+So: merge-ready for the current config/tuning work, but not as “mixed-leg per-filesystem tuning”.
+
+### How to test that the optimizer saves correctly in local mode
+
+Use an explicit config file so the target is unambiguous:
+
+```bash
+rm -f ./tmp-local.json
+./target/release/fro-optimize \
+  -c ./tmp-local.json \
+  --test-dir /mnt/nvme \
+  --test-size 64MiB \
+  --iters 5 \
+  read
+
+jq '.mount_overrides.by_mountpoint' ./tmp-local.json
+```
+
+What to expect:
+
+- `fro-optimize` prints the config path it saved to
+- `tmp-local.json` exists
+- `mount_overrides.by_mountpoint` contains an entry for the filesystem containing `--test-dir`
+
+To validate that `fro` actually uses it:
+
+```bash
+./target/release/fro read --direct -n 1 -c ./tmp-local.json /mnt/nvme/some-file
+```
+
+`fro` prints the active params vector. The **right-hand triple** in:
+
+```text
+[page_threads, page_block, page_qd, direct_threads, direct_block, direct_qd]
+```
+
+should match the saved direct params for that mount when you use `--direct`.
+
+### How to test “global/system mode” without touching `/etc`
+
+The code supports `/etc/fro.json`, but for safe local testing you can redirect the system path:
+
+```bash
+tmp_home="$(mktemp -d)"
+tmp_sys="$(pwd)/tmp-system.json"
+: > "$tmp_sys"
+
+HOME="$tmp_home" \
+FRO_SYSTEM_CONFIG="$tmp_sys" \
+./target/release/fro-optimize \
+  --test-dir /mnt/nvme \
+  --test-size 64MiB \
+  --iters 5 \
+  read
+
+jq '.mount_overrides.by_mountpoint' "$tmp_sys"
+```
+
+Why this works:
+
+- `HOME` points at a temp home with no `~/.fro/fro.json`
+- `FRO_SYSTEM_CONFIG` redirects the system config path
+- because the user config does not exist, default resolution falls through to the system config path
+
+If you want to test the real path instead, run the same command with `sudo` and either:
+
+```bash
+sudo ./target/release/fro-optimize -c /etc/fro.json --test-dir /mnt/nvme --test-size 64MiB --iters 5 read
+```
+
+or let `/etc/fro.json` win naturally in the search order.
+
+### How to check that each filesystem gets the right settings
+
+1. Discover the mounts you care about:
+
+```bash
+./target/release/fro-optimize --list-devices
+```
+
+2. Put intentionally different values into each mount override in one config bundle.
+
+3. Run `fro ... -n 1 -c <config>` against a file on each filesystem and inspect the printed params vector.
+
+Example:
+
+```bash
+./target/release/fro read --direct -n 1 -c ./tmp-local.json /mnt/fast/file.bin
+./target/release/fro read --direct -n 1 -c ./tmp-local.json /mnt/slow/file.bin
+```
+
+If the two mounts have different direct overrides, the last three numbers in the params vector should differ accordingly.
+
+For page-cache selection, use `--no-direct`; then check the **left-hand triple**.
+
+Practical tip:
+
+- make the overrides obviously different (for example `num_threads = 77` vs `55`) so the chosen mount is easy to spot in the output
+
+Important limitation on this branch:
+
+- `copy` currently chooses params from the **destination** path only
+- `diff` / `dual-read-bench` currently choose params from **file2** only
+
+So today you can verify per-filesystem selection for those commands, but only for their current single-context-path behavior.
 
 ### Reference results (4× NVMe RAID-0):
 
