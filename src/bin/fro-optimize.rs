@@ -88,7 +88,7 @@ struct DeviceLeafInfo {
     vdev_path: Vec<String>,
 }
 
-#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq, Default)]
 struct MountInfoEntry {
     mount_point: String,
     fstype: String,
@@ -253,10 +253,12 @@ fn collect_home_targets() -> Vec<PathBuf> {
 
     if let Ok(rd) = fs::read_dir(&home) {
         for ent in rd.flatten() {
-            if let Ok(ft) = ent.file_type() {
-                if !ft.is_symlink() {
-                    continue;
-                }
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !ft.is_symlink() {
+                continue;
             }
 
             let link = match fs::read_link(ent.path()) {
@@ -411,42 +413,12 @@ fn base_block_name_from_devpath(devpath: &Path) -> Option<String> {
     Some(name)
 }
 
-fn dev_by_id_for_block_name(block: &str) -> Vec<String> {
+// Returns all /dev/disk/by-id symlink names whose canonical target has the same basename as
+// the canonical form of `devpath`. Works for both a block name (e.g. "nvme0n1") and a devnode
+// path (e.g. /dev/nvme0n1 or /dev/nvme0n1p1).
+fn dev_by_id_for_devpath(devpath: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let dir = Path::new("/dev/disk/by-id");
-    let rd = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-
-    for ent in rd.flatten() {
-        let name = ent.file_name().to_string_lossy().to_string();
-        let link = match fs::read_link(ent.path()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // Resolve ../../nvme0n1 -> /dev/nvme0n1
-        let target = if link.is_absolute() {
-            link
-        } else {
-            dir.join(link)
-        };
-        let canon = match fs::canonicalize(&target) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if canon.file_name().map(|n| n == block).unwrap_or(false) {
-            out.push(name);
-        }
-    }
-
-    out.sort();
-    out
-}
-
-fn dev_by_id_for_devnode(devnode: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let canon_dev = match fs::canonicalize(devnode) {
+    let canon_dev = match fs::canonicalize(devpath) {
         Ok(p) => p,
         Err(_) => return out,
     };
@@ -485,9 +457,13 @@ fn dev_by_id_for_devnode(devnode: &Path) -> Vec<String> {
     out
 }
 
+fn dev_by_id_for_block_name(block: &str) -> Vec<String> {
+    dev_by_id_for_devpath(Path::new("/dev").join(block).as_path())
+}
+
 fn enrich_device_leaf_from_devnode(leaf: &mut DeviceLeafInfo, devnode: &Path) {
     leaf.devnode = Some(devnode.display().to_string());
-    leaf.by_id = dev_by_id_for_devnode(devnode);
+    leaf.by_id = dev_by_id_for_devpath(devnode);
 
     // `model`/`serial` live on the base block device.
     if let Some(base) = base_block_name_from_devpath(devnode) {
@@ -943,34 +919,7 @@ fn read_mountinfo() -> Vec<MountInfoEntry> {
             fstype,
             mount_source,
             major_minor,
-            writable_dir: None,
-            device_kind: None,
-            device_name: None,
-            device_model: None,
-            device_serial: None,
-            device_by_id: Vec::new(),
-            pci_bdf: None,
-            pci_numa_node: None,
-            pci_local_cpulist: None,
-            pcie_current_link_width: None,
-            pcie_current_link_speed: None,
-            pcie_max_link_width: None,
-            pcie_max_link_speed: None,
-            aer_dev_correctable: None,
-            aer_dev_nonfatal: None,
-            aer_dev_fatal: None,
-            zfs_pool: None,
-            zfs_dataset: None,
-            zfs_props: None,
-            zpool_vdevs: Vec::new(),
-            zpool_vdevs_info: Vec::new(),
-            md_level: None,
-            md_chunk_bytes: None,
-            md_members: Vec::new(),
-            md_members_info: Vec::new(),
-            signature: None,
-            device_db_profile: None,
-            device_db_read_direct: None,
+            ..Default::default()
         });
     }
 
@@ -990,136 +939,28 @@ mod tests {
                 fstype: "ext4".into(),
                 mount_source: "/dev/nvme0n1p2".into(),
                 major_minor: "259:2".into(),
-                writable_dir: None,
-                device_kind: None,
-                device_name: None,
-                device_model: None,
-                device_serial: None,
-                device_by_id: Vec::new(),
-                pci_bdf: None,
-                pci_numa_node: None,
-                pci_local_cpulist: None,
-                pcie_current_link_width: None,
-                pcie_current_link_speed: None,
-                pcie_max_link_width: None,
-                pcie_max_link_speed: None,
-                aer_dev_correctable: None,
-                aer_dev_nonfatal: None,
-                aer_dev_fatal: None,
-                zfs_pool: None,
-                zfs_dataset: None,
-                zfs_props: None,
-                zpool_vdevs: Vec::new(),
-                zpool_vdevs_info: Vec::new(),
-                md_level: None,
-                md_chunk_bytes: None,
-                md_members: Vec::new(),
-                md_members_info: Vec::new(),
-                signature: None,
-                device_db_profile: None,
-                device_db_read_direct: None,
+                ..Default::default()
             },
             MountInfoEntry {
                 mount_point: "/run".into(),
                 fstype: "tmpfs".into(),
                 mount_source: "tmpfs".into(),
                 major_minor: "0:5".into(),
-                writable_dir: None,
-                device_kind: None,
-                device_name: None,
-                device_model: None,
-                device_serial: None,
-                device_by_id: Vec::new(),
-                pci_bdf: None,
-                pci_numa_node: None,
-                pci_local_cpulist: None,
-                pcie_current_link_width: None,
-                pcie_current_link_speed: None,
-                pcie_max_link_width: None,
-                pcie_max_link_speed: None,
-                aer_dev_correctable: None,
-                aer_dev_nonfatal: None,
-                aer_dev_fatal: None,
-                zfs_pool: None,
-                zfs_dataset: None,
-                zfs_props: None,
-                zpool_vdevs: Vec::new(),
-                zpool_vdevs_info: Vec::new(),
-                md_level: None,
-                md_chunk_bytes: None,
-                md_members: Vec::new(),
-                md_members_info: Vec::new(),
-                signature: None,
-                device_db_profile: None,
-                device_db_read_direct: None,
+                ..Default::default()
             },
             MountInfoEntry {
                 mount_point: "/snap/core".into(),
                 fstype: "squashfs".into(),
                 mount_source: "/dev/loop0".into(),
                 major_minor: "7:0".into(),
-                writable_dir: None,
-                device_kind: None,
-                device_name: None,
-                device_model: None,
-                device_serial: None,
-                device_by_id: Vec::new(),
-                pci_bdf: None,
-                pci_numa_node: None,
-                pci_local_cpulist: None,
-                pcie_current_link_width: None,
-                pcie_current_link_speed: None,
-                pcie_max_link_width: None,
-                pcie_max_link_speed: None,
-                aer_dev_correctable: None,
-                aer_dev_nonfatal: None,
-                aer_dev_fatal: None,
-                zfs_pool: None,
-                zfs_dataset: None,
-                zfs_props: None,
-                zpool_vdevs: Vec::new(),
-                zpool_vdevs_info: Vec::new(),
-                md_level: None,
-                md_chunk_bytes: None,
-                md_members: Vec::new(),
-                md_members_info: Vec::new(),
-                signature: None,
-                device_db_profile: None,
-                device_db_read_direct: None,
+                ..Default::default()
             },
             MountInfoEntry {
                 mount_point: "/var/lib/data".into(),
                 fstype: "xfs".into(),
                 mount_source: "/dev/md0".into(),
                 major_minor: "9:0".into(),
-                writable_dir: None,
-                device_kind: None,
-                device_name: None,
-                device_model: None,
-                device_serial: None,
-                device_by_id: Vec::new(),
-                pci_bdf: None,
-                pci_numa_node: None,
-                pci_local_cpulist: None,
-                pcie_current_link_width: None,
-                pcie_current_link_speed: None,
-                pcie_max_link_width: None,
-                pcie_max_link_speed: None,
-                aer_dev_correctable: None,
-                aer_dev_nonfatal: None,
-                aer_dev_fatal: None,
-                zfs_pool: None,
-                zfs_dataset: None,
-                zfs_props: None,
-                zpool_vdevs: Vec::new(),
-                zpool_vdevs_info: Vec::new(),
-                md_level: None,
-                md_chunk_bytes: None,
-                md_members: Vec::new(),
-                md_members_info: Vec::new(),
-                signature: None,
-                device_db_profile: None,
-                device_db_read_direct: None,
+                ..Default::default()
             },
         ];
 
@@ -1136,34 +977,7 @@ mod tests {
             fstype: "zfs".into(),
             mount_source: "tank/dataset".into(),
             major_minor: "0:0".into(),
-            writable_dir: None,
-            device_kind: None,
-            device_name: None,
-            device_model: None,
-            device_serial: None,
-            device_by_id: Vec::new(),
-            pci_bdf: None,
-            pci_numa_node: None,
-            pci_local_cpulist: None,
-            pcie_current_link_width: None,
-            pcie_current_link_speed: None,
-            pcie_max_link_width: None,
-            pcie_max_link_speed: None,
-            aer_dev_correctable: None,
-            aer_dev_nonfatal: None,
-            aer_dev_fatal: None,
-            zfs_pool: None,
-            zfs_dataset: None,
-            zfs_props: None,
-            zpool_vdevs: Vec::new(),
-            zpool_vdevs_info: Vec::new(),
-            md_level: None,
-            md_chunk_bytes: None,
-            md_members: Vec::new(),
-            md_members_info: Vec::new(),
-            signature: None,
-            device_db_profile: None,
-            device_db_read_direct: None,
+            ..Default::default()
         };
         assert!(is_disk_backed_mount(&z));
     }
@@ -1176,34 +990,12 @@ mod tests {
             fstype: "ext4".into(),
             mount_source: "/dev/md127".into(),
             major_minor: "9:127".into(),
-            writable_dir: None,
             device_kind: Some("md".into()),
             device_name: Some("md127".into()),
             device_model: Some("unknown".into()),
-            device_serial: None,
-            device_by_id: Vec::new(),
-            pci_bdf: None,
-            pci_numa_node: None,
-            pci_local_cpulist: None,
-            pcie_current_link_width: None,
-            pcie_current_link_speed: None,
-            pcie_max_link_width: None,
-            pcie_max_link_speed: None,
-            aer_dev_correctable: None,
-            aer_dev_nonfatal: None,
-            aer_dev_fatal: None,
-            zfs_pool: None,
-            zfs_dataset: None,
-            zfs_props: None,
-            zpool_vdevs: Vec::new(),
-            zpool_vdevs_info: Vec::new(),
             md_level: Some("raid0".into()),
-            md_chunk_bytes: None,
-            md_members: Vec::new(),
-            md_members_info: Vec::new(),
             signature: Some("fstype=ext4;dev=md;level=raid0;model=unknown".into()),
-            device_db_profile: None,
-            device_db_read_direct: None,
+            ..Default::default()
         };
 
         let p = device_db_match(&db, &e).unwrap();
@@ -1339,36 +1131,6 @@ fn main() {
         println!("--iters <n> overrides the internal -n used for each optimized mode (useful for quick runs/tests).");
         std::process::exit(0);
     }
-    if args.len() > 1 && (args[1] == "--list-devices" || args[1] == "--list-devices-all") {
-        let all = args[1] == "--list-devices-all";
-        let home_targets = collect_home_targets();
-        let db = load_device_db();
-
-        let entries = read_mountinfo();
-        let mut entries: Vec<_> = if all {
-            entries
-        } else {
-            entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect()
-        };
-
-        for e in entries.iter_mut() {
-            let mp = Path::new(&e.mount_point);
-            let wd = find_writable_dir_for_mount(mp, &home_targets);
-            e.writable_dir = wd.map(|p| p.display().to_string());
-
-            fill_device_info(e);
-            if let Some(ref db) = db {
-                if let Some(p) = device_db_match(db, e) {
-                    e.device_db_profile = Some(p.id.clone());
-                    e.device_db_read_direct = Some(p.params.read.direct.clone());
-                }
-            }
-        }
-
-        let out = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
-        println!("{}", out);
-        return;
-    }
 
     let mut test_size: Option<u64> = None;
     let mut min_test_size: u64 = 256 * 1024 * 1024;
@@ -1376,6 +1138,8 @@ fn main() {
     let mut max_drive_writes: f64 = 0.05;
     let mut plan = false;
     let mut all = false;
+    let mut list_devices = false;
+    let mut list_devices_all = false;
     let mut config_path: Option<&str> = None;
     let mut all_dirs: Vec<String> = Vec::new();
     let mut iters_override: Option<u64> = None;
@@ -1384,7 +1148,11 @@ fn main() {
     while i < args.len() {
         let arg = &args[i];
         i += 1;
-        if arg == "--test-dir" {
+        if arg == "--list-devices" {
+            list_devices = true;
+        } else if arg == "--list-devices-all" {
+            list_devices_all = true;
+        } else if arg == "--test-dir" {
             test_dir = &args[i];
             i += 1;
         } else if arg == "-c" || arg == "--config" {
@@ -1437,6 +1205,36 @@ fn main() {
         } else {
             patterns.push(arg);
         }
+    }
+
+    if list_devices || list_devices_all {
+        let home_targets = collect_home_targets();
+        let db = load_device_db();
+
+        let entries = read_mountinfo();
+        let mut entries: Vec<_> = if list_devices_all {
+            entries
+        } else {
+            entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect()
+        };
+
+        for e in entries.iter_mut() {
+            let mp = Path::new(&e.mount_point);
+            let wd = find_writable_dir_for_mount(mp, &home_targets);
+            e.writable_dir = wd.map(|p| p.display().to_string());
+
+            fill_device_info(e);
+            if let Some(ref db) = db {
+                if let Some(p) = device_db_match(db, e) {
+                    e.device_db_profile = Some(p.id.clone());
+                    e.device_db_read_direct = Some(p.params.read.direct.clone());
+                }
+            }
+        }
+
+        let out = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+        println!("{}", out);
+        return;
     }
 
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
