@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "example-ext4-mdraid0",
+      "match": {
+        "fstype": "ext4",
+        "dev_kind": "md",
+        "md_level": "raid0"
+      },
+      "params": {
+        "read": {
+          "direct": { "num_threads": 16, "block_size": 3145728, "qd": 2 },
+          "page_cache": { "num_threads": 31, "block_size": 131072, "qd": 1 }
+        },
+        "grep": {
+          "direct": { "num_threads": 16, "block_size": 3145728, "qd": 2 },
+          "page_cache": { "num_threads": 31, "block_size": 131072, "qd": 1 }
+        }
+      },
+      "notes": "Example profile; currently mirrors built-in defaults (not a claim of optimality)."
+    }
+  ]
+}

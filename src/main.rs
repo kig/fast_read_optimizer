@@ -8,7 +8,6 @@ mod writer;
 mod differ;
 mod mincore;
 
-use config::AppConfig;
 use optimizer::run_optimizer;
 use reader::read_file;
 use writer::write_file;
@@ -17,15 +16,16 @@ use differ::{diff_files, bench_diff_memory};
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "--help" {
-        println!("USAGE: {} grep [--no-direct] [--direct] [-v] [-n iterations] <pattern> <filename>", args[0]);
-        println!("USAGE: {} read [--no-direct] [--direct] [-n iterations] <filename>", args[0]);
-        println!("USAGE: {} write [--no-direct] [--direct] [-n iterations] <filename>", args[0]);
-        println!("USAGE: {} copy [--no-direct] [--direct] [-v] [-n iterations] <source> <target>", args[0]);
-        println!("USAGE: {} diff [--no-direct] [--direct] [-v] [-n iterations] <file1> <file2>", args[0]);
-        println!("USAGE: {} dual-read-bench [--no-direct] [--direct] [-v] [-n iterations] <file1> <file2>", args[0]);
+        println!("USAGE: {} grep [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <pattern> <filename>", args[0]);
+        println!("USAGE: {} read [--no-direct] [--direct] [-n iterations] [-c config.json] <filename>", args[0]);
+        println!("USAGE: {} write [--no-direct] [--direct] [-n iterations] [-c config.json] <filename>", args[0]);
+        println!("USAGE: {} copy [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <source> <target>", args[0]);
+        println!("USAGE: {} diff [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <file1> <file2>", args[0]);
+        println!("USAGE: {} dual-read-bench [--no-direct] [--direct] [-v] [-n iterations] [-c config.json] <file1> <file2>", args[0]);
         println!("USAGE: {} bench-diff", args[0]);
         println!("USAGE: {} bench-mmap-write <filename>", args[0]);
         println!("USAGE: {} bench-write <filename>", args[0]);
+        println!("\nConfig resolution (when -c is not provided): $FRO_CONFIG, then ~/.fro/fro.json, then /etc/fro.json");
         return;
     }
     let mode = args[1].as_str();
@@ -37,10 +37,14 @@ fn main() {
     let mut filename = "";
     let mut iterations = if mode == "read" { 1000 } else { 1 };
     let mut save_config = false;
+    let mut config_path: Option<&str> = None;
     
     let mut i = 2;
     while i < args.len() {
-        if args[i] == "--direct" {
+        if args[i] == "-c" || args[i] == "--config" {
+            i += 1;
+            if i < args.len() { config_path = Some(args[i].as_str()); }
+        } else if args[i] == "--direct" {
             io_mode = common::IOMode::Direct;
             io_mode_write = common::IOMode::Direct;
         } else if args[i] == "--no-direct" {
@@ -83,10 +87,12 @@ fn main() {
 
     if filename == "" { println!("Filename missing"); return; }
 
-    let mut config = AppConfig::load("fro.json");
+    let mut config = config::load_config(config_path);
 
-    let params_page_cache = config.get_params(mode, false);
-    let params_direct = config.get_params(mode, true);
+    let context_path = filename;
+
+    let params_page_cache = config.get_params_for_path(mode, false, context_path);
+    let params_direct = config.get_params_for_path(mode, true, context_path);
     
     let num_threads_pc = params_page_cache.num_threads;
     let qd_pc = params_page_cache.qd;
@@ -162,9 +168,16 @@ fn main() {
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
         let off = if direct { 3 } else { 0 };
-        config.update_params(mode, direct, config::IOParams {
-            num_threads: best_params[off+0], block_size: best_params[off+1], qd: best_params[off+2] as usize
-        });
-        config.save("fro.json");
+        config.update_params_for_path(
+            mode,
+            direct,
+            context_path,
+            config::IOParams {
+                num_threads: best_params[off + 0],
+                block_size: best_params[off + 1],
+                qd: best_params[off + 2] as usize,
+            },
+        );
+        config.save();
     }
 }
