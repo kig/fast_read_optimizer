@@ -292,16 +292,19 @@ pub fn load_config(path: Option<&str>) -> LoadedConfig {
     }
 
     // Write as bundle v1 at the default locations.
+    let mut db_paths = vec![
+        "/etc/fro.d/disk-id.json".into(),
+        "/etc/fro.d/fro-device-db.json".into(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        db_paths.push(format!("{}/.config/fro/fro-device-db.json", home));
+    }
     let bundle = ConfigBundleV1 {
         version: 1,
         defaults: cfg,
         mount_overrides: MountOverrides::default(),
         device_db: DeviceDbConfig {
-            paths: vec![
-                "/etc/fro.d/disk-id.json".into(),
-                "/etc/fro.d/fro-device-db.json".into(),
-                "~/.config/fro/fro-device-db.json".into(),
-            ],
+            paths: db_paths,
             allow_online_update: false,
         },
     };

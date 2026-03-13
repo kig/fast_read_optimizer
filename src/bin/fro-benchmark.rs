@@ -141,10 +141,14 @@ fn choose_test_size(
     size = align_down(size, 4096).max(4096);
 
     if size < min_size {
-        size
-    } else {
-        size
+        eprintln!(
+            "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
+            format_bytes(size),
+            format_bytes(min_size),
+        );
     }
+
+    size
 }
 
 fn main() {
