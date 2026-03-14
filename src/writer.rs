@@ -2,6 +2,7 @@ use crate::common::{AlignedBuffer, IOMode};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::Rng;
+use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
@@ -209,7 +210,7 @@ pub fn write_file(
 
     let random_block = if source.is_none() {
         let mut block = vec![0u8; block_size as usize];
-        rand::thread_rng().fill(&mut block[..]);
+        rand::rng().fill(&mut block[..]);
         Some(Arc::new(block))
     } else {
         None
@@ -311,7 +312,7 @@ pub fn bench_mmap_write(filename: &str) {
         threads.push(std::thread::spawn(move || {
             let slice =
                 unsafe { std::slice::from_raw_parts_mut(thread_ptr_addr as *mut u8, chunk_size) };
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let mut block = vec![0u8; 1024 * 1024];
             rng.fill(&mut block[..]);
 
@@ -355,7 +356,7 @@ pub fn bench_write(filename: &str) {
     }
 
     let mut block = vec![0u8; 1024 * 1024];
-    rand::thread_rng().fill(&mut block[..]);
+    rand::rng().fill(&mut block[..]);
 
     let start = std::time::Instant::now();
 

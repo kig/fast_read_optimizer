@@ -2,6 +2,7 @@ use crate::common::{AlignedBuffer, IOMode};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::Rng;
+use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
@@ -285,7 +286,7 @@ pub fn bench_diff_memory(num_threads: usize, block_size: usize) {
     let total_size = 1024 * 1024 * 1024;
     let mut buf1 = vec![0u8; total_size];
     let mut buf2 = vec![0u8; total_size];
-    rand::thread_rng().fill(&mut buf1[..]);
+    rand::rng().fill(&mut buf1[..]);
     buf2.copy_from_slice(&buf1);
     let start = std::time::Instant::now();
     let mismatch = Arc::new(AtomicU64::new(0));

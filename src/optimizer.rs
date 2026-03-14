@@ -1,4 +1,5 @@
 use rand::Rng;
+use rand::RngExt;
 
 // Use a stochastic hill climber to find the best-performing parameters for the given IO function.
 // Takes in start_params and scaling factors to convert them to use with the IO function.
@@ -15,7 +16,7 @@ pub fn run_optimizer<F>(
 where
     F: FnMut(&[u64]) -> u64,
 {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut fastest_time = 1e9;
     let mut fastest_time_decayed = fastest_time;
     let mut optimize_params = start_params.clone();
@@ -30,10 +31,10 @@ where
         let mut scaled_params = vec![0u64; optimize_params.len()];
         for j in 0..optimize_params.len() {
             if num_iterations > 1 {
-                let jump_multiplier = (rng.gen::<f64>().powf(2.0)
+                let jump_multiplier = (rng.random::<f64>().powf(2.0)
                     * (iterations_since_last_fastest_found as f64 / 4.0).log2()
                     + 1.0) as u64;
-                let r = rng.gen::<u64>();
+                let r = rng.random::<u64>();
                 if r < u64::MAX / 3 {
                     optimize_params[j] += jump_multiplier;
                 } else if r < u64::MAX / 3 * 2 {
