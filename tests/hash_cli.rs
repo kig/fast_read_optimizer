@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
+use fro::block_hash::BlockHashManifest;
+use fro::config::{AppConfig, ConfigBundleV1, DeviceDbConfig, IOParams, MountOverrides};
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
@@ -28,6 +30,16 @@ fn run_fro(args: &[&str]) -> std::process::Output {
 
 fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     path.with_extension(format!("bin.fro-hash.{}.json", suffix))
+}
+
+fn write_config(path: &std::path::Path, defaults: AppConfig) {
+    let bundle = ConfigBundleV1 {
+        version: 1,
+        defaults,
+        mount_overrides: MountOverrides::default(),
+        device_db: DeviceDbConfig::default(),
+    };
+    fs::write(path, serde_json::to_string_pretty(&bundle).unwrap()).unwrap();
 }
 
 #[test]
@@ -225,4 +237,76 @@ fn recover_in_place_all_repairs_all_inputs_and_restores_sidecars() {
         assert!(sidecar_path(&target, suffix).exists());
         assert!(sidecar_path(&backup, suffix).exists());
     }
+}
+
+#[test]
+fn hash_and_verify_use_separate_config_and_sidecar_geometry() {
+    let tmp = unique_temp_dir("fro-hash-config");
+    let cfg = tmp.join("fro.json");
+    let target = tmp.join("target.bin");
+
+    let mut defaults = AppConfig::default();
+    defaults.read.page_cache = IOParams {
+        num_threads: 31,
+        block_size: 128 * 1024,
+        qd: 1,
+    };
+    defaults.hash.page_cache = IOParams {
+        num_threads: 7,
+        block_size: 2 * 1024 * 1024,
+        qd: 4,
+    };
+    defaults.verify.page_cache = IOParams {
+        num_threads: 5,
+        block_size: 256 * 1024,
+        qd: 3,
+    };
+    write_config(&cfg, defaults);
+
+    let data = (0..(5 * 1024 * 1024 + 12345))
+        .map(|i| ((i * 41) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&[
+        "hash",
+        "--no-direct",
+        "-n",
+        "1",
+        "-c",
+        cfg.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest: BlockHashManifest =
+        serde_json::from_str(&fs::read_to_string(sidecar_path(&target, "0")).unwrap()).unwrap();
+    assert_eq!(manifest.block_size, 2 * 1024 * 1024);
+
+    let out = run_fro(&[
+        "verify",
+        "--no-direct",
+        "-n",
+        "1",
+        "-c",
+        cfg.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+
+    let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(saved["defaults"]["read"]["page_cache"]["block_size"], 128 * 1024);
+    assert_eq!(saved["defaults"]["hash"]["page_cache"]["block_size"], 2 * 1024 * 1024);
+    assert_eq!(saved["defaults"]["verify"]["page_cache"]["block_size"], 256 * 1024);
 }

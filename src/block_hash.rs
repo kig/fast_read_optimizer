@@ -13,6 +13,13 @@ use crate::mincore::is_first_page_resident;
 
 pub const BLOCK_HASH_SIZE: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestGeometry {
+    file_size: u64,
+    block_size: u64,
+    block_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHashManifest {
     pub file_size: u64,
@@ -153,6 +160,34 @@ fn hash_hashes(values: &[u64]) -> u64 {
     xxh3_64(&bytes)
 }
 
+fn validate_block_size(block_size: u64) -> std::io::Result<()> {
+    if block_size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "block hash block size must be greater than zero",
+        ));
+    }
+    if block_size % 4096 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "block hash block size must be a multiple of 4096 bytes, got {}",
+                block_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn block_count_for_size(file_size: u64, block_size: u64) -> std::io::Result<usize> {
+    validate_block_size(block_size)?;
+    Ok(if file_size == 0 {
+        0
+    } else {
+        file_size.div_ceil(block_size) as usize
+    })
+}
+
 pub fn default_hash_base(filename: &str) -> String {
     format!("{}.fro-hash", filename)
 }
@@ -196,6 +231,61 @@ fn hash_base_for_file(index: usize, path: &str, hash_base: Option<&str>) -> Stri
     } else {
         default_hash_base(path)
     }
+}
+
+fn manifest_geometry(
+    manifests: &[Option<BlockHashManifest>],
+    label: &str,
+) -> std::io::Result<Option<ManifestGeometry>> {
+    let mut expected: Option<ManifestGeometry> = None;
+
+    for manifest in manifests.iter().flatten() {
+        let block_count = block_count_for_size(manifest.file_size, manifest.block_size)?;
+        if manifest.block_hashes.len() != block_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} has {} block hashes but file_size={} and block_size={} imply {}",
+                    label,
+                    manifest.block_hashes.len(),
+                    manifest.file_size,
+                    manifest.block_size,
+                    block_count
+                ),
+            ));
+        }
+
+        let current = ManifestGeometry {
+            file_size: manifest.file_size,
+            block_size: manifest.block_size,
+            block_count,
+        };
+
+        if let Some(previous) = expected {
+            if previous.file_size != current.file_size
+                || previous.block_size != current.block_size
+                || previous.block_count != current.block_count
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} disagree on geometry; saw file_size={}, block_size={}, blocks={} and file_size={}, block_size={}, blocks={}",
+                        label,
+                        previous.file_size,
+                        previous.block_size,
+                        previous.block_count,
+                        current.file_size,
+                        current.block_size,
+                        current.block_count
+                    ),
+                ));
+            }
+        } else {
+            expected = Some(current);
+        }
+    }
+
+    Ok(expected)
 }
 
 fn consistent_intact_manifest(
@@ -426,6 +516,14 @@ fn block_offset(thread_base: u64, block_id: u64, num_threads: u64, block_size: u
     thread_base + block_id * num_threads * block_size
 }
 
+fn use_direct_for_hashing(filename: &str, io_mode: IOMode) -> bool {
+    let file_cached = match is_first_page_resident(filename) {
+        Ok(true) => io_mode != IOMode::Direct,
+        _ => io_mode == IOMode::PageCache,
+    };
+    (!file_cached) || io_mode == IOMode::Direct
+}
+
 fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
     debug_assert_eq!(
         len % 4096,
@@ -560,36 +658,34 @@ fn thread_hash_reader(
     }
 }
 
-pub fn hash_file_blocks(
+fn hash_file_blocks_inner(
     filename: &str,
     num_threads_p: u64,
+    block_size_p: u64,
     qd_p: usize,
     num_threads_d: u64,
+    block_size_d: u64,
     qd_d: usize,
     io_mode: IOMode,
-) -> BlockHashManifest {
+) -> std::io::Result<BlockHashManifest> {
     let read_count = Arc::new(AtomicU64::new(0));
-
-    let file_cached = match is_first_page_resident(filename) {
-        Ok(true) => io_mode != IOMode::Direct,
-        _ => io_mode == IOMode::PageCache,
-    };
-    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
+    let use_direct = use_direct_for_hashing(filename, io_mode);
 
     let num_threads = if use_direct {
         num_threads_d
     } else {
         num_threads_p
     };
-    let block_size = BLOCK_HASH_SIZE;
+    let block_size = if use_direct {
+        block_size_d
+    } else {
+        block_size_p
+    };
     let qd = if use_direct { qd_d } else { qd_p };
+    validate_block_size(block_size)?;
 
     let file_size = std::fs::metadata(filename).unwrap().len();
-    let block_count = if file_size == 0 {
-        0
-    } else {
-        ((file_size + block_size - 1) / block_size) as usize
-    };
+    let block_count = block_count_for_size(file_size, block_size)?;
     let block_hashes = Arc::new(
         (0..block_count)
             .map(|_| AtomicU64::new(0))
@@ -629,25 +725,58 @@ pub fn hash_file_blocks(
         .collect::<Vec<_>>();
     let hash_of_hashes = hash_hashes(&block_hashes);
 
-    BlockHashManifest {
+    Ok(BlockHashManifest {
         file_size,
         block_size,
         bytes_hashed: read_count.load(Ordering::SeqCst),
         block_hashes,
         hash_of_hashes,
-    }
+    })
+}
+
+pub fn hash_file_blocks(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+) -> std::io::Result<BlockHashManifest> {
+    hash_file_blocks_inner(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )
 }
 
 pub fn hash_file_to_replicas(
     filename: &str,
     hash_base: Option<&str>,
     num_threads_p: u64,
+    block_size_p: u64,
     qd_p: usize,
     num_threads_d: u64,
+    block_size_d: u64,
     qd_d: usize,
     io_mode: IOMode,
 ) -> std::io::Result<BlockHashManifest> {
-    let manifest = hash_file_blocks(filename, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
+    let manifest = hash_file_blocks(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )?;
     let base = hash_base
         .map(str::to_string)
         .unwrap_or_else(|| default_hash_base(filename));
@@ -659,20 +788,37 @@ pub fn verify_file_with_replicas(
     filename: &str,
     hash_base: Option<&str>,
     num_threads_p: u64,
+    block_size_p: u64,
     qd_p: usize,
     num_threads_d: u64,
+    block_size_d: u64,
     qd_d: usize,
     io_mode: IOMode,
 ) -> std::io::Result<VerifyReport> {
-    let current = hash_file_blocks(filename, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
     let base = hash_base_for_file(0, filename, hash_base);
     let manifests = load_manifest_replicas(&base);
+    let manifest_geometry = manifest_geometry(&manifests, &format!("hash replicas for {}", filename))?;
+    let current = hash_file_blocks_inner(
+        filename,
+        num_threads_p,
+        manifest_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
+        qd_p,
+        num_threads_d,
+        manifest_geometry.map(|g| g.block_size).unwrap_or(block_size_d),
+        qd_d,
+        io_mode,
+    )?;
     Ok(verify_report_from_current(&current, &manifests))
 }
 
-fn read_block(path: &str, block_index: usize, file_size: u64) -> std::io::Result<Vec<u8>> {
-    let offset = block_index as u64 * BLOCK_HASH_SIZE;
-    let len = std::cmp::min(BLOCK_HASH_SIZE, file_size.saturating_sub(offset)) as usize;
+fn read_block(
+    path: &str,
+    block_index: usize,
+    file_size: u64,
+    block_size: u64,
+) -> std::io::Result<Vec<u8>> {
+    let offset = block_index as u64 * block_size;
+    let len = std::cmp::min(block_size, file_size.saturating_sub(offset)) as usize;
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];
@@ -680,8 +826,8 @@ fn read_block(path: &str, block_index: usize, file_size: u64) -> std::io::Result
     Ok(buf)
 }
 
-fn write_block(path: &str, block_index: usize, data: &[u8]) -> std::io::Result<()> {
-    let offset = block_index as u64 * BLOCK_HASH_SIZE;
+fn write_block(path: &str, block_index: usize, block_size: u64, data: &[u8]) -> std::io::Result<()> {
+    let offset = block_index as u64 * block_size;
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(data)?;
@@ -716,6 +862,15 @@ fn ensure_matching_file_geometry(
                 ),
             ));
         }
+        if manifest.block_size != first.block_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "recover expects identical block sizes; {} uses {} bytes but target uses {} bytes",
+                    path, manifest.block_size, first.block_size
+                ),
+            ));
+        }
         if manifest.block_hashes.len() != first.block_hashes.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -730,6 +885,43 @@ fn ensure_matching_file_geometry(
     }
 
     Ok(())
+}
+
+fn common_manifest_geometry_for_recovery(
+    files: &[String],
+    stored_replicas: &[Vec<Option<BlockHashManifest>>],
+) -> std::io::Result<Option<ManifestGeometry>> {
+    let mut expected: Option<ManifestGeometry> = None;
+
+    for (path, replicas) in files.iter().zip(stored_replicas.iter()) {
+        let Some(current) = manifest_geometry(replicas, &format!("hash replicas for {}", path))? else {
+            continue;
+        };
+        if let Some(previous) = expected {
+            if previous.file_size != current.file_size
+                || previous.block_size != current.block_size
+                || previous.block_count != current.block_count
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "recover expects all sidecars to agree on geometry; {} uses file_size={}, block_size={}, blocks={} but another sidecar set uses file_size={}, block_size={}, blocks={}",
+                        path,
+                        current.file_size,
+                        current.block_size,
+                        current.block_count,
+                        previous.file_size,
+                        previous.block_size,
+                        previous.block_count
+                    ),
+                ));
+            }
+        } else {
+            expected = Some(current);
+        }
+    }
+
+    Ok(expected)
 }
 
 fn repair_file_set(
@@ -768,8 +960,14 @@ fn repair_file_set(
                         &files[source_index],
                         block_index,
                         manifests_now[source_index].file_size,
+                        manifests_now[source_index].block_size,
                     )?;
-                    write_block(&files[target_index], block_index, &block)?;
+                    write_block(
+                        &files[target_index],
+                        block_index,
+                        manifests_now[target_index].block_size,
+                        &block,
+                    )?;
                     manifests_now[target_index].block_hashes[block_index] =
                         decision.elected_hash.unwrap();
                     repaired_blocks += 1;
@@ -817,8 +1015,10 @@ pub fn recover_file_with_copies(
     copies: &[String],
     hash_base: Option<&str>,
     num_threads_p: u64,
+    block_size_p: u64,
     qd_p: usize,
     num_threads_d: u64,
+    block_size_d: u64,
     qd_d: usize,
     io_mode: IOMode,
     recover_mode: RecoverMode,
@@ -828,11 +1028,21 @@ pub fn recover_file_with_copies(
     files.extend(copies.iter().cloned());
 
     let stored_replicas = load_manifest_sets(&files, hash_base);
+    let stored_geometry = common_manifest_geometry_for_recovery(&files, &stored_replicas)?;
     let mut used_fast_path = false;
     let mut fell_back_to_full_scan = false;
 
     let mut manifests_now = if recover_mode == RecoverMode::Fast {
-        let mut current = hash_file_blocks(target, num_threads_p, qd_p, num_threads_d, qd_d, io_mode);
+        let mut current = hash_file_blocks_inner(
+            target,
+            num_threads_p,
+            stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
+            qd_p,
+            num_threads_d,
+            stored_geometry.map(|g| g.block_size).unwrap_or(block_size_d),
+            qd_d,
+            io_mode,
+        )?;
         let verify_report = verify_report_from_current(&current, &stored_replicas[0]);
         if consistent_intact_manifest(&stored_replicas[0]).is_some() && verify_report.bad_blocks.is_empty()
         {
@@ -859,20 +1069,33 @@ pub fn recover_file_with_copies(
         let mut manifests = Vec::with_capacity(files.len());
         manifests.push(current);
         for path in files.iter().skip(1) {
-            manifests.push(hash_file_blocks(
+            manifests.push(hash_file_blocks_inner(
                 path,
                 num_threads_p,
+                stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
                 qd_p,
                 num_threads_d,
+                stored_geometry.map(|g| g.block_size).unwrap_or(block_size_d),
                 qd_d,
                 io_mode,
-            ));
+            )?);
         }
         manifests
     } else {
         files.iter()
-            .map(|path| hash_file_blocks(path, num_threads_p, qd_p, num_threads_d, qd_d, io_mode))
-            .collect::<Vec<_>>()
+            .map(|path| {
+                hash_file_blocks_inner(
+                    path,
+                    num_threads_p,
+                    stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
+                    qd_p,
+                    num_threads_d,
+                    stored_geometry.map(|g| g.block_size).unwrap_or(block_size_d),
+                    qd_d,
+                    io_mode,
+                )
+            })
+            .collect::<std::io::Result<Vec<_>>>()?
     };
 
     ensure_matching_file_geometry(&files, &manifests_now)?;
@@ -934,7 +1157,17 @@ mod tests {
         let path = unique_temp_file("fro-block-hash");
         fs::write(&path, &data).unwrap();
 
-        let manifest = hash_file_blocks(path.to_str().unwrap(), 3, 2, 3, 2, IOMode::PageCache);
+        let manifest = hash_file_blocks(
+            path.to_str().unwrap(),
+            3,
+            BLOCK_HASH_SIZE,
+            2,
+            3,
+            BLOCK_HASH_SIZE,
+            2,
+            IOMode::PageCache,
+        )
+        .unwrap();
 
         assert_eq!(manifest.file_size, data.len() as u64);
         assert_eq!(manifest.block_size, block_size as u64);
@@ -952,7 +1185,17 @@ mod tests {
         let path = unique_temp_file("fro-block-hash-corrupt");
         fs::write(&path, &data).unwrap();
 
-        let mut manifest = hash_file_blocks(path.to_str().unwrap(), 2, 2, 2, 2, IOMode::PageCache);
+        let mut manifest = hash_file_blocks(
+            path.to_str().unwrap(),
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            IOMode::PageCache,
+        )
+        .unwrap();
         manifest.block_hashes[1] ^= 1;
 
         assert!(!manifest.verify_integrity());
@@ -967,7 +1210,17 @@ mod tests {
         let path = unique_temp_file("fro-block-hash-majority");
         fs::write(&path, &data).unwrap();
 
-        let mut manifest = hash_file_blocks(path.to_str().unwrap(), 2, 2, 2, 2, IOMode::PageCache);
+        let mut manifest = hash_file_blocks(
+            path.to_str().unwrap(),
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            IOMode::PageCache,
+        )
+        .unwrap();
 
         assert!(manifest.verify_integrity());
 

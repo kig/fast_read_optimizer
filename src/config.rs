@@ -24,6 +24,10 @@ pub struct AppConfig {
     pub grep: ModeConfig,
     pub diff: ModeConfig,
     pub dual_read_bench: ModeConfig,
+    #[serde(default = "default_hash_mode_config")]
+    pub hash: ModeConfig,
+    #[serde(default = "default_verify_mode_config")]
+    pub verify: ModeConfig,
 }
 
 // New config wrapper. For now it primarily wraps the existing AppConfig shape,
@@ -55,6 +59,8 @@ pub struct AppConfigPatch {
     pub grep: Option<ModeConfigPatch>,
     pub diff: Option<ModeConfigPatch>,
     pub dual_read_bench: Option<ModeConfigPatch>,
+    pub hash: Option<ModeConfigPatch>,
+    pub verify: Option<ModeConfigPatch>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -182,6 +188,8 @@ impl AppConfigPatch {
             "grep" => self.grep.as_ref(),
             "diff" => self.diff.as_ref(),
             "dual-read-bench" | "dual_read_bench" => self.dual_read_bench.as_ref(),
+            "hash" => self.hash.as_ref(),
+            "verify" => self.verify.as_ref(),
             _ => None,
         }
     }
@@ -194,6 +202,8 @@ impl AppConfigPatch {
             "grep" => &mut self.grep,
             "diff" => &mut self.diff,
             "dual-read-bench" | "dual_read_bench" => &mut self.dual_read_bench,
+            "hash" => &mut self.hash,
+            "verify" => &mut self.verify,
             _ => return,
         };
 
@@ -364,6 +374,21 @@ impl Default for AppConfig {
             page_cache: default_cache.clone(),
         };
 
+        let default_hash = IOParams {
+            num_threads: default_cache.num_threads,
+            block_size: crate::block_hash::BLOCK_HASH_SIZE,
+            qd: default_cache.qd,
+        };
+        let default_hash_direct = IOParams {
+            num_threads: default_direct.num_threads,
+            block_size: crate::block_hash::BLOCK_HASH_SIZE,
+            qd: default_direct.qd,
+        };
+        let default_hash_mode = ModeConfig {
+            direct: default_hash_direct.clone(),
+            page_cache: default_hash.clone(),
+        };
+
         let default_write_mode = ModeConfig {
             direct: default_write_direct.clone(),
             page_cache: default_write.clone(),
@@ -386,6 +411,8 @@ impl Default for AppConfig {
                 direct: default_direct.clone(),
                 page_cache: diff_cache.clone(),
             },
+            hash: default_hash_mode.clone(),
+            verify: default_hash_mode,
         }
     }
 }
@@ -405,6 +432,8 @@ impl AppConfig {
             "grep" => &self.grep,
             "diff" => &self.diff,
             "dual-read-bench" => &self.dual_read_bench,
+            "hash" => &self.hash,
+            "verify" => &self.verify,
             _ => {
                 return if direct {
                     self.read.direct.clone()
@@ -429,6 +458,8 @@ impl AppConfig {
             "grep" => &mut self.grep,
             "diff" => &mut self.diff,
             "dual-read-bench" => &mut self.dual_read_bench,
+            "hash" => &mut self.hash,
+            "verify" => &mut self.verify,
             _ => return,
         };
 
@@ -438,6 +469,14 @@ impl AppConfig {
             mode_config.page_cache = params;
         }
     }
+}
+
+fn default_hash_mode_config() -> ModeConfig {
+    AppConfig::default().hash
+}
+
+fn default_verify_mode_config() -> ModeConfig {
+    AppConfig::default().verify
 }
 
 #[cfg(test)]
@@ -618,6 +657,41 @@ mod tests {
         let p = reloaded.get_params("diff", false);
         assert_eq!(p.num_threads, 3);
         assert_eq!(p.block_size, 123);
+
+        restore_env_var("FRO_CONFIG", old_fro);
+        restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
+        restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn load_config_reads_legacy_appconfig_without_hash_verify_fields() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let tmp = unique_temp_dir("fro-test");
+        let cfg_path = tmp.join("legacy-missing-hash-verify.json");
+
+        let old_fro = set_env_var("FRO_CONFIG", None);
+        let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
+        let old_home = set_env_var("HOME", None);
+
+        let legacy = AppConfig::default();
+        let legacy_text = serde_json::json!({
+            "read": legacy.read,
+            "write": legacy.write,
+            "copy": legacy.copy,
+            "grep": legacy.grep,
+            "diff": legacy.diff,
+            "dual_read_bench": legacy.dual_read_bench,
+        });
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&legacy_text).unwrap()).unwrap();
+
+        let loaded = load_config(Some(cfg_path.to_str().unwrap()));
+        let hash = loaded.get_params("hash", false);
+        let verify = loaded.get_params("verify", false);
+        assert_eq!(hash.block_size, crate::block_hash::BLOCK_HASH_SIZE);
+        assert_eq!(verify.block_size, crate::block_hash::BLOCK_HASH_SIZE);
+        assert_eq!(hash.num_threads, 31);
+        assert_eq!(verify.qd, 1);
 
         restore_env_var("FRO_CONFIG", old_fro);
         restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
