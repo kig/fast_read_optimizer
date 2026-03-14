@@ -213,19 +213,23 @@ Examples:
 
 ---
 
-### `fro write [flags] <filename>`
+### `fro write [--create <size>] [flags] <filename>`
 
 Writes random data into an **existing file**.
 
 Important:
 
-- `write` determines the write size from the current file length; if you want a 4 GiB write, create a 4 GiB file first.
+- By default, `write` determines the write size from the current file length.
+- `--create <size>` creates the file if needed, sets it to the requested size, and then runs the write workload.
 
 Example:
 
 ```bash
 truncate -s 4G out.bin
 ./target/release/fro write --direct-write -n 1 out.bin
+
+# Or create + size the file in one step
+./target/release/fro write --create 64MiB --no-direct -n 1 out.bin
 ```
 
 ---
@@ -267,6 +271,134 @@ Example:
 
 ```bash
 ./target/release/fro dual-read-bench --no-direct -n 1 a.bin b.bin
+```
+
+---
+
+### Block-hash recovery decision table (observed behavior)
+
+The block-hash workflow (`hash` / `verify` / `recover`) ultimately relies on `BlockRecoveryDecision` to explain why a block was accepted, recovered, or left unrepaired.
+
+The table below is not hand-written policy text: it is the exact observed output from running:
+
+```bash
+cargo test document_block_recovery_decision_table -- --nocapture
+```
+
+Current recorded behavior:
+
+| Scenario | Elected hash | Repair source | Basis | Failure | Status message |
+| --- | --- | --- | --- | --- | --- |
+| target block matches an intact manifest | 111 | 0 | IntactHash | - | recovered block based on intact hash |
+| intact manifests agree, but no available file copy matches them | 111 | - | - | IntactHashWithoutMatchingBlock | failed to recover corrupt block [intact hash found but no matching file block] |
+| intact manifests disagree with each other | - | - | - | ConflictingIntactHashes | failed to recover corrupt block [conflicting intact hashes] |
+| two file copies agree and no intact manifest overrides them | 444 | 0 | FileAndFileAgreement | - | recovered block based on file+file agreement |
+| one file copy agrees with a manifest witness | 555 | 0 | FileAndManifestAgreement | - | recovered block based on file+manifest agreement |
+| two manifest witnesses agree, but no file copy matches them | 111 | - | - | ManifestOnlyAgreement | failed to recover corrupt block [manifest+manifest hashes agree] |
+| all witnesses are missing | - | - | - | NoBlockHashFound | failed to recover corrupt block [no block hash found either] |
+
+Interpretation notes:
+
+- `Repair source = 0` means the target block already matches the elected hash; `recover` does not need to copy data from another file.
+- A blank repair source means the code found an elected hash (or a failure reason), but did not identify a file copy that can safely supply replacement bytes.
+- `IntactHash` outranks the other agreement modes; if intact manifests disagree, the decision is a hard failure rather than falling through to weaker witnesses.
+
+---
+
+### `fro recover` semantics and modes
+
+Current form:
+
+```bash
+./target/release/fro recover [--fast] [--in-place-all] [--hash-base path] <target> <copy1> [copy2 ...]
+```
+
+What it does today:
+
+- Default mode repairs **only the first file** in place.
+- Later paths are treated as read-only candidate sources.
+- `recover` expects full-file replicas with identical file sizes and the same 1 MiB block geometry.
+- `recover` exits nonzero if any requested target file still has unrepaired blocks at the end.
+
+Mode summary:
+
+- Default `recover`
+  - hashes all candidate files (`target` + copies)
+  - elects a block hash
+  - rewrites only the first file when another file has the winning block bytes
+  - refreshes the first file’s sidecars when they are missing/corrupt/outdated and the file ends in a clean state
+- `recover --fast`
+  - first behaves like `verify` on the first file
+  - if the first file has intact sidecars and no corruption is found, it stops there
+  - otherwise it falls back to the full multi-file recover flow
+  - this is the cheapest “scrub the primary copy” mode
+- `recover --in-place-all`
+  - attempts to repair every input file in place
+  - also rewrites missing/corrupt sidecar replicas for files that end in a clean state
+  - cannot be combined with `--fast`
+
+Failure UX:
+
+- For each unrepaired block, `recover` prints the file index, file path, block number, and the exact failure reason.
+- If the run is incomplete, it exits nonzero and tells the user that more clean replicas may be needed.
+- If no writes were needed, it says so explicitly.
+
+Best-fit use case:
+
+- This is best thought of as **replica scrub + block repair**, not RAID and not FEC.
+- It is useful for large mostly-static blobs with multiple full copies:
+  - disk / VM images
+  - model checkpoints
+  - tarballs / ISOs / archives
+  - replicated backup artifacts
+- It cannot synthesize missing bytes from parity math; at least one file still needs the correct block contents.
+
+---
+
+### Block-hash observed speeds (recorded runs)
+
+These are example release-mode measurements from the current code on one real workload, recorded from actual runs rather than estimated:
+
+```bash
+./target/release/fro hash --no-direct -n 1 -v /mnt/fast/5GB_file.dat
+# hash 4376176641 bytes in 0.0944 s, 46.4 GB/s, [31, 131072, 1, 16, 262144, 8]
+
+./target/release/fro verify --no-direct -n 1 -v /mnt/fast/5GB_file.dat
+# verify 4376176641 bytes in 0.0879 s, 49.8 GB/s, [31, 131072, 1, 16, 262144, 8]
+
+# staging copy used for the recover measurement:
+./target/release/fro copy -n 1 /mnt/fast/5GB_file.dat /mnt/fast/5GB_file_copy.dat
+
+./target/release/fro recover --fast --no-direct -n 1 -v /mnt/fast/5GB_file.dat /mnt/fast/5GB_file_copy.dat
+# recover: repaired_blocks=0, repaired_files=0, sidecars_refreshed=0, failed_blocks=0, used_fast_path=true, fell_back_to_full_scan=false
+# recover 4376176641 bytes in 0.0842 s, 52.0 GB/s, [31, 131072, 1, 16, 262144, 8]
+
+./target/release/fro recover --no-direct -n 1 -v /mnt/fast/5GB_file.dat /mnt/fast/5GB_file_copy.dat
+# recover: repaired_blocks=0, repaired_files=0, sidecars_refreshed=0, failed_blocks=0, used_fast_path=false, fell_back_to_full_scan=false
+# recover 8752353282 bytes in 0.2223 s, 39.4 GB/s, [31, 131072, 1, 16, 262144, 8]
+```
+
+Important interpretation note:
+
+- `verify` hashes the target file once, then compares those hashes against the loaded manifest replicas. On the clean path it does **not** hash blocks a second time.
+- `recover --fast` hashes only the first file on the clean path when the first file already has intact sidecars.
+- Default `recover` hashes each candidate file once up front (`target` + every recovery copy), because it is preparing for block election and possible repair.
+- Successful repairs update the repaired block hashes in memory and refresh sidecars from that result; the current implementation does not require a second whole-target re-hash pass after writing blocks.
+
+### Demo scripts
+
+The repo includes a reproducible recover demo under `perf/`:
+
+```bash
+# Create a demo fileset, hash it, corrupt different blocks in different copies,
+# run recover --in-place-all, and verify every repaired copy matches the pristine file.
+./perf/recover_demo.sh /mnt/fast/fro-test
+```
+
+Helper script used by the demo:
+
+```bash
+./perf/corrupt_recover_demo_copies.sh /mnt/fast/fro-test
 ```
 
 ---

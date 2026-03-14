@@ -60,7 +60,12 @@ fn smoke_benchmark_runs_with_limited_iters_and_size() {
         .output()
         .expect("failed to run fro-benchmark");
 
-    assert!(out.status.success(), "stdout:\n{}\nstderr:\n{}\n", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}\n",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("read (forced page cache, hot)"));

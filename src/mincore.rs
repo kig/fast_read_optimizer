@@ -1,4 +1,4 @@
-use libc::{mmap, munmap, mincore, sysconf, _SC_PAGESIZE, MAP_SHARED, PROT_READ};
+use libc::{mincore, mmap, munmap, sysconf, MAP_SHARED, PROT_READ, _SC_PAGESIZE};
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
@@ -10,14 +10,7 @@ pub fn is_first_page_resident(file_path: &str) -> Result<bool, String> {
         let page_size = sysconf(_SC_PAGESIZE) as usize;
 
         // 1. Map the first page of the file
-        let addr = mmap(
-            ptr::null_mut(),
-            page_size,
-            PROT_READ,
-            MAP_SHARED,
-            fd,
-            0,
-        );
+        let addr = mmap(ptr::null_mut(), page_size, PROT_READ, MAP_SHARED, fd, 0);
 
         if addr == libc::MAP_FAILED {
             return Err("mmap failed".to_string());
@@ -25,10 +18,10 @@ pub fn is_first_page_resident(file_path: &str) -> Result<bool, String> {
 
         // 2. Prepare the status vector (1 byte per page)
         let mut vec: u8 = 0;
-        
+
         // 3. Call mincore
         let result = mincore(addr, page_size, &mut vec as *mut u8);
-        
+
         // Clean up mapping
         munmap(addr, page_size);
 
@@ -75,4 +68,3 @@ pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
         vec.iter().all(|&b| (b & 1) != 0)
     }
 }
-

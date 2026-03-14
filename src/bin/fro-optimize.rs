@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
 struct IOParams {
@@ -209,7 +209,8 @@ fn is_disk_backed_mount(e: &MountInfoEntry) -> bool {
     }
 
     // Common non-disk mount roots.
-    const EXCLUDE_MP_PREFIX: &[&str] = &["/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/snapd"];
+    const EXCLUDE_MP_PREFIX: &[&str] =
+        &["/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/snapd"];
     if EXCLUDE_MP_PREFIX.iter().any(|p| mp.starts_with(p)) {
         return false;
     }
@@ -439,7 +440,11 @@ fn dev_by_id_for_devpath(devpath: &Path) -> Vec<String> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let target = if link.is_absolute() { link } else { dir.join(link) };
+        let target = if link.is_absolute() {
+            link
+        } else {
+            dir.join(link)
+        };
         let canon = match fs::canonicalize(&target) {
             Ok(p) => p,
             Err(_) => continue,
@@ -472,15 +477,22 @@ fn enrich_device_leaf_from_devnode(leaf: &mut DeviceLeafInfo, devnode: &Path) {
         leaf.serial = read_sysfs_trimmed(&sys.join("device/serial"));
 
         if let Ok(devlink) = fs::read_link(sys.join("device")) {
-            let devpath = if devlink.is_absolute() { devlink } else { sys.join(devlink) };
+            let devpath = if devlink.is_absolute() {
+                devlink
+            } else {
+                sys.join(devlink)
+            };
             let devpath = fs::canonicalize(devpath).unwrap_or_else(|_| sys.join("device"));
             if let Some(bdf) = pci_bdf_from_sysfs_path(&devpath) {
                 leaf.pci_bdf = Some(bdf.clone());
                 let pcidir = Path::new("/sys/bus/pci/devices").join(&bdf);
-                leaf.pci_numa_node = read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
+                leaf.pci_numa_node =
+                    read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
                 leaf.pci_local_cpulist = read_sysfs_trimmed(&pcidir.join("local_cpulist"));
-                leaf.pcie_current_link_width = read_sysfs_trimmed(&pcidir.join("current_link_width"));
-                leaf.pcie_current_link_speed = read_sysfs_trimmed(&pcidir.join("current_link_speed"));
+                leaf.pcie_current_link_width =
+                    read_sysfs_trimmed(&pcidir.join("current_link_width"));
+                leaf.pcie_current_link_speed =
+                    read_sysfs_trimmed(&pcidir.join("current_link_speed"));
             }
         }
     }
@@ -522,8 +534,12 @@ fn parse_zfs_get_props(out: &str) -> BTreeMap<String, String> {
 
 fn zfs_get_props(dataset: &str) -> Option<BTreeMap<String, String>> {
     // Keep this small/structured; callers can always run `zfs get all` themselves.
-    let props = "recordsize,compression,compressratio,atime,sync,primarycache,secondarycache,logbias";
-    let out = run_cmd_stdout("zfs", &["get", "-Hp", "-o", "property,value", props, dataset])?;
+    let props =
+        "recordsize,compression,compressratio,atime,sync,primarycache,secondarycache,logbias";
+    let out = run_cmd_stdout(
+        "zfs",
+        &["get", "-Hp", "-o", "property,value", props, dataset],
+    )?;
     let m = parse_zfs_get_props(&out);
     if m.is_empty() {
         None
@@ -695,7 +711,11 @@ fn fill_device_info(e: &mut MountInfoEntry) {
                 e.zpool_vdevs_info = info;
             }
 
-            let topo = if e.zpool_vdevs_info.iter().any(|l| l.vdev_path.iter().any(|p| p.starts_with("mirror-"))) {
+            let topo = if e
+                .zpool_vdevs_info
+                .iter()
+                .any(|l| l.vdev_path.iter().any(|p| p.starts_with("mirror-")))
+            {
                 "mirror"
             } else if e
                 .zpool_vdevs_info
@@ -721,8 +741,14 @@ fn fill_device_info(e: &mut MountInfoEntry) {
                 .iter()
                 .map(|l| {
                     let bdf = l.pci_bdf.clone().unwrap_or_else(|| "?".into());
-                    let w = l.pcie_current_link_width.clone().unwrap_or_else(|| "?".into());
-                    let s = l.pcie_current_link_speed.clone().unwrap_or_else(|| "?".into());
+                    let w = l
+                        .pcie_current_link_width
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
+                    let s = l
+                        .pcie_current_link_speed
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
                     format!("{}@{}({}@{})", l.name, bdf, w, s)
                 })
                 .collect();
@@ -730,7 +756,10 @@ fn fill_device_info(e: &mut MountInfoEntry) {
             let devs = devs.join(",");
 
             let pool = e.zfs_pool.clone().unwrap_or_else(|| "unknown".into());
-            e.signature = Some(format!("fstype=zfs;pool={};topology={};models={};devs={}", pool, topo, models, devs));
+            e.signature = Some(format!(
+                "fstype=zfs;pool={};topology={};models={};devs={}",
+                pool, topo, models, devs
+            ));
         } else {
             e.signature = Some(format!("fstype={};source={}", e.fstype, e.mount_source));
         }
@@ -772,7 +801,8 @@ fn fill_device_info(e: &mut MountInfoEntry) {
         if let Some(bdf) = pci_bdf_from_sysfs_path(&devpath) {
             e.pci_bdf = Some(bdf.clone());
             let pcidir = Path::new("/sys/bus/pci/devices").join(&bdf);
-            e.pci_numa_node = read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
+            e.pci_numa_node =
+                read_sysfs_trimmed(&pcidir.join("numa_node")).and_then(|s| s.parse().ok());
             e.pci_local_cpulist = read_sysfs_trimmed(&pcidir.join("local_cpulist"));
             e.pcie_current_link_width = read_sysfs_trimmed(&pcidir.join("current_link_width"));
             e.pcie_current_link_speed = read_sysfs_trimmed(&pcidir.join("current_link_speed"));
@@ -786,7 +816,8 @@ fn fill_device_info(e: &mut MountInfoEntry) {
 
     if kind == "md" {
         e.md_level = read_sysfs_trimmed(&sys.join("md/level"));
-        e.md_chunk_bytes = read_sysfs_trimmed(&sys.join("md/chunk_size")).and_then(|s| s.parse().ok());
+        e.md_chunk_bytes =
+            read_sysfs_trimmed(&sys.join("md/chunk_size")).and_then(|s| s.parse().ok());
 
         let slaves_dir = sys.join("slaves");
         if let Ok(rd) = fs::read_dir(slaves_dir) {
@@ -836,8 +867,14 @@ fn fill_device_info(e: &mut MountInfoEntry) {
                 .iter()
                 .map(|l| {
                     let bdf = l.pci_bdf.clone().unwrap_or_else(|| "?".into());
-                    let w = l.pcie_current_link_width.clone().unwrap_or_else(|| "?".into());
-                    let s = l.pcie_current_link_speed.clone().unwrap_or_else(|| "?".into());
+                    let w = l
+                        .pcie_current_link_width
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
+                    let s = l
+                        .pcie_current_link_speed
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
                     format!("{}@{}({}@{})", l.name, bdf, w, s)
                 })
                 .collect();
@@ -855,7 +892,10 @@ fn fill_device_info(e: &mut MountInfoEntry) {
 }
 
 fn load_device_db() -> Option<DeviceDb> {
-    let p = std::env::var("FRO_DEVICE_DB").ok().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("fro-device-db.json"));
+    let p = std::env::var("FRO_DEVICE_DB")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("fro-device-db.json"));
     let data = fs::read_to_string(p).ok()?;
     let db: DeviceDb = serde_json::from_str(&data).ok()?;
     if db.version != 1 {
@@ -964,7 +1004,10 @@ mod tests {
             },
         ];
 
-        let kept: Vec<_> = entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect();
+        let kept: Vec<_> = entries
+            .into_iter()
+            .filter(|e| is_disk_backed_mount(e))
+            .collect();
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].mount_point, "/");
         assert_eq!(kept[1].mount_point, "/var/lib/data");
@@ -1051,7 +1094,6 @@ errors: No known data errors
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("nope"), None);
     }
-
 }
 
 fn fs_stats_for_path(path: &Path) -> Option<(u64, u64)> {
@@ -1064,7 +1106,11 @@ fn fs_stats_for_path(path: &Path) -> Option<(u64, u64)> {
         return None;
     }
 
-    let frsize = if vfs.f_frsize == 0 { vfs.f_bsize } else { vfs.f_frsize } as u64;
+    let frsize = if vfs.f_frsize == 0 {
+        vfs.f_bsize
+    } else {
+        vfs.f_frsize
+    } as u64;
     let total = frsize.saturating_mul(vfs.f_blocks as u64);
     let avail = frsize.saturating_mul(vfs.f_bavail as u64);
     Some((total, avail))
@@ -1215,7 +1261,10 @@ fn main() {
         let mut entries: Vec<_> = if list_devices_all {
             entries
         } else {
-            entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect()
+            entries
+                .into_iter()
+                .filter(|e| is_disk_backed_mount(e))
+                .collect()
         };
 
         for e in entries.iter_mut() {
@@ -1259,16 +1308,94 @@ fn main() {
         let mut configs: Vec<Vec<String>> = vec![
             argsv!("read", "-s", "--direct", "-n", &read_iters, &source_file),
             argsv!("read", "-s", "--no-direct", "-n", &read_iters, &source_file),
-            argsv!("grep", "-s", "--direct", "-n", &read_iters, "needle", &source_file),
-            argsv!("grep", "-s", "--no-direct", "-n", &read_iters, "needle", &source_file),
-            argsv!("write", "-s", "--direct", "-n", &write_iters, &target_file_dir),
-            argsv!("write", "-s", "--no-direct", "-n", &write_iters, &target_file_cache),
-            argsv!("copy", "-s", "--direct", "-n", &write_iters, &source_file, &target_file_dir),
-            argsv!("copy", "-s", "--no-direct", "-n", &write_iters, &source_file, &target_file_cache),
-            argsv!("diff", "-s", "--direct", "-n", &read_iters, &source_file, &target_file_dir),
-            argsv!("diff", "-s", "--no-direct", "-n", &read_iters, &source_file, &target_file_cache),
-            argsv!("dual-read-bench", "-s", "--direct", "-n", &read_iters, &source_file, &target_file_dir),
-            argsv!("dual-read-bench", "-s", "--no-direct", "-n", &read_iters, &source_file, &target_file_cache),
+            argsv!(
+                "grep",
+                "-s",
+                "--direct",
+                "-n",
+                &read_iters,
+                "needle",
+                &source_file
+            ),
+            argsv!(
+                "grep",
+                "-s",
+                "--no-direct",
+                "-n",
+                &read_iters,
+                "needle",
+                &source_file
+            ),
+            argsv!(
+                "write",
+                "-s",
+                "--direct",
+                "-n",
+                &write_iters,
+                &target_file_dir
+            ),
+            argsv!(
+                "write",
+                "-s",
+                "--no-direct",
+                "-n",
+                &write_iters,
+                &target_file_cache
+            ),
+            argsv!(
+                "copy",
+                "-s",
+                "--direct",
+                "-n",
+                &write_iters,
+                &source_file,
+                &target_file_dir
+            ),
+            argsv!(
+                "copy",
+                "-s",
+                "--no-direct",
+                "-n",
+                &write_iters,
+                &source_file,
+                &target_file_cache
+            ),
+            argsv!(
+                "diff",
+                "-s",
+                "--direct",
+                "-n",
+                &read_iters,
+                &source_file,
+                &target_file_dir
+            ),
+            argsv!(
+                "diff",
+                "-s",
+                "--no-direct",
+                "-n",
+                &read_iters,
+                &source_file,
+                &target_file_cache
+            ),
+            argsv!(
+                "dual-read-bench",
+                "-s",
+                "--direct",
+                "-n",
+                &read_iters,
+                &source_file,
+                &target_file_dir
+            ),
+            argsv!(
+                "dual-read-bench",
+                "-s",
+                "--no-direct",
+                "-n",
+                &read_iters,
+                &source_file,
+                &target_file_cache
+            ),
         ];
 
         if let Some(cfg) = config_path {
@@ -1278,112 +1405,117 @@ fn main() {
             }
         }
 
-    let mut selected = Vec::new();
-    for cfg in configs {
-        if patterns.is_empty() {
-            selected.push(cfg);
-            continue;
-        }
-        let mut ok = false;
-        for p in patterns.iter() {
-            if cfg[0].starts_with(p.as_str()) {
-                ok = true;
-                break;
+        let mut selected = Vec::new();
+        for cfg in configs {
+            if patterns.is_empty() {
+                selected.push(cfg);
+                continue;
             }
-        }
-        if ok {
-            selected.push(cfg);
-        }
-    }
-
-    if selected.is_empty() {
-        eprintln!("No optimizer modes selected.");
-        return;
-    }
-
-    let mut need_source = false;
-    let mut need_target_dir = false;
-    let mut need_target_cache = false;
-    let mut need_target_dir_matching = false;
-    let mut need_target_cache_matching = false;
-
-    let mut num_full_writes: u64 = 0;
-    for cfg in &selected {
-        let op = cfg[0].as_str();
-
-        if cfg.iter().any(|s| s == &source_file) {
-            need_source = true;
-        }
-        if cfg.iter().any(|s| s == &target_file_dir) {
-            need_target_dir = true;
-        }
-        if cfg.iter().any(|s| s == &target_file_cache) {
-            need_target_cache = true;
-        }
-
-        if (op == "diff" || op == "dual-read-bench") && cfg.iter().any(|s| s == &target_file_dir) {
-            need_target_dir_matching = true;
-        }
-        if (op == "diff" || op == "dual-read-bench") && cfg.iter().any(|s| s == &target_file_cache) {
-            need_target_cache_matching = true;
-        }
-
-        if op == "write" || op == "copy" {
-            let mut n = 1_u64;
-            let mut j = 0;
-            while j + 1 < cfg.len() {
-                if cfg[j] == "-n" {
-                    n = cfg[j + 1].parse::<u64>().unwrap_or(1);
+            let mut ok = false;
+            for p in patterns.iter() {
+                if cfg[0].starts_with(p.as_str()) {
+                    ok = true;
                     break;
                 }
-                j += 1;
             }
-            num_full_writes = num_full_writes.saturating_add(n);
+            if ok {
+                selected.push(cfg);
+            }
         }
-    }
 
-    if need_target_dir || need_target_cache {
-        need_source = true;
-    }
+        if selected.is_empty() {
+            eprintln!("No optimizer modes selected.");
+            return;
+        }
 
-    let file_count = (need_source as u64) + (need_target_dir as u64) + (need_target_cache as u64);
-    let setup_writes = (need_source as u64)
-        + (need_target_dir_matching as u64)
-        + (need_target_cache_matching as u64);
-    num_full_writes = num_full_writes.saturating_add(setup_writes);
+        let mut need_source = false;
+        let mut need_target_dir = false;
+        let mut need_target_cache = false;
+        let mut need_target_dir_matching = false;
+        let mut need_target_cache_matching = false;
 
-    let size = if let Some(s) = test_size {
-        align_down(s, 4096).max(4096)
-    } else if let Some((total, avail)) = fs_stats_for_path(test_path) {
-        let space_cap = ((avail as f64) * 0.60 / (file_count as f64)) as u64;
-        let wear_cap = if num_full_writes == 0 {
-            u64::MAX
+        let mut num_full_writes: u64 = 0;
+        for cfg in &selected {
+            let op = cfg[0].as_str();
+
+            if cfg.iter().any(|s| s == &source_file) {
+                need_source = true;
+            }
+            if cfg.iter().any(|s| s == &target_file_dir) {
+                need_target_dir = true;
+            }
+            if cfg.iter().any(|s| s == &target_file_cache) {
+                need_target_cache = true;
+            }
+
+            if (op == "diff" || op == "dual-read-bench")
+                && cfg.iter().any(|s| s == &target_file_dir)
+            {
+                need_target_dir_matching = true;
+            }
+            if (op == "diff" || op == "dual-read-bench")
+                && cfg.iter().any(|s| s == &target_file_cache)
+            {
+                need_target_cache_matching = true;
+            }
+
+            if op == "write" || op == "copy" {
+                let mut n = 1_u64;
+                let mut j = 0;
+                while j + 1 < cfg.len() {
+                    if cfg[j] == "-n" {
+                        n = cfg[j + 1].parse::<u64>().unwrap_or(1);
+                        break;
+                    }
+                    j += 1;
+                }
+                num_full_writes = num_full_writes.saturating_add(n);
+            }
+        }
+
+        if need_target_dir || need_target_cache {
+            need_source = true;
+        }
+
+        let file_count =
+            (need_source as u64) + (need_target_dir as u64) + (need_target_cache as u64);
+        let setup_writes = (need_source as u64)
+            + (need_target_dir_matching as u64)
+            + (need_target_cache_matching as u64);
+        num_full_writes = num_full_writes.saturating_add(setup_writes);
+
+        let size = if let Some(s) = test_size {
+            align_down(s, 4096).max(4096)
+        } else if let Some((total, avail)) = fs_stats_for_path(test_path) {
+            let space_cap = ((avail as f64) * 0.60 / (file_count as f64)) as u64;
+            let wear_cap = if num_full_writes == 0 {
+                u64::MAX
+            } else {
+                ((total as f64) * max_drive_writes / (num_full_writes as f64)) as u64
+            };
+
+            let mut size = max_test_size.min(space_cap).min(wear_cap);
+            size = align_down(size, 4096).max(4096);
+
+            if size < min_test_size {
+                eprintln!(
+                    "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
+                    fmt_gib(size),
+                    fmt_gib(min_test_size)
+                );
+            }
+
+            size
         } else {
-            ((total as f64) * max_drive_writes / (num_full_writes as f64)) as u64
+            eprintln!("Warning: statvfs failed for --test-dir; falling back to 4GiB");
+            4 * 1024 * 1024 * 1024
         };
 
-        let mut size = max_test_size.min(space_cap).min(wear_cap);
-        size = align_down(size, 4096).max(4096);
+        let est_user_writes = size.saturating_mul(num_full_writes);
+        let alloc = size.saturating_mul(file_count);
 
-        if size < min_test_size {
+        if test_size.is_none() {
             eprintln!(
-                "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
-                fmt_gib(size),
-                fmt_gib(min_test_size)
-            );
-        }
-
-        size
-    } else {
-        eprintln!("Warning: statvfs failed for --test-dir; falling back to 4GiB");
-        4 * 1024 * 1024 * 1024
-    };
-
-    let est_user_writes = size.saturating_mul(num_full_writes);
-    let alloc = size.saturating_mul(file_count);
-
-    if test_size.is_none() {
-        eprintln!(
             "Auto-sized test file: {} (alloc={} across {} files; est_writes={} => est_user_writes={})",
             fmt_gib(size),
             fmt_gib(alloc),
@@ -1391,94 +1523,99 @@ fn main() {
             num_full_writes,
             fmt_gib(est_user_writes),
         );
-    }
+        }
 
-    if plan {
-        println!("fro-optimize plan");
-        println!("  test_dir: {}", test_dir);
-        println!("  test_size: {}", fmt_gib(size));
-        println!("  file_count: {} (source={} direct_target={} cache_target={})", file_count, need_source, need_target_dir, need_target_cache);
-        println!("  alloc_total: {}", fmt_gib(alloc));
-        println!("  est_full_writes: {}", num_full_writes);
-        println!("  est_user_writes: {}", fmt_gib(est_user_writes));
-        println!("  max_drive_writes: {}", max_drive_writes);
-        println!("  selected_modes:");
-        for cfg in &selected {
-            println!("    {}", cfg.join(" "));
+        if plan {
+            println!("fro-optimize plan");
+            println!("  test_dir: {}", test_dir);
+            println!("  test_size: {}", fmt_gib(size));
+            println!(
+                "  file_count: {} (source={} direct_target={} cache_target={})",
+                file_count, need_source, need_target_dir, need_target_cache
+            );
+            println!("  alloc_total: {}", fmt_gib(alloc));
+            println!("  est_full_writes: {}", num_full_writes);
+            println!("  est_user_writes: {}", fmt_gib(est_user_writes));
+            println!("  max_drive_writes: {}", max_drive_writes);
+            println!("  selected_modes:");
+            for cfg in &selected {
+                println!("    {}", cfg.join(" "));
+            }
+            return;
         }
-        return;
-    }
 
-    // Setup temp files (only the ones we actually need).
-    if need_source {
-        if let Ok(f) = fs::File::create(&source_file) {
-            let _ = f.set_len(size);
-        }
-        let mut cmd = Command::new(&fro_exe);
-        cmd.arg("write");
-        if let Some(cfg) = config_path {
-            cmd.args(["-c", cfg]);
-        }
-        let _ = cmd
-            .arg(&source_file)
-            .status()
-            .expect("Failed to write fro_bench_tmp_source");
-    }
-    if need_target_dir {
-        if let Ok(f) = fs::File::create(&target_file_dir) {
-            let _ = f.set_len(size);
-        }
-        if need_target_dir_matching {
+        // Setup temp files (only the ones we actually need).
+        if need_source {
+            if let Ok(f) = fs::File::create(&source_file) {
+                let _ = f.set_len(size);
+            }
             let mut cmd = Command::new(&fro_exe);
-            cmd.arg("copy");
+            cmd.arg("write");
             if let Some(cfg) = config_path {
                 cmd.args(["-c", cfg]);
             }
             let _ = cmd
-                .args([&source_file, &target_file_dir])
+                .arg(&source_file)
                 .status()
-                .expect("Failed to prepare fro_bench_tmp_direct");
+                .expect("Failed to write fro_bench_tmp_source");
         }
-    }
-    if need_target_cache {
-        if let Ok(f) = fs::File::create(&target_file_cache) {
-            let _ = f.set_len(size);
-        }
-        if need_target_cache_matching {
-            let mut cmd = Command::new(&fro_exe);
-            cmd.arg("copy");
-            if let Some(cfg) = config_path {
-                cmd.args(["-c", cfg]);
+        if need_target_dir {
+            if let Ok(f) = fs::File::create(&target_file_dir) {
+                let _ = f.set_len(size);
             }
-            let _ = cmd
-                .args([&source_file, &target_file_cache])
+            if need_target_dir_matching {
+                let mut cmd = Command::new(&fro_exe);
+                cmd.arg("copy");
+                if let Some(cfg) = config_path {
+                    cmd.args(["-c", cfg]);
+                }
+                let _ = cmd
+                    .args([&source_file, &target_file_dir])
+                    .status()
+                    .expect("Failed to prepare fro_bench_tmp_direct");
+            }
+        }
+        if need_target_cache {
+            if let Ok(f) = fs::File::create(&target_file_cache) {
+                let _ = f.set_len(size);
+            }
+            if need_target_cache_matching {
+                let mut cmd = Command::new(&fro_exe);
+                cmd.arg("copy");
+                if let Some(cfg) = config_path {
+                    cmd.args(["-c", cfg]);
+                }
+                let _ = cmd
+                    .args([&source_file, &target_file_cache])
+                    .status()
+                    .expect("Failed to prepare fro_bench_tmp_cache");
+            }
+        }
+
+        println!("Running optimizer for all modes... (This may take a while)");
+
+        for args in selected {
+            println!("Optimizing: fro {:?}", args);
+            let status = Command::new(&fro_exe)
+                .args(&args)
                 .status()
-                .expect("Failed to prepare fro_bench_tmp_cache");
+                .expect("Failed to execute process");
+
+            if !status.success() {
+                eprintln!("Warning: Optimization failed for {:?}", args);
+            }
         }
-    }
 
-    println!("Running optimizer for all modes... (This may take a while)");
+        let _ = fs::remove_file(source_file);
+        let _ = fs::remove_file(target_file_dir);
+        let _ = fs::remove_file(target_file_cache);
 
-    for args in selected {
-        println!("Optimizing: fro {:?}", args);
-        let status = Command::new(&fro_exe)
-            .args(&args)
-            .status()
-            .expect("Failed to execute process");
-
-        if !status.success() {
-            eprintln!("Warning: Optimization failed for {:?}", args);
-        }
-    }
-
-    let _ = fs::remove_file(source_file);
-    let _ = fs::remove_file(target_file_dir);
-    let _ = fs::remove_file(target_file_cache);
-
-    let saved_to = config_path
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| fro::config::resolve_default_config_path().display().to_string());
-    println!("Optimization complete! Results saved to {}", saved_to);
+        let saved_to = config_path.map(|p| p.to_string()).unwrap_or_else(|| {
+            fro::config::resolve_default_config_path()
+                .display()
+                .to_string()
+        });
+        println!("Optimization complete! Results saved to {}", saved_to);
     };
 
     if all {

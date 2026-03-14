@@ -62,7 +62,10 @@ fn optimize_all_writes_target_config_and_selection_uses_mount_overrides() {
         .and_then(|m| m.as_object_mut())
         .expect("expected mount_overrides.by_mountpoint");
 
-    assert!(!by_mount.is_empty(), "expected at least one mount override entry");
+    assert!(
+        !by_mount.is_empty(),
+        "expected at least one mount override entry"
+    );
 
     // Pick one override and mutate it to a unique value; then assert config selection returns it.
     let mp = by_mount.keys().next().unwrap().to_string();
@@ -113,5 +116,4 @@ fn optimize_all_writes_target_config_and_selection_uses_mount_overrides() {
         "expected to see overridden params in output, got:\n{}",
         combined
     );
-
 }

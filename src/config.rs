@@ -74,8 +74,14 @@ pub struct DeviceDbConfig {
 
 #[derive(Clone, Debug)]
 pub enum LoadedConfig {
-    Legacy { path: PathBuf, config: AppConfig },
-    BundleV1 { path: PathBuf, bundle: ConfigBundleV1 },
+    Legacy {
+        path: PathBuf,
+        config: AppConfig,
+    },
+    BundleV1 {
+        path: PathBuf,
+        bundle: ConfigBundleV1,
+    },
 }
 
 impl LoadedConfig {
@@ -115,7 +121,13 @@ impl LoadedConfig {
 
         patch
             .get_mode_patch(mode)
-            .and_then(|m| if direct { m.direct.clone() } else { m.page_cache.clone() })
+            .and_then(|m| {
+                if direct {
+                    m.direct.clone()
+                } else {
+                    m.page_cache.clone()
+                }
+            })
             .unwrap_or(base)
     }
 
@@ -124,7 +136,13 @@ impl LoadedConfig {
         self.defaults_mut().update_params(mode, direct, params)
     }
 
-    pub fn update_params_for_path(&mut self, mode: &str, direct: bool, path: &str, params: IOParams) {
+    pub fn update_params_for_path(
+        &mut self,
+        mode: &str,
+        direct: bool,
+        path: &str,
+        params: IOParams,
+    ) {
         match self {
             LoadedConfig::BundleV1 { bundle, .. } => {
                 let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
@@ -143,7 +161,9 @@ impl LoadedConfig {
 
     pub fn save(&self) {
         match self {
-            LoadedConfig::Legacy { path, config } => config.save(path.to_str().unwrap_or("fro.json")),
+            LoadedConfig::Legacy { path, config } => {
+                config.save(path.to_str().unwrap_or("fro.json"))
+            }
             LoadedConfig::BundleV1 { path, bundle } => {
                 if let Ok(data) = serde_json::to_string_pretty(bundle) {
                     let _ = fs::write(path, data);
@@ -318,11 +338,27 @@ pub fn load_config(path: Option<&str>) -> LoadedConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let default_direct = IOParams { num_threads: 16, block_size: 3 * 1024 * 1024, qd: 2 };
-        let default_cache = IOParams { num_threads: 31, block_size: 128 * 1024, qd: 1 };
-        let default_write_direct = IOParams { num_threads: 4, block_size: 256 * 1024, qd: 3 };
-        let default_write = IOParams { num_threads: 4, block_size: 1024 * 1024, qd: 2 };
-        
+        let default_direct = IOParams {
+            num_threads: 16,
+            block_size: 3 * 1024 * 1024,
+            qd: 2,
+        };
+        let default_cache = IOParams {
+            num_threads: 31,
+            block_size: 128 * 1024,
+            qd: 1,
+        };
+        let default_write_direct = IOParams {
+            num_threads: 4,
+            block_size: 256 * 1024,
+            qd: 3,
+        };
+        let default_write = IOParams {
+            num_threads: 4,
+            block_size: 1024 * 1024,
+            qd: 2,
+        };
+
         let default_mode = ModeConfig {
             direct: default_direct.clone(),
             page_cache: default_cache.clone(),
@@ -336,14 +372,20 @@ impl Default for AppConfig {
         // Custom defaults based on previous tuning
         let mut diff_cache = default_cache.clone();
         diff_cache.num_threads = 4;
-        
+
         AppConfig {
             read: default_mode.clone(),
             write: default_write_mode.clone(),
             copy: default_write_mode.clone(),
             grep: default_mode.clone(),
-            diff: ModeConfig { direct: default_direct.clone(), page_cache: diff_cache.clone() },
-            dual_read_bench: ModeConfig { direct: default_direct.clone(), page_cache: diff_cache.clone() },
+            diff: ModeConfig {
+                direct: default_direct.clone(),
+                page_cache: diff_cache.clone(),
+            },
+            dual_read_bench: ModeConfig {
+                direct: default_direct.clone(),
+                page_cache: diff_cache.clone(),
+            },
         }
     }
 }
@@ -354,7 +396,7 @@ impl AppConfig {
             let _ = fs::write(path, data);
         }
     }
-    
+
     pub fn get_params(&self, mode: &str, direct: bool) -> IOParams {
         let mode_config = match mode {
             "read" => &self.read,
@@ -363,9 +405,15 @@ impl AppConfig {
             "grep" => &self.grep,
             "diff" => &self.diff,
             "dual-read-bench" => &self.dual_read_bench,
-            _ => return if direct { self.read.direct.clone() } else { self.read.page_cache.clone() },
+            _ => {
+                return if direct {
+                    self.read.direct.clone()
+                } else {
+                    self.read.page_cache.clone()
+                }
+            }
         };
-        
+
         if direct {
             mode_config.direct.clone()
         } else {
@@ -383,7 +431,7 @@ impl AppConfig {
             "dual-read-bench" => &mut self.dual_read_bench,
             _ => return,
         };
-        
+
         if direct {
             mode_config.direct = params;
         } else {
