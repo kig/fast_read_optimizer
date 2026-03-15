@@ -15,14 +15,18 @@ impl AlignedBuffer {
         let num_pages = (len + 4095) / 4096;
         let mut allocation = vec![PageAligned([0; 4096]); num_pages].into_boxed_slice();
         let ptr = allocation.as_mut_ptr() as *mut u8;
-        
-        Self { allocation, ptr, len }
+
+        Self {
+            allocation,
+            ptr,
+            len,
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
-    
+
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -33,4 +37,8 @@ unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
 #[derive(PartialEq, Copy, Clone)]
-pub enum IOMode { Auto, Direct, PageCache, }
+pub enum IOMode {
+    Auto,
+    Direct,
+    PageCache,
+}
