@@ -1,13 +1,357 @@
 use crate::common::{AlignedBuffer, IOMode};
+use crate::config::LoadedConfig;
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::Rng;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedWriteParams {
+    pub use_direct: bool,
+    pub qd: usize,
+    pub block_size: u64,
+}
+
+struct PendingAppend {
+    buffer: AlignedBuffer,
+    len: usize,
+}
+
+struct PendingOffsetWrite {
+    buffer: AlignedBuffer,
+    len: usize,
+}
+
+#[allow(dead_code)]
+pub struct SequentialWriter {
+    file_page_cache: File,
+    file_direct: File,
+    io_uring: IoUring,
+    pending: Vec<Option<PendingAppend>>,
+    bytes_written: u64,
+    bytes_submitted: u64,
+    use_direct: bool,
+    block_size: usize,
+    staging: Vec<u8>,
+}
+
+pub struct OffsetWriter {
+    file_page_cache: File,
+    file_direct: File,
+    io_uring: IoUring,
+    pending: Vec<Option<PendingOffsetWrite>>,
+    bytes_written: u64,
+    use_direct: bool,
+}
+
+impl SequentialWriter {
+    pub fn create(path: &str, qd: usize, block_size: u64, io_mode: IOMode) -> std::io::Result<Self> {
+        Self::open(path, qd, block_size, io_mode, true)
+    }
+
+    pub fn open_append(
+        path: &str,
+        qd: usize,
+        block_size: u64,
+        io_mode: IOMode,
+    ) -> std::io::Result<Self> {
+        Self::open(path, qd, block_size, io_mode, false)
+    }
+
+    fn open(
+        path: &str,
+        qd: usize,
+        block_size: u64,
+        io_mode: IOMode,
+        truncate: bool,
+    ) -> std::io::Result<Self> {
+        if qd == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "qd must be greater than zero",
+            ));
+        }
+        if block_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "block_size must be greater than zero",
+            ));
+        }
+        let (file_page_cache, file_direct, bytes_written) = open_writer_files(path, truncate, None)?;
+        Ok(Self {
+            file_page_cache,
+            file_direct,
+            io_uring: IoUring::new(1024).unwrap(),
+            pending: std::iter::repeat_with(|| None).take(qd).collect(),
+            bytes_written,
+            bytes_submitted: bytes_written,
+            use_direct: io_mode != IOMode::PageCache,
+            block_size: aligned_block_size(block_size as usize),
+            staging: Vec::new(),
+        })
+    }
+
+    pub fn append(&mut self, data: &[u8]) -> std::io::Result<u64> {
+        let start = self.bytes_written;
+        self.bytes_written += data.len() as u64;
+        self.staging.extend_from_slice(data);
+        self.submit_ready_chunks(false)?;
+        Ok(start)
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.submit_ready_chunks(true)?;
+        while self.pending.iter().any(Option::is_some) {
+            self.wait_for_one()?;
+        }
+        if !self.staging.is_empty() {
+            let tail = std::mem::take(&mut self.staging);
+            self.submit_chunk(&tail, false)?;
+            while self.pending.iter().any(Option::is_some) {
+                self.wait_for_one()?;
+            }
+        }
+        self.file_page_cache.flush()
+    }
+
+    fn submit_ready_chunks(&mut self, flush_all: bool) -> std::io::Result<()> {
+        while self.pending.iter().all(Option::is_some) {
+            self.wait_for_one()?;
+        }
+
+        loop {
+            let chunk_len = if self.use_direct {
+                if self.staging.len() < self.block_size {
+                    0
+                } else {
+                    self.block_size
+                }
+            } else if flush_all {
+                self.staging.len().min(self.block_size)
+            } else if self.staging.len() >= self.block_size {
+                self.block_size
+            } else {
+                0
+            };
+
+            if chunk_len == 0 {
+                return Ok(());
+            }
+
+            let chunk = self.staging[..chunk_len].to_vec();
+            self.submit_chunk(&chunk, self.use_direct)?;
+            self.staging.drain(..chunk_len);
+
+            if self.pending.iter().all(Option::is_some) {
+                self.wait_for_one()?;
+            }
+        }
+    }
+
+    fn submit_chunk(&mut self, data: &[u8], direct_requested: bool) -> std::io::Result<()> {
+        if self.pending.iter().all(Option::is_some) {
+            self.wait_for_one()?;
+        }
+
+        let slot = self
+            .pending
+            .iter()
+            .position(Option::is_none)
+            .expect("pending slot should exist");
+        let start = self.bytes_submitted;
+        self.bytes_submitted += data.len() as u64;
+
+        let mut buffer = AlignedBuffer::new(data.len());
+        buffer.as_mut_slice().copy_from_slice(data);
+        let use_direct = direct_requested && start % 4096 == 0 && data.len() % 4096 == 0;
+        let fd = if use_direct {
+            self.file_direct.as_raw_fd()
+        } else {
+            self.file_page_cache.as_raw_fd()
+        };
+        unsafe {
+            let mut sqe = self.io_uring.prepare_sqe().unwrap();
+            sqe.prep_write(fd, &buffer.as_slice()[..data.len()], start);
+            sqe.set_user_data(slot as u64);
+        }
+        self.pending[slot] = Some(PendingAppend {
+            buffer,
+            len: data.len(),
+        });
+        self.io_uring.submit_sqes().unwrap();
+        Ok(())
+    }
+
+    fn wait_for_one(&mut self) -> std::io::Result<()> {
+        let cq = self.io_uring.wait_for_cqe().unwrap();
+        let slot = cq.user_data() as usize;
+        let written = cq.result()?;
+        let pending = self.pending[slot]
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing pending append"))?;
+        let _keep_buffer_alive = pending.buffer;
+        if written as usize != pending.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "short write: expected {} bytes, wrote {}",
+                    pending.len, written
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OffsetWriter {
+    pub fn create(
+        path: &str,
+        total_size: u64,
+        qd: usize,
+        io_mode: IOMode,
+    ) -> std::io::Result<Self> {
+        if qd == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "qd must be greater than zero",
+            ));
+        }
+        let (file_page_cache, file_direct, _) = open_writer_files(path, true, Some(total_size))?;
+        Ok(Self {
+            file_page_cache,
+            file_direct,
+            io_uring: IoUring::new(1024).unwrap(),
+            pending: std::iter::repeat_with(|| None).take(qd).collect(),
+            bytes_written: 0,
+            use_direct: io_mode != IOMode::PageCache,
+        })
+    }
+
+    pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        if self.pending.iter().all(Option::is_some) {
+            self.wait_for_one()?;
+        }
+        let slot = self
+            .pending
+            .iter()
+            .position(Option::is_none)
+            .expect("pending slot should exist");
+        let mut buffer = AlignedBuffer::new(data.len());
+        buffer.as_mut_slice().copy_from_slice(data);
+        let use_direct = self.use_direct && offset % 4096 == 0 && data.len() % 4096 == 0;
+        let fd = if use_direct {
+            self.file_direct.as_raw_fd()
+        } else {
+            self.file_page_cache.as_raw_fd()
+        };
+        unsafe {
+            let mut sqe = self.io_uring.prepare_sqe().unwrap();
+            sqe.prep_write(fd, &buffer.as_slice()[..data.len()], offset);
+            sqe.set_user_data(slot as u64);
+        }
+        self.pending[slot] = Some(PendingOffsetWrite {
+            buffer,
+            len: data.len(),
+        });
+        self.io_uring.submit_sqes().unwrap();
+        self.bytes_written = self.bytes_written.max(offset + data.len() as u64);
+        Ok(())
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        while self.pending.iter().any(Option::is_some) {
+            self.wait_for_one()?;
+        }
+        self.file_page_cache.flush()
+    }
+
+    fn wait_for_one(&mut self) -> std::io::Result<()> {
+        let cq = self.io_uring.wait_for_cqe().unwrap();
+        let slot = cq.user_data() as usize;
+        let written = cq.result()?;
+        let pending = self.pending[slot]
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing pending offset write"))?;
+        let _keep_buffer_alive = pending.buffer;
+        if written as usize != pending.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "short write: expected {} bytes, wrote {}",
+                    pending.len, written
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn aligned_block_size(block_size: usize) -> usize {
+    block_size.max(4096) / 4096 * 4096
+}
+
+fn open_writer_files(
+    path: &str,
+    truncate: bool,
+    set_len: Option<u64>,
+) -> std::io::Result<(File, File, u64)> {
+    let mut page_cache_options = OpenOptions::new();
+    page_cache_options.write(true).create(true);
+    if truncate {
+        page_cache_options.truncate(true);
+    }
+    let file_page_cache = page_cache_options.open(path)?;
+    if let Some(size) = set_len {
+        file_page_cache.set_len(size)?;
+        unsafe {
+            libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
+        }
+    }
+    let bytes_written = file_page_cache.metadata()?.len();
+    let file_direct = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
+    Ok((file_page_cache, file_direct, bytes_written))
+}
+
+#[allow(dead_code)]
+pub fn resolve_writer_params_for_mode(
+    config: &LoadedConfig,
+    mode: &str,
+    filename: &str,
+    io_mode: IOMode,
+) -> ResolvedWriteParams {
+    let page_cache = config.get_params_for_path(mode, false, filename);
+    let direct = config.get_params_for_path(mode, true, filename);
+    let use_direct = io_mode != IOMode::PageCache;
+    let qd = if use_direct { direct.qd } else { page_cache.qd };
+    let block_size = if use_direct {
+        direct.block_size
+    } else {
+        page_cache.block_size
+    };
+    ResolvedWriteParams {
+        use_direct,
+        qd,
+        block_size,
+    }
+}
 
 fn thread_writer(
     thread_id: u64,
@@ -344,7 +688,6 @@ pub fn bench_mmap_write(filename: &str) {
 }
 
 pub fn bench_write(filename: &str) {
-    use std::io::Write;
     let size = 1024 * 1024 * 1024; // 1 GB
     let mut f = OpenOptions::new()
         .write(true)
@@ -368,4 +711,47 @@ pub fn bench_write(filename: &str) {
 
     let dur = start.elapsed().as_secs_f64();
     println!("Standard write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+        path
+    }
+
+    #[test]
+    fn sequential_writer_appends_in_order() {
+        let path = unique_temp_file("fro-sequential-writer");
+        let mut writer =
+            SequentialWriter::create(path.to_str().unwrap(), 3, 4096, IOMode::Auto).unwrap();
+
+        let a = vec![0x11; 4096];
+        let b = vec![0x22; 123];
+        let c = vec![0x33; 8192];
+
+        assert_eq!(writer.append(&a).unwrap(), 0);
+        assert_eq!(writer.append(&b).unwrap(), a.len() as u64);
+        assert_eq!(writer.append(&c).unwrap(), (a.len() + b.len()) as u64);
+        writer.flush().unwrap();
+
+        let data = fs::read(&path).unwrap();
+        assert_eq!(writer.bytes_written(), (a.len() + b.len() + c.len()) as u64);
+        assert_eq!(data.len(), a.len() + b.len() + c.len());
+        assert_eq!(&data[..a.len()], &a);
+        assert_eq!(&data[a.len()..a.len() + b.len()], &b);
+        assert_eq!(&data[a.len() + b.len()..], &c);
+
+        let _ = fs::remove_file(path);
+    }
 }

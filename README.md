@@ -392,8 +392,21 @@ This repository also exposes a small public Rust API through the `fro` crate:
 
 - `fro::config`
 - `fro::block_hash`
+- `fro::reader`
+- `fro::stream`
+- `fro::writer`
+- `fro::IOMode`
 
-For the Rust-facing API notes, exported data structures, and current caveats about embedding the block-hash helpers directly, see [`docs/API.md`](docs/API.md).
+For the Rust-facing API notes and examples, see [`docs/API.md`](docs/API.md).
+
+There are now example programs under `examples/` showing how to build on the crate:
+
+- `examples/model_loader.rs`
+- `examples/hw_sha256.rs`
+- `examples/parallel_zstd.rs`
+
+`examples/parallel_zstd.rs` now includes both compression and decompression paths and demonstrates the small streaming helpers intended for building high-throughput block pipelines with minimal glue code.
+The high-level Rust API now centers on `fro::stream::ParallelFile` and `fro::stream::ParallelWriter`, so blockwise compressors and decompressors can read like the obvious pseudocode: iterate blocks in parallel, then `write_at_index(...)` or `write_at_offset(...)`.
 
 ## Development notes
 
