@@ -426,7 +426,8 @@ fn thread_writer(
     write_count: Arc<AtomicU64>,
     random_block: Option<&[u8]>,
     total_size: u64,
-    use_direct: bool,
+    use_direct_read: bool,
+    use_direct_write: bool,
 ) -> io::Result<()> {
     let mut buffers = Vec::new();
     for _ in 0..qd {
@@ -452,7 +453,7 @@ fn thread_writer(
         let dst_offset = dest_base_offset + next_offset;
         let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
         if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
-            let fd = if use_direct && is_aligned_read {
+            let fd = if use_direct_read && is_aligned_read {
                 src_direct.as_raw_fd()
             } else {
                 src_pagecache.as_raw_fd()
@@ -470,7 +471,7 @@ fn thread_writer(
             }
         } else {
             let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
-            let fd = if use_direct && is_aligned_write {
+            let fd = if use_direct_write && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
                 dest_file.1.as_raw_fd()
@@ -503,7 +504,7 @@ fn thread_writer(
             let len = result as u64;
             let dst_offset = dest_base_offset + buffer_offsets[idx];
             let is_aligned_write = (dst_offset % 4096 == 0) && (len % 4096 == 0);
-            let fd = if use_direct && is_aligned_write {
+            let fd = if use_direct_write && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
                 dest_file.1.as_raw_fd()
@@ -528,7 +529,7 @@ fn thread_writer(
                 let dst_offset = dest_base_offset + next_offset;
                 let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
                 if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
-                    let fd = if use_direct && is_aligned_read {
+                    let fd = if use_direct_read && is_aligned_read {
                         src_direct.as_raw_fd()
                     } else {
                         src_pagecache.as_raw_fd()
@@ -546,7 +547,7 @@ fn thread_writer(
                     }
                 } else {
                     let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
-                    let fd = if use_direct && is_aligned_write {
+                    let fd = if use_direct_write && is_aligned_write {
                         dest_file.0.as_raw_fd()
                     } else {
                         dest_file.1.as_raw_fd()
@@ -642,7 +643,8 @@ pub fn copy_file_range(
                 write_count,
                 None,
                 copy_size,
-                direct_read && direct_write,
+                direct_read,
+                direct_write,
             )
         }));
     }
@@ -773,6 +775,7 @@ pub fn write_file(
                 random_block.as_ref().map(|b| &b[..]),
                 total_size,
                 direct_read,
+                direct_write,
             )
         }));
     }
