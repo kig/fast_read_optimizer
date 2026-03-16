@@ -69,7 +69,13 @@ fn build_args(input: &Path, output: &Path, flags: &[&str]) -> Vec<String> {
     args
 }
 
-fn compare_outputs(case_name: &str, example: &Output, system: &Output, example_output: &Path, system_output: &Path) {
+fn compare_outputs(
+    case_name: &str,
+    example: &Output,
+    system: &Output,
+    example_output: &Path,
+    system_output: &Path,
+) {
     assert_eq!(
         example.status.success(),
         system.status.success(),
@@ -172,7 +178,13 @@ fn dd_example_matches_system_dd_for_supported_flag_combinations() {
         let example = run_example(&example_args);
         let system = run_system_dd(&system_args);
 
-        compare_outputs(case.name, &example, &system, &example_output, &system_output);
+        compare_outputs(
+            case.name,
+            &example,
+            &system,
+            &example_output,
+            &system_output,
+        );
     }
 }
 
@@ -190,7 +202,13 @@ fn dd_example_direct_flags_preserve_output_semantics() {
         DdCase {
             name: "direct-write",
             initial_output: None,
-            flags: &["bs=4096", "count=4", "seek=1", "oflag=direct", "status=none"],
+            flags: &[
+                "bs=4096",
+                "count=4",
+                "seek=1",
+                "oflag=direct",
+                "status=none",
+            ],
         },
         DdCase {
             name: "direct-read-write-notrunc",
@@ -264,4 +282,36 @@ fn dd_example_direct_flags_preserve_output_semantics() {
             case.name
         );
     }
+}
+
+#[test]
+fn dd_example_matches_system_dd_when_writing_to_dev_null() {
+    let tmp = unique_temp_dir("dd-dev-null");
+    let input = tmp.join("input.bin");
+    let input_bytes = (0..(1024 * 1024 * 4 + 137))
+        .map(|i| ((i * 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&input, input_bytes).unwrap();
+
+    let args = vec![
+        format!("if={}", input.display()),
+        "of=/dev/null".to_string(),
+        "bs=1M".to_string(),
+        "skip=1".to_string(),
+        "seek=1".to_string(),
+        "count=2".to_string(),
+        "status=none".to_string(),
+    ];
+    let example = run_example(&args);
+    let system = run_system_dd(&args);
+
+    assert_eq!(
+        example.status.success(),
+        system.status.success(),
+        "example stderr=\n{}\nsystem stderr=\n{}",
+        String::from_utf8_lossy(&example.stderr),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(example.stdout, system.stdout);
+    assert_eq!(example.stderr, system.stderr);
 }

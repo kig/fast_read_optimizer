@@ -741,12 +741,24 @@ fn submit_read(
 fn open_reader_files(filename: &str, use_direct: bool) -> std::io::Result<(File, File)> {
     let file = File::open(filename)?;
     let file_direct = if use_direct {
-        OpenOptions::new()
+        match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(filename)?
+            .open(filename)
+        {
+            Ok(file_direct) => file_direct,
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE)
+                ) || err.kind() == std::io::ErrorKind::InvalidInput =>
+            {
+                file.try_clone()?
+            }
+            Err(err) => return Err(err),
+        }
     } else {
-        File::open(filename)?
+        file.try_clone()?
     };
     Ok((file, file_direct))
 }

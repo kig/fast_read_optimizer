@@ -9,6 +9,12 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
 
+fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> u64 {
+    let page_cache = config.get_params_for_path(mode, false, path);
+    let direct = config.get_params_for_path(mode, true, path);
+    page_cache.block_size.max(direct.block_size)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRange {
     pub offset: u64,
@@ -123,10 +129,11 @@ impl ParallelFile {
     }
 
     pub fn block_size(&self) -> std::io::Result<u64> {
-        Ok(
-            resolve_reader_params_for_mode(&self.config, &self.mode, &self.path, self.io_mode)?
-                .block_size,
-        )
+        Ok(default_logical_block_size(
+            &self.config,
+            &self.mode,
+            &self.path,
+        ))
     }
 
     pub fn foreach_block<F>(&self, visit: F) -> std::io::Result<ParallelReadReport>
@@ -374,7 +381,9 @@ impl ParallelWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, LoadedConfig};
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_file(prefix: &str) -> String {
@@ -432,6 +441,57 @@ mod tests {
         writer.write_at_index(0, b"b".to_vec()).unwrap();
         let err = writer.finish().unwrap_err();
         assert!(err.to_string().contains("duplicate write"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn foreach_block_uses_stable_logical_block_size_across_io_modes() {
+        let path = unique_temp_file("fro-parallel-file-block-size");
+        fs::write(&path, (0..200).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+
+        let mut app = AppConfig::default();
+        app.read.page_cache.block_size = 64 * 1024;
+        app.read.direct.block_size = 1024 * 1024;
+        let cfg = LoadedConfig::Legacy {
+            path: PathBuf::from("unused.json"),
+            config: app,
+        };
+
+        let page_cache = ParallelFile::open(&cfg, "read", &path, IOMode::PageCache).unwrap();
+        let direct = ParallelFile::open(&cfg, "read", &path, IOMode::Direct).unwrap();
+
+        assert_eq!(page_cache.block_size().unwrap(), 1024 * 1024);
+        assert_eq!(direct.block_size().unwrap(), 1024 * 1024);
+
+        let page_cache_chunks = Arc::new(Mutex::new(Vec::new()));
+        let direct_chunks = Arc::new(Mutex::new(Vec::new()));
+
+        let page_cache_chunks_for_visit = page_cache_chunks.clone();
+        page_cache
+            .foreach_block(move |index, data| {
+                page_cache_chunks_for_visit
+                    .lock()
+                    .unwrap()
+                    .push((index, data.len()));
+                Ok(())
+            })
+            .unwrap();
+
+        let direct_chunks_for_visit = direct_chunks.clone();
+        direct
+            .foreach_block(move |index, data| {
+                direct_chunks_for_visit
+                    .lock()
+                    .unwrap()
+                    .push((index, data.len()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            *page_cache_chunks.lock().unwrap(),
+            *direct_chunks.lock().unwrap()
+        );
         let _ = fs::remove_file(path);
     }
 }

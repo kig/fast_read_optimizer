@@ -1,5 +1,5 @@
 use crate::config::load_config;
-use crate::reader::{load_file_to_memory_for_mode, resolve_reader_params_for_mode};
+use crate::reader::load_file_to_memory_for_mode;
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{self, resolve_writer_params_for_mode, SequentialWriter};
 use crate::IOMode;
@@ -163,9 +163,5 @@ pub fn optimal_block_size<P: AsRef<Path>>(path: P) -> io::Result<u64> {
 }
 
 pub fn optimal_block_size_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<u64> {
-    let config = load_config(None);
-    Ok(
-        resolve_reader_params_for_mode(&config, "read", path_str(path.as_ref())?, io_mode)?
-            .block_size,
-    )
+    open_with_mode(path, io_mode)?.block_size()
 }

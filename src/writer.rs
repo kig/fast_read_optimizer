@@ -327,6 +327,37 @@ fn aligned_block_size(block_size: usize) -> usize {
     block_size.max(4096) / 4096 * 4096
 }
 
+fn direct_open_should_fallback(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE)
+    ) || err.kind() == io::ErrorKind::InvalidInput
+}
+
+fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
+    match OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
+        Err(err) => Err(err),
+    }
+}
+
 fn open_writer_files(
     path: &str,
     truncate: bool,
@@ -338,17 +369,21 @@ fn open_writer_files(
         page_cache_options.truncate(true);
     }
     let file_page_cache = page_cache_options.open(path)?;
+    let is_regular_file = file_page_cache.metadata()?.file_type().is_file();
     if let Some(size) = set_len {
-        file_page_cache.set_len(size)?;
-        unsafe {
-            libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
+        if is_regular_file {
+            file_page_cache.set_len(size)?;
+            unsafe {
+                libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
+            }
         }
     }
-    let bytes_written = file_page_cache.metadata()?.len();
-    let file_direct = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)?;
+    let bytes_written = if is_regular_file {
+        file_page_cache.metadata()?.len()
+    } else {
+        0
+    };
+    let file_direct = open_direct_writer_or_fallback(path, &file_page_cache)?;
     Ok((file_page_cache, file_direct, bytes_written))
 }
 
@@ -596,9 +631,11 @@ pub fn write_file(
     // Ensure target file exists and has the correct size. Pre-allocate blocks.
     {
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
-        f.set_len(total_size)?;
-        unsafe {
-            libc::posix_fallocate(f.as_raw_fd(), 0, total_size as i64);
+        if f.metadata()?.file_type().is_file() {
+            f.set_len(total_size)?;
+            unsafe {
+                libc::posix_fallocate(f.as_raw_fd(), 0, total_size as i64);
+            }
         }
     }
 
@@ -609,17 +646,11 @@ pub fn write_file(
         let random_block = random_block.clone();
         threads.push(std::thread::spawn(move || -> io::Result<()> {
             let dest_file_nodir = OpenOptions::new().write(true).open(&filename)?;
-            let dest_file_dir = OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&filename)?;
+            let dest_file_dir = open_direct_writer_or_fallback(&filename, &dest_file_nodir)?;
             let source_files = source
                 .map(|s| -> io::Result<(File, File)> {
                     let s_nodir = File::open(&s)?;
-                    let s_dir = OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_DIRECT)
-                        .open(&s)?;
+                    let s_dir = open_direct_reader_or_fallback(&s, &s_nodir)?;
                     Ok((s_dir, s_nodir))
                 })
                 .transpose()?;

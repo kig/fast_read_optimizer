@@ -249,8 +249,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .join()
             .map_err(|_| io::Error::other("progress thread panicked"))?;
     }
-    copy_result?;
-    let report = writer_result?;
+    let report = match (copy_result, writer_result) {
+        (Ok(()), Ok(report)) => report,
+        (Err(copy_err), Err(writer_err))
+            if copy_err.to_string().contains("sending on a closed channel") =>
+        {
+            return Err(writer_err.into());
+        }
+        (Err(copy_err), _) => return Err(copy_err.into()),
+        (_, Err(writer_err)) => return Err(writer_err.into()),
+    };
 
     if opts.fsync {
         OpenOptions::new()

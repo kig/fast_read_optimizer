@@ -51,3 +51,51 @@ fn offset_writer_can_preserve_existing_prefix_and_suffix() {
     assert_eq!(report.bytes_written, 6);
     assert_eq!(fs::read(path).unwrap(), b"abcXYZghij".to_vec());
 }
+
+#[test]
+fn direct_mode_keeps_high_level_block_iteration_stable() {
+    let tmp = unique_temp_dir("fro-public-api-direct");
+    fs::create_dir_all(&tmp).unwrap();
+    let path = tmp.join("source.bin");
+    let bytes = (0..(1024 * 1024 + 137))
+        .map(|i| ((i * 11) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &bytes).unwrap();
+
+    let page_cache_block_size =
+        fro::optimal_block_size_with_mode(&path, fro::IOMode::PageCache).unwrap();
+    let direct_block_size = fro::optimal_block_size_with_mode(&path, fro::IOMode::Direct).unwrap();
+    assert_eq!(page_cache_block_size, direct_block_size);
+
+    let page_cache_reader = fro::open_with_mode(&path, fro::IOMode::PageCache).unwrap();
+    let direct_reader = fro::open_with_mode(&path, fro::IOMode::Direct).unwrap();
+    let page_cache_chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let direct_chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let page_cache_chunks_for_visit = page_cache_chunks.clone();
+    page_cache_reader
+        .foreach_block(move |index, data| {
+            page_cache_chunks_for_visit
+                .lock()
+                .unwrap()
+                .push((index, data.len()));
+            Ok(())
+        })
+        .unwrap();
+
+    let direct_chunks_for_visit = direct_chunks.clone();
+    direct_reader
+        .foreach_block(move |index, data| {
+            direct_chunks_for_visit
+                .lock()
+                .unwrap()
+                .push((index, data.len()));
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        *page_cache_chunks.lock().unwrap(),
+        *direct_chunks.lock().unwrap()
+    );
+}
