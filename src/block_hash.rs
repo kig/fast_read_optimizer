@@ -1,3 +1,4 @@
+use libc::{c_uchar, size_t};
 use iou::IoUring;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -11,27 +12,174 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::common::{AlignedBuffer, IOMode};
 use crate::mincore::is_first_page_resident;
 
+#[link(name = "crypto")]
+unsafe extern "C" {
+    fn SHA256(data: *const c_uchar, len: size_t, md: *mut c_uchar) -> *mut c_uchar;
+}
+
 pub const BLOCK_HASH_SIZE: u64 = 1024 * 1024;
+const MAX_DIGEST_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManifestGeometry {
     file_size: u64,
     block_size: u64,
     block_count: usize,
+    hash_type: BlockHashAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockHashAlgorithm {
+    Xxh3,
+    Sha256,
+}
+
+impl BlockHashAlgorithm {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "xxh3" | "xxh3_64" => Some(Self::Xxh3),
+            "sha256" => Some(Self::Sha256),
+            _ => None,
+        }
+    }
+
+    fn digest_len(self) -> usize {
+        match self {
+            Self::Xxh3 => 8,
+            Self::Sha256 => 32,
+        }
+    }
+
+    fn hash_block(self, data: &[u8]) -> BlockDigest {
+        match self {
+            Self::Xxh3 => BlockDigest::from_prefix(&xxh3_64(data).to_le_bytes()),
+            Self::Sha256 => BlockDigest::from_prefix(&sha256_digest(data)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockDigest {
+    len: u8,
+    bytes: [u8; MAX_DIGEST_LEN],
+}
+
+impl BlockDigest {
+    fn from_prefix(bytes: &[u8]) -> Self {
+        let mut digest = [0u8; MAX_DIGEST_LEN];
+        digest[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            len: bytes.len() as u8,
+            bytes: digest,
+        }
+    }
+
+    fn is_valid_for(&self, hash_type: BlockHashAlgorithm) -> bool {
+        self.len as usize == hash_type.digest_len()
+            && self.bytes[hash_type.digest_len()..].iter().all(|byte| *byte == 0)
+    }
+
+    fn as_bytes_for(&self, hash_type: BlockHashAlgorithm) -> &[u8] {
+        debug_assert!(self.is_valid_for(hash_type));
+        &self.bytes[..hash_type.digest_len()]
+    }
+
+    fn to_hex(&self) -> String {
+        let mut hex = String::with_capacity(self.len as usize * 2);
+        for byte in &self.bytes[..self.len as usize] {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hex, "{:02x}", byte);
+        }
+        hex
+    }
+
+    fn from_hex(value: &str) -> Result<Self, String> {
+        if value.len() % 2 != 0 {
+            return Err(format!(
+                "expected an even number of hex characters, got {}",
+                value.len(),
+            ));
+        }
+        if value.len() / 2 > MAX_DIGEST_LEN {
+            return Err(format!(
+                "expected at most {} hex characters, got {}",
+                MAX_DIGEST_LEN * 2,
+                value.len()
+            ));
+        }
+        let mut digest = [0u8; MAX_DIGEST_LEN];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            let text = std::str::from_utf8(chunk).map_err(|err| err.to_string())?;
+            digest[index] = u8::from_str_radix(text, 16).map_err(|err| err.to_string())?;
+        }
+        Ok(Self {
+            len: (value.len() / 2) as u8,
+            bytes: digest,
+        })
+    }
+}
+
+impl std::fmt::Display for BlockDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl Serialize for BlockDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for BlockDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_hex(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHashManifest {
+    pub hash_type: BlockHashAlgorithm,
     pub file_size: u64,
     pub block_size: u64,
     pub bytes_hashed: u64,
-    pub block_hashes: Vec<u64>,
-    pub hash_of_hashes: u64,
+    pub block_hashes: Vec<BlockDigest>,
+    pub hash_of_hashes: BlockDigest,
 }
 
 impl BlockHashManifest {
     pub fn verify_integrity(&self) -> bool {
-        self.hash_of_hashes == hash_hashes(&self.block_hashes)
+        if self.bytes_hashed != self.file_size {
+            return false;
+        }
+        if validate_block_size(self.block_size).is_err() {
+            return false;
+        }
+        if !self.hash_of_hashes.is_valid_for(self.hash_type) {
+            return false;
+        }
+        if self
+            .block_hashes
+            .iter()
+            .any(|digest| !digest.is_valid_for(self.hash_type))
+        {
+            return false;
+        }
+        match block_count_for_size(self.file_size, self.block_size) {
+            Ok(expected_blocks) => {
+                expected_blocks == self.block_hashes.len()
+                    && self.hash_of_hashes == hash_hashes(self.hash_type, &self.block_hashes)
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -43,7 +191,7 @@ pub enum BlockHashWitnessKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHashVote {
-    pub hash: u64,
+    pub hash: BlockDigest,
     pub total_votes: usize,
     pub file_copy_votes: usize,
     pub hash_replica_votes: usize,
@@ -90,7 +238,7 @@ impl BlockRecoveryFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockRecoveryDecision {
     pub block_index: usize,
-    pub elected_hash: Option<u64>,
+    pub elected_hash: Option<BlockDigest>,
     pub repair_source_index: Option<usize>,
     pub basis: Option<BlockRecoveryBasis>,
     pub failure: Option<BlockRecoveryFailure>,
@@ -112,7 +260,7 @@ impl BlockRecoveryDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockVerifyIssue {
     pub block_index: usize,
-    pub current_hash: u64,
+    pub current_hash: BlockDigest,
     pub decision: BlockRecoveryDecision,
 }
 
@@ -130,7 +278,7 @@ pub struct BlockRecoverIssue {
     pub file_index: usize,
     pub file_path: String,
     pub block_index: usize,
-    pub current_hash: u64,
+    pub current_hash: BlockDigest,
     pub decision: BlockRecoveryDecision,
 }
 
@@ -152,12 +300,22 @@ pub struct RecoverReport {
     pub failed_blocks: Vec<BlockRecoverIssue>,
 }
 
-fn hash_hashes(values: &[u64]) -> u64 {
-    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<u64>());
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    let ret = unsafe { SHA256(data.as_ptr(), data.len(), digest.as_mut_ptr()) };
+    assert!(!ret.is_null(), "SHA256 returned null");
+    digest
+}
+
+fn hash_hashes(hash_type: BlockHashAlgorithm, values: &[BlockDigest]) -> BlockDigest {
+    let mut bytes = Vec::with_capacity(values.len() * hash_type.digest_len());
     for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        if !value.is_valid_for(hash_type) {
+            return BlockDigest::from_prefix(&[]);
+        }
+        bytes.extend_from_slice(value.as_bytes_for(hash_type));
     }
-    xxh3_64(&bytes)
+    hash_type.hash_block(&bytes)
 }
 
 fn validate_block_size(block_size: u64) -> std::io::Result<()> {
@@ -259,24 +417,28 @@ fn manifest_geometry(
             file_size: manifest.file_size,
             block_size: manifest.block_size,
             block_count,
+            hash_type: manifest.hash_type,
         };
 
         if let Some(previous) = expected {
             if previous.file_size != current.file_size
                 || previous.block_size != current.block_size
                 || previous.block_count != current.block_count
+                || previous.hash_type != current.hash_type
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "{} disagree on geometry; saw file_size={}, block_size={}, blocks={} and file_size={}, block_size={}, blocks={}",
+                        "{} disagree on geometry; saw file_size={}, block_size={}, blocks={}, hash_type={:?} and file_size={}, block_size={}, blocks={}, hash_type={:?}",
                         label,
                         previous.file_size,
                         previous.block_size,
                         previous.block_count,
+                        previous.hash_type,
                         current.file_size,
                         current.block_size,
-                        current.block_count
+                        current.block_count,
+                        current.hash_type
                     ),
                 ));
             }
@@ -299,6 +461,7 @@ fn consistent_intact_manifest(
     if intact.all(|manifest| {
         manifest.file_size == first.file_size
             && manifest.block_size == first.block_size
+            && manifest.hash_type == first.hash_type
             && manifest.block_hashes == first.block_hashes
     }) {
         Some(first)
@@ -315,6 +478,7 @@ fn sidecars_are_fully_healthy_for_current(
         && manifests.iter().all(|manifest| {
             manifest.as_ref().is_some_and(|manifest| {
                 manifest.verify_integrity()
+                    && manifest.hash_type == current.hash_type
                     && manifest.file_size == current.file_size
                     && manifest.block_size == current.block_size
                     && manifest.block_hashes == current.block_hashes
@@ -365,7 +529,7 @@ fn verify_report_from_current(
     }
 }
 
-fn tally_hash_votes(values: &[(u64, BlockHashWitnessKind)]) -> Vec<BlockHashVote> {
+fn tally_hash_votes(values: &[(BlockDigest, BlockHashWitnessKind)]) -> Vec<BlockHashVote> {
     let mut votes = Vec::<BlockHashVote>::new();
     for (hash, kind) in values {
         if let Some(vote) = votes.iter_mut().find(|vote| vote.hash == *hash) {
@@ -394,7 +558,10 @@ fn tally_hash_votes(values: &[(u64, BlockHashWitnessKind)]) -> Vec<BlockHashVote
     votes
 }
 
-fn first_matching_file_copy(file_copy_hashes: &[Option<u64>], expected_hash: u64) -> Option<usize> {
+fn first_matching_file_copy(
+    file_copy_hashes: &[Option<BlockDigest>],
+    expected_hash: BlockDigest,
+) -> Option<usize> {
     file_copy_hashes
         .iter()
         .position(|hash| hash.is_some_and(|value| value == expected_hash))
@@ -419,12 +586,11 @@ where
 
 pub fn recover_block_hash(
     block_index: usize,
-    file_copy_hashes: &[Option<u64>],
+    file_copy_hashes: &[Option<BlockDigest>],
     hash_manifests: &[Option<&BlockHashManifest>],
 ) -> BlockRecoveryDecision {
-    let mut witnesses = Vec::<(u64, BlockHashWitnessKind)>::new();
-    let mut intact_manifest_hashes = Vec::<u64>::new();
-    let mut all_manifest_hashes = Vec::<u64>::new();
+    let mut witnesses = Vec::<(BlockDigest, BlockHashWitnessKind)>::new();
+    let mut intact_manifest_hashes = Vec::<BlockDigest>::new();
 
     for hash in file_copy_hashes.iter().flatten() {
         witnesses.push((*hash, BlockHashWitnessKind::FileCopy));
@@ -432,7 +598,6 @@ pub fn recover_block_hash(
 
     for manifest in hash_manifests.iter().flatten() {
         if let Some(hash) = manifest.block_hashes.get(block_index) {
-            all_manifest_hashes.push(*hash);
             if manifest.verify_integrity() {
                 intact_manifest_hashes.push(*hash);
             }
@@ -452,6 +617,19 @@ pub fn recover_block_hash(
                 failure: Some(BlockRecoveryFailure::ConflictingIntactHashes),
                 votes,
             };
+        }
+
+        if let Some(top) = unique_top_vote(&votes, |vote| vote.file_copy_votes >= 2) {
+            if top.hash != first {
+                return BlockRecoveryDecision {
+                    block_index,
+                    elected_hash: None,
+                    repair_source_index: None,
+                    basis: None,
+                    failure: Some(BlockRecoveryFailure::ConflictingIntactHashes),
+                    votes,
+                };
+            }
         }
 
         return BlockRecoveryDecision {
@@ -542,10 +720,12 @@ fn submit_read(
     block_id: u64,
     use_direct: bool,
     file_size: u64,
-) {
+) -> std::io::Result<()> {
     let direct = should_use_direct_io(use_direct, offset, buffer.as_slice().len(), file_size);
     unsafe {
-        let mut sqe = io_uring.prepare_sqe().unwrap();
+        let mut sqe = io_uring
+            .prepare_sqe()
+            .ok_or_else(|| std::io::Error::other("io_uring submission queue is full"))?;
         if direct {
             sqe.prep_read(file_direct.as_raw_fd(), buffer.as_mut_slice(), offset);
         } else {
@@ -553,20 +733,35 @@ fn submit_read(
         }
         sqe.set_user_data(block_id);
     }
+    Ok(())
 }
 
-fn open_reader_files(filename: &str, use_direct: bool) -> (File, File) {
-    let file = File::open(filename).unwrap();
+fn open_reader_files(filename: &str, use_direct: bool) -> std::io::Result<(File, File)> {
+    let file = File::open(filename)?;
     let file_direct = if use_direct {
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(filename)
-            .unwrap()
+            ?
     } else {
-        File::open(filename).unwrap()
+        File::open(filename)?
     };
-    (file, file_direct)
+    Ok((file, file_direct))
+}
+
+fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
+    let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
+    let mut ready = vec![(cq.user_data(), cq.result()?)];
+
+    while io_uring.cq_ready() > 0 {
+        let cq = io_uring
+            .peek_for_cqe()
+            .ok_or_else(|| std::io::Error::other("completion queue reported ready but no CQE was available"))?;
+        ready.push((cq.user_data(), cq.result()?));
+    }
+
+    Ok(ready)
 }
 
 fn thread_hash_reader(
@@ -578,18 +773,19 @@ fn thread_hash_reader(
     file_direct: &mut File,
     io_uring: &mut IoUring,
     read_count: Arc<AtomicU64>,
-    block_hashes: Arc<Vec<AtomicU64>>,
+    hash_type: BlockHashAlgorithm,
     use_direct: bool,
-) {
+) -> std::io::Result<Vec<(usize, BlockDigest)>> {
     let mut buffers = Vec::new();
     for _ in 0..qd {
         buffers.push(AlignedBuffer::new(block_size as usize));
     }
 
-    let file_size = file.seek(SeekFrom::End(0)).unwrap();
+    let file_size = file.seek(SeekFrom::End(0))?;
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
+    let mut digests = Vec::new();
 
     for _ in 0..qd {
         let current_offset = block_offset(offset, block_num as u64, num_threads, block_size);
@@ -605,31 +801,25 @@ fn thread_hash_reader(
             block_num as u64,
             use_direct,
             file_size,
-        );
+        )?;
         block_num += 1;
         inflight += 1;
     }
 
     if inflight == 0 {
-        return;
+        return Ok(digests);
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        let cq = io_uring.wait_for_cqe().unwrap();
-        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
-
-        while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
-            ready.push((cq.user_data() as u64, cq.result().unwrap()));
-        }
+        let ready = wait_for_ready(io_uring)?;
 
         for (block_id, result) in ready {
             if result > 0 {
                 let current_offset = block_offset(offset, block_id, num_threads, block_size);
                 let hash_index = (current_offset / block_size) as usize;
                 let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
-                block_hashes[hash_index].store(xxh3_64(buf), Ordering::Relaxed);
+                digests.push((hash_index, hash_type.hash_block(buf)));
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
             }
             inflight -= 1;
@@ -645,21 +835,22 @@ fn thread_hash_reader(
                     block_num as u64,
                     use_direct,
                     file_size,
-                );
+                )?;
                 block_num += 1;
                 inflight += 1;
             }
         }
 
-        io_uring.submit_sqes().unwrap();
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
         if inflight == 0 {
-            return;
+            return Ok(digests);
         }
     }
 }
 
 fn hash_file_blocks_inner(
     filename: &str,
+    hash_type: BlockHashAlgorithm,
     num_threads_p: u64,
     block_size_p: u64,
     qd_p: usize,
@@ -684,22 +875,22 @@ fn hash_file_blocks_inner(
     let qd = if use_direct { qd_d } else { qd_p };
     validate_block_size(block_size)?;
 
-    let file_size = std::fs::metadata(filename).unwrap().len();
+    let file_size = std::fs::metadata(filename)?.len();
     let block_count = block_count_for_size(file_size, block_size)?;
-    let block_hashes = Arc::new(
-        (0..block_count)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>(),
-    );
+    if use_direct && file_size % block_size != 0 {
+        eprintln!(
+            "Warning: hash requested direct I/O but the final partial block will use page-cache reads"
+        );
+    }
+    let mut block_hashes = vec![BlockDigest::from_prefix(&[]); block_count];
 
     let mut threads = vec![];
     for thread_id in 0..num_threads {
         let read_count = read_count.clone();
         let filename = filename.to_string();
-        let block_hashes = block_hashes.clone();
-        threads.push(std::thread::spawn(move || {
-            let (mut file, mut file_direct) = open_reader_files(&filename, use_direct);
-            let mut io_uring = IoUring::new(1024).unwrap();
+        threads.push(std::thread::spawn(move || -> std::io::Result<Vec<(usize, BlockDigest)>> {
+            let (mut file, mut file_direct) = open_reader_files(&filename, use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
             thread_hash_reader(
                 thread_id,
                 num_threads,
@@ -709,23 +900,24 @@ fn hash_file_blocks_inner(
                 &mut file_direct,
                 &mut io_uring,
                 read_count,
-                block_hashes,
+                hash_type,
                 use_direct,
             )
         }));
     }
 
     for thread in threads {
-        thread.join().unwrap();
+        for (index, digest) in thread
+            .join()
+            .map_err(|_| std::io::Error::other("hash worker thread panicked"))??
+        {
+            block_hashes[index] = digest;
+        }
     }
-
-    let block_hashes = block_hashes
-        .iter()
-        .map(|value| value.load(Ordering::Relaxed))
-        .collect::<Vec<_>>();
-    let hash_of_hashes = hash_hashes(&block_hashes);
+    let hash_of_hashes = hash_hashes(hash_type, &block_hashes);
 
     Ok(BlockHashManifest {
+        hash_type,
         file_size,
         block_size,
         bytes_hashed: read_count.load(Ordering::SeqCst),
@@ -736,6 +928,7 @@ fn hash_file_blocks_inner(
 
 pub fn hash_file_blocks(
     filename: &str,
+    hash_type: BlockHashAlgorithm,
     num_threads_p: u64,
     block_size_p: u64,
     qd_p: usize,
@@ -746,6 +939,7 @@ pub fn hash_file_blocks(
 ) -> std::io::Result<BlockHashManifest> {
     hash_file_blocks_inner(
         filename,
+        hash_type,
         num_threads_p,
         block_size_p,
         qd_p,
@@ -759,6 +953,7 @@ pub fn hash_file_blocks(
 pub fn hash_file_to_replicas(
     filename: &str,
     hash_base: Option<&str>,
+    hash_type: BlockHashAlgorithm,
     num_threads_p: u64,
     block_size_p: u64,
     qd_p: usize,
@@ -769,6 +964,7 @@ pub fn hash_file_to_replicas(
 ) -> std::io::Result<BlockHashManifest> {
     let manifest = hash_file_blocks(
         filename,
+        hash_type,
         num_threads_p,
         block_size_p,
         qd_p,
@@ -800,6 +996,7 @@ pub fn verify_file_with_replicas(
     let manifest_geometry = manifest_geometry(&manifests, &format!("hash replicas for {}", filename))?;
     let current = hash_file_blocks_inner(
         filename,
+        manifest_geometry.map(|g| g.hash_type).unwrap_or(BlockHashAlgorithm::Xxh3),
         num_threads_p,
         manifest_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
         qd_p,
@@ -831,6 +1028,7 @@ fn write_block(path: &str, block_index: usize, block_size: u64, data: &[u8]) -> 
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(data)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -879,6 +1077,15 @@ fn ensure_matching_file_geometry(
                     path,
                     manifest.block_hashes.len(),
                     first.block_hashes.len()
+                ),
+            ));
+        }
+        if manifest.hash_type != first.hash_type {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "recover expects identical hash types; {} uses {:?} but target uses {:?}",
+                    path, manifest.hash_type, first.hash_type
                 ),
             ));
         }
@@ -998,7 +1205,7 @@ fn repair_file_set(
             continue;
         }
 
-        manifest.hash_of_hashes = hash_hashes(&manifest.block_hashes);
+        manifest.hash_of_hashes = hash_hashes(manifest.hash_type, &manifest.block_hashes);
         if !sidecars_are_fully_healthy_for_current(manifest, &stored_replicas[index]) {
             let base = hash_base_for_file(index, &files[index], hash_base);
             save_manifest_replicas(&base, manifest)?;
@@ -1035,6 +1242,9 @@ pub fn recover_file_with_copies(
     let mut manifests_now = if recover_mode == RecoverMode::Fast {
         let mut current = hash_file_blocks_inner(
             target,
+            stored_geometry
+                .map(|g| g.hash_type)
+                .unwrap_or(BlockHashAlgorithm::Xxh3),
             num_threads_p,
             stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
             qd_p,
@@ -1048,7 +1258,7 @@ pub fn recover_file_with_copies(
         {
             used_fast_path = true;
             let mut sidecars_refreshed = 0;
-            current.hash_of_hashes = hash_hashes(&current.block_hashes);
+            current.hash_of_hashes = hash_hashes(current.hash_type, &current.block_hashes);
             if !sidecars_are_fully_healthy_for_current(&current, &stored_replicas[0]) {
                 let base = hash_base_for_file(0, target, hash_base);
                 save_manifest_replicas(&base, &current)?;
@@ -1071,6 +1281,9 @@ pub fn recover_file_with_copies(
         for path in files.iter().skip(1) {
             manifests.push(hash_file_blocks_inner(
                 path,
+                stored_geometry
+                    .map(|g| g.hash_type)
+                    .unwrap_or(BlockHashAlgorithm::Xxh3),
                 num_threads_p,
                 stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
                 qd_p,
@@ -1086,6 +1299,9 @@ pub fn recover_file_with_copies(
             .map(|path| {
                 hash_file_blocks_inner(
                     path,
+                    stored_geometry
+                        .map(|g| g.hash_type)
+                        .unwrap_or(BlockHashAlgorithm::Xxh3),
                     num_threads_p,
                     stored_geometry.map(|g| g.block_size).unwrap_or(block_size_p),
                     qd_p,
@@ -1146,8 +1362,18 @@ mod tests {
         (0..size).map(|i| ((i * 131) % 251) as u8).collect()
     }
 
-    fn expected_hashes(data: &[u8], block_size: usize) -> Vec<u64> {
-        data.chunks(block_size).map(xxh3_64).collect()
+    fn digest_u64(value: u64) -> BlockDigest {
+        BlockDigest::from_prefix(&value.to_le_bytes())
+    }
+
+    fn digest_sha256(byte: u8) -> BlockDigest {
+        BlockHashAlgorithm::Sha256.hash_block(&[byte; 17])
+    }
+
+    fn expected_hashes(data: &[u8], block_size: usize) -> Vec<BlockDigest> {
+        data.chunks(block_size)
+            .map(|chunk| BlockHashAlgorithm::Xxh3.hash_block(chunk))
+            .collect()
     }
 
     #[test]
@@ -1159,6 +1385,7 @@ mod tests {
 
         let manifest = hash_file_blocks(
             path.to_str().unwrap(),
+            BlockHashAlgorithm::Xxh3,
             3,
             BLOCK_HASH_SIZE,
             2,
@@ -1187,6 +1414,7 @@ mod tests {
 
         let mut manifest = hash_file_blocks(
             path.to_str().unwrap(),
+            BlockHashAlgorithm::Xxh3,
             2,
             BLOCK_HASH_SIZE,
             2,
@@ -1196,7 +1424,7 @@ mod tests {
             IOMode::PageCache,
         )
         .unwrap();
-        manifest.block_hashes[1] ^= 1;
+        manifest.block_hashes[1] = digest_u64(1);
 
         assert!(!manifest.verify_integrity());
 
@@ -1212,6 +1440,7 @@ mod tests {
 
         let mut manifest = hash_file_blocks(
             path.to_str().unwrap(),
+            BlockHashAlgorithm::Xxh3,
             2,
             BLOCK_HASH_SIZE,
             2,
@@ -1224,36 +1453,101 @@ mod tests {
 
         assert!(manifest.verify_integrity());
 
-        manifest.hash_of_hashes ^= 1;
+        manifest.hash_of_hashes = digest_u64(1);
         assert!(!manifest.verify_integrity());
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
+    fn sha256_manifest_uses_variable_digest_size() {
+        let block_size = BLOCK_HASH_SIZE as usize;
+        let data = fixture_bytes(block_size + 31);
+        let path = unique_temp_file("fro-block-hash-sha256");
+        fs::write(&path, &data).unwrap();
+
+        let manifest = hash_file_blocks(
+            path.to_str().unwrap(),
+            BlockHashAlgorithm::Sha256,
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            2,
+            BLOCK_HASH_SIZE,
+            2,
+            IOMode::PageCache,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.hash_type, BlockHashAlgorithm::Sha256);
+        assert!(manifest
+            .block_hashes
+            .iter()
+            .all(|digest| digest.len as usize == BlockHashAlgorithm::Sha256.digest_len()));
+        assert_eq!(
+            manifest.hash_of_hashes.len as usize,
+            BlockHashAlgorithm::Sha256.digest_len()
+        );
+        assert!(manifest.verify_integrity());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn verify_integrity_rejects_wrong_digest_lengths_and_partial_hashes() {
+        let manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Sha256,
+            file_size: BLOCK_HASH_SIZE,
+            block_size: BLOCK_HASH_SIZE,
+            bytes_hashed: BLOCK_HASH_SIZE - 1,
+            block_hashes: vec![digest_u64(99)],
+            hash_of_hashes: digest_sha256(7),
+        };
+        assert!(!manifest.verify_integrity());
+
+        let manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Sha256,
+            file_size: BLOCK_HASH_SIZE,
+            block_size: BLOCK_HASH_SIZE,
+            bytes_hashed: BLOCK_HASH_SIZE,
+            block_hashes: vec![digest_sha256(9)],
+            hash_of_hashes: digest_u64(7),
+        };
+        assert!(!manifest.verify_integrity());
+    }
+
+    #[test]
     fn recover_block_hash_prefers_intact_hash_manifest() {
         let manifest_a = BlockHashManifest {
-            file_size: BLOCK_HASH_SIZE,
+            hash_type: BlockHashAlgorithm::Xxh3,
+            file_size: BLOCK_HASH_SIZE * 2,
             block_size: BLOCK_HASH_SIZE,
-            bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![111, 222],
-            hash_of_hashes: hash_hashes(&[111, 222]),
+            bytes_hashed: BLOCK_HASH_SIZE * 2,
+            block_hashes: vec![digest_u64(111), digest_u64(222)],
+            hash_of_hashes: hash_hashes(
+                BlockHashAlgorithm::Xxh3,
+                &[digest_u64(111), digest_u64(222)],
+            ),
         };
         let manifest_b = BlockHashManifest {
-            file_size: BLOCK_HASH_SIZE,
+            hash_type: BlockHashAlgorithm::Xxh3,
+            file_size: BLOCK_HASH_SIZE * 2,
             block_size: BLOCK_HASH_SIZE,
-            bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![111, 999],
-            hash_of_hashes: hash_hashes(&[111, 999]),
+            bytes_hashed: BLOCK_HASH_SIZE * 2,
+            block_hashes: vec![digest_u64(111), digest_u64(999)],
+            hash_of_hashes: hash_hashes(
+                BlockHashAlgorithm::Xxh3,
+                &[digest_u64(111), digest_u64(999)],
+            ),
         };
 
         let decision = recover_block_hash(
             0,
-            &[Some(111), Some(333)],
+            &[Some(digest_u64(111)), Some(digest_u64(333))],
             &[Some(&manifest_a), Some(&manifest_b), None],
         );
 
-        assert_eq!(decision.elected_hash, Some(111));
+        assert_eq!(decision.elected_hash, Some(digest_u64(111)));
         assert_eq!(decision.repair_source_index, Some(0));
         assert_eq!(decision.basis, Some(BlockRecoveryBasis::IntactHash));
         assert_eq!(decision.failure, None);
@@ -1261,33 +1555,35 @@ mod tests {
             decision.status_message(),
             "recovered block based on intact hash"
         );
-        assert_eq!(decision.votes[0].hash, 111);
+        assert_eq!(decision.votes[0].hash, digest_u64(111));
     }
 
     #[test]
     fn recover_block_hash_reports_manifest_only_agreement() {
         let manifest_a = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![111],
-            hash_of_hashes: 0,
+            block_hashes: vec![digest_u64(111)],
+            hash_of_hashes: digest_u64(0),
         };
         let manifest_b = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![111],
-            hash_of_hashes: 0,
+            block_hashes: vec![digest_u64(111)],
+            hash_of_hashes: digest_u64(0),
         };
 
         let decision = recover_block_hash(
             0,
-            &[Some(222), Some(333)],
+            &[Some(digest_u64(222)), Some(digest_u64(333))],
             &[Some(&manifest_a), Some(&manifest_b), None],
         );
 
-        assert_eq!(decision.elected_hash, Some(111));
+        assert_eq!(decision.elected_hash, Some(digest_u64(111)));
         assert_eq!(decision.repair_source_index, None);
         assert_eq!(decision.basis, None);
         assert_eq!(
@@ -1303,27 +1599,29 @@ mod tests {
     #[test]
     fn recover_block_hash_can_use_file_and_manifest_agreement() {
         let good_manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![555],
-            hash_of_hashes: 0,
+            block_hashes: vec![digest_u64(555)],
+            hash_of_hashes: digest_u64(0),
         };
         let bad_manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE,
-            block_hashes: vec![777],
-            hash_of_hashes: 0,
+            block_hashes: vec![digest_u64(777)],
+            hash_of_hashes: digest_u64(0),
         };
 
         let decision = recover_block_hash(
             0,
-            &[Some(555), Some(999)],
+            &[Some(digest_u64(555)), Some(digest_u64(999))],
             &[Some(&good_manifest), Some(&bad_manifest), None],
         );
 
-        assert_eq!(decision.elected_hash, Some(555));
+        assert_eq!(decision.elected_hash, Some(digest_u64(555)));
         assert_eq!(decision.repair_source_index, Some(0));
         assert_eq!(
             decision.basis,
@@ -1339,9 +1637,13 @@ mod tests {
     #[test]
     fn recover_block_hash_can_use_file_and_file_agreement() {
         let decision =
-            recover_block_hash(0, &[Some(444), Some(444), Some(999)], &[None, None, None]);
+            recover_block_hash(
+                0,
+                &[Some(digest_u64(444)), Some(digest_u64(444)), Some(digest_u64(999))],
+                &[None, None, None],
+            );
 
-        assert_eq!(decision.elected_hash, Some(444));
+        assert_eq!(decision.elected_hash, Some(digest_u64(444)));
         assert_eq!(decision.repair_source_index, Some(0));
         assert_eq!(
             decision.basis,
@@ -1352,6 +1654,49 @@ mod tests {
             decision.status_message(),
             "recovered block based on file+file agreement"
         );
+    }
+
+    #[test]
+    fn recover_block_hash_rejects_intact_manifest_that_disagrees_with_file_majority() {
+        let manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
+            file_size: BLOCK_HASH_SIZE,
+            block_size: BLOCK_HASH_SIZE,
+            bytes_hashed: BLOCK_HASH_SIZE,
+            block_hashes: vec![digest_u64(999)],
+            hash_of_hashes: hash_hashes(BlockHashAlgorithm::Xxh3, &[digest_u64(999)]),
+        };
+
+        let decision = recover_block_hash(
+            0,
+            &[Some(digest_u64(111)), Some(digest_u64(111)), Some(digest_u64(222))],
+            &[Some(&manifest), None, None],
+        );
+
+        assert_eq!(decision.elected_hash, None);
+        assert_eq!(decision.failure, Some(BlockRecoveryFailure::ConflictingIntactHashes));
+    }
+
+    #[test]
+    fn recover_block_hash_rejects_intact_manifest_when_one_file_matches_but_majority_disagrees() {
+        let manifest = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
+            file_size: BLOCK_HASH_SIZE,
+            block_size: BLOCK_HASH_SIZE,
+            bytes_hashed: BLOCK_HASH_SIZE,
+            block_hashes: vec![digest_u64(111)],
+            hash_of_hashes: hash_hashes(BlockHashAlgorithm::Xxh3, &[digest_u64(111)]),
+        };
+
+        let decision = recover_block_hash(
+            0,
+            &[Some(digest_u64(111)), Some(digest_u64(999)), Some(digest_u64(999))],
+            &[Some(&manifest), None, None],
+        );
+
+        assert_eq!(decision.elected_hash, None);
+        assert_eq!(decision.repair_source_index, None);
+        assert_eq!(decision.failure, Some(BlockRecoveryFailure::ConflictingIntactHashes));
     }
 
     #[test]
@@ -1374,18 +1719,26 @@ mod tests {
     #[test]
     fn consistent_intact_manifest_requires_full_manifest_agreement() {
         let manifest_a = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE * 2,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE * 2,
-            block_hashes: vec![111, 222],
-            hash_of_hashes: hash_hashes(&[111, 222]),
+            block_hashes: vec![digest_u64(111), digest_u64(222)],
+            hash_of_hashes: hash_hashes(
+                BlockHashAlgorithm::Xxh3,
+                &[digest_u64(111), digest_u64(222)],
+            ),
         };
         let manifest_b = BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
             file_size: BLOCK_HASH_SIZE * 2,
             block_size: BLOCK_HASH_SIZE,
             bytes_hashed: BLOCK_HASH_SIZE * 2,
-            block_hashes: vec![111, 999],
-            hash_of_hashes: hash_hashes(&[111, 999]),
+            block_hashes: vec![digest_u64(111), digest_u64(999)],
+            hash_of_hashes: hash_hashes(
+                BlockHashAlgorithm::Xxh3,
+                &[digest_u64(111), digest_u64(999)],
+            ),
         };
 
         assert!(consistent_intact_manifest(&[Some(manifest_a), Some(manifest_b)]).is_none());
@@ -1395,9 +1748,9 @@ mod tests {
     fn document_block_recovery_decision_table() {
         struct Case {
             scenario: &'static str,
-            file_copy_hashes: Vec<Option<u64>>,
+            file_copy_hashes: Vec<Option<BlockDigest>>,
             manifests: Vec<Option<BlockHashManifest>>,
-            expected_elected_hash: Option<u64>,
+            expected_elected_hash: Option<BlockDigest>,
             expected_repair_source_index: Option<usize>,
             expected_basis: Option<BlockRecoveryBasis>,
             expected_failure: Option<BlockRecoveryFailure>,
@@ -1406,30 +1759,32 @@ mod tests {
 
         fn intact_manifest(block_hash: u64) -> BlockHashManifest {
             BlockHashManifest {
+                hash_type: BlockHashAlgorithm::Xxh3,
                 file_size: BLOCK_HASH_SIZE,
                 block_size: BLOCK_HASH_SIZE,
                 bytes_hashed: BLOCK_HASH_SIZE,
-                block_hashes: vec![block_hash],
-                hash_of_hashes: hash_hashes(&[block_hash]),
+                block_hashes: vec![digest_u64(block_hash)],
+                hash_of_hashes: hash_hashes(BlockHashAlgorithm::Xxh3, &[digest_u64(block_hash)]),
             }
         }
 
         fn corrupted_manifest(block_hash: u64) -> BlockHashManifest {
             BlockHashManifest {
+                hash_type: BlockHashAlgorithm::Xxh3,
                 file_size: BLOCK_HASH_SIZE,
                 block_size: BLOCK_HASH_SIZE,
                 bytes_hashed: BLOCK_HASH_SIZE,
-                block_hashes: vec![block_hash],
-                hash_of_hashes: 0,
+                block_hashes: vec![digest_u64(block_hash)],
+                hash_of_hashes: digest_u64(0),
             }
         }
 
         let cases = vec![
             Case {
                 scenario: "target block matches an intact manifest",
-                file_copy_hashes: vec![Some(111), Some(333)],
+                file_copy_hashes: vec![Some(digest_u64(111)), Some(digest_u64(333))],
                 manifests: vec![Some(intact_manifest(111)), Some(corrupted_manifest(999)), None],
-                expected_elected_hash: Some(111),
+                expected_elected_hash: Some(digest_u64(111)),
                 expected_repair_source_index: Some(0),
                 expected_basis: Some(BlockRecoveryBasis::IntactHash),
                 expected_failure: None,
@@ -1437,9 +1792,9 @@ mod tests {
             },
             Case {
                 scenario: "intact manifests agree, but no available file copy matches them",
-                file_copy_hashes: vec![Some(222), Some(333)],
+                file_copy_hashes: vec![Some(digest_u64(222)), Some(digest_u64(333))],
                 manifests: vec![Some(intact_manifest(111)), Some(intact_manifest(111)), None],
-                expected_elected_hash: Some(111),
+                expected_elected_hash: Some(digest_u64(111)),
                 expected_repair_source_index: None,
                 expected_basis: None,
                 expected_failure: Some(BlockRecoveryFailure::IntactHashWithoutMatchingBlock),
@@ -1447,7 +1802,7 @@ mod tests {
             },
             Case {
                 scenario: "intact manifests disagree with each other",
-                file_copy_hashes: vec![Some(111), Some(222)],
+                file_copy_hashes: vec![Some(digest_u64(111)), Some(digest_u64(222))],
                 manifests: vec![Some(intact_manifest(111)), Some(intact_manifest(222)), None],
                 expected_elected_hash: None,
                 expected_repair_source_index: None,
@@ -1457,9 +1812,13 @@ mod tests {
             },
             Case {
                 scenario: "two file copies agree and no intact manifest overrides them",
-                file_copy_hashes: vec![Some(444), Some(444), Some(999)],
+                file_copy_hashes: vec![
+                    Some(digest_u64(444)),
+                    Some(digest_u64(444)),
+                    Some(digest_u64(999)),
+                ],
                 manifests: vec![None, None, None],
-                expected_elected_hash: Some(444),
+                expected_elected_hash: Some(digest_u64(444)),
                 expected_repair_source_index: Some(0),
                 expected_basis: Some(BlockRecoveryBasis::FileAndFileAgreement),
                 expected_failure: None,
@@ -1467,9 +1826,9 @@ mod tests {
             },
             Case {
                 scenario: "one file copy agrees with a manifest witness",
-                file_copy_hashes: vec![Some(555), Some(999)],
+                file_copy_hashes: vec![Some(digest_u64(555)), Some(digest_u64(999))],
                 manifests: vec![Some(corrupted_manifest(555)), Some(corrupted_manifest(777)), None],
-                expected_elected_hash: Some(555),
+                expected_elected_hash: Some(digest_u64(555)),
                 expected_repair_source_index: Some(0),
                 expected_basis: Some(BlockRecoveryBasis::FileAndManifestAgreement),
                 expected_failure: None,
@@ -1477,9 +1836,9 @@ mod tests {
             },
             Case {
                 scenario: "two manifest witnesses agree, but no file copy matches them",
-                file_copy_hashes: vec![Some(222), Some(333)],
+                file_copy_hashes: vec![Some(digest_u64(222)), Some(digest_u64(333))],
                 manifests: vec![Some(corrupted_manifest(111)), Some(corrupted_manifest(111)), None],
-                expected_elected_hash: Some(111),
+                expected_elected_hash: Some(digest_u64(111)),
                 expected_repair_source_index: None,
                 expected_basis: None,
                 expected_failure: Some(BlockRecoveryFailure::ManifestOnlyAgreement),

@@ -1,5 +1,6 @@
 use rand::Rng;
 use rand::RngExt;
+use std::io;
 
 // Use a stochastic hill climber to find the best-performing parameters for the given IO function.
 // Takes in start_params and scaling factors to convert them to use with the IO function.
@@ -12,9 +13,9 @@ pub fn run_optimizer<F>(
     num_iterations: usize,
     verbose: bool,
     mut op: F,
-) -> Vec<u64>
+) -> io::Result<Vec<u64>>
 where
-    F: FnMut(&[u64]) -> u64,
+    F: FnMut(&[u64]) -> io::Result<u64>,
 {
     let mut rng = rand::rng();
     let mut fastest_time = 1e9;
@@ -45,7 +46,7 @@ where
             }
             scaled_params[j] = optimize_params[j] * param_scaling_factors[j];
         }
-        let count = op(&scaled_params);
+        let count = op(&scaled_params)?;
         let cpu_time_used = start.elapsed().as_secs_f64();
         if cpu_time_used < fastest_time_decayed {
             fastest_time_decayed = cpu_time_used;
@@ -85,8 +86,8 @@ where
         for j in 0..optimize_params.len() {
             scaled_params[j] = optimize_params[j] * param_scaling_factors[j];
         }
-        scaled_params
+        Ok(scaled_params)
     } else {
-        best_scaled_params
+        Ok(best_scaled_params)
     }
 }

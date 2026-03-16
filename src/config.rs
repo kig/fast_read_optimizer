@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Once;
+
+static MOUNTINFO_WARNING: Once = Once::new();
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IOParams {
@@ -221,7 +224,18 @@ fn mountpoint_for_path(path: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let path = canonical.to_string_lossy();
 
-    let data = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let data = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(data) => data,
+        Err(err) => {
+            MOUNTINFO_WARNING.call_once(|| {
+                eprintln!(
+                    "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
+                    err
+                );
+            });
+            return None;
+        }
+    };
 
     let mut best: Option<String> = None;
     let mut best_len = 0usize;
@@ -300,28 +314,53 @@ pub fn load_config(path: Option<&str>) -> LoadedConfig {
         .unwrap_or_else(resolve_default_config_path);
 
     if path.exists() {
-        let data = fs::read_to_string(&path).unwrap_or_default();
+        match fs::read_to_string(&path) {
+            Ok(data) => {
+                if let Ok(bundle) = serde_json::from_str::<ConfigBundleV1>(&data) {
+                    if bundle.version == 1 {
+                        return LoadedConfig::BundleV1 { path, bundle };
+                    }
+                }
 
-        // Prefer bundle format if it matches.
-        if let Ok(bundle) = serde_json::from_str::<ConfigBundleV1>(&data) {
-            if bundle.version == 1 {
-                return LoadedConfig::BundleV1 { path, bundle };
+                if let Ok(config) = serde_json::from_str::<AppConfig>(&data) {
+                    return LoadedConfig::Legacy { path, config };
+                }
+
+                eprintln!(
+                    "Warning: config {} is malformed; using defaults without overwriting it",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: could not read config {} ({}); using defaults without overwriting it",
+                    path.display(),
+                    err
+                );
             }
         }
 
-        if let Ok(config) = serde_json::from_str::<AppConfig>(&data) {
-            return LoadedConfig::Legacy { path, config };
-        }
+        return LoadedConfig::BundleV1 {
+            path,
+            bundle: default_bundle_v1(),
+        };
     }
 
     // Create a default config at the chosen path.
-    let cfg = AppConfig::default();
-
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
 
-    // Write as bundle v1 at the default locations.
+    let bundle = default_bundle_v1();
+
+    if let Ok(data) = serde_json::to_string_pretty(&bundle) {
+        let _ = fs::write(&path, data);
+    }
+
+    LoadedConfig::BundleV1 { path, bundle }
+}
+
+fn default_bundle_v1() -> ConfigBundleV1 {
     let mut db_paths = vec![
         "/etc/fro.d/disk-id.json".into(),
         "/etc/fro.d/fro-device-db.json".into(),
@@ -329,21 +368,15 @@ pub fn load_config(path: Option<&str>) -> LoadedConfig {
     if let Ok(home) = std::env::var("HOME") {
         db_paths.push(format!("{}/.config/fro/fro-device-db.json", home));
     }
-    let bundle = ConfigBundleV1 {
+    ConfigBundleV1 {
         version: 1,
-        defaults: cfg,
+        defaults: AppConfig::default(),
         mount_overrides: MountOverrides::default(),
         device_db: DeviceDbConfig {
             paths: db_paths,
             allow_online_update: false,
         },
-    };
-
-    if let Ok(data) = serde_json::to_string_pretty(&bundle) {
-        let _ = fs::write(&path, data);
     }
-
-    LoadedConfig::BundleV1 { path, bundle }
 }
 
 impl Default for AppConfig {
@@ -696,5 +729,26 @@ mod tests {
         restore_env_var("FRO_CONFIG", old_fro);
         restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
         restore_env_var("HOME", old_home);
+    }
+
+    #[test]
+    fn load_config_keeps_malformed_file_on_disk() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let tmp = unique_temp_dir("fro-test");
+        let cfg_path = tmp.join("broken.json");
+        std::fs::write(&cfg_path, "{ definitely not json\n").unwrap();
+
+        let loaded = load_config(Some(cfg_path.to_str().unwrap()));
+        match loaded {
+            LoadedConfig::BundleV1 { ref path, ref bundle } => {
+                assert_eq!(path, &cfg_path);
+                assert_eq!(bundle.version, 1);
+            }
+            _ => panic!("expected bundle fallback"),
+        }
+
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(text, "{ definitely not json\n");
     }
 }

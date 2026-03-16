@@ -11,12 +11,13 @@ mod writer;
 
 use block_hash::{
     default_hash_base, hash_file_to_replicas, recover_file_with_copies, verify_file_with_replicas,
-    RecoverMode,
+    BlockHashAlgorithm, RecoverMode,
 };
 use differ::{bench_diff_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::read_file;
 use writer::write_file;
+use std::io;
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -142,10 +143,11 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "hash" => Some(CommandHelp {
             name: "hash",
-            usage: "hash [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
+            usage: "hash [--auto|--no-direct|--direct] [--hash-type xxh3|sha256] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
             summary: "Hash a file into fixed 1 MiB blocks and write three JSON sidecar replicas.",
             notes: &[
                 "Default sidecar base is <file>.fro-hash.",
+                "Use --hash-type xxh3 or --hash-type sha256 to choose the sidecar digest algorithm.",
                 "Default -n for hash is 1.",
             ],
             examples: &[(
@@ -159,6 +161,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Re-hash a file, compare it to its sidecars, and report bad blocks.",
             notes: &[
                 "Read-only command.",
+                "verify follows the hash type stored in the sidecar manifest.",
                 "On a clean file with intact sidecars, verify hashes the file once and stops.",
             ],
             examples: &[(
@@ -174,6 +177,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "Default recover rewrites only the first file; later files are read-only sources.",
                 "--fast behaves like verify on the first file unless corruption forces a full multi-file scan.",
                 "--in-place-all attempts to repair every input file and refresh broken sidecars.",
+                "recover follows each file's stored sidecar hash type.",
             ],
             examples: &[
                 (
@@ -286,11 +290,11 @@ fn print_general_help(program: &str) {
     );
 }
 
-fn main() {
+fn try_main() -> io::Result<i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || is_help_flag(args[1].as_str()) {
         print_general_help(args[0].as_str());
-        return;
+        return Ok(0);
     }
     if args.len() >= 3 && is_help_flag(args[2].as_str()) {
         if let Some(help) = command_help(args[1].as_str()) {
@@ -300,7 +304,7 @@ fn main() {
             println!();
             print_general_help(args[0].as_str());
         }
-        return;
+        return Ok(0);
     }
     let mode = args[1].as_str();
     let mut io_mode = common::IOMode::Auto;
@@ -312,6 +316,7 @@ fn main() {
     let mut extra_paths: Vec<String> = Vec::new();
     let mut hash_base: Option<&str> = None;
     let mut recover_mode = RecoverMode::Standard;
+    let mut hash_type = BlockHashAlgorithm::Xxh3;
     let mut recover_fast_requested = false;
     let mut recover_in_place_all_requested = false;
     let mut create_size: Option<u64> = None;
@@ -339,7 +344,7 @@ fn main() {
                     None
                 });
                 if create_size.is_none() {
-                    return;
+                    return Ok(1);
                 }
             }
         } else if args[i] == "--fast" {
@@ -348,6 +353,17 @@ fn main() {
         } else if args[i] == "--in-place-all" {
             recover_in_place_all_requested = true;
             recover_mode = RecoverMode::InPlaceAll;
+        } else if args[i] == "--hash-type" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("Missing value for --hash-type");
+                return;
+            }
+            let Some(parsed) = BlockHashAlgorithm::parse(&args[i].to_ascii_lowercase()) else {
+                eprintln!("Invalid --hash-type: {}", args[i]);
+                return;
+            };
+            hash_type = parsed;
         } else if args[i] == "--direct" {
             io_mode = common::IOMode::Direct;
             io_mode_write = common::IOMode::Direct;
@@ -370,7 +386,12 @@ fn main() {
         } else if args[i] == "-n" {
             i += 1;
             if i < args.len() {
-                iterations = args[i].parse().expect("Invalid number of iterations");
+                iterations = args[i].parse().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid number of iterations: {}", err),
+                    )
+                })?;
             }
         } else if mode == "copy" || mode == "diff" || mode == "dual-read-bench" {
             if source.is_none() {
@@ -397,41 +418,41 @@ fn main() {
     }
     if mode == "bench-diff" {
         bench_diff_memory(16, 1024 * 1024);
-        return;
+        return Ok(0);
     }
     if mode == "bench-mmap-write" {
         if filename == "" {
             println!("Filename missing");
-            return;
+            return Ok(1);
         }
         writer::bench_mmap_write(filename);
-        return;
+        return Ok(0);
     }
     if mode == "bench-write" {
         if filename == "" {
             println!("Filename missing");
-            return;
+            return Ok(1);
         }
         writer::bench_write(filename);
-        return;
+        return Ok(0);
     }
 
     if filename == "" {
         println!("Filename missing");
-        return;
+        return Ok(1);
     }
 
     if mode == "recover" && extra_paths.is_empty() {
         println!("At least one recovery copy is required");
-        return;
+        return Ok(1);
     }
     if mode != "write" && create_size.is_some() {
         println!("--create is only supported for write");
-        return;
+        return Ok(1);
     }
     if mode == "recover" && recover_fast_requested && recover_in_place_all_requested {
         println!("--fast and --in-place-all cannot be used together");
-        return;
+        return Ok(1);
     }
 
     let mut config = config::load_config(config_path);
@@ -498,6 +519,7 @@ fn main() {
             let manifest = hash_file_to_replicas(
                 filename,
                 hash_base_owned.as_deref(),
+                hash_type,
                 p[0],
                 p[1],
                 p[2] as usize,
@@ -505,17 +527,17 @@ fn main() {
                 p[4],
                 p[5] as usize,
                 io_mode,
-            )
-            .expect("Failed to hash file");
+            )?;
             println!(
-                "wrote {} hash blocks ({} bytes each) to {}[0-2].json",
+                "wrote {} {:?} hash blocks ({} bytes each) to {}[0-2].json",
                 manifest.block_hashes.len(),
+                manifest.hash_type,
                 manifest.block_size,
                 hash_base_owned
                     .as_deref()
                     .unwrap_or(&default_hash_base(filename))
             );
-            manifest.bytes_hashed
+            Ok(manifest.bytes_hashed)
         } else if mode == "verify" {
             let report = verify_file_with_replicas(
                 filename,
@@ -527,8 +549,7 @@ fn main() {
                 p[4],
                 p[5] as usize,
                 io_mode,
-            )
-            .expect("Failed to verify file");
+            )?;
             println!(
                 "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
                 report.loaded_manifests,
@@ -545,7 +566,7 @@ fn main() {
             if !report.bad_blocks.is_empty() {
                 exit_code = 1;
             }
-            report.bytes_hashed
+            Ok(report.bytes_hashed)
         } else if mode == "recover" {
             let report = recover_file_with_copies(
                 filename,
@@ -559,8 +580,7 @@ fn main() {
                 p[5] as usize,
                 io_mode,
                 recover_mode,
-            )
-            .expect("Failed to recover file");
+            )?;
             println!(
                 "recover: repaired_blocks={}, repaired_files={}, sidecars_refreshed={}, failed_blocks={}, used_fast_path={}, fell_back_to_full_scan={}",
                 report.repaired_blocks,
@@ -588,7 +608,7 @@ fn main() {
             } else if report.repaired_blocks == 0 {
                 println!("recover: no block writes were needed");
             }
-            report.bytes_hashed
+            Ok(report.bytes_hashed)
         } else if mode == "write" {
             write_file(
                 source,
@@ -618,12 +638,8 @@ fn main() {
                 io_mode_write,
             )
         } else if mode == "diff" || mode == "dual-read-bench" {
-            let s1 = std::fs::metadata(source.unwrap())
-                .expect("Could not read file 1")
-                .len();
-            let s2 = std::fs::metadata(filename)
-                .expect("Could not read file 2")
-                .len();
+            let s1 = std::fs::metadata(source.unwrap())?.len();
+            let s2 = std::fs::metadata(filename)?.len();
             if s1 != s2 {
                 if verbose {
                     eprintln!("Files have different sizes: {} != {}", s1, s2);
@@ -635,11 +651,7 @@ fn main() {
 
             if exit_code == 0 {
                 let bench_only = mode == "dual-read-bench";
-                let size = std::fs::File::open(filename)
-                    .unwrap()
-                    .metadata()
-                    .unwrap()
-                    .len();
+                let size = std::fs::File::open(filename)?.metadata()?.len();
                 let res = diff_files(
                     source.unwrap(),
                     filename,
@@ -651,16 +663,19 @@ fn main() {
                     p[5] as usize,
                     io_mode,
                     bench_only,
-                );
+                )?;
                 if res != 0 && mode == "diff" {
                     exit_code = 1;
                 }
-                size * 2
+                Ok(size * 2)
             } else {
-                0
+                Ok(0)
             }
         } else {
-            panic!("Invalid mode {}", mode)
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid mode {}", mode),
+            ))
         }
     };
 
@@ -671,7 +686,7 @@ fn main() {
         iterations,
         verbose,
         mode_callback,
-    );
+    )?;
 
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
@@ -690,6 +705,18 @@ fn main() {
     }
 
     if exit_code != 0 {
-        std::process::exit(exit_code);
+        return Ok(exit_code);
+    }
+    Ok(0)
+}
+
+fn main() {
+    match try_main() {
+        Ok(code) if code == 0 => {}
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            std::process::exit(1);
+        }
     }
 }

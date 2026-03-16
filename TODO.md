@@ -160,10 +160,10 @@ Notes:
 Goal: build a string that is stable across reboots and portable across machines.
 
 - For single devices: use `/dev/disk/by-id/*` if available.
-- For NVMe: include model + serial + firmware + PCI ID when available from sysfs.
+- For NVMe: include model + serial + firmware + PCI ID + current / max lanes & total GT/s when available from sysfs.
 - For RAID/LVM/DM: create a composite signature:
   - RAID level + chunk size (if readable)
-  - list of member device IDs
+  - list of member devices with the above info
 
 Example signature strings:
 
@@ -396,6 +396,13 @@ Let users download a device DB so optimization is usually unnecessary.
 - [ ] Golden-file tests for config selection precedence.
 - [ ] Manual test matrix: single NVMe, md RAID0, dm-crypt, tmpfs, network FS (should not crash; should fall back).
 
+### Additional
+
+- [ ] Separate presets for cold / hot page cache.
+- [ ] Estimate max performance for the mounts and compare to achieved.
+- [ ] Store max performance achieved for mounts.
+- [ ] Use max performance to decide which IO path to take (zfs may have slow hot page cache perf compared to direct IO due to ARC.)
+
 ---
 
 ## Open questions / decisions needed
@@ -405,3 +412,4 @@ Let users download a device DB so optimization is usually unnecessary.
 - How conservative should the default wear budget be (bytes written per optimize run)?
 - For page-cache “hot” tests, should we cap test size relative to RAM (to avoid false “hot”)?
 - How do we want to handle devices where direct IO is unsupported or unreliable?
+

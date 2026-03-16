@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
-use fro::block_hash::BlockHashManifest;
+use fro::block_hash::{BlockHashAlgorithm, BlockHashManifest};
 use fro::config::{AppConfig, ConfigBundleV1, DeviceDbConfig, IOParams, MountOverrides};
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -75,6 +75,14 @@ fn hash_verify_recover_round_trip() {
         assert!(sidecar_path(&backup, suffix).exists());
     }
 
+    let manifest_text = fs::read_to_string(sidecar_path(&target, "0")).unwrap();
+    let manifest: BlockHashManifest = serde_json::from_str(&manifest_text).unwrap();
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest.hash_type, BlockHashAlgorithm::Xxh3);
+    assert_eq!(manifest_json["hash_type"], "xxh3");
+    assert_eq!(manifest_json["block_hashes"][0].as_str().unwrap().len(), 16);
+    assert_eq!(manifest_json["hash_of_hashes"].as_str().unwrap().len(), 16);
+
     let out = run_fro(&["verify", "--no-direct", "-n", "1", target.to_str().unwrap()]);
     assert!(
         out.status.success(),
@@ -113,6 +121,49 @@ fn hash_verify_recover_round_trip() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("repaired_blocks=1"));
+
+    let out = run_fro(&["verify", "--no-direct", "-n", "1", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+}
+
+#[test]
+fn hash_sha256_sidecars_verify_without_cli_override() {
+    let tmp = unique_temp_dir("fro-hash-sha256-cli");
+    let target = tmp.join("target.bin");
+    let data = (0..(2 * 1024 * 1024 + 777))
+        .map(|i| ((i * 13) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&[
+        "hash",
+        "--hash-type",
+        "sha256",
+        "--no-direct",
+        "-n",
+        "1",
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest_text = fs::read_to_string(sidecar_path(&target, "0")).unwrap();
+    let manifest: BlockHashManifest = serde_json::from_str(&manifest_text).unwrap();
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest.hash_type, BlockHashAlgorithm::Sha256);
+    assert_eq!(manifest_json["hash_type"], "sha256");
+    assert_eq!(manifest_json["block_hashes"][0].as_str().unwrap().len(), 64);
+    assert_eq!(manifest_json["hash_of_hashes"].as_str().unwrap().len(), 64);
 
     let out = run_fro(&["verify", "--no-direct", "-n", "1", target.to_str().unwrap()]);
     assert!(
@@ -309,4 +360,44 @@ fn hash_and_verify_use_separate_config_and_sidecar_geometry() {
     assert_eq!(saved["defaults"]["read"]["page_cache"]["block_size"], 128 * 1024);
     assert_eq!(saved["defaults"]["hash"]["page_cache"]["block_size"], 2 * 1024 * 1024);
     assert_eq!(saved["defaults"]["verify"]["page_cache"]["block_size"], 256 * 1024);
+}
+
+#[test]
+fn hash_supports_sha256_sidecars() {
+    let tmp = unique_temp_dir("fro-hash-sha256");
+    let target = tmp.join("target.bin");
+
+    let data = (0..(3 * 1024 * 1024 + 321))
+        .map(|i| ((i * 53) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&[
+        "hash",
+        "--no-direct",
+        "--hash-type",
+        "sha256",
+        "-n",
+        "1",
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest: BlockHashManifest =
+        serde_json::from_str(&fs::read_to_string(sidecar_path(&target, "0")).unwrap()).unwrap();
+    assert_eq!(manifest.hash_type, BlockHashAlgorithm::Sha256);
+
+    let out = run_fro(&["verify", "--no-direct", "-n", "1", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
 }
