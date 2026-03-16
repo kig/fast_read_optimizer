@@ -69,6 +69,33 @@ fn build_args(input: &Path, output: &Path, flags: &[&str]) -> Vec<String> {
     args
 }
 
+fn compare_outputs(case_name: &str, example: &Output, system: &Output, example_output: &Path, system_output: &Path) {
+    assert_eq!(
+        example.status.success(),
+        system.status.success(),
+        "case {}: example stderr=\n{}\nsystem stderr=\n{}",
+        case_name,
+        String::from_utf8_lossy(&example.stderr),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(
+        example.stdout, system.stdout,
+        "case {}: stdout mismatch",
+        case_name
+    );
+    assert_eq!(
+        example.stderr, system.stderr,
+        "case {}: stderr mismatch",
+        case_name
+    );
+    assert_eq!(
+        fs::read(example_output).unwrap(),
+        fs::read(system_output).unwrap(),
+        "case {}: output mismatch",
+        case_name
+    );
+}
+
 #[test]
 fn dd_example_matches_system_dd_for_supported_flag_combinations() {
     let input_bytes = (0..97).map(|i| ((i * 13) % 251) as u8).collect::<Vec<_>>();
@@ -145,28 +172,95 @@ fn dd_example_matches_system_dd_for_supported_flag_combinations() {
         let example = run_example(&example_args);
         let system = run_system_dd(&system_args);
 
-        assert_eq!(
-            example.status.success(),
-            system.status.success(),
-            "case {}: example stderr=\n{}\nsystem stderr=\n{}",
+        compare_outputs(case.name, &example, &system, &example_output, &system_output);
+    }
+}
+
+#[test]
+fn dd_example_direct_flags_preserve_output_semantics() {
+    let input_bytes = (0..(4096 * 3 + 1537))
+        .map(|i| ((i * 17) % 251) as u8)
+        .collect::<Vec<_>>();
+    let cases = [
+        DdCase {
+            name: "direct-read",
+            initial_output: None,
+            flags: &["bs=4096", "count=4", "iflag=direct", "status=none"],
+        },
+        DdCase {
+            name: "direct-write",
+            initial_output: None,
+            flags: &["bs=4096", "count=4", "seek=1", "oflag=direct", "status=none"],
+        },
+        DdCase {
+            name: "direct-read-write-notrunc",
+            initial_output: Some(b"0123456789abcdefghijklmnopqrstuvwxyz"),
+            flags: &[
+                "bs=4096",
+                "count=2",
+                "skip=1",
+                "seek=1",
+                "iflag=direct",
+                "oflag=direct",
+                "conv=notrunc",
+                "status=none",
+            ],
+        },
+    ];
+
+    for case in cases {
+        let tmp = unique_temp_dir(case.name);
+        let input = tmp.join("input.bin");
+        let example_output = tmp.join("example.bin");
+        let baseline_output = tmp.join("baseline.bin");
+        let system_output = tmp.join("system.bin");
+        fs::write(&input, &input_bytes).unwrap();
+        if let Some(initial) = case.initial_output {
+            fs::write(&example_output, initial).unwrap();
+            fs::write(&baseline_output, initial).unwrap();
+            fs::write(&system_output, initial).unwrap();
+        }
+
+        let example_args = build_args(&input, &example_output, case.flags);
+        let baseline_flags = case
+            .flags
+            .iter()
+            .copied()
+            .filter(|flag| *flag != "iflag=direct" && *flag != "oflag=direct")
+            .collect::<Vec<_>>();
+        let baseline_args = build_args(&input, &baseline_output, &baseline_flags);
+        let example = run_example(&example_args);
+        let baseline = run_example(&baseline_args);
+        let system_args = build_args(&input, &system_output, &baseline_flags);
+        let system = run_system_dd(&system_args);
+
+        compare_outputs(
             case.name,
-            String::from_utf8_lossy(&example.stderr),
-            String::from_utf8_lossy(&system.stderr)
+            &baseline,
+            &system,
+            &baseline_output,
+            &system_output,
         );
         assert_eq!(
-            example.stdout, system.stdout,
-            "case {}: stdout mismatch",
+            example.status.success(),
+            baseline.status.success(),
+            "case {}: direct flag changed exit status",
             case.name
         );
         assert_eq!(
-            example.stderr, system.stderr,
-            "case {}: stderr mismatch",
+            example.stdout, baseline.stdout,
+            "case {}: direct flag changed stdout",
+            case.name
+        );
+        assert_eq!(
+            example.stderr, baseline.stderr,
+            "case {}: direct flag changed stderr",
             case.name
         );
         assert_eq!(
             fs::read(&example_output).unwrap(),
-            fs::read(&system_output).unwrap(),
-            "case {}: output mismatch",
+            fs::read(&baseline_output).unwrap(),
+            "case {}: direct flag changed output bytes",
             case.name
         );
     }
