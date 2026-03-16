@@ -65,11 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loaded = load_file_to_memory_for_mode(&config, "read", &opts.filename, opts.io_mode)?;
     let elapsed = start.elapsed().as_secs_f64();
 
-    let page_checksum = loaded
-        .data
-        .iter()
-        .step_by(4096)
-        .fold(0u64, |acc, byte| acc.wrapping_mul(131).wrapping_add(*byte as u64));
+    let page_checksum = loaded.data.iter().step_by(4096).fold(0u64, |acc, byte| {
+        acc.wrapping_mul(131).wrapping_add(*byte as u64)
+    });
 
     println!(
         "model_loader loaded {} bytes in {:.4} s, {:.1} GB/s",

@@ -41,7 +41,8 @@ pub struct ParallelFile {
 #[derive(Clone)]
 pub struct ParallelWriter {
     tx: mpsc::Sender<WriteRequest>,
-    finish_handle: Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<ParallelWriteReport>>>>>,
+    finish_handle:
+        Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<ParallelWriteReport>>>>>,
 }
 
 enum WriteRequest {
@@ -153,7 +154,9 @@ impl ParallelFile {
         let mut bytes = vec![0u8; len];
         let mut filled = 0usize;
         while filled < len {
-            let read = self.file.read_at(&mut bytes[filled..], offset + filled as u64)?;
+            let read = self
+                .file
+                .read_at(&mut bytes[filled..], offset + filled as u64)?;
             if read == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -294,12 +297,8 @@ impl ParallelWriter {
                     })
                 }
                 WriterMode::ByOffset { total_size } => {
-                    let mut out = OffsetWriter::create(
-                        &output_path,
-                        total_size,
-                        write_params.qd,
-                        io_mode,
-                    )?;
+                    let mut out =
+                        OffsetWriter::create(&output_path, total_size, write_params.qd, io_mode)?;
                     for request in rx {
                         let (offset, data) = match request {
                             WriteRequest::ByOffset { offset, data } => (offset, data),
@@ -378,7 +377,8 @@ mod tests {
     fn offset_writer_writes_exact_offsets() {
         let cfg = crate::config::load_config(None);
         let path = unique_temp_file("fro-parallel-writer-offset");
-        let writer = ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 8).unwrap();
+        let writer =
+            ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 8).unwrap();
         writer.write_at_offset(4, b"efgh".to_vec()).unwrap();
         writer.write_at_offset(0, b"abcd".to_vec()).unwrap();
         let report = writer.finish().unwrap();
