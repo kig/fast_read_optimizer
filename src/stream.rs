@@ -15,6 +15,14 @@ fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> 
     page_cache.block_size.max(direct.block_size)
 }
 
+fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode {
+    if block_size % 4096 == 0 {
+        io_mode
+    } else {
+        IOMode::PageCache
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRange {
     pub offset: u64,
@@ -106,7 +114,7 @@ impl ParallelFile {
     {
         let path = self.path.clone();
         let config = self.config.clone();
-        let io_mode = self.io_mode;
+        let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
         let visit = Arc::new(visit);
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
         let direct = config.get_params_for_path(&self.mode, true, &path);

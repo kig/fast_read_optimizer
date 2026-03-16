@@ -48,7 +48,7 @@ fn offset_writer_can_preserve_existing_prefix_and_suffix() {
     writer.write_at_offset(3, b"XYZ".to_vec()).unwrap();
     let report = writer.finish().unwrap();
 
-    assert_eq!(report.bytes_written, 6);
+    assert_eq!(report.bytes_written, 3);
     assert_eq!(fs::read(path).unwrap(), b"abcXYZghij".to_vec());
 }
 

@@ -287,7 +287,6 @@ impl OffsetWriter {
             len: data.len(),
         });
         self.io_uring.submit_sqes().map_err(io::Error::other)?;
-        self.bytes_written = self.bytes_written.max(offset + data.len() as u64);
         Ok(())
     }
 
@@ -319,6 +318,7 @@ impl OffsetWriter {
                 ),
             ));
         }
+        self.bytes_written += written as u64;
         Ok(())
     }
 }
@@ -372,9 +372,12 @@ fn open_writer_files(
     let is_regular_file = file_page_cache.metadata()?.file_type().is_file();
     if let Some(size) = set_len {
         if is_regular_file {
-            file_page_cache.set_len(size)?;
-            unsafe {
-                libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
+            let current_len = file_page_cache.metadata()?.len();
+            if truncate || current_len < size {
+                file_page_cache.set_len(size)?;
+                unsafe {
+                    libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
+                }
             }
         }
     }
@@ -414,6 +417,8 @@ fn thread_writer(
     thread_id: u64,
     source_file: Option<(&File, &File)>,
     dest_file: (&File, &File),
+    source_base_offset: u64,
+    dest_base_offset: u64,
     num_threads: u64,
     block_size: u64,
     qd: usize,
@@ -443,9 +448,11 @@ fn thread_writer(
         buffer_offsets[i] = next_offset;
         let len = (total_size - next_offset).min(block_size);
 
-        let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
+        let src_offset = source_base_offset + next_offset;
+        let dst_offset = dest_base_offset + next_offset;
+        let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
         if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
-            let fd = if use_direct && is_aligned {
+            let fd = if use_direct && is_aligned_read {
                 src_direct.as_raw_fd()
             } else {
                 src_pagecache.as_raw_fd()
@@ -457,12 +464,13 @@ fn thread_writer(
                 sqe.prep_read(
                     fd,
                     &mut buffers[i].as_mut_slice()[..len as usize],
-                    next_offset,
+                    src_offset,
                 );
                 sqe.set_user_data((i as u64) | (1u64 << 40));
             }
         } else {
-            let fd = if use_direct && is_aligned {
+            let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
+            let fd = if use_direct && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
                 dest_file.1.as_raw_fd()
@@ -471,7 +479,7 @@ fn thread_writer(
                 let mut sqe = io_uring
                     .prepare_sqe()
                     .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-                sqe.prep_write(fd, &buffers[i].as_slice()[..len as usize], next_offset);
+                sqe.prep_write(fd, &buffers[i].as_slice()[..len as usize], dst_offset);
                 sqe.set_user_data((i as u64) | (2u64 << 40));
             }
         }
@@ -493,8 +501,9 @@ fn thread_writer(
         if state == 1 {
             // Read finished
             let len = result as u64;
-            let is_aligned = (buffer_offsets[idx] % 4096 == 0) && (len % 4096 == 0);
-            let fd = if use_direct && is_aligned {
+            let dst_offset = dest_base_offset + buffer_offsets[idx];
+            let is_aligned_write = (dst_offset % 4096 == 0) && (len % 4096 == 0);
+            let fd = if use_direct && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
                 dest_file.1.as_raw_fd()
@@ -503,11 +512,7 @@ fn thread_writer(
                 let mut sqe = io_uring
                     .prepare_sqe()
                     .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-                sqe.prep_write(
-                    fd,
-                    &buffers[idx].as_slice()[..result as usize],
-                    buffer_offsets[idx],
-                );
+                sqe.prep_write(fd, &buffers[idx].as_slice()[..result as usize], dst_offset);
                 sqe.set_user_data((idx as u64) | (2u64 << 40));
             }
             io_uring.submit_sqes().map_err(io::Error::other)?;
@@ -519,9 +524,11 @@ fn thread_writer(
                 buffer_offsets[idx] = next_offset;
                 let len = (total_size - next_offset).min(block_size);
 
-                let is_aligned = (next_offset % 4096 == 0) && (len == block_size);
+                let src_offset = source_base_offset + next_offset;
+                let dst_offset = dest_base_offset + next_offset;
+                let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
                 if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
-                    let fd = if use_direct && is_aligned {
+                    let fd = if use_direct && is_aligned_read {
                         src_direct.as_raw_fd()
                     } else {
                         src_pagecache.as_raw_fd()
@@ -533,12 +540,13 @@ fn thread_writer(
                         sqe.prep_read(
                             fd,
                             &mut buffers[idx].as_mut_slice()[..len as usize],
-                            next_offset,
+                            src_offset,
                         );
                         sqe.set_user_data((idx as u64) | (1u64 << 40));
                     }
                 } else {
-                    let fd = if use_direct && is_aligned {
+                    let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
+                    let fd = if use_direct && is_aligned_write {
                         dest_file.0.as_raw_fd()
                     } else {
                         dest_file.1.as_raw_fd()
@@ -547,7 +555,7 @@ fn thread_writer(
                         let mut sqe = io_uring
                             .prepare_sqe()
                             .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-                        sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], next_offset);
+                        sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], dst_offset);
                         sqe.set_user_data((idx as u64) | (2u64 << 40));
                     }
                 }
@@ -558,6 +566,102 @@ fn thread_writer(
         }
     }
     Ok(())
+}
+
+pub fn copy_file_range(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    let mut threads = vec![];
+    let write_count = Arc::new(AtomicU64::new(0));
+    let source_meta = File::open(source)?.metadata()?;
+    let source_size = source_meta.len();
+    let copy_size = copy_size.min(source_size.saturating_sub(source_offset));
+
+    let direct_write = io_mode_write != IOMode::PageCache;
+    let direct_read = io_mode_read == IOMode::Direct || io_mode_read == IOMode::Auto;
+
+    let num_threads = if direct_write {
+        num_threads_d
+    } else {
+        num_threads_p
+    };
+    let block_size = if direct_write {
+        block_size_d
+    } else {
+        block_size_p
+    };
+    let qd = if direct_write { qd_d } else { qd_p };
+
+    {
+        let f = OpenOptions::new().write(true).create(true).open(filename)?;
+        if f.metadata()?.file_type().is_file() {
+            let required_size = dest_offset.saturating_add(copy_size);
+            let current_len = f.metadata()?.len();
+            if truncate_target || current_len < required_size {
+                f.set_len(required_size)?;
+                unsafe {
+                    libc::posix_fallocate(f.as_raw_fd(), 0, required_size as i64);
+                }
+            }
+        }
+    }
+
+    for thread_id in 0..num_threads {
+        let write_count = write_count.clone();
+        let filename = filename.to_string();
+        let source = source.to_string();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            let dest_file_nodir = OpenOptions::new().write(true).open(&filename)?;
+            let dest_file_dir = open_direct_writer_or_fallback(&filename, &dest_file_nodir)?;
+            let src_nodir = File::open(&source)?;
+            let src_dir = open_direct_reader_or_fallback(&source, &src_nodir)?;
+            let mut io_uring = IoUring::new(1024).map_err(io::Error::other)?;
+            thread_writer(
+                thread_id,
+                Some((&src_dir, &src_nodir)),
+                (&dest_file_dir, &dest_file_nodir),
+                source_offset,
+                dest_offset,
+                num_threads,
+                block_size,
+                qd,
+                &mut io_uring,
+                write_count,
+                None,
+                copy_size,
+                direct_read && direct_write,
+            )
+        }));
+    }
+
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("write worker thread panicked"))??;
+    }
+
+    if io_mode_write != IOMode::PageCache {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(filename)?
+            .sync_all()?;
+    }
+
+    Ok(write_count.load(Ordering::SeqCst))
 }
 /*
 write (direct)                      | 10.40        | 10.00        | PASS
@@ -659,6 +763,8 @@ pub fn write_file(
                 thread_id,
                 source_files.as_ref().map(|(d, n)| (d, n)),
                 (&dest_file_dir, &dest_file_nodir),
+                0,
+                0,
                 num_threads,
                 block_size,
                 qd,

@@ -705,11 +705,13 @@ fn use_direct_for_hashing(filename: &str, io_mode: IOMode) -> bool {
 }
 
 fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
-    debug_assert_eq!(
-        len % 4096,
-        0,
-        "Direct I/O requires a 4096-byte aligned read length"
-    );
+    if use_direct {
+        debug_assert_eq!(
+            len % 4096,
+            0,
+            "Direct I/O requires a 4096-byte aligned read length"
+        );
+    }
     use_direct && (offset % 4096 == 0) && (len % 4096 == 0) && (offset + len as u64 <= file_size)
 }
 

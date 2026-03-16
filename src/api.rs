@@ -1,7 +1,9 @@
 use crate::config::load_config;
 use crate::reader::load_file_to_memory_for_mode;
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
-use crate::writer::{self, resolve_writer_params_for_mode, SequentialWriter};
+use crate::writer::{
+    self, copy_file_range as copy_range_internal, resolve_writer_params_for_mode, SequentialWriter,
+};
 use crate::IOMode;
 use std::io;
 use std::path::Path;
@@ -147,6 +149,39 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         Some(source),
         target,
         None,
+        page_cache.num_threads,
+        page_cache.block_size,
+        page_cache.qd,
+        direct.num_threads,
+        direct.block_size,
+        direct.qd,
+        io_mode_read,
+        io_mode_write,
+    )
+}
+
+pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
+    source: S,
+    target: D,
+    source_offset: u64,
+    dest_offset: u64,
+    len: u64,
+    truncate_target: bool,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    let config = load_config(None);
+    let source = path_str(source.as_ref())?;
+    let target = path_str(target.as_ref())?;
+    let page_cache = config.get_params_for_path("copy", false, target);
+    let direct = config.get_params_for_path("copy", true, target);
+    copy_range_internal(
+        source,
+        target,
+        source_offset,
+        dest_offset,
+        len,
+        truncate_target,
         page_cache.num_threads,
         page_cache.block_size,
         page_cache.qd,

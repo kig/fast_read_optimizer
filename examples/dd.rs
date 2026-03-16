@@ -1,5 +1,5 @@
 use fro::IOMode;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -198,27 +198,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(available);
     let copy_len = available.min(requested);
     let output_offset = opts.seek.saturating_mul(block_size);
-    let existing_output_size = if opts.notrunc {
-        fs::metadata(&opts.output)
-            .map(|meta| meta.len())
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let total_size = existing_output_size.max(output_offset.saturating_add(copy_len));
     let job_count = if copy_len == 0 {
         0
     } else {
         copy_len.div_ceil(block_size) as usize
     };
-    let writer =
-        fro::offset_writer_with_options(&opts.output, total_size, opts.output_mode, !opts.notrunc)?;
-    let copy_input = input.clone();
-    let copy_writer = writer.clone();
     let copied = Arc::new(AtomicU64::new(0));
     let copied_progress = copied.clone();
     let done = Arc::new(AtomicBool::new(false));
     let done_progress = done.clone();
+    let start_block = opts.skip;
+    let end_block = start_block + job_count as u64;
     let progress_thread = if opts.status == StatusMode::Progress {
         Some(thread::spawn(move || {
             while !done_progress.load(Ordering::Relaxed) {
@@ -230,35 +220,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let copy_result = input.foreach_index_parallel(job_count, move |job_index| {
-        let job_offset = job_index as u64 * block_size;
-        let remaining = copy_len.saturating_sub(job_offset);
-        if remaining == 0 {
-            return Ok(());
-        }
-        let len = remaining.min(block_size) as usize;
-        let data = copy_input.read_range(input_offset + job_offset, len)?;
-        copy_writer.write_at_offset(output_offset + job_offset, data)?;
-        copied.fetch_add(len as u64, Ordering::Relaxed);
-        Ok(())
-    });
-    let writer_result = writer.finish();
+    let is_dev_null = opts.output == "/dev/null";
+    let copy_result = if is_dev_null {
+        input.foreach_block_parallel(block_size, move |block_index, data| {
+            let block_index = block_index as u64;
+            if block_index < start_block || block_index >= end_block {
+                return Ok(());
+            }
+            copied.fetch_add(data.len() as u64, Ordering::Relaxed);
+            Ok(())
+        })?;
+        Ok(copy_len)
+    } else {
+        fro::copy_file_range_with_modes(
+            &opts.input,
+            &opts.output,
+            input_offset,
+            output_offset,
+            copy_len,
+            !opts.notrunc,
+            opts.input_mode,
+            opts.output_mode,
+        )
+    };
     done.store(true, Ordering::Relaxed);
     if let Some(progress_thread) = progress_thread {
         progress_thread
             .join()
             .map_err(|_| io::Error::other("progress thread panicked"))?;
     }
-    let report = match (copy_result, writer_result) {
-        (Ok(()), Ok(report)) => report,
-        (Err(copy_err), Err(writer_err))
-            if copy_err.to_string().contains("sending on a closed channel") =>
-        {
-            return Err(writer_err.into());
-        }
-        (Err(copy_err), _) => return Err(copy_err.into()),
-        (_, Err(writer_err)) => return Err(writer_err.into()),
-    };
+    let bytes_copied = copy_result?;
 
     if opts.fsync {
         OpenOptions::new()
@@ -268,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sync_all()?;
     }
     if opts.status != StatusMode::None {
-        print_summary(report.bytes_written, start.elapsed());
+        print_summary(bytes_copied, start.elapsed());
     }
     Ok(())
 }
