@@ -13,6 +13,8 @@ enum StatusMode {
     Progress,
 }
 
+const DEFAULT_DD_BLOCK_SIZE: u64 = 512;
+
 struct Options {
     input: String,
     output: String,
@@ -144,8 +146,17 @@ fn parse_args() -> Result<Options, String> {
     })
 }
 
-fn print_summary(bytes: u64, elapsed: Duration) {
+fn record_counts(bytes: u64, block_size: u64) -> (u64, u64) {
+    let full = bytes / block_size;
+    let partial = u64::from(bytes % block_size != 0);
+    (full, partial)
+}
+
+fn print_summary(bytes: u64, block_size: u64, elapsed: Duration) {
     let secs = elapsed.as_secs_f64();
+    let (full_records, partial_records) = record_counts(bytes, block_size);
+    eprintln!("{}+{} records in", full_records, partial_records);
+    eprintln!("{}+{} records out", full_records, partial_records);
     eprintln!(
         "{} bytes copied in {:.4} s, {:.1} GB/s",
         bytes,
@@ -168,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && opts.seek == 0
         && !opts.notrunc
     {
+        let record_block_size = DEFAULT_DD_BLOCK_SIZE;
         let bytes = fro::copy_file_with_modes(
             &opts.input,
             &opts.output,
@@ -182,13 +194,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sync_all()?;
         }
         if opts.status != StatusMode::None {
-            print_summary(bytes, start.elapsed());
+            print_summary(bytes, record_block_size, start.elapsed());
         }
         return Ok(());
     }
 
     let input = fro::open_with_mode(&opts.input, opts.input_mode)?;
-    let block_size = opts.block_size.unwrap_or(input.block_size()?);
+    let block_size = opts.block_size.unwrap_or(DEFAULT_DD_BLOCK_SIZE);
     let input_size = input.len()?;
     let input_offset = opts.skip.saturating_mul(block_size);
     let available = input_size.saturating_sub(input_offset);
@@ -259,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sync_all()?;
     }
     if opts.status != StatusMode::None {
-        print_summary(bytes_copied, start.elapsed());
+        print_summary(bytes_copied, block_size, start.elapsed());
     }
     Ok(())
 }

@@ -315,3 +315,29 @@ fn dd_example_matches_system_dd_when_writing_to_dev_null() {
     assert_eq!(example.stdout, system.stdout);
     assert_eq!(example.stderr, system.stderr);
 }
+
+#[test]
+fn dd_example_prints_dd_style_record_counts() {
+    let tmp = unique_temp_dir("dd-record-counts");
+    let input = tmp.join("input.bin");
+    let output = tmp.join("output.bin");
+    let input_bytes = (0..97).map(|i| ((i * 23) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, input_bytes).unwrap();
+
+    let args = vec![
+        format!("if={}", input.display()),
+        format!("of={}", output.display()),
+        "bs=10".to_string(),
+    ];
+    let output = run_example(&args);
+    assert!(
+        output.status.success(),
+        "stderr=\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("9+1 records in"), "stderr=\n{stderr}");
+    assert!(stderr.contains("9+1 records out"), "stderr=\n{stderr}");
+    assert!(stderr.contains("97 bytes copied in"), "stderr=\n{stderr}");
+}
