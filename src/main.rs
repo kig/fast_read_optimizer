@@ -42,6 +42,77 @@ fn parse_size(s: &str) -> Option<u64> {
     num.checked_mul(mult)
 }
 
+const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
+const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
+
+fn mark_optimizer_params(mask: &mut [bool; 6], indices: &[usize], include_block_size: bool) {
+    for &index in indices {
+        if include_block_size || index % 3 != 1 {
+            mask[index] = true;
+        }
+    }
+}
+
+fn active_optimizer_param_mask(
+    mode: &str,
+    io_mode: common::IOMode,
+    io_mode_write: common::IOMode,
+) -> Vec<bool> {
+    let mut mask = [false; 6];
+    match mode {
+        "read" | "grep" | "hash" | "diff" | "dual-read-bench" => match io_mode {
+            common::IOMode::Direct => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
+        "verify" | "recover" => match io_mode {
+            common::IOMode::Direct => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
+            }
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, false);
+            }
+            common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, false);
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
+            }
+        },
+        "write" | "copy" => match io_mode_write {
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            common::IOMode::Direct | common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
+        _ => mask.fill(true),
+    }
+    mask.to_vec()
+}
+
+fn print_verify_report(report: &block_hash::VerifyReport) {
+    println!(
+        "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
+        report.loaded_manifests,
+        report.ok_blocks,
+        report.bad_blocks.len()
+    );
+    for issue in &report.bad_blocks {
+        println!(
+            "block {}: {}",
+            issue.block_index,
+            issue.decision.status_message()
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CommandHelp {
     name: &'static str,
@@ -499,6 +570,7 @@ fn try_main() -> io::Result<i32> {
     let params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1];
 
     let mode_name = mode;
+    let optimizer_mask = active_optimizer_param_mask(mode, io_mode, io_mode_write);
     let verbose = verbose
         || mode == "read"
         || mode == "write"
@@ -561,20 +633,10 @@ fn try_main() -> io::Result<i32> {
                 p[5] as usize,
                 io_mode,
             )?;
-            println!(
-                "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
-                report.loaded_manifests,
-                report.ok_blocks,
-                report.bad_blocks.len()
-            );
-            for issue in &report.bad_blocks {
-                println!(
-                    "block {}: {}",
-                    issue.block_index,
-                    issue.decision.status_message()
-                );
+            if iterations == 1 {
+                print_verify_report(&report);
             }
-            if !report.bad_blocks.is_empty() {
+            if iterations == 1 && !report.bad_blocks.is_empty() {
                 exit_code = 1;
             }
             Ok(report.bytes_hashed)
@@ -694,10 +756,29 @@ fn try_main() -> io::Result<i32> {
         mode_name,
         start_params,
         params_steps,
+        optimizer_mask,
         iterations,
         verbose,
         mode_callback,
     )?;
+
+    if mode == "verify" && iterations > 1 {
+        let report = verify_file_with_replicas(
+            filename,
+            hash_base_owned.as_deref(),
+            best_params[0],
+            best_params[1],
+            best_params[2] as usize,
+            best_params[3],
+            best_params[4],
+            best_params[5] as usize,
+            io_mode,
+        )?;
+        print_verify_report(&report);
+        if !report.bad_blocks.is_empty() {
+            exit_code = 1;
+        }
+    }
 
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
@@ -729,5 +810,35 @@ fn main() {
             eprintln!("Error: {}", err);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_optimizer_param_mask;
+    use crate::common::IOMode;
+
+    #[test]
+    fn verify_skips_block_size_mutations() {
+        assert_eq!(
+            active_optimizer_param_mask("verify", IOMode::PageCache, IOMode::Auto),
+            vec![true, false, true, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("verify", IOMode::Direct, IOMode::Auto),
+            vec![false, false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn write_only_mutates_write_side_params() {
+        assert_eq!(
+            active_optimizer_param_mask("write", IOMode::Auto, IOMode::PageCache),
+            vec![true, true, true, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Auto),
+            vec![false, false, false, true, true, true]
+        );
     }
 }

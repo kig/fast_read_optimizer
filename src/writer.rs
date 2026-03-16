@@ -572,17 +572,6 @@ pub fn write_file(
     };
     let qd = if direct_write { qd_d } else { qd_p };
 
-    if direct_read && total_size % block_size != 0 {
-        eprintln!(
-            "Warning: write requested direct source reads but the final partial block will use page-cache reads"
-        );
-    }
-    if direct_write && total_size % block_size != 0 {
-        eprintln!(
-            "Warning: write requested direct destination writes but the final partial block will use page-cache writes"
-        );
-    }
-
     // println!("direct-read: {} | direct-write: {} | t={} bs={} qd={}", direct_read, direct_write, num_threads, block_size / 1024, qd);
 
     let random_block = if source.is_none() {

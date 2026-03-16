@@ -9,6 +9,7 @@ pub fn run_optimizer<F>(
     name: &str,
     start_params: Vec<u64>,
     param_scaling_factors: Vec<u64>,
+    mutable_param_mask: Vec<bool>,
     num_iterations: usize,
     verbose: bool,
     mut op: F,
@@ -16,6 +17,8 @@ pub fn run_optimizer<F>(
 where
     F: FnMut(&[u64]) -> io::Result<u64>,
 {
+    assert_eq!(start_params.len(), param_scaling_factors.len());
+    assert_eq!(start_params.len(), mutable_param_mask.len());
     let mut rng = rand::rng();
     let mut fastest_time = 1e9;
     let mut fastest_time_decayed = fastest_time;
@@ -30,7 +33,7 @@ where
         fastest_time_decayed *= 1.0005;
         let mut scaled_params = vec![0u64; optimize_params.len()];
         for j in 0..optimize_params.len() {
-            if num_iterations > 1 {
+            if num_iterations > 1 && mutable_param_mask[j] {
                 let jump_multiplier = (rng.random::<f64>().powf(2.0)
                     * (iterations_since_last_fastest_found as f64 / 4.0).log2()
                     + 1.0) as u64;
@@ -88,5 +91,36 @@ where
         Ok(scaled_params)
     } else {
         Ok(best_scaled_params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_optimizer;
+    use std::io;
+
+    #[test]
+    fn inactive_params_are_never_changed() -> io::Result<()> {
+        let start_params = vec![2, 8, 16];
+        let scaling = vec![1, 1, 1];
+        let mutable_mask = vec![true, false, false];
+
+        let best = run_optimizer(
+            "test",
+            start_params.clone(),
+            scaling,
+            mutable_mask,
+            16,
+            true,
+            |params| {
+                assert_eq!(params[1], start_params[1]);
+                assert_eq!(params[2], start_params[2]);
+                Ok(1024)
+            },
+        )?;
+
+        assert_eq!(best[1], start_params[1]);
+        assert_eq!(best[2], start_params[2]);
+        Ok(())
     }
 }

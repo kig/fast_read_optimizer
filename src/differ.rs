@@ -247,12 +247,6 @@ pub fn diff_files(
     let s1 = std::fs::metadata(file1)?.len();
     let s2 = std::fs::metadata(file2)?.len();
     let file_size = std::cmp::min(s1, s2);
-    if use_direct && file_size % block_size != 0 {
-        eprintln!(
-            "Warning: diff requested direct I/O but the final partial block will use page-cache reads"
-        );
-    }
-
     for thread_id in 0..num_threads {
         let mismatch = mismatch.clone();
         let f1_name = file1.to_string();

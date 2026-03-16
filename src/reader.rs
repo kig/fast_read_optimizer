@@ -639,12 +639,6 @@ pub fn load_file_to_memory(
             params,
         });
     }
-    if params.use_direct && file_size % params.block_size != 0 {
-        eprintln!(
-            "Warning: read requested direct I/O but the final partial block will use page-cache reads"
-        );
-    }
-
     let output = Arc::new(SharedOutput {
         ptr: data.as_mut_ptr(),
         len: data.len(),
@@ -752,12 +746,6 @@ where
             params,
         });
     }
-    if params.use_direct && file_size % params.block_size != 0 {
-        eprintln!(
-            "Warning: read requested direct I/O but the final partial block will use page-cache reads"
-        );
-    }
-
     let read_count = Arc::new(AtomicU64::new(0));
     let results = Arc::new(
         (0..block_count)
@@ -872,12 +860,6 @@ where
     if file_size == 0 {
         return Ok((0, 0, params));
     }
-    if params.use_direct && file_size % params.block_size != 0 {
-        eprintln!(
-            "Warning: read requested direct I/O but the final partial block will use page-cache reads"
-        );
-    }
-
     let read_count = Arc::new(AtomicU64::new(0));
     let visitor = Arc::new(visitor);
 

@@ -878,11 +878,6 @@ fn hash_file_blocks_inner(
 
     let file_size = std::fs::metadata(filename)?.len();
     let block_count = block_count_for_size(file_size, block_size)?;
-    if use_direct && file_size % block_size != 0 {
-        eprintln!(
-            "Warning: hash requested direct I/O but the final partial block will use page-cache reads"
-        );
-    }
     let mut block_hashes = vec![BlockDigest::from_prefix(&[]); block_count];
 
     let mut threads = vec![];
