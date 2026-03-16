@@ -716,7 +716,11 @@ mod tests {
             "diff": legacy.diff,
             "dual_read_bench": legacy.dual_read_bench,
         });
-        std::fs::write(&cfg_path, serde_json::to_string_pretty(&legacy_text).unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string_pretty(&legacy_text).unwrap(),
+        )
+        .unwrap();
 
         let loaded = load_config(Some(cfg_path.to_str().unwrap()));
         let hash = loaded.get_params("hash", false);
@@ -741,7 +745,10 @@ mod tests {
 
         let loaded = load_config(Some(cfg_path.to_str().unwrap()));
         match loaded {
-            LoadedConfig::BundleV1 { ref path, ref bundle } => {
+            LoadedConfig::BundleV1 {
+                ref path,
+                ref bundle,
+            } => {
                 assert_eq!(path, &cfg_path);
                 assert_eq!(bundle.version, 1);
             }

@@ -16,8 +16,8 @@ use block_hash::{
 use differ::{bench_diff_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::read_file;
-use writer::write_file;
 use std::io;
+use writer::write_file;
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -245,7 +245,9 @@ fn print_command_help(program: &str, help: CommandHelp) {
 
 fn print_general_help(program: &str) {
     println!("fast_read_optimizer (fro)");
-    println!("High-throughput Linux file IO utilities with companion benchmark and optimizer tooling.");
+    println!(
+        "High-throughput Linux file IO utilities with companion benchmark and optimizer tooling."
+    );
     println!();
     println!("USAGE:");
     println!("  {} <command> [options]", program);
@@ -254,12 +256,21 @@ fn print_general_help(program: &str) {
     println!("Utilities:");
     for (name, summary) in [
         ("grep", "search for a literal byte substring while reading"),
-        ("write", "rewrite or create a file through the tuned write path"),
-        ("copy", "copy one file to another with tuned read/write settings"),
+        (
+            "write",
+            "rewrite or create a file through the tuned write path",
+        ),
+        (
+            "copy",
+            "copy one file to another with tuned read/write settings",
+        ),
         ("diff", "compare two files and report the first mismatch"),
         ("hash", "write 1 MiB block-hash sidecars"),
         ("verify", "scrub a file against its block-hash sidecars"),
-        ("recover", "repair corrupted blocks from one or more replicas"),
+        (
+            "recover",
+            "repair corrupted blocks from one or more replicas",
+        ),
     ] {
         println!("  {:<16} {}", name, summary);
     }
@@ -357,11 +368,11 @@ fn try_main() -> io::Result<i32> {
             i += 1;
             if i >= args.len() {
                 eprintln!("Missing value for --hash-type");
-                return;
+                return Ok(1);
             }
             let Some(parsed) = BlockHashAlgorithm::parse(&args[i].to_ascii_lowercase()) else {
                 eprintln!("Invalid --hash-type: {}", args[i]);
-                return;
+                return Ok(1);
             };
             hash_type = parsed;
         } else if args[i] == "--direct" {

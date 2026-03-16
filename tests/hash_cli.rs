@@ -1,8 +1,8 @@
+use fro::block_hash::{BlockHashAlgorithm, BlockHashManifest};
+use fro::config::{AppConfig, ConfigBundleV1, DeviceDbConfig, IOParams, MountOverrides};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
-use fro::block_hash::{BlockHashAlgorithm, BlockHashManifest};
-use fro::config::{AppConfig, ConfigBundleV1, DeviceDbConfig, IOParams, MountOverrides};
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
@@ -188,12 +188,16 @@ fn recover_fast_uses_target_only_clean_path() {
     fs::write(&target, &data).unwrap();
     fs::write(&backup, &data).unwrap();
 
-    assert!(run_fro(&["hash", "--no-direct", "-n", "1", target.to_str().unwrap()])
-        .status
-        .success());
-    assert!(run_fro(&["hash", "--no-direct", "-n", "1", backup.to_str().unwrap()])
-        .status
-        .success());
+    assert!(
+        run_fro(&["hash", "--no-direct", "-n", "1", target.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        run_fro(&["hash", "--no-direct", "-n", "1", backup.to_str().unwrap()])
+            .status
+            .success()
+    );
 
     let mut backup_file = fs::OpenOptions::new().write(true).open(&backup).unwrap();
     backup_file.seek(SeekFrom::Start(block as u64 + 3)).unwrap();
@@ -235,12 +239,16 @@ fn recover_in_place_all_repairs_all_inputs_and_restores_sidecars() {
     fs::write(&target, &data).unwrap();
     fs::write(&backup, &data).unwrap();
 
-    assert!(run_fro(&["hash", "--no-direct", "-n", "1", target.to_str().unwrap()])
-        .status
-        .success());
-    assert!(run_fro(&["hash", "--no-direct", "-n", "1", backup.to_str().unwrap()])
-        .status
-        .success());
+    assert!(
+        run_fro(&["hash", "--no-direct", "-n", "1", target.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        run_fro(&["hash", "--no-direct", "-n", "1", backup.to_str().unwrap()])
+            .status
+            .success()
+    );
 
     let mut target_file = fs::OpenOptions::new().write(true).open(&target).unwrap();
     target_file.seek(SeekFrom::Start(7)).unwrap();
@@ -277,11 +285,19 @@ fn recover_in_place_all_repairs_all_inputs_and_restores_sidecars() {
     assert!(stdout.contains("sidecars_refreshed=2"));
 
     let out = run_fro(&["verify", "--no-direct", "-n", "1", target.to_str().unwrap()]);
-    assert!(out.status.success(), "target verify failed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "target verify failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
 
     let out = run_fro(&["verify", "--no-direct", "-n", "1", backup.to_str().unwrap()]);
-    assert!(out.status.success(), "backup verify failed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "backup verify failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
 
     for suffix in ["0", "1", "2"] {
@@ -356,10 +372,20 @@ fn hash_and_verify_use_separate_config_and_sidecar_geometry() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
 
-    let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
-    assert_eq!(saved["defaults"]["read"]["page_cache"]["block_size"], 128 * 1024);
-    assert_eq!(saved["defaults"]["hash"]["page_cache"]["block_size"], 2 * 1024 * 1024);
-    assert_eq!(saved["defaults"]["verify"]["page_cache"]["block_size"], 256 * 1024);
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(
+        saved["defaults"]["read"]["page_cache"]["block_size"],
+        128 * 1024
+    );
+    assert_eq!(
+        saved["defaults"]["hash"]["page_cache"]["block_size"],
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        saved["defaults"]["verify"]["page_cache"]["block_size"],
+        256 * 1024
+    );
 }
 
 #[test]

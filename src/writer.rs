@@ -2,10 +2,9 @@ use crate::common::{AlignedBuffer, IOMode};
 use crate::config::LoadedConfig;
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
-use rand::Rng;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +51,12 @@ pub struct OffsetWriter {
 }
 
 impl SequentialWriter {
-    pub fn create(path: &str, qd: usize, block_size: u64, io_mode: IOMode) -> std::io::Result<Self> {
+    pub fn create(
+        path: &str,
+        qd: usize,
+        block_size: u64,
+        io_mode: IOMode,
+    ) -> std::io::Result<Self> {
         Self::open(path, qd, block_size, io_mode, true)
     }
 
@@ -84,11 +88,12 @@ impl SequentialWriter {
                 "block_size must be greater than zero",
             ));
         }
-        let (file_page_cache, file_direct, bytes_written) = open_writer_files(path, truncate, None)?;
+        let (file_page_cache, file_direct, bytes_written) =
+            open_writer_files(path, truncate, None)?;
         Ok(Self {
             file_page_cache,
             file_direct,
-            io_uring: IoUring::new(1024).unwrap(),
+            io_uring: IoUring::new(1024).map_err(io::Error::other)?,
             pending: std::iter::repeat_with(|| None).take(qd).collect(),
             bytes_written,
             bytes_submitted: bytes_written,
@@ -168,7 +173,7 @@ impl SequentialWriter {
             .pending
             .iter()
             .position(Option::is_none)
-            .expect("pending slot should exist");
+            .ok_or_else(|| io::Error::other("pending slot should exist"))?;
         let start = self.bytes_submitted;
         self.bytes_submitted += data.len() as u64;
 
@@ -181,7 +186,10 @@ impl SequentialWriter {
             self.file_page_cache.as_raw_fd()
         };
         unsafe {
-            let mut sqe = self.io_uring.prepare_sqe().unwrap();
+            let mut sqe = self
+                .io_uring
+                .prepare_sqe()
+                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             sqe.prep_write(fd, &buffer.as_slice()[..data.len()], start);
             sqe.set_user_data(slot as u64);
         }
@@ -189,12 +197,12 @@ impl SequentialWriter {
             buffer,
             len: data.len(),
         });
-        self.io_uring.submit_sqes().unwrap();
+        self.io_uring.submit_sqes().map_err(io::Error::other)?;
         Ok(())
     }
 
     fn wait_for_one(&mut self) -> std::io::Result<()> {
-        let cq = self.io_uring.wait_for_cqe().unwrap();
+        let cq = self.io_uring.wait_for_cqe().map_err(io::Error::other)?;
         let slot = cq.user_data() as usize;
         let written = cq.result()?;
         let pending = self.pending[slot]
@@ -231,7 +239,7 @@ impl OffsetWriter {
         Ok(Self {
             file_page_cache,
             file_direct,
-            io_uring: IoUring::new(1024).unwrap(),
+            io_uring: IoUring::new(1024).map_err(io::Error::other)?,
             pending: std::iter::repeat_with(|| None).take(qd).collect(),
             bytes_written: 0,
             use_direct: io_mode != IOMode::PageCache,
@@ -246,7 +254,7 @@ impl OffsetWriter {
             .pending
             .iter()
             .position(Option::is_none)
-            .expect("pending slot should exist");
+            .ok_or_else(|| io::Error::other("pending slot should exist"))?;
         let mut buffer = AlignedBuffer::new(data.len());
         buffer.as_mut_slice().copy_from_slice(data);
         let use_direct = self.use_direct && offset % 4096 == 0 && data.len() % 4096 == 0;
@@ -256,7 +264,10 @@ impl OffsetWriter {
             self.file_page_cache.as_raw_fd()
         };
         unsafe {
-            let mut sqe = self.io_uring.prepare_sqe().unwrap();
+            let mut sqe = self
+                .io_uring
+                .prepare_sqe()
+                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             sqe.prep_write(fd, &buffer.as_slice()[..data.len()], offset);
             sqe.set_user_data(slot as u64);
         }
@@ -264,7 +275,7 @@ impl OffsetWriter {
             buffer,
             len: data.len(),
         });
-        self.io_uring.submit_sqes().unwrap();
+        self.io_uring.submit_sqes().map_err(io::Error::other)?;
         self.bytes_written = self.bytes_written.max(offset + data.len() as u64);
         Ok(())
     }
@@ -281,7 +292,7 @@ impl OffsetWriter {
     }
 
     fn wait_for_one(&mut self) -> std::io::Result<()> {
-        let cq = self.io_uring.wait_for_cqe().unwrap();
+        let cq = self.io_uring.wait_for_cqe().map_err(io::Error::other)?;
         let slot = cq.user_data() as usize;
         let written = cq.result()?;
         let pending = self.pending[slot]
@@ -365,7 +376,7 @@ fn thread_writer(
     random_block: Option<&[u8]>,
     total_size: u64,
     use_direct: bool,
-) {
+) -> io::Result<()> {
     let mut buffers = Vec::new();
     for _ in 0..qd {
         let mut buffer = AlignedBuffer::new(block_size as usize);
@@ -394,7 +405,9 @@ fn thread_writer(
                 src_pagecache.as_raw_fd()
             };
             unsafe {
-                let mut sqe = io_uring.prepare_sqe().unwrap();
+                let mut sqe = io_uring
+                    .prepare_sqe()
+                    .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                 sqe.prep_read(
                     fd,
                     &mut buffers[i].as_mut_slice()[..len as usize],
@@ -409,7 +422,9 @@ fn thread_writer(
                 dest_file.1.as_raw_fd()
             };
             unsafe {
-                let mut sqe = io_uring.prepare_sqe().unwrap();
+                let mut sqe = io_uring
+                    .prepare_sqe()
+                    .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                 sqe.prep_write(fd, &buffers[i].as_slice()[..len as usize], next_offset);
                 sqe.set_user_data((i as u64) | (2u64 << 40));
             }
@@ -418,16 +433,16 @@ fn thread_writer(
         inflight += 1;
     }
     if inflight == 0 {
-        return;
+        return Ok(());
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(io::Error::other)?;
 
     while inflight > 0 {
-        let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
+        let cq = io_uring.wait_for_cqe().map_err(io::Error::other)?;
         let user_data = cq.user_data();
         let idx = (user_data & 0xFFFFFFFF) as usize;
         let state = (user_data >> 40) as u8;
-        let result = cq.result().expect("IO failed");
+        let result = cq.result()?;
 
         if state == 1 {
             // Read finished
@@ -439,7 +454,9 @@ fn thread_writer(
                 dest_file.1.as_raw_fd()
             };
             unsafe {
-                let mut sqe = io_uring.prepare_sqe().unwrap();
+                let mut sqe = io_uring
+                    .prepare_sqe()
+                    .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                 sqe.prep_write(
                     fd,
                     &buffers[idx].as_slice()[..result as usize],
@@ -447,7 +464,7 @@ fn thread_writer(
                 );
                 sqe.set_user_data((idx as u64) | (2u64 << 40));
             }
-            io_uring.submit_sqes().unwrap();
+            io_uring.submit_sqes().map_err(io::Error::other)?;
         } else {
             // Write finished
             write_count.fetch_add(result as u64, Ordering::SeqCst);
@@ -464,7 +481,9 @@ fn thread_writer(
                         src_pagecache.as_raw_fd()
                     };
                     unsafe {
-                        let mut sqe = io_uring.prepare_sqe().unwrap();
+                        let mut sqe = io_uring
+                            .prepare_sqe()
+                            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                         sqe.prep_read(
                             fd,
                             &mut buffers[idx].as_mut_slice()[..len as usize],
@@ -479,17 +498,20 @@ fn thread_writer(
                         dest_file.1.as_raw_fd()
                     };
                     unsafe {
-                        let mut sqe = io_uring.prepare_sqe().unwrap();
+                        let mut sqe = io_uring
+                            .prepare_sqe()
+                            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                         sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], next_offset);
                         sqe.set_user_data((idx as u64) | (2u64 << 40));
                     }
                 }
-                io_uring.submit_sqes().unwrap();
+                io_uring.submit_sqes().map_err(io::Error::other)?;
                 next_offset += num_threads * block_size;
                 inflight += 1;
             }
         }
     }
+    Ok(())
 }
 /*
 write (direct)                      | 10.40        | 10.00        | PASS
@@ -521,18 +543,18 @@ pub fn write_file(
     qd_d: usize,
     io_mode_read: IOMode,
     io_mode_write: IOMode,
-) -> u64 {
+) -> io::Result<u64> {
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
     let (total_size, _file_cached) = if let Some(s) = source {
         let file_cached = Ok(true) == is_first_page_resident(s);
-        let f = File::open(s).unwrap();
-        (f.metadata().unwrap().len(), file_cached)
+        let f = File::open(s)?;
+        (f.metadata()?.len(), file_cached)
     } else if let Some(size) = create_size {
         (size, false)
     } else {
-        let f = File::open(filename).unwrap();
-        (f.metadata().unwrap().len(), false)
+        let f = File::open(filename)?;
+        (f.metadata()?.len(), false)
     };
 
     let direct_write = io_mode_write != IOMode::PageCache;
@@ -550,6 +572,17 @@ pub fn write_file(
     };
     let qd = if direct_write { qd_d } else { qd_p };
 
+    if direct_read && total_size % block_size != 0 {
+        eprintln!(
+            "Warning: write requested direct source reads but the final partial block will use page-cache reads"
+        );
+    }
+    if direct_write && total_size % block_size != 0 {
+        eprintln!(
+            "Warning: write requested direct destination writes but the final partial block will use page-cache writes"
+        );
+    }
+
     // println!("direct-read: {} | direct-write: {} | t={} bs={} qd={}", direct_read, direct_write, num_threads, block_size / 1024, qd);
 
     let random_block = if source.is_none() {
@@ -562,12 +595,8 @@ pub fn write_file(
 
     // Ensure target file exists and has the correct size. Pre-allocate blocks.
     {
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(filename)
-            .unwrap();
-        f.set_len(total_size).unwrap();
+        let f = OpenOptions::new().write(true).create(true).open(filename)?;
+        f.set_len(total_size)?;
         unsafe {
             libc::posix_fallocate(f.as_raw_fd(), 0, total_size as i64);
         }
@@ -578,23 +607,23 @@ pub fn write_file(
         let filename = filename.to_string();
         let source = source.map(|s| s.to_string());
         let random_block = random_block.clone();
-        threads.push(std::thread::spawn(move || {
-            let dest_file_nodir = OpenOptions::new().write(true).open(&filename).unwrap();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            let dest_file_nodir = OpenOptions::new().write(true).open(&filename)?;
             let dest_file_dir = OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_DIRECT)
-                .open(&filename)
-                .unwrap();
-            let source_files = source.map(|s| {
-                let s_nodir = File::open(&s).unwrap();
-                let s_dir = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open(&s)
-                    .unwrap();
-                (s_dir, s_nodir)
-            });
-            let mut io_uring = IoUring::new(1024).unwrap();
+                .open(&filename)?;
+            let source_files = source
+                .map(|s| -> io::Result<(File, File)> {
+                    let s_nodir = File::open(&s)?;
+                    let s_dir = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(&s)?;
+                    Ok((s_dir, s_nodir))
+                })
+                .transpose()?;
+            let mut io_uring = IoUring::new(1024).map_err(io::Error::other)?;
             thread_writer(
                 thread_id,
                 source_files.as_ref().map(|(d, n)| (d, n)),
@@ -607,13 +636,15 @@ pub fn write_file(
                 random_block.as_ref().map(|b| &b[..]),
                 total_size,
                 direct_read,
-            );
+            )
         }));
     }
     for thread in threads {
-        thread.join().unwrap();
+        thread
+            .join()
+            .map_err(|_| io::Error::other("write worker thread panicked"))??;
     }
-    write_count.load(Ordering::SeqCst)
+    Ok(write_count.load(Ordering::SeqCst))
 }
 
 pub fn bench_mmap_write(filename: &str) {

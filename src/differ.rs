@@ -1,9 +1,9 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
-use rand::Rng;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ fn thread_differ(
     mismatch: Arc<AtomicU64>,
     bench_only: bool,
     use_direct: bool,
-) {
+) -> io::Result<()> {
     let mut buffers1 = Vec::new();
     let mut buffers2 = Vec::new();
     for _ in 0..(qd * 2) {
@@ -56,7 +56,9 @@ fn thread_differ(
             file2.1.as_raw_fd()
         };
         unsafe {
-            let mut sqe1 = io_uring.prepare_sqe().unwrap();
+            let mut sqe1 = io_uring
+                .prepare_sqe()
+                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             sqe1.prep_read(
                 f1_fd,
                 &mut buffers1[idx].as_mut_slice()[..len as usize],
@@ -64,7 +66,9 @@ fn thread_differ(
             );
             sqe1.set_user_data((idx as u64) | (1u64 << 40));
 
-            let mut sqe2 = io_uring.prepare_sqe().unwrap();
+            let mut sqe2 = io_uring
+                .prepare_sqe()
+                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             sqe2.prep_read(
                 f2_fd,
                 &mut buffers2[idx].as_mut_slice()[..len as usize],
@@ -77,19 +81,19 @@ fn thread_differ(
     }
 
     if inflight == 0 {
-        return;
+        return Ok(());
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(io::Error::other)?;
 
     let mut ready1 = vec![false; qd * 2];
     let mut ready2 = vec![false; qd * 2];
 
     while inflight > 0 && mismatch.load(Ordering::Relaxed) == 0 {
-        let cq = io_uring.wait_for_cqe().expect("wait_for_cqe failed");
+        let cq = io_uring.wait_for_cqe().map_err(io::Error::other)?;
         let ud = cq.user_data();
         let idx = (ud & 0xFFFFFFFF) as usize;
         let file_num = (ud >> 40) as u8;
-        cq.result().expect("IO failed");
+        cq.result()?;
         inflight -= 1;
         if file_num == 1 {
             ready1[idx] = true;
@@ -100,11 +104,13 @@ fn thread_differ(
         let mut ready_indices = vec![idx];
 
         while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
+            let cq = io_uring.peek_for_cqe().ok_or_else(|| {
+                io::Error::other("completion queue reported ready but no CQE was available")
+            })?;
             let ud = cq.user_data();
             let idx2 = (ud & 0xFFFFFFFF) as usize;
             let file_num = (ud >> 40) as u8;
-            cq.result().expect("IO failed");
+            cq.result()?;
             inflight -= 1;
             if file_num == 1 {
                 ready1[idx2] = true;
@@ -173,7 +179,9 @@ fn thread_differ(
                     file2.1.as_raw_fd()
                 };
                 unsafe {
-                    let mut sqe1 = io_uring.prepare_sqe().unwrap();
+                    let mut sqe1 = io_uring
+                        .prepare_sqe()
+                        .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                     sqe1.prep_read(
                         f1_fd,
                         &mut buffers1[next_idx].as_mut_slice()[..next_len as usize],
@@ -181,7 +189,9 @@ fn thread_differ(
                     );
                     sqe1.set_user_data((next_idx as u64) | (1u64 << 40));
 
-                    let mut sqe2 = io_uring.prepare_sqe().unwrap();
+                    let mut sqe2 = io_uring
+                        .prepare_sqe()
+                        .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
                     sqe2.prep_read(
                         f2_fd,
                         &mut buffers2[next_idx].as_mut_slice()[..next_len as usize],
@@ -197,9 +207,10 @@ fn thread_differ(
             }
         }
         if submitted {
-            io_uring.submit_sqes().unwrap();
+            io_uring.submit_sqes().map_err(io::Error::other)?;
         }
     }
+    Ok(())
 }
 
 pub fn diff_files(
@@ -213,7 +224,7 @@ pub fn diff_files(
     qd_d: usize,
     io_mode: IOMode,
     bench_only: bool,
-) -> u64 {
+) -> io::Result<u64> {
     let mismatch = Arc::new(AtomicU64::new(0));
     let mut threads = vec![];
 
@@ -233,32 +244,31 @@ pub fn diff_files(
     };
     let qd = if use_direct { qd_d } else { qd_p };
 
-    let s1 = std::fs::metadata(file1)
-        .expect("Could not open file 1")
-        .len();
-    let s2 = std::fs::metadata(file2)
-        .expect("Could not open file 2")
-        .len();
+    let s1 = std::fs::metadata(file1)?.len();
+    let s2 = std::fs::metadata(file2)?.len();
     let file_size = std::cmp::min(s1, s2);
+    if use_direct && file_size % block_size != 0 {
+        eprintln!(
+            "Warning: diff requested direct I/O but the final partial block will use page-cache reads"
+        );
+    }
 
     for thread_id in 0..num_threads {
         let mismatch = mismatch.clone();
         let f1_name = file1.to_string();
         let f2_name = file2.to_string();
-        threads.push(std::thread::spawn(move || {
-            let f1_pagecache = File::open(&f1_name).unwrap();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            let f1_pagecache = File::open(&f1_name)?;
             let f1_direct = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECT)
-                .open(&f1_name)
-                .unwrap();
-            let f2_pagecache = File::open(&f2_name).unwrap();
+                .open(&f1_name)?;
+            let f2_pagecache = File::open(&f2_name)?;
             let f2_direct = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECT)
-                .open(&f2_name)
-                .unwrap();
-            let mut io_uring = IoUring::new(1024).unwrap();
+                .open(&f2_name)?;
+            let mut io_uring = IoUring::new(1024).map_err(io::Error::other)?;
             thread_differ(
                 thread_id,
                 (&f1_direct, &f1_pagecache),
@@ -271,15 +281,17 @@ pub fn diff_files(
                 mismatch,
                 bench_only,
                 use_direct,
-            );
+            )
         }));
     }
 
     for thread in threads {
-        thread.join().unwrap();
+        thread
+            .join()
+            .map_err(|_| io::Error::other("diff worker thread panicked"))??;
     }
 
-    mismatch.load(Ordering::SeqCst)
+    Ok(mismatch.load(Ordering::SeqCst))
 }
 
 pub fn bench_diff_memory(num_threads: usize, block_size: usize) {

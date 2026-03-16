@@ -215,8 +215,7 @@ fn open_reader_files(filename: &str, use_direct: bool) -> std::io::Result<(File,
         OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(filename)
-            ?
+            .open(filename)?
     } else {
         File::open(filename)?
     };
@@ -237,6 +236,7 @@ fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
     Ok(ready)
 }
 
+#[allow(dead_code)]
 fn thread_reader(
     thread_id: u64,
     pattern: String,
@@ -624,7 +624,10 @@ pub fn load_file_to_memory(
     let file_len = usize::try_from(file_size).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("file is too large to fit in memory on this platform: {}", file_size),
+            format!(
+                "file is too large to fit in memory on this platform: {}",
+                file_size
+            ),
         )
     })?;
 
@@ -756,7 +759,11 @@ where
     }
 
     let read_count = Arc::new(AtomicU64::new(0));
-    let results = Arc::new((0..block_count).map(|_| Mutex::new(None)).collect::<Vec<_>>());
+    let results = Arc::new(
+        (0..block_count)
+            .map(|_| Mutex::new(None))
+            .collect::<Vec<_>>(),
+    );
     let mapper = Arc::new(mapper);
 
     let mut threads = vec![];
@@ -963,7 +970,11 @@ pub fn read_file(
             all_matches.extend(block.matches.iter().copied());
         }
         for pair in blocks.blocks.windows(2) {
-            all_matches.extend(find_boundary_matches(&pair[0], &pair[1], pattern.as_bytes()));
+            all_matches.extend(find_boundary_matches(
+                &pair[0],
+                &pair[1],
+                pattern.as_bytes(),
+            ));
         }
         all_matches.sort_unstable();
         all_matches.dedup();
