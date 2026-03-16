@@ -1,20 +1,17 @@
 use blake3::Hasher;
-use fro::config::load_config;
-use fro::reader::visit_file_blocks_for_mode;
 use fro::IOMode;
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::mpsc;
 
 struct Options {
-    config_path: Option<String>,
     io_mode: IOMode,
     filenames: Vec<String>,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "USAGE: {} [--auto|--no-direct|--direct] [-c config.json] <file> [file ...]",
+        "USAGE: {} [--auto|--no-direct|--direct] <file> [file ...]",
         program
     );
 }
@@ -26,20 +23,12 @@ fn parse_args() -> Result<Options, String> {
         return Err("missing file".to_string());
     }
 
-    let mut config_path = None;
     let mut io_mode = IOMode::Auto;
     let mut filenames = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "-c" | "--config" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("missing value for --config".to_string());
-                }
-                config_path = Some(args[i].clone());
-            }
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
@@ -56,11 +45,7 @@ fn parse_args() -> Result<Options, String> {
         return Err("missing file".to_string());
     }
 
-    Ok(Options {
-        config_path,
-        io_mode,
-        filenames,
-    })
+    Ok(Options { io_mode, filenames })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -71,11 +56,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
-fn hash_file(
-    path: &str,
-    config: &fro::config::LoadedConfig,
-    io_mode: IOMode,
-) -> io::Result<blake3::Hash> {
+fn hash_file(path: &str, io_mode: IOMode) -> io::Result<blake3::Hash> {
     let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
 
     let hash_thread = std::thread::spawn(move || -> io::Result<blake3::Hash> {
@@ -101,25 +82,24 @@ fn hash_file(
     });
 
     let sender = tx.clone();
-    let visit_result = visit_file_blocks_for_mode(config, "hash", path, io_mode, move |block| {
+    let visit_result = fro::visit_blocks_with_mode(path, io_mode, move |block_index, data| {
         sender
-            .send((block.block_index, block.data.to_vec()))
+            .send((block_index, data.to_vec()))
             .map_err(|_| io::Error::other("failed to queue block for hashing"))
     });
     drop(tx);
-    let digest = hash_thread
+    let hash_result = hash_thread
         .join()
-        .map_err(|_| io::Error::other("hash worker thread panicked"))??;
+        .map_err(|_| io::Error::other("hash worker thread panicked"))?;
     visit_result?;
-    Ok(digest)
+    Ok(hash_result?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = parse_args().map_err(io::Error::other)?;
-    let config = load_config(opts.config_path.as_deref());
 
     for filename in &opts.filenames {
-        let digest = hash_file(filename, &config, opts.io_mode)?;
+        let digest = hash_file(filename, opts.io_mode)?;
         println!("{}  {}", hex_digest(digest.as_bytes()), filename);
     }
 

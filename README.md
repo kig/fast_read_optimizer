@@ -82,6 +82,24 @@ fro-optimize --help
 fro-benchmark --help
 ```
 
+## Rust crate API
+
+The crate now exposes a small opinionated high-level API for the common cases, loading the default `fro.json` automatically and using tuned parameters by default:
+
+```rust
+let bytes = fro::read_file("checkpoint.bin")?;
+fro::write_file("copy.bin", &bytes)?;
+fro::copy_file("checkpoint.bin", "checkpoint.backup")?;
+
+let reader = fro::open("checkpoint.bin")?;
+reader.foreach_block(|block_index, block| {
+    println!("block {} has {} bytes", block_index, block.len());
+    Ok(())
+})?;
+```
+
+For stream-style writes, use `fro::create(...)` for sequential output or `fro::offset_writer(...)` for parallel offset writes. See `examples/dd.rs`, `examples/sha256sum.rs`, and `examples/b3sum.rs` for end-to-end usage.
+
 ### How `fro` utilities behave
 
 Every `fro <command>` run goes through the optimizer.

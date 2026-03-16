@@ -229,13 +229,24 @@ impl OffsetWriter {
         qd: usize,
         io_mode: IOMode,
     ) -> std::io::Result<Self> {
+        Self::with_truncate(path, total_size, qd, io_mode, true)
+    }
+
+    pub fn with_truncate(
+        path: &str,
+        total_size: u64,
+        qd: usize,
+        io_mode: IOMode,
+        truncate: bool,
+    ) -> std::io::Result<Self> {
         if qd == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "qd must be greater than zero",
             ));
         }
-        let (file_page_cache, file_direct, _) = open_writer_files(path, true, Some(total_size))?;
+        let (file_page_cache, file_direct, _) =
+            open_writer_files(path, truncate, Some(total_size))?;
         Ok(Self {
             file_page_cache,
             file_direct,

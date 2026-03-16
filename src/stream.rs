@@ -52,7 +52,7 @@ enum WriteRequest {
 
 enum WriterMode {
     ByIndex { block_count: usize },
-    ByOffset { total_size: u64 },
+    ByOffset { total_size: u64, truncate: bool },
 }
 
 impl ParallelFile {
@@ -120,6 +120,20 @@ impl ParallelFile {
             file_size,
             params,
         })
+    }
+
+    pub fn block_size(&self) -> std::io::Result<u64> {
+        Ok(
+            resolve_reader_params_for_mode(&self.config, &self.mode, &self.path, self.io_mode)?
+                .block_size,
+        )
+    }
+
+    pub fn foreach_block<F>(&self, visit: F) -> std::io::Result<ParallelReadReport>
+    where
+        F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.foreach_block_parallel(self.block_size()?, visit)
     }
 
     pub fn foreach_index_parallel<F>(&self, job_count: usize, visit: F) -> std::io::Result<()>
@@ -195,11 +209,25 @@ impl ParallelWriter {
         io_mode: IOMode,
         total_size: u64,
     ) -> std::io::Result<Self> {
+        Self::fixed_size_with_truncate(config, mode, path, io_mode, total_size, true)
+    }
+
+    pub fn fixed_size_with_truncate(
+        config: &LoadedConfig,
+        mode: &str,
+        path: &str,
+        io_mode: IOMode,
+        total_size: u64,
+        truncate: bool,
+    ) -> std::io::Result<Self> {
         Self::spawn(
             path,
             resolve_writer_params_for_mode(config, mode, path, io_mode),
             io_mode,
-            WriterMode::ByOffset { total_size },
+            WriterMode::ByOffset {
+                total_size,
+                truncate,
+            },
         )
     }
 
@@ -296,9 +324,17 @@ impl ParallelWriter {
                         write_params,
                     })
                 }
-                WriterMode::ByOffset { total_size } => {
-                    let mut out =
-                        OffsetWriter::create(&output_path, total_size, write_params.qd, io_mode)?;
+                WriterMode::ByOffset {
+                    total_size,
+                    truncate,
+                } => {
+                    let mut out = OffsetWriter::with_truncate(
+                        &output_path,
+                        total_size,
+                        write_params.qd,
+                        io_mode,
+                        truncate,
+                    )?;
                     for request in rx {
                         let (offset, data) = match request {
                             WriteRequest::ByOffset { offset, data } => (offset, data),
