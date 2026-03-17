@@ -82,6 +82,8 @@ fro-optimize --help
 fro-benchmark --help
 ```
 
+For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
+
 ## Rust crate API
 
 The crate now exposes a small opinionated high-level API for the common cases, loading the default `fro.json` automatically and using tuned parameters by default:
