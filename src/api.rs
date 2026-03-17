@@ -145,10 +145,9 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     let target = path_str(target.as_ref())?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
-    writer::write_file(
-        Some(source),
+    writer::copy_file(
+        source,
         target,
-        None,
         page_cache.num_threads,
         page_cache.block_size,
         page_cache.qd,

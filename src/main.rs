@@ -17,7 +17,7 @@ use differ::{bench_diff_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::read_file;
 use std::io;
-use writer::write_file;
+use writer::{write_file, copy_file};
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -84,11 +84,19 @@ fn active_optimizer_param_mask(
                 mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
             }
         },
-        "write" | "copy" => match io_mode_write {
+        "write" => match io_mode_write {
             common::IOMode::PageCache => {
                 mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
             }
             common::IOMode::Direct | common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
+        "copy" => {
+            if io_mode_write == common::IOMode::PageCache || io_mode == common::IOMode::PageCache {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            if !(io_mode_write == common::IOMode::PageCache && io_mode == common::IOMode::PageCache) {
                 mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
             }
         },
@@ -407,73 +415,95 @@ fn try_main() -> io::Result<i32> {
     let mut config_path: Option<&str> = None;
 
     let mut i = 2;
+    let mut end_flags = false;
     while i < args.len() {
-        if args[i] == "-c" || args[i] == "--config" {
-            i += 1;
-            if i < args.len() {
-                config_path = Some(args[i].as_str());
-            }
-        } else if args[i] == "--hash-base" {
-            i += 1;
-            if i < args.len() {
-                hash_base = Some(args[i].as_str());
-            }
-        } else if args[i] == "--create" {
-            i += 1;
-            if i < args.len() {
-                create_size = parse_size(args[i].as_str()).or_else(|| {
-                    eprintln!("Invalid --create size: {}", args[i]);
-                    None
-                });
-                if create_size.is_none() {
+        let is_flag = !end_flags && args[i].starts_with("-");
+        if is_flag {
+            if args[i] == "--" {
+                end_flags = true;
+            } else if args[i] == "--help" {
+                if let Some(help) = command_help(args[1].as_str()) {
+                    print_command_help(args[0].as_str(), help);
+                } else {
+                    eprintln!("Unknown command: {}", args[1]);
+                    println!();
+                    print_general_help(args[0].as_str());
+                }
+                return Ok(0);
+            } else if args[i] == "-c" || args[i] == "--config" {
+                i += 1;
+                if i < args.len() {
+                    config_path = Some(args[i].as_str());
+                }
+            } else if args[i] == "--hash-base" {
+                i += 1;
+                if i < args.len() {
+                    hash_base = Some(args[i].as_str());
+                }
+            } else if args[i] == "--create" {
+                i += 1;
+                if i < args.len() {
+                    create_size = parse_size(args[i].as_str()).or_else(|| {
+                        eprintln!("Invalid --create size: {}", args[i]);
+                        None
+                    });
+                    if create_size.is_none() {
+                        return Ok(1);
+                    }
+                }
+            } else if args[i] == "--fast" {
+                recover_fast_requested = true;
+                recover_mode = RecoverMode::Fast;
+            } else if args[i] == "--in-place-all" {
+                recover_in_place_all_requested = true;
+                recover_mode = RecoverMode::InPlaceAll;
+            } else if args[i] == "--hash-type" {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Missing value for --hash-type");
                     return Ok(1);
                 }
-            }
-        } else if args[i] == "--fast" {
-            recover_fast_requested = true;
-            recover_mode = RecoverMode::Fast;
-        } else if args[i] == "--in-place-all" {
-            recover_in_place_all_requested = true;
-            recover_mode = RecoverMode::InPlaceAll;
-        } else if args[i] == "--hash-type" {
-            i += 1;
-            if i >= args.len() {
-                eprintln!("Missing value for --hash-type");
-                return Ok(1);
-            }
-            let Some(parsed) = BlockHashAlgorithm::parse(&args[i].to_ascii_lowercase()) else {
-                eprintln!("Invalid --hash-type: {}", args[i]);
-                return Ok(1);
-            };
-            hash_type = parsed;
-        } else if args[i] == "--direct" {
-            io_mode = common::IOMode::Direct;
-            io_mode_write = common::IOMode::Direct;
-        } else if args[i] == "--no-direct" {
-            io_mode = common::IOMode::PageCache;
-            io_mode_write = common::IOMode::PageCache;
-        } else if args[i] == "--auto" {
-            io_mode = common::IOMode::Auto;
-            io_mode_write = common::IOMode::Auto;
-        } else if args[i] == "--direct-write" {
-            io_mode_write = common::IOMode::Direct;
-        } else if args[i] == "--no-direct-write" {
-            io_mode_write = common::IOMode::PageCache;
-        } else if args[i] == "--auto-write" {
-            io_mode_write = common::IOMode::Auto;
-        } else if args[i] == "-v" || args[i] == "--verbose" {
-            verbose = true;
-        } else if args[i] == "-s" || args[i] == "--save" {
-            save_config = true;
-        } else if args[i] == "-n" {
-            i += 1;
-            if i < args.len() {
-                iterations = args[i].parse().map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid number of iterations: {}", err),
-                    )
-                })?;
+                let Some(parsed) = BlockHashAlgorithm::parse(&args[i].to_ascii_lowercase()) else {
+                    eprintln!("Invalid --hash-type: {}", args[i]);
+                    return Ok(1);
+                };
+                hash_type = parsed;
+            } else if args[i] == "--direct" {
+                io_mode = common::IOMode::Direct;
+                io_mode_write = common::IOMode::Direct;
+            } else if args[i] == "--no-direct" {
+                io_mode = common::IOMode::PageCache;
+                io_mode_write = common::IOMode::PageCache;
+            } else if args[i] == "--auto" {
+                io_mode = common::IOMode::Auto;
+                io_mode_write = common::IOMode::Auto;
+            } else if args[i] == "--direct-write" {
+                io_mode_write = common::IOMode::Direct;
+            } else if args[i] == "--no-direct-write" {
+                io_mode_write = common::IOMode::PageCache;
+            } else if args[i] == "--auto-write" {
+                io_mode_write = common::IOMode::Auto;
+            } else if args[i] == "-v" || args[i] == "--verbose" {
+                verbose = true;
+            } else if args[i] == "-s" || args[i] == "--save" {
+                save_config = true;
+            } else if args[i] == "-n" {
+                i += 1;
+                if i < args.len() {
+                    iterations = args[i].parse().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid number of iterations: {}", err),
+                        )
+                    })?;
+                }
+            } else {
+                eprintln!("Unknown flag for {}: {}", args[0], args[i]);
+                println!();
+                if let Some(help) = command_help(args[0].as_str()) {
+                    print_command_help(args[0].as_str(), help);
+                }
+                return Ok(0);
             }
         } else if mode == "copy" || mode == "diff" || mode == "dual-read-bench" {
             if source.is_none() {
@@ -573,10 +603,7 @@ fn try_main() -> io::Result<i32> {
     let optimizer_mask = active_optimizer_param_mask(mode, io_mode, io_mode_write);
     let verbose = verbose
         || mode == "read"
-        || mode == "write"
-        || mode == "hash"
-        || mode == "verify"
-        || mode == "recover";
+        || mode == "write";
     if verbose {
         eprintln!("Opening file {} for {}", filename, mode);
     }
@@ -684,7 +711,6 @@ fn try_main() -> io::Result<i32> {
             Ok(report.bytes_hashed)
         } else if mode == "write" {
             write_file(
-                source,
                 filename,
                 create_size,
                 p[0],
@@ -693,23 +719,26 @@ fn try_main() -> io::Result<i32> {
                 p[3],
                 p[4],
                 p[5] as usize,
-                io_mode,
                 io_mode_write,
             )
         } else if mode == "copy" {
-            write_file(
-                source,
-                filename,
-                create_size,
-                p[0],
-                p[1],
-                p[2] as usize,
-                p[3],
-                p[4],
-                p[5] as usize,
-                io_mode,
-                io_mode_write,
-            )
+            if let Some(src) = source {
+                copy_file(
+                    src,
+                    filename,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                    io_mode_write,
+                )
+            } else {
+                eprintln!("Copy is missing a destination path.");
+                Ok(1)
+            }
         } else if mode == "diff" || mode == "dual-read-bench" {
             let s1 = std::fs::metadata(source.unwrap())?.len();
             let s2 = std::fs::metadata(filename)?.len();

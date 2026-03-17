@@ -665,25 +665,60 @@ pub fn copy_file_range(
 
     Ok(write_count.load(Ordering::SeqCst))
 }
+
 /*
 write (direct)                      | 10.40        | 10.00        | PASS
 write (auto, hot)                   | 10.50        | 10.00        | PASS
 
-copy (direct)                       | 6.50         | 6.00         | PASS
-copy (auto, cold)                   | 6.40         | 6.00         | PASS
-
 write (page cache, cold)            | 2.50         | 10.00        | REGRESSION
 write (page cache, hot)             | 3.20         | 10.00        | REGRESSION
 write (auto, cold)                  | 1.70         | 10.00        | REGRESSION
+*/
+pub fn write_file(
+    filename: &str,
+    create_size: Option<u64>,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    return _write_file_internal(None, filename, create_size, num_threads_p, block_size_p, qd_p, num_threads_d, block_size_d, qd_d, IOMode::Direct, io_mode_write);
+}
+
+/*
+copy (direct)                       | 6.50         | 6.00         | PASS
+copy (auto, cold)                   | 6.40         | 6.00         | PASS
 
 copy (page cache, cold)             | 1.00         | 0.50         | PASS
 
 copy (hot cache R, direct W)        | 2.60         | 10.00        | REGRESSION
 copy (auto, hot)                    | 1.40         | 10.00        | REGRESSION
-
 */
+pub fn copy_file(
+    source_filename: &str,
+    target_filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    return copy_file_range(
+        source_filename, 
+        target_filename,
+        0, 0, u64::MAX, true, 
+        num_threads_p, block_size_p, qd_p, num_threads_d, block_size_d, qd_d, 
+        io_mode_read, io_mode_write
+    );
+}
 
-pub fn write_file(
+fn _write_file_internal(
     source: Option<&str>,
     filename: &str,
     create_size: Option<u64>,
@@ -734,14 +769,11 @@ pub fn write_file(
         None
     };
 
-    // Ensure target file exists and has the correct size. Pre-allocate blocks.
+    // Ensure target file exists and has the correct size.
     {
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
             f.set_len(total_size)?;
-            unsafe {
-                libc::posix_fallocate(f.as_raw_fd(), 0, total_size as i64);
-            }
         }
     }
 
