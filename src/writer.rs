@@ -614,6 +614,7 @@ pub fn copy_file_range(
             if truncate_target || current_len < required_size {
                 f.set_len(required_size)?;
                 unsafe {
+                    libc::posix_fadvise(f.as_raw_fd(), dest_offset.try_into().unwrap(), copy_size.try_into().unwrap(), libc::POSIX_FADV_NOREUSE);
                     libc::posix_fallocate(f.as_raw_fd(), 0, required_size as i64);
                 }
             }
@@ -774,6 +775,9 @@ fn _write_file_internal(
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
             f.set_len(total_size)?;
+            unsafe {
+                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_NOREUSE);
+            }
         }
     }
 
