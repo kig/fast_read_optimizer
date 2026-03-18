@@ -38,6 +38,28 @@ fn read_write_and_copy_file_use_high_level_api() {
 }
 
 #[test]
+fn write_file_range_and_memory_copy_use_high_level_api() {
+    let tmp = unique_temp_dir("fro-public-api-memory");
+    fs::create_dir_all(&tmp).unwrap();
+    let source = tmp.join("source.bin");
+    let sliced = tmp.join("slice.bin");
+    let copied = tmp.join("copied.bin");
+    let bytes = (0..(1024 * 1024 + 137))
+        .map(|i| ((i * 17) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    fs::write(&source, &bytes).unwrap();
+
+    let range_written = fro::write_file_range(&sliced, &bytes, 11, 4099).unwrap();
+    assert_eq!(range_written, 4099);
+    assert_eq!(fs::read(&sliced).unwrap(), bytes[11..(11 + 4099)].to_vec());
+
+    let copied_bytes = fro::copy_file_via_memory(&source, &copied).unwrap();
+    assert_eq!(copied_bytes, bytes.len() as u64);
+    assert_eq!(fs::read(&copied).unwrap(), bytes);
+}
+
+#[test]
 fn offset_writer_can_preserve_existing_prefix_and_suffix() {
     let tmp = unique_temp_dir("fro-public-api-offset");
     fs::create_dir_all(&tmp).unwrap();

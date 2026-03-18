@@ -389,6 +389,20 @@ fn main() {
             files_to_prep: vec![source_file.clone()],
         },
         TestCase {
+            name: "read (to memory, hot)",
+            args: vec![
+                "read".into(),
+                "--to-memory".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+            ],
+            target: 5.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
             name: "copy (direct)",
             args: vec![
                 "copy".into(),
@@ -433,6 +447,23 @@ fn main() {
             target: 2.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (via memory, hot cache R, direct W)",
+            args: vec![
+                "copy".into(),
+                "--via-memory".into(),
+                "--no-direct".into(),
+                "--direct-write".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_dir.clone(),
+            ],
+            target: 0.8,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
             name: "copy (auto, cold)",
@@ -933,7 +964,13 @@ fn main() {
         }
     }
 
-    for (filename, need) in [(source_file, need_source), (target_file_cache, need_target_cache), (target_file_dir, need_target_dir)].iter() {
+    for (filename, need) in [
+        (source_file, need_source),
+        (target_file_cache, need_target_cache),
+        (target_file_dir, need_target_dir),
+    ]
+    .iter()
+    {
         if *need {
             std::fs::remove_file(filename)
                 .unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));

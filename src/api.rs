@@ -91,7 +91,12 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_file_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<Vec<u8>> {
     let config = load_config(None);
-    Ok(load_file_to_memory_for_mode(&config, "read", path_str(path.as_ref())?, io_mode)?.data)
+    Ok(
+        load_file_to_memory_for_mode(&config, "read", path_str(path.as_ref())?, io_mode)?
+            .data
+            .as_slice()
+            .to_vec(),
+    )
 }
 
 pub fn visit_blocks<P, F>(path: P, visit: F) -> io::Result<ParallelReadReport>
@@ -119,6 +124,15 @@ pub fn write_file<P: AsRef<Path>>(path: P, data: &[u8]) -> io::Result<u64> {
     write_file_with_mode(path, data, IOMode::Auto)
 }
 
+pub fn write_file_range<P: AsRef<Path>>(
+    path: P,
+    data: &[u8],
+    offset: usize,
+    len: usize,
+) -> io::Result<u64> {
+    write_file_range_with_mode(path, data, offset, len, IOMode::Auto)
+}
+
 pub fn write_file_with_mode<P: AsRef<Path>>(
     path: P,
     data: &[u8],
@@ -130,8 +144,49 @@ pub fn write_file_with_mode<P: AsRef<Path>>(
     Ok(writer.bytes_written())
 }
 
+pub fn write_file_range_with_mode<P: AsRef<Path>>(
+    path: P,
+    data: &[u8],
+    offset: usize,
+    len: usize,
+    io_mode: IOMode,
+) -> io::Result<u64> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer range overflows"))?;
+    let slice = data.get(offset..end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "buffer range {}..{} is out of bounds for {} bytes",
+                offset,
+                end,
+                data.len()
+            ),
+        )
+    })?;
+    write_file_with_mode(path, slice, io_mode)
+}
+
 pub fn copy_file<S: AsRef<Path>, D: AsRef<Path>>(source: S, target: D) -> io::Result<u64> {
     copy_file_with_modes(source, target, IOMode::Auto, IOMode::Auto)
+}
+
+pub fn copy_file_via_memory<S: AsRef<Path>, D: AsRef<Path>>(
+    source: S,
+    target: D,
+) -> io::Result<u64> {
+    copy_file_via_memory_with_modes(source, target, IOMode::Auto, IOMode::Auto)
+}
+
+pub fn copy_file_via_memory_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
+    source: S,
+    target: D,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    let data = read_file_with_mode(source, io_mode_read)?;
+    write_file_with_mode(target, &data, io_mode_write)
 }
 
 pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(

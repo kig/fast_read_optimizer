@@ -91,7 +91,9 @@ The crate now exposes a small opinionated high-level API for the common cases, l
 ```rust
 let bytes = fro::read_file("checkpoint.bin")?;
 fro::write_file("copy.bin", &bytes)?;
+fro::write_file_range("copy.part", &bytes, 4096, 1 << 20)?;
 fro::copy_file("checkpoint.bin", "checkpoint.backup")?;
+fro::copy_file_via_memory("checkpoint.bin", "checkpoint.ram-copy")?;
 
 let reader = fro::open("checkpoint.bin")?;
 reader.foreach_block(|block_index, block| {

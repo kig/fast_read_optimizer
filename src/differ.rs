@@ -334,3 +334,45 @@ pub fn bench_diff_memory(num_threads: usize, block_size: usize) {
         (total_size * 2) as f64 / dur / 1e9
     );
 }
+
+pub fn bench_memcpy_memory(num_threads: usize, total_size: usize) {
+    let start = std::time::Instant::now();
+    let src = Arc::new(AlignedBuffer::new_uninit(total_size).unwrap());
+    let mut dst = AlignedBuffer::new_uninit(total_size).unwrap();
+    let src_ptr = src.as_ptr() as usize;
+    let dst_ptr = dst.as_mut_slice().as_mut_ptr() as usize;
+    let mut threads = vec![];
+
+    for t in 0..num_threads {
+        let chunk_size = total_size / num_threads;
+        let start_off = t * chunk_size;
+        let end_off = if t == num_threads - 1 {
+            total_size
+        } else {
+            start_off + chunk_size
+        };
+        threads.push(std::thread::spawn(move || {
+            let len = end_off - start_off;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (src_ptr as *const u8).add(start_off),
+                    (dst_ptr as *mut u8).add(start_off),
+                    len,
+                );
+            }
+        }));
+    }
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    let dur = start.elapsed().as_secs_f64();
+    std::hint::black_box(dst);
+    println!(
+        "Memory memcpy {} bytes in {:.4} s, {:.1} GB/s",
+        total_size,
+        dur,
+        (total_size * 2) as f64 / dur / 1e9
+    );
+}

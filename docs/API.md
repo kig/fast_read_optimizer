@@ -19,6 +19,14 @@ And now exposes:
 
 The public API is useful, but it is still closely tied to the CLI implementation and should be treated as evolving rather than as a polished long-term stability contract.
 
+At the high-level convenience layer, the most commonly useful helpers are now:
+
+- `fro::read_file(...)`
+- `fro::write_file(...)`
+- `fro::write_file_range(...)`
+- `fro::copy_file(...)`
+- `fro::copy_file_via_memory(...)`
+
 If you are an agent generating Rust code, the fastest path is usually:
 
 1. `load_config(None)` or `load_config(Some(path))`
