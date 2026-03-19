@@ -463,6 +463,24 @@ mod tests {
     }
 
     #[test]
+    fn fixed_size_offset_writer_zero_fills_unwritten_gaps() {
+        let cfg = crate::config::load_config(None);
+        let path = unique_temp_file("fro-parallel-writer-offset-gaps");
+        let writer =
+            ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 16).unwrap();
+        writer.write_at_offset(0, b"abcd".to_vec()).unwrap();
+        writer.write_at_offset(12, b"xy".to_vec()).unwrap();
+
+        let report = writer.finish().unwrap();
+        assert_eq!(report.bytes_written, 6);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"abcd\0\0\0\0\0\0\0\0xy\0\0".to_vec()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn indexed_writer_rejects_duplicate_indexes() {
         let cfg = crate::config::load_config(None);
         let path = unique_temp_file("fro-parallel-writer-dup");

@@ -42,7 +42,7 @@
 
 - [x] Add checked arithmetic and checked `u64`→`usize` conversions for block/offset math in `reader`, `stream`, and writer offset paths, then test overflow boundaries explicitly.
 - [x] Treat short `io_uring` reads in the read/map/load paths as retry-or-error conditions instead of accepting partial CQE results as complete logical blocks.
-- [ ] Decide and document the contract for sparse offset writes: either enforce completeness for fixed-size outputs or explicitly preserve "gaps are caller-defined" semantics and test that model.
+- [x] Decide and document the contract for sparse offset writes: either enforce completeness for fixed-size outputs or explicitly preserve "gaps are caller-defined" semantics and test that model.
 - [ ] Make direct-I/O fallback observable and testable so `--direct` users can tell when unsupported filesystems or unaligned tails silently took the page-cache path.
 - [ ] Define the durability contract for high-level write APIs (`flush` vs `sync`) and add explicit tests or APIs for the promised level.
 - [ ] Add explicit sync policies for library and CLI writes (for example `fsync` default with optional `nosync`), and test file plus parent-directory sync semantics for create/replace/rename flows.

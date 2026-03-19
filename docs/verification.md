@@ -115,6 +115,19 @@ Required hardening:
 - if forbidden, track written ranges and reject incomplete outputs
 - if valid, model and test sparse semantics explicitly
 
+Status:
+
+- fixed-size offset writes are now documented as deterministic gap-filling writes, not completeness-enforcing writes
+- with `truncate = true`, the destination is prepared to `total_size` and unwritten regions read back as zeroes
+- with `truncate = false`, existing bytes outside caller-written ranges are preserved and the file is extended only if needed
+
+Formal contribution:
+
+- Premise 1: the offset-writer API now states the meaning of an unwritten range instead of leaving it implicit.
+- Premise 2: tests cover both branches of the contract: zero-filled gaps for default fixed-size outputs and preserved untouched bytes for `truncate = false`.
+- Therefore, `(successful offset-write return) -> (every byte in the output is either caller-written data or bytes defined by the documented gap policy)`.
+- This closes the semantics hole for callers and for later verification work, because "missing write" is no longer an undefined state in the model.
+
 ### 5. Durability semantics are under-specified
 
 The high-level writer flushes pending work and then calls `File::flush()`:

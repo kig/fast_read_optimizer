@@ -75,6 +75,24 @@ fn offset_writer_can_preserve_existing_prefix_and_suffix() {
 }
 
 #[test]
+fn offset_writer_zero_fills_unwritten_gaps_by_default() {
+    let tmp = unique_temp_dir("fro-public-api-offset-zero-fill");
+    fs::create_dir_all(&tmp).unwrap();
+    let path = tmp.join("target.bin");
+
+    let writer = fro::offset_writer(&path, 16).unwrap();
+    writer.write_at_offset(0, b"abcd".to_vec()).unwrap();
+    writer.write_at_offset(12, b"xy".to_vec()).unwrap();
+    let report = writer.finish().unwrap();
+
+    assert_eq!(report.bytes_written, 6);
+    assert_eq!(
+        fs::read(path).unwrap(),
+        b"abcd\0\0\0\0\0\0\0\0xy\0\0".to_vec()
+    );
+}
+
+#[test]
 fn direct_mode_keeps_high_level_block_iteration_stable() {
     let tmp = unique_temp_dir("fro-public-api-direct");
     fs::create_dir_all(&tmp).unwrap();
