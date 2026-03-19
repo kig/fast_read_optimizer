@@ -98,9 +98,6 @@ proptest! {
             }
             let offset = raw_offset % total_size;
             let remaining = total_size - offset;
-            if remaining == 0 {
-                continue;
-            }
             let len = 1 + ((raw_len - 1) % remaining);
             let bytes = vec![fill; len];
             writer.write_at_offset(offset as u64, bytes.clone()).unwrap();
