@@ -64,19 +64,44 @@ pub fn validate_read_result(
     expected_len: usize,
     result: u32,
 ) -> io::Result<usize> {
-    let actual_len = result as usize;
+    interpret_read_result(operation, offset, expected_len, i64::from(result))
+}
+
+fn interpret_read_result(
+    operation: &str,
+    offset: u64,
+    expected_len: usize,
+    actual_len: i64,
+) -> io::Result<usize> {
+    if actual_len < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{operation} reported negative completion at offset {offset}: {actual_len}"),
+        ));
+    }
+    let actual_len = usize::try_from(actual_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{operation} completion does not fit in usize at offset {offset}"),
+        )
+    })?;
     if actual_len == expected_len {
         return Ok(actual_len);
     }
-    let kind = if actual_len == 0 {
+    let kind = if actual_len < expected_len {
         io::ErrorKind::UnexpectedEof
     } else {
-        io::ErrorKind::UnexpectedEof
+        io::ErrorKind::InvalidData
+    };
+    let detail = if actual_len < expected_len {
+        "short read"
+    } else {
+        "oversized read completion"
     };
     Err(io::Error::new(
         kind,
         format!(
-            "{operation} short read at offset {offset}: expected {expected_len} bytes, got {actual_len}"
+            "{operation} {detail} at offset {offset}: expected {expected_len} bytes, got {actual_len}"
         ),
     ))
 }
@@ -113,5 +138,55 @@ mod tests {
         let err = validate_read_result("read", 12_288, 4_096, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(err.to_string().contains("expected 4096 bytes, got 0"));
+    }
+
+    #[test]
+    fn injected_short_read_lengths_follow_documented_contract() {
+        const BLOCK_SIZE: usize = 1024;
+        const OFFSET: u64 = 16 * 1024;
+
+        let mut lengths = Vec::new();
+        lengths.extend((0_i64..=255).collect::<Vec<_>>());
+        lengths.extend((0_i64..).map(|n| n * 17).take_while(|len| *len <= 1190));
+        lengths.extend([-255, -34, -17, -1, 1023, 1024, 1025]);
+        lengths.sort_unstable();
+        lengths.dedup();
+
+        for actual_len in lengths {
+            let result = interpret_read_result("read", OFFSET, BLOCK_SIZE, actual_len);
+            match actual_len.cmp(&(BLOCK_SIZE as i64)) {
+                std::cmp::Ordering::Less if actual_len >= 0 => {
+                    let err = result.unwrap_err();
+                    assert_eq!(
+                        err.kind(),
+                        io::ErrorKind::UnexpectedEof,
+                        "length {actual_len} should be rejected as a short read"
+                    );
+                }
+                std::cmp::Ordering::Equal => {
+                    assert_eq!(
+                        result.unwrap(),
+                        BLOCK_SIZE,
+                        "length {actual_len} should be accepted as an exact completion"
+                    );
+                }
+                std::cmp::Ordering::Greater => {
+                    let err = result.unwrap_err();
+                    assert_eq!(
+                        err.kind(),
+                        io::ErrorKind::InvalidData,
+                        "length {actual_len} should be rejected as oversized"
+                    );
+                }
+                std::cmp::Ordering::Less => {
+                    let err = result.unwrap_err();
+                    assert_eq!(
+                        err.kind(),
+                        io::ErrorKind::InvalidData,
+                        "negative completion {actual_len} should be rejected"
+                    );
+                }
+            }
+        }
     }
 }

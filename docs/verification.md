@@ -81,7 +81,8 @@ Formal contribution:
 
 Remaining gap:
 
-- the current tests prove the validator policy directly and exercise the normal end-to-end paths, but we still want injected short-completion tests so the runtime wiring is demonstrated under a synthetic short-read fault model
+- the validator now has injected unit coverage over synthetic completion lengths, including `0..=255`, `n * 17` beyond `1024`, negative values, and exact/near-block-size boundaries
+- a later, stronger step would still be a live CQE fault-injection seam, but the current injected-length tests already prove the shared decision rule over the intended fault domain
 
 ### 3. Unsafe destination slicing depends on caller-side checks
 
