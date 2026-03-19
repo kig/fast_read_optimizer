@@ -143,8 +143,7 @@ fn hash_sha256_sidecars_verify_without_cli_override() {
 
     let out = run_fro(&[
         "hash",
-        "--hash-type",
-        "sha256",
+        "--sha256",
         "--no-direct",
         "-n",
         "1",
@@ -401,8 +400,7 @@ fn hash_supports_sha256_sidecars() {
     let out = run_fro(&[
         "hash",
         "--no-direct",
-        "--hash-type",
-        "sha256",
+        "--sha256",
         "-n",
         "1",
         target.to_str().unwrap(),
