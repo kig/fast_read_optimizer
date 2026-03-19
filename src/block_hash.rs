@@ -36,14 +36,6 @@ pub enum BlockHashAlgorithm {
 }
 
 impl BlockHashAlgorithm {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "xxh3" | "xxh3_64" => Some(Self::Xxh3),
-            "sha256" => Some(Self::Sha256),
-            _ => None,
-        }
-    }
-
     fn digest_len(self) -> usize {
         match self {
             Self::Xxh3 => 8,

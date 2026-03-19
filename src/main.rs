@@ -11,7 +11,7 @@ mod reader;
 mod writer;
 
 use block_hash::{
-    default_hash_base, hash_file_to_replicas, recover_file_with_copies, verify_file_with_replicas,
+    default_hash_base, hash_file_to_replicas, hash_file_blocks, recover_file_with_copies, verify_file_with_replicas,
     BlockHashAlgorithm, RecoverMode,
 };
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
@@ -206,16 +206,16 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             ],
             examples: &[
                 (
-                    "Do one copy run with current defaults",
-                    "copy -n 1 in.bin out.bin",
+                    "Copy in.bin to out.bin",
+                    "copy in.bin out.bin",
                 ),
                 (
                     "Read through page cache but force direct writes to the destination",
-                    "copy --no-direct --direct-write -n 1 in.bin out.bin",
+                    "copy --no-direct --direct-write in.bin out.bin",
                 ),
                 (
                     "Load the whole source into RAM, then flush it with direct writes",
-                    "copy --via-memory --no-direct --direct-write -n 1 in.bin out.bin",
+                    "copy --via-memory --no-direct --direct-write in.bin out.bin",
                 ),
             ],
         }),
@@ -226,7 +226,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &["Exits nonzero on mismatch."],
             examples: &[(
                 "Check whether two large files are byte-identical",
-                "diff --direct -n 1 a.bin b.bin",
+                "diff --direct a.bin b.bin",
             )],
         }),
         "dual-read-bench" => Some(CommandHelp {
@@ -241,16 +241,21 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "hash" => Some(CommandHelp {
             name: "hash",
-            usage: "hash [--auto|--no-direct|--direct] [--hash-type xxh3|sha256] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
-            summary: "Hash a file into fixed 1 MiB blocks and write three JSON sidecar replicas.",
+            usage: "hash [--auto|--no-direct|--direct] [--xxh3|--sha256] [--hash-only] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
+            summary: "Hash a file in parallel 1 MiB blocks, hash the hashes, and write three JSON sidecar replicas.",
             notes: &[
                 "Default sidecar base is <file>.fro-hash.",
-                "Use --hash-type xxh3 or --hash-type sha256 to choose the sidecar digest algorithm.",
+                "Use --xxh3 or --sha256 to choose the sidecar digest algorithm. (NB: this is not sha256sum-compatible.)",
+                "Use --hash-only to only print the filename and hash of hashes.",
                 "Default -n for hash is 1.",
             ],
             examples: &[(
                 "Create block-hash sidecars for one large file",
-                "hash --no-direct -n 1 bigfile.dat",
+                "hash --no-direct bigfile.dat",
+            ),
+            (
+                "Get a SHA256 hash of block hashes for easy file comparisons",
+                "hash --sha256 --hash-only bigfile.dat",
             )],
         }),
         "verify" => Some(CommandHelp {
@@ -264,7 +269,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             ],
             examples: &[(
                 "Scrub one file against its block-hash sidecars",
-                "verify --no-direct -n 1 bigfile.dat",
+                "verify --no-direct bigfile.dat",
             )],
         }),
         "recover" => Some(CommandHelp {
@@ -280,11 +285,11 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             examples: &[
                 (
                     "Repair a target file from one clean copy",
-                    "recover --no-direct -n 1 target.bin backup.bin",
+                    "recover --no-direct target.bin backup.bin",
                 ),
                 (
                     "Use verify-like fast scrub behavior and only fall back to full recovery if needed",
-                    "recover --fast --no-direct -n 1 target.bin backup.bin",
+                    "recover --fast --no-direct target.bin backup.bin",
                 ),
             ],
         }),
@@ -447,6 +452,7 @@ fn try_main() -> io::Result<i32> {
     let mut hash_base: Option<&str> = None;
     let mut recover_mode = RecoverMode::Standard;
     let mut hash_type = BlockHashAlgorithm::Xxh3;
+    let mut hash_only = false;
     let mut recover_fast_requested = false;
     let mut recover_in_place_all_requested = false;
     let mut create_size: Option<u64> = None;
@@ -520,17 +526,12 @@ fn try_main() -> io::Result<i32> {
             } else if args[i] == "--in-place-all" {
                 recover_in_place_all_requested = true;
                 recover_mode = RecoverMode::InPlaceAll;
-            } else if args[i] == "--hash-type" {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("Missing value for --hash-type");
-                    return Ok(1);
-                }
-                let Some(parsed) = BlockHashAlgorithm::parse(&args[i].to_ascii_lowercase()) else {
-                    eprintln!("Invalid --hash-type: {}", args[i]);
-                    return Ok(1);
-                };
-                hash_type = parsed;
+            } else if args[i] == "--sha256" {
+                hash_type = BlockHashAlgorithm::Sha256;
+            } else if args[i] == "--xxh3" {
+                hash_type = BlockHashAlgorithm::Xxh3;            
+            } else if args[i] == "--hash-only" {
+                hash_only = true;
             } else if args[i] == "--direct" {
                 io_mode = common::IOMode::Direct;
                 io_mode_write = common::IOMode::Direct;
@@ -733,28 +734,46 @@ fn try_main() -> io::Result<i32> {
                 io_mode,
             )
         } else if mode == "hash" {
-            let manifest = hash_file_to_replicas(
-                filename,
-                hash_base_owned.as_deref(),
-                hash_type,
-                p[0],
-                p[1],
-                p[2] as usize,
-                p[3],
-                p[4],
-                p[5] as usize,
-                io_mode,
-            )?;
-            println!(
-                "wrote {} {:?} hash blocks ({} bytes each) to {}[0-2].json",
-                manifest.block_hashes.len(),
-                manifest.hash_type,
-                manifest.block_size,
-                hash_base_owned
-                    .as_deref()
-                    .unwrap_or(&default_hash_base(filename))
-            );
-            Ok(manifest.bytes_hashed)
+            if hash_only || iterations > 1 {
+                let manifest = hash_file_blocks(
+                    filename,
+                    hash_type,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                )?;
+                if iterations == 1 {
+                    println!("{}  {}", manifest.hash_of_hashes, filename);
+                }
+                Ok(manifest.bytes_hashed)
+            } else {
+                let manifest = hash_file_to_replicas(
+                    filename,
+                    hash_base_owned.as_deref(),
+                    hash_type,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                )?;
+                println!(
+                    "wrote {} {:?} hash blocks ({} bytes each) to {}.[0-2].json",
+                    manifest.block_hashes.len(),
+                    manifest.hash_type,
+                    manifest.block_size,
+                    hash_base_owned
+                        .as_deref()
+                        .unwrap_or(&default_hash_base(filename))
+                );
+                Ok(manifest.bytes_hashed)
+            }
         } else if mode == "verify" {
             let report = verify_file_with_replicas(
                 filename,
