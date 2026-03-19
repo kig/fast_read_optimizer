@@ -661,6 +661,14 @@ Implement first:
 - `Fifo × {LocalExt4, LocalTmpfs} × relevant PERMISSIONS`
 - `{Stdin, Stdout, Stderr}` for the operations that are supposed to support streams
 
+Progress:
+
+- the first deterministic CI-friendly slice now exercises the high-level `read_file`, `write_file`, and `copy_file` APIs on ordinary local temp-directory paths
+- covered local path kinds: regular file, directory, symlink-to-regular, and symlink-to-directory
+- covered permission classes: readable/writable baseline, `0o444`, `0o000`, and creation inside an unwritable parent directory
+- expected results are asserted as stable coarse classes: exact-byte success, permission-denied, or invalid-input-class rejection
+- this closes the first part of the "real file semantics" hole for local path-based APIs without pretending that FIFOs, stdio, procfs/sysfs, devices, or network filesystems are already verified here
+
 Then extend to:
 
 - `ProcFS`

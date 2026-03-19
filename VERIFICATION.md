@@ -25,6 +25,10 @@ The following proof-relevant items are implemented and covered by tests:
 - initial property-based model tests for:
   - read-partition reconstruction on small randomized files
   - fixed-size offset writes against a reference byte-vector model
+- initial real-world compatibility matrix coverage for high-level local-path APIs:
+  - `read_file`, `write_file`, and `copy_file`
+  - regular files, directories, and symlinks
+  - permission-gated reads/writes and unwritable parent-directory creation
 - shared janitor checks and a tracked pre-commit hook
 
 ## Why these items matter
@@ -34,6 +38,7 @@ Formal logic summary:
 - If derived offsets are checked before use, then successful execution implies the code did not rely on wrapped arithmetic.
 - If logical block completion is accepted only when `actual_len == expected_len`, then successful execution implies full logical block delivery rather than an arbitrary positive prefix.
 - If unwritten output ranges have a documented meaning, then successful offset writes imply every output byte is either caller-written data or data defined by the documented gap policy.
+- If each tested local path kind maps to an explicit result class, then successful execution or explicit rejection on that matrix point implies the high-level API classifies that real OS object according to the documented contract rather than by accident.
 
 Together, these close three high-value proof holes:
 
@@ -51,7 +56,7 @@ The main remaining verification items are:
 - add property-based tests for partitioning, copy equivalence, and hash / verify / recover invariants
 - add fuzzing targets
 - run Miri and bounded-proof experiments
-- build the real-world compatibility matrix across file type, access surface, and permissions
+- extend the real-world compatibility matrix beyond the first local API slice to FIFOs, stdio, procfs/sysfs, privileged device cases, and network-backed environments
 
 ## How to validate the current state
 
