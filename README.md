@@ -22,6 +22,7 @@ Build the release binaries first:
 
 ```bash
 cargo build --release
+cargo build --release --examples
 # Optionally install
 cargo install --path .
 ```
@@ -31,6 +32,7 @@ Get some big numbers to impress the neighbors:
 ```bash
 fro write -v --create 4GB some_huge_file 
 # write 4294967296 bytes in 1.1062 s, 3.9 GB/s
+
 fro hash -v --no-direct -n 10 some_huge_file
 # Cold cache: hash 4294967296 bytes in 1.0280 s, 4.2 GB/s
 # Hot cache: hash 4294967296 bytes in 0.0777 s, 55.3 GB/s
@@ -39,9 +41,15 @@ fro hash -v --no-direct -n 10 some_huge_file
 # time xxhsum some_huge_file
 # real    0.796s
 # time b3sum some_huge_file
-# real    0.374s (cold cache is 1.5s, so b3sum is fast at reading)
+# real    0.374s (cold cache is 1.5s)
+
+# There's a b3sum example that's using fro for IO and the blake3 crate for hashing
+time target/release/examples/b3sum some_huge_file
+# real    0.117s (cold cache is 0.253s)
+
 fro verify -v some_huge_file
 # verify 4294967296 bytes in 0.0849 s, 50.6 GB/s
+
 fro grep -v my_needle_string some_huge_file
 # grep 4294967296 bytes in 0.0755 s, 56.9 GB/s
 # For comparison:
@@ -49,11 +57,13 @@ fro grep -v my_needle_string some_huge_file
 # real    1.223s
 # time rg -FUbcoa my_needle_string some_huge_file
 # real    0.874s
+
 fro copy -v some_huge_file copy_of_the_file
 # copy 4294967296 bytes in 0.9693 s, 4.4 GB/s
 # For comparison:
 # time cp some_huge_file copy_of_the_file
 # real    7.341s
+
 fro diff -v some_huge_file copy_of_the_file
 # Using direct IO: diff 8589934592 bytes in 0.4167 s, 20.6 GB/s
 # Hot cache: diff 8589934592 bytes in 0.1468 s, 58.5 GB/s
@@ -70,8 +80,17 @@ fro recover --in-place-all some_huge_file copy_of_the_file
 fro verify -v some_huge_file
 # verify: loaded 3/3 hash replicas, ok_blocks=4096, bad_blocks=0
 # verify 4294967296 bytes in 0.0877 s, 49.0 GB/s
+
 fro diff -v some_huge_file copy_of_the_file
 # diff 8589934592 bytes in 0.5486 s, 15.7 GB/s
+
+# If you want to use SHA-256 for the block hash instead of xxh3
+fro hash -v --sha256 myfile
+# hash 4376176641 bytes in 0.1394 s, 31.4 GB/s
+
+# You can also get a one-line hash-of-hashes
+fro hash --sha256 --hash-only myfile
+# 14733bac870c294e483edafcaa26701554d2a238d542b6e5d9bd1e4abbf12705  myfile
 ```
 
 Then inspect the tools:
@@ -83,6 +102,10 @@ fro-benchmark --help
 ```
 
 For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
+
+## Examples
+
+See `examples/` for some example programs that use the fro library (e.g. a 3x faster b3sum, faster dd, direct-IO sha256sum). 
 
 ## Rust crate API
 
