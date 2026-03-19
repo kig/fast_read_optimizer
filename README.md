@@ -1,6 +1,6 @@
 # fast_read_optimizer (`fro`)
 
-`fro` is a Linux CLI and Rust crate for very fast large-file IO. On one observed release-mode run against a page-cached 5 GB file, it measured about **46.4 GB/s** for `hash`, **49.8 GB/s** for `verify`, **52.0 GB/s** for `recover --fast`, and **39.4 GB/s** for full two-file `recover`. On a 4x PCIe4 NVMe array, the performance was still **>20 GB/s** - good enough to act as a practical scrub / repair tool for disk images, archives, model checkpoints, and other large mostly-static blobs.
+`fro` is a Linux CLI and Rust crate for very fast large-file IO. On one observed release-mode run against a page-cached 5 GB file, it measured about **46.4 GB/s** for `hash`, **49.8 GB/s** for `verify`, **52.0 GB/s** for `recover --fast`, and **39.4 GB/s** for full two-file `recover`. On a 4x PCIe4 NVMe array, the performance was still **>20 GB/s**, making it a practical scrub / repair tool for disk images, archives, model checkpoints, and other large mostly-static blobs.
 
 It combines tuned striped IO, literal search, copy / diff utilities, a benchmark harness, an optimizer, and block-hash sidecars for verification and repair. If you work with big files and care whether direct IO, page cache, block size, queue depth, or replica scrubbing actually help on your machine, `fro` is built for that job.
 
@@ -27,7 +27,7 @@ cargo build --release --examples
 cargo install --path .
 ```
 
-Get some big numbers to impress the neighbors:
+Example runs:
 
 ```bash
 fro write -v --create 4GB some_huge_file 
@@ -114,11 +114,11 @@ cargo test --quiet
 cargo run --quiet --manifest-path janitor/Cargo.toml -- all
 ```
 
-For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
+For verification status and the current proof outline, see [`VERIFICATION.md`](VERIFICATION.md). For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
 
 ## Examples
 
-See `examples/` for some example programs that use the fro library (e.g. a 3x faster b3sum, faster dd, direct-IO sha256sum). 
+See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`.
 
 ## Rust crate API
 
@@ -307,20 +307,6 @@ cargo test document_block_recovery_decision_table -- --nocapture
 | one file copy agrees with a manifest witness | 555 | 0 | FileAndManifestAgreement | - | recovered block based on file+manifest agreement |
 | two manifest witnesses agree, but no file copy matches them | 111 | - | - | ManifestOnlyAgreement | failed to recover corrupt block [manifest+manifest hashes agree] |
 | all witnesses are missing | - | - | - | NoBlockHashFound | failed to recover corrupt block [no block hash found either] |
-
-### Recover demo scripts
-
-The repo includes a reproducible demo that creates a clean file, clones it, corrupts different blocks in different copies, repairs them, and proves they match again:
-
-```bash
-./perf/recover_demo.sh /mnt/fast/fro-test
-```
-
-The corruption helper is also available separately:
-
-```bash
-./perf/corrupt_recover_demo_copies.sh /mnt/fast/fro-test
-```
 
 ## Benchmarks
 
