@@ -20,6 +20,4 @@ pub const SRC_TREE_MAX_DEPTH: usize = 6;
 pub const FORMAL_TOOL_BINARIES: &[(&str, &str)] = &[
     ("cargo-miri", "Rust interpreter / UB checker"),
     ("cargo-kani", "CBMC-backed bounded model checking"),
-    ("cargo-creusot", "Why3-based deductive verification"),
-    ("prusti-rustc", "Viper-based specification verification"),
 ];

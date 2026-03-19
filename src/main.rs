@@ -18,6 +18,7 @@ use block_hash::{
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::{load_file_to_memory, read_file};
+use std::fs::OpenOptions;
 use std::io;
 use verified_copy::copy_file_verified_with_options;
 use writer::{copy_file, write_buffer, write_file};
@@ -43,6 +44,10 @@ fn parse_size(s: &str) -> Option<u64> {
         _ => return None,
     };
     num.checked_mul(mult)
+}
+
+fn sync_path(path: &str) -> io::Result<()> {
+    OpenOptions::new().read(true).write(true).open(path)?.sync_all()
 }
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
@@ -198,15 +203,17 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--via-memory] [--verified] [--xxh3|--sha256] [--hash-base path] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            usage: "copy [--via-memory] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
             summary: "Copy one file to another using the same tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
-                "--verified hashes the source, copies the file, fsyncs the destination, writes durable destination sidecars, then verifies the destination against the source-derived manifest.",
+                "--verify hashes the source, copies the file, fsyncs the destination, and verifies the destination against the source-derived manifest without leaving sidecars by default.",
+                "--hash with --verify leaves durable sidecars at the destination and at the source if the source did not already have sidecars.",
+                "--verify-diff fsyncs the destination and then runs a diff pass instead of block-hash verification.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
-                "--verified currently syncs the file and sidecar files, but not the parent directory.",
+                "Verification success is reported to stderr unless --quiet is used.",
             ],
             examples: &[
                 (
@@ -222,8 +229,16 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                     "copy --via-memory --no-direct --direct-write in.bin out.bin",
                 ),
                 (
-                    "Copy a file, write destination sidecars, and verify the destination against the source manifest",
-                    "copy --verified --sha256 --no-direct in.bin out.bin",
+                    "Copy a file, fsync it, and verify the destination against the source manifest without leaving sidecars",
+                    "copy --verify --sha256 --no-direct in.bin out.bin",
+                ),
+                (
+                    "Copy a file, verify it, and leave source/destination sidecars",
+                    "copy --verify --hash --sha256 --no-direct in.bin out.bin",
+                ),
+                (
+                    "Copy a file and run a diff pass after fsync",
+                    "copy --verify-diff --no-direct in.bin out.bin",
                 ),
             ],
         }),
@@ -452,7 +467,10 @@ fn try_main() -> io::Result<i32> {
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
     let mut via_memory = legacy_copy_via_memory;
-    let mut verified_copy = false;
+    let mut verify_copy = false;
+    let mut verify_copy_diff = false;
+    let mut persist_verification_hashes = false;
+    let mut quiet = false;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -560,8 +578,14 @@ fn try_main() -> io::Result<i32> {
                 to_memory = true;
             } else if args[i] == "--via-memory" {
                 via_memory = true;
-            } else if args[i] == "--verified" {
-                verified_copy = true;
+            } else if args[i] == "--verify" || args[i] == "--verified" {
+                verify_copy = true;
+            } else if args[i] == "--verify-diff" {
+                verify_copy_diff = true;
+            } else if args[i] == "--hash" {
+                persist_verification_hashes = true;
+            } else if args[i] == "-q" || args[i] == "--quiet" {
+                quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
                 verbose = true;
             } else if args[i] == "-s" || args[i] == "--save" {
@@ -658,20 +682,32 @@ fn try_main() -> io::Result<i32> {
         println!("--via-memory is only supported for copy");
         return Ok(1);
     }
-    if verified_copy && mode != "copy" {
-        println!("--verified is only supported for copy");
+    if (verify_copy || verify_copy_diff) && mode != "copy" {
+        println!("--verify and --verify-diff are only supported for copy");
+        return Ok(1);
+    }
+    if verify_copy && verify_copy_diff {
+        println!("--verify and --verify-diff cannot be used together");
+        return Ok(1);
+    }
+    if persist_verification_hashes && !verify_copy {
+        println!("--hash is only supported for copy --verify");
         return Ok(1);
     }
     if via_memory && save_config {
         println!("copy --via-memory does not support --save; tune read and write separately");
         return Ok(1);
     }
-    if verified_copy && save_config {
-        println!("copy --verified does not support --save; tune copy and verify separately");
+    if (verify_copy || verify_copy_diff) && save_config {
+        println!("copy verification modes do not support --save; tune copy and verification separately");
         return Ok(1);
     }
-    if verified_copy && iterations > 1 {
-        println!("copy --verified requires -n 1");
+    if (verify_copy || verify_copy_diff) && iterations > 1 {
+        println!("copy verification modes require -n 1");
+        return Ok(1);
+    }
+    if verify_copy_diff && hash_base.is_some() {
+        println!("copy --verify-diff does not use --hash-base");
         return Ok(1);
     }
 
@@ -872,7 +908,16 @@ fn try_main() -> io::Result<i32> {
             )
         } else if mode == "copy" {
             if let Some(src) = source {
-                if verified_copy {
+                if verify_copy {
+                    let target_hash_base_owned = if persist_verification_hashes {
+                        Some(
+                            hash_base_owned
+                                .clone()
+                                .unwrap_or_else(|| default_hash_base(filename)),
+                        )
+                    } else {
+                        None
+                    };
                     let report = copy_file_verified_with_options(
                         src,
                         filename,
@@ -880,18 +925,85 @@ fn try_main() -> io::Result<i32> {
                         io_mode_write,
                         hash_type,
                         via_memory,
-                        hash_base_owned.as_deref(),
+                        target_hash_base_owned.as_deref(),
                     )?;
-                    println!(
-                        "verified-copy: bytes_copied={}, bytes_hashed={}, verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}",
-                        report.bytes_copied,
-                        report.source_bytes_hashed,
-                        report.verified_blocks,
-                        report.repaired_blocks,
-                        report.used_recovery,
-                        report.hash_type
-                    );
+                    if !quiet {
+                        eprintln!(
+                            "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
+                            report.verified_blocks,
+                            report.repaired_blocks,
+                            report.used_recovery,
+                            report.hash_type,
+                            report.hashes_persisted
+                        );
+                    }
                     Ok(report.bytes_copied)
+                } else if verify_copy_diff {
+                    let copied = if via_memory {
+                        let read_page_cache = config.get_params_for_path("read", false, src);
+                        let read_direct = config.get_params_for_path("read", true, src);
+                        let loaded = load_file_to_memory(
+                            src,
+                            read_page_cache.num_threads,
+                            read_page_cache.block_size,
+                            read_page_cache.qd,
+                            read_direct.num_threads,
+                            read_direct.block_size,
+                            read_direct.qd,
+                            io_mode,
+                        )?;
+                        let write_page_cache = config.get_params_for_path("write", false, filename);
+                        let write_direct = config.get_params_for_path("write", true, filename);
+                        write_buffer(
+                            filename,
+                            &loaded.data,
+                            write_page_cache.num_threads,
+                            write_page_cache.block_size,
+                            write_page_cache.qd,
+                            write_direct.num_threads,
+                            write_direct.block_size,
+                            write_direct.qd,
+                            io_mode_write,
+                        )?
+                    } else {
+                        copy_file(
+                            src,
+                            filename,
+                            p[0],
+                            p[1],
+                            p[2] as usize,
+                            p[3],
+                            p[4],
+                            p[5] as usize,
+                            io_mode,
+                            io_mode_write,
+                        )?
+                    };
+                    sync_path(filename)?;
+                    let diff_page_cache = config.get_params_for_path("diff", false, filename);
+                    let diff_direct = config.get_params_for_path("diff", true, filename);
+                    let diff_res = diff_files(
+                        src,
+                        filename,
+                        diff_page_cache.num_threads,
+                        diff_page_cache.block_size,
+                        diff_page_cache.qd,
+                        diff_direct.num_threads,
+                        diff_direct.block_size,
+                        diff_direct.qd,
+                        io_mode,
+                        false,
+                    )?;
+                    if diff_res != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("copy verify-diff found a mismatch at byte offset {}", diff_res),
+                        ));
+                    }
+                    if !quiet {
+                        eprintln!("copy verify-diff: success");
+                    }
+                    Ok(copied)
                 } else if via_memory {
                     let read_page_cache = config.get_params_for_path("read", false, src);
                     let read_direct = config.get_params_for_path("read", true, src);

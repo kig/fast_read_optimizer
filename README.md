@@ -64,8 +64,8 @@ fro copy -v some_huge_file copy_of_the_file
 # time cp some_huge_file copy_of_the_file
 # real    7.341s
 
-fro copy --verified --sha256 --no-direct some_huge_file verified_copy_of_the_file
-# verified-copy: bytes_copied=4294967296, bytes_hashed=4294967296, verified_blocks=4096, repaired_blocks=0, used_recovery=false, hash_type=Sha256
+fro copy --verify --sha256 --no-direct some_huge_file verified_copy_of_the_file
+# stderr: copy verify: success; verified_blocks=4096, repaired_blocks=0, used_recovery=false, hash_type=Sha256, sidecars_written=false
 
 fro diff -v some_huge_file copy_of_the_file
 # Using direct IO: diff 8589934592 bytes in 0.4167 s, 20.6 GB/s
@@ -225,12 +225,28 @@ fro copy --no-direct --direct-write in.bin out.bin
 This reads `in.bin` through the page cache but forces direct writes to `out.bin`, which is useful when experimenting with mixed cache / direct behavior.
 
 ```bash
-fro copy --verified --sha256 --no-direct in.bin out.bin
+fro copy --verify --sha256 --no-direct in.bin out.bin
 ```
 
-This hashes `in.bin`, copies it to `out.bin`, `fsync`s the destination file, writes durable block-hash sidecars for the destination, and then verifies `out.bin` against the **source-derived** manifest. If the first verification pass finds bad blocks, `fro` attempts a `recover`-style repair using `in.bin` as the clean source and verifies again before returning success.
+This hashes `in.bin`, copies it to `out.bin`, `fsync`s the destination file, and then verifies `out.bin` against the **source-derived** manifest without leaving sidecars by default. If the first verification pass finds bad blocks, `fro` repairs `out.bin` from `in.bin` using the source-derived manifest as the gold standard, `fsync`s again, and verifies one final time before returning success.
 
-Current verified-copy limits:
+If you also want to leave sidecars behind:
+
+```bash
+fro copy --verify --hash --sha256 --no-direct in.bin out.bin
+```
+
+That writes durable sidecars for `out.bin` and, if `in.bin` did not already have them, also leaves durable sidecars at the source.
+
+If you want a simpler postcondition check:
+
+```bash
+fro copy --verify-diff --no-direct in.bin out.bin
+```
+
+That copies, `fsync`s the destination file, and then runs a diff pass.
+
+Current copy-verification limits:
 
 - it syncs the destination file and sidecar files, but not the parent directory
 - it verifies that the destination matches the source as observed during this run

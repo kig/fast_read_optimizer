@@ -207,11 +207,12 @@ For the library, the equivalent should likely be explicit APIs or options rather
 
 Progress:
 
-- `fro` now has a first verified-copy mode for the single-source/single-target case
-- the implementation hashes the source first, copies the file, `fsync`s the destination file, writes durable destination sidecars from the **source-derived** manifest, then verifies the destination against that manifest
-- if the first verification pass finds bad blocks, the mode runs the existing `recover` logic with the source file as the clean copy, `fsync`s again, and re-verifies before returning success
+- `fro` now has a first source-verified copy mode for the single-source/single-target case
+- the default `copy --verify` path hashes the source first, copies the file, `fsync`s the destination file, then verifies the destination against the **source-derived** manifest without leaving sidecars behind
+- if the first verification pass finds bad blocks, the mode repairs the destination from the source using that source-derived manifest as the gold standard, `fsync`s again, and re-verifies before returning success
+- `copy --verify --hash` is the opt-in persistence layer: after successful verification, it leaves durable sidecars at the destination and at the source if the source did not already have them
 - this is intentionally stronger than "copy, then hash the destination" because the postcondition is tied to the source-derived oracle rather than the target's self-description
-- the current hole is still explicit: file contents and sidecar files are synced, but parent-directory sync and concurrent-source-mutation defenses remain outside the present contract
+- the current hole is still explicit: file contents and optional sidecar files are synced, but parent-directory sync and concurrent-source-mutation defenses remain outside the present contract
 
 ### 5d. Verification obligations for durable and verified modes
 
@@ -481,7 +482,6 @@ Most promising candidates:
 Possible tools:
 
 - Kani for bounded model checking of pure helper logic
-- Creusot or Prusti for contract-style proofs if the helper logic is kept pure and isolated
 
 These tools are likely most useful once the hot-path arithmetic and partition logic are factored into small pure helpers.
 

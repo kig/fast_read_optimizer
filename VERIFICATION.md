@@ -29,12 +29,12 @@ The following proof-relevant items are implemented and covered by tests:
   - `read_file`, `write_file`, and `copy_file`
   - regular files, directories, and symlinks
   - permission-gated reads/writes and unwritable parent-directory creation
-- a first verified-copy mode:
+- a first source-verified copy mode:
   - hashes the source into a source-derived manifest
   - copies and `fsync`s the destination file
-  - writes durable destination sidecars from the source manifest
-  - verifies the destination against that source-derived manifest
-  - falls back to `recover`-style repair from the source and re-verifies before success
+  - verifies the destination against that source-derived manifest without leaving sidecars by default
+  - falls back to source-manifest-guided repair from the source and re-verifies before success
+  - optionally persists sidecars only when explicitly requested
 - shared janitor checks and a tracked pre-commit hook
 
 ## Why these items matter
@@ -45,7 +45,7 @@ Formal logic summary:
 - If logical block completion is accepted only when `actual_len == expected_len`, then successful execution implies full logical block delivery rather than an arbitrary positive prefix.
 - If unwritten output ranges have a documented meaning, then successful offset writes imply every output byte is either caller-written data or data defined by the documented gap policy.
 - If each tested local path kind maps to an explicit result class, then successful execution or explicit rejection on that matrix point implies the high-level API classifies that real OS object according to the documented contract rather than by accident.
-- If the destination is verified against a source-derived manifest after copy and sync, then successful verified-copy return implies the destination matched the source bytes observed during source hashing, not merely a self-consistent post-copy target state.
+- If the destination is verified against a source-derived manifest after copy and sync, then successful copy-verification return implies the destination matched the source bytes observed during source hashing, not merely a self-consistent post-copy target state.
 
 Together, these close three high-value proof holes:
 
