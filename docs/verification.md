@@ -67,6 +67,22 @@ Required hardening:
 - or fail the operation on any unexpected short read
 - add tests with injected short completions
 
+Status:
+
+- implemented as explicit error-on-short-read validation in `src/reader.rs` and the coupled block-hash reader in `src/block_hash.rs`
+- shared completion checks now live in `src/io_util.rs`, so reader, mapper, visitor, loader, and block-hash paths apply the same predicate
+
+Formal contribution:
+
+- Premise 1: for every completion, the code now computes the expected logical byte count for that `(file_size, offset, block_size)` triple.
+- Premise 2: the operation continues only if `actual_len == expected_len`; otherwise it returns `UnexpectedEof`.
+- Therefore, `(successful logical block completion) -> (the full requested logical bytes for that block were delivered)`.
+- This removes the previous ambiguity where any positive CQE result could masquerade as a valid block, which is the key local lemma needed for the read-partitioning and hash-integrity arguments.
+
+Remaining gap:
+
+- the current tests prove the validator policy directly and exercise the normal end-to-end paths, but we still want injected short-completion tests so the runtime wiring is demonstrated under a synthetic short-read fault model
+
 ### 3. Unsafe destination slicing depends on caller-side checks
 
 `output_slice_mut()` builds raw mutable slices:
@@ -258,6 +274,11 @@ Suggested approach:
 
 - introduce a test seam around completion handling so unit tests can feed synthetic CQE lengths
 - model the expected file bytes with a plain `Vec<u8>`
+
+Progress:
+
+- the completion policy is now explicit: partial completions are rejected instead of being treated as successful logical blocks
+- next evidence step is an injected-CQE test seam to show the policy fires in the live `io_uring` loops
 
 ### C. Unsafe buffer/slice usage
 

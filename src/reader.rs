@@ -1,6 +1,6 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::{IOParams, LoadedConfig};
-use crate::io_util::open_reader_files;
+use crate::io_util::{expected_read_len, open_reader_files, validate_read_result};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
@@ -396,22 +396,21 @@ fn thread_reader(
 
     loop {
         for (block_id, result) in wait_for_ready(io_uring)? {
-            if result > 0 {
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len = validate_read_result("read", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
                 if !pattern.is_empty() {
                     let buf = &buffers[block_id as usize % qd].as_slice()
-                        [..std::cmp::min(result as usize, (block_size as usize) + pattern.len())];
+                        [..std::cmp::min(actual_len, (block_size as usize) + pattern.len())];
                     for idx in finder.find_iter(buf) {
-                        matches.push(
-                            block_offset(offset, block_id, num_threads, block_size)?
-                                .checked_add(idx as u64)
-                                .ok_or_else(|| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::InvalidInput,
-                                        "grep match offset overflowed",
-                                    )
-                                })?,
-                        );
+                        matches.push(current_offset.checked_add(idx as u64).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "grep match offset overflowed",
+                            )
+                        })?);
                     }
                 }
             }
@@ -488,8 +487,12 @@ fn thread_loader(
     io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        for (_block_id, result) in wait_for_ready(io_uring)? {
-            if result > 0 {
+        for (block_id, result) in wait_for_ready(io_uring)? {
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("load-to-memory", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
             }
             inflight -= 1;
@@ -574,10 +577,13 @@ where
 
     loop {
         for (block_id, result) in wait_for_ready(io_uring)? {
-            if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("map-file-blocks", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 let block_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
+                let buf = &buffers[block_id as usize % qd].as_slice()[..actual_len];
                 let mapped = mapper(ReaderBlock {
                     block_index,
                     offset: current_offset,
@@ -663,10 +669,13 @@ where
 
     loop {
         for (block_id, result) in wait_for_ready(io_uring)? {
-            if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("visit-file-blocks", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 let block_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
+                let buf = &buffers[block_id as usize % qd].as_slice()[..actual_len];
                 visitor(ReaderBlock {
                     block_index,
                     offset: current_offset,

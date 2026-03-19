@@ -9,7 +9,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::common::{AlignedBuffer, IOMode};
-use crate::io_util::open_reader_files;
+use crate::io_util::{expected_read_len, open_reader_files, validate_read_result};
 use crate::mincore::is_first_page_resident;
 
 #[link(name = "crypto")]
@@ -816,10 +816,13 @@ fn thread_hash_reader(
         let ready = wait_for_ready(io_uring)?;
 
         for (block_id, result) in ready {
-            if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("hash-file-blocks", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 let hash_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
+                let buf = &buffers[block_id as usize % qd].as_slice()[..actual_len];
                 digests.push((hash_index, hash_type.hash_block(buf)));
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
             }
