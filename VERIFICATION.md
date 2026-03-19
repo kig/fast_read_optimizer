@@ -59,6 +59,14 @@ cargo test --quiet
 cargo run --quiet --manifest-path janitor/Cargo.toml -- all
 ```
 
+Targeted Miri command surface, when a nightly toolchain with the `miri` component is available:
+
+```bash
+cargo +nightly miri test --lib common::tests::aligned_buffer_page_storage_is_aligned_and_mutable -- --exact
+cargo +nightly miri test --lib reader::tests::output_slice_mut_writes_only_checked_window -- --exact
+cargo +nightly miri test --lib reader::tests::output_slice_mut_preserves_non_overlapping_regions -- --exact
+```
+
 ## Current reference document
 
 The full outline, subsystem obligations, evidence plan, and remaining holes live in [`docs/verification.md`](docs/verification.md).

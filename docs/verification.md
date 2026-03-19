@@ -439,6 +439,20 @@ Run regularly on:
 
 Miri is especially valuable here because the code uses raw pointers, `mmap`, and manual slice construction.
 
+Current Miri-safe surface:
+
+- `common::tests::aligned_buffer_page_storage_is_aligned_and_mutable`
+- `reader::tests::output_slice_mut_writes_only_checked_window`
+- `reader::tests::output_slice_mut_preserves_non_overlapping_regions`
+
+These tests are aimed at the unsafe buffer/slice surface that does not depend on `io_uring` execution. In this environment, the nightly Miri toolchain is not fully available on the active Rust installation, so the current deliverable is a focused Miri target plus the command needed to execute it when nightly with `miri` is installed:
+
+```bash
+cargo +nightly miri test --lib common::tests::aligned_buffer_page_storage_is_aligned_and_mutable -- --exact
+cargo +nightly miri test --lib reader::tests::output_slice_mut_writes_only_checked_window -- --exact
+cargo +nightly miri test --lib reader::tests::output_slice_mut_preserves_non_overlapping_regions -- --exact
+```
+
 ### Bounded proof experiments
 
 Most promising candidates:

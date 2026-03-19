@@ -49,7 +49,7 @@
 - [ ] Design and implement a verified write/copy mode that stages `hash -> copy -> fsync -> recover/repair if needed -> fsync -> optional verify`, with a documented success/failure contract.
 - [ ] Add property-based model tests for read partitioning, indexed/offset writer ordering, copy equivalence, and hash/verify/recover invariants.
 - [ ] Add fuzz targets for config/manifest parsing plus model-based fuzzing of read/write/copy/hash orchestration on small files.
-- [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani/Creusot/Prusti) for arithmetic and partition helpers.
+- [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani/Creusot/Prusti) for arithmetic and partition helpers. Targeted Miri-safe tests now cover `common::AlignedBuffer` page-backed storage and `reader` destination-slice construction; executing them still requires a nightly toolchain with the `miri` component installed.
 - [ ] Build a real-world compatibility matrix over file kind, access surface, and permission mode; run the meaningful Cartesian-product cases and assert documented success/failure behavior for each.
 
 ### Follow-on tuning ideas

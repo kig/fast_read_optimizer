@@ -1290,6 +1290,44 @@ mod tests {
         let err = checked_output_offset(24, 16, 32).unwrap_err();
         assert!(err.to_string().contains("destination"));
     }
+
+    #[test]
+    fn output_slice_mut_writes_only_checked_window() {
+        let mut backing = vec![0u8; 32];
+        let shared = SharedOutput {
+            ptr: backing.as_mut_ptr(),
+            len: backing.len(),
+        };
+        let start = checked_output_offset(8, 12, backing.len()).unwrap();
+
+        unsafe {
+            output_slice_mut(&shared, start, 12).fill(0xAB);
+        }
+
+        assert!(backing[..8].iter().all(|byte| *byte == 0));
+        assert!(backing[8..20].iter().all(|byte| *byte == 0xAB));
+        assert!(backing[20..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn output_slice_mut_preserves_non_overlapping_regions() {
+        let mut backing = vec![0u8; 24];
+        let shared = SharedOutput {
+            ptr: backing.as_mut_ptr(),
+            len: backing.len(),
+        };
+        let left = checked_output_offset(0, 8, backing.len()).unwrap();
+        let right = checked_output_offset(16, 8, backing.len()).unwrap();
+
+        unsafe {
+            output_slice_mut(&shared, left, 8).fill(0x11);
+            output_slice_mut(&shared, right, 8).fill(0x22);
+        }
+
+        assert_eq!(&backing[..8], &[0x11; 8]);
+        assert_eq!(&backing[8..16], &[0; 8]);
+        assert_eq!(&backing[16..], &[0x22; 8]);
+    }
 }
 unsafe fn output_slice_mut(output: &SharedOutput, offset: usize, len: usize) -> &mut [u8] {
     std::slice::from_raw_parts_mut(output.ptr.add(offset), len)
