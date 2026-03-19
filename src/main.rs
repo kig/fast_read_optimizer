@@ -8,16 +8,18 @@ mod io_util;
 mod mincore;
 mod optimizer;
 mod reader;
+mod verified_copy;
 mod writer;
 
 use block_hash::{
-    default_hash_base, hash_file_to_replicas, hash_file_blocks, recover_file_with_copies, verify_file_with_replicas,
-    BlockHashAlgorithm, RecoverMode,
+    default_hash_base, hash_file_blocks, hash_file_to_replicas, recover_file_with_copies,
+    verify_file_with_replicas, BlockHashAlgorithm, RecoverMode,
 };
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::{load_file_to_memory, read_file};
 use std::io;
+use verified_copy::copy_file_verified_with_options;
 use writer::{copy_file, write_buffer, write_file};
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -196,13 +198,15 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--via-memory] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            usage: "copy [--via-memory] [--verified] [--xxh3|--sha256] [--hash-base path] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
             summary: "Copy one file to another using the same tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
+                "--verified hashes the source, copies the file, fsyncs the destination, writes durable destination sidecars, then verifies the destination against the source-derived manifest.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
+                "--verified currently syncs the file and sidecar files, but not the parent directory.",
             ],
             examples: &[
                 (
@@ -216,6 +220,10 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 (
                     "Load the whole source into RAM, then flush it with direct writes",
                     "copy --via-memory --no-direct --direct-write in.bin out.bin",
+                ),
+                (
+                    "Copy a file, write destination sidecars, and verify the destination against the source manifest",
+                    "copy --verified --sha256 --no-direct in.bin out.bin",
                 ),
             ],
         }),
@@ -444,6 +452,7 @@ fn try_main() -> io::Result<i32> {
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
     let mut via_memory = legacy_copy_via_memory;
+    let mut verified_copy = false;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -529,7 +538,7 @@ fn try_main() -> io::Result<i32> {
             } else if args[i] == "--sha256" {
                 hash_type = BlockHashAlgorithm::Sha256;
             } else if args[i] == "--xxh3" {
-                hash_type = BlockHashAlgorithm::Xxh3;            
+                hash_type = BlockHashAlgorithm::Xxh3;
             } else if args[i] == "--hash-only" {
                 hash_only = true;
             } else if args[i] == "--direct" {
@@ -551,6 +560,8 @@ fn try_main() -> io::Result<i32> {
                 to_memory = true;
             } else if args[i] == "--via-memory" {
                 via_memory = true;
+            } else if args[i] == "--verified" {
+                verified_copy = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
                 verbose = true;
             } else if args[i] == "-s" || args[i] == "--save" {
@@ -647,8 +658,20 @@ fn try_main() -> io::Result<i32> {
         println!("--via-memory is only supported for copy");
         return Ok(1);
     }
+    if verified_copy && mode != "copy" {
+        println!("--verified is only supported for copy");
+        return Ok(1);
+    }
     if via_memory && save_config {
         println!("copy --via-memory does not support --save; tune read and write separately");
+        return Ok(1);
+    }
+    if verified_copy && save_config {
+        println!("copy --verified does not support --save; tune copy and verify separately");
+        return Ok(1);
+    }
+    if verified_copy && iterations > 1 {
+        println!("copy --verified requires -n 1");
         return Ok(1);
     }
 
@@ -849,7 +872,27 @@ fn try_main() -> io::Result<i32> {
             )
         } else if mode == "copy" {
             if let Some(src) = source {
-                if via_memory {
+                if verified_copy {
+                    let report = copy_file_verified_with_options(
+                        src,
+                        filename,
+                        io_mode,
+                        io_mode_write,
+                        hash_type,
+                        via_memory,
+                        hash_base_owned.as_deref(),
+                    )?;
+                    println!(
+                        "verified-copy: bytes_copied={}, bytes_hashed={}, verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}",
+                        report.bytes_copied,
+                        report.source_bytes_hashed,
+                        report.verified_blocks,
+                        report.repaired_blocks,
+                        report.used_recovery,
+                        report.hash_type
+                    );
+                    Ok(report.bytes_copied)
+                } else if via_memory {
                     let read_page_cache = config.get_params_for_path("read", false, src);
                     let read_direct = config.get_params_for_path("read", true, src);
                     let loaded = load_file_to_memory(

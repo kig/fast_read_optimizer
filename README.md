@@ -64,6 +64,9 @@ fro copy -v some_huge_file copy_of_the_file
 # time cp some_huge_file copy_of_the_file
 # real    7.341s
 
+fro copy --verified --sha256 --no-direct some_huge_file verified_copy_of_the_file
+# verified-copy: bytes_copied=4294967296, bytes_hashed=4294967296, verified_blocks=4096, repaired_blocks=0, used_recovery=false, hash_type=Sha256
+
 fro diff -v some_huge_file copy_of_the_file
 # Using direct IO: diff 8589934592 bytes in 0.4167 s, 20.6 GB/s
 # Hot cache: diff 8589934592 bytes in 0.1468 s, 58.5 GB/s
@@ -130,6 +133,7 @@ fro::write_file("copy.bin", &bytes)?;
 fro::write_file_range("copy.part", &bytes, 4096, 1 << 20)?;
 fro::copy_file("checkpoint.bin", "checkpoint.backup")?;
 fro::copy_file_via_memory("checkpoint.bin", "checkpoint.ram-copy")?;
+fro::copy_file_verified("checkpoint.bin", "checkpoint.verified-copy")?;
 
 let reader = fro::open("checkpoint.bin")?;
 reader.foreach_block(|block_index, block| {
@@ -219,6 +223,18 @@ fro copy --no-direct --direct-write in.bin out.bin
 ```
 
 This reads `in.bin` through the page cache but forces direct writes to `out.bin`, which is useful when experimenting with mixed cache / direct behavior.
+
+```bash
+fro copy --verified --sha256 --no-direct in.bin out.bin
+```
+
+This hashes `in.bin`, copies it to `out.bin`, `fsync`s the destination file, writes durable block-hash sidecars for the destination, and then verifies `out.bin` against the **source-derived** manifest. If the first verification pass finds bad blocks, `fro` attempts a `recover`-style repair using `in.bin` as the clean source and verifies again before returning success.
+
+Current verified-copy limits:
+
+- it syncs the destination file and sidecar files, but not the parent directory
+- it verifies that the destination matches the source as observed during this run
+- it does not defend against concurrent mutation of the source while the command is running
 
 ### `fro diff`
 

@@ -356,12 +356,35 @@ fn json_error_to_io(err: serde_json::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
-pub fn save_manifest_replicas(base: &str, manifest: &BlockHashManifest) -> std::io::Result<()> {
+fn write_manifest_replicas(
+    base: &str,
+    manifest: &BlockHashManifest,
+    sync: bool,
+) -> std::io::Result<()> {
     let data = serde_json::to_vec_pretty(manifest).map_err(json_error_to_io)?;
     for path in hash_replica_paths(base) {
-        std::fs::write(path, &data)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(&data)?;
+        if sync {
+            file.sync_all()?;
+        }
     }
     Ok(())
+}
+
+pub fn save_manifest_replicas(base: &str, manifest: &BlockHashManifest) -> std::io::Result<()> {
+    write_manifest_replicas(base, manifest, false)
+}
+
+pub fn save_manifest_replicas_durable(
+    base: &str,
+    manifest: &BlockHashManifest,
+) -> std::io::Result<()> {
+    write_manifest_replicas(base, manifest, true)
 }
 
 pub fn load_manifest_replicas(base: &str) -> Vec<Option<BlockHashManifest>> {

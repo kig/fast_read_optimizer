@@ -205,6 +205,14 @@ Conceptually:
 
 For the library, the equivalent should likely be explicit APIs or options rather than hidden behavior.
 
+Progress:
+
+- `fro` now has a first verified-copy mode for the single-source/single-target case
+- the implementation hashes the source first, copies the file, `fsync`s the destination file, writes durable destination sidecars from the **source-derived** manifest, then verifies the destination against that manifest
+- if the first verification pass finds bad blocks, the mode runs the existing `recover` logic with the source file as the clean copy, `fsync`s again, and re-verifies before returning success
+- this is intentionally stronger than "copy, then hash the destination" because the postcondition is tied to the source-derived oracle rather than the target's self-description
+- the current hole is still explicit: file contents and sidecar files are synced, but parent-directory sync and concurrent-source-mutation defenses remain outside the present contract
+
 ### 5d. Verification obligations for durable and verified modes
 
 For `sync = full`, the required proof obligations are:

@@ -2,6 +2,7 @@ mod api;
 mod common;
 mod io_util;
 mod mincore;
+mod verified_copy;
 
 pub mod block_hash;
 pub mod config;
@@ -20,5 +21,8 @@ pub use api::{
 pub use common::IOMode;
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,
+};
+pub use verified_copy::{
+    copy_file_verified, copy_file_verified_with_options, VerifiedCopyReport,
 };
 pub use writer::{OffsetWriter, SequentialWriter};
