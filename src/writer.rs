@@ -1,12 +1,12 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::LoadedConfig;
+use crate::io_util::{open_direct_reader_or_fallback, open_direct_writer_or_fallback};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ struct PendingAppend {
 struct PendingOffsetWrite {
     buffer: AlignedBuffer,
     len: usize,
+    end_offset: u64,
 }
 
 #[allow(dead_code)]
@@ -50,6 +51,7 @@ pub struct OffsetWriter {
     io_uring: IoUring,
     pending: Vec<Option<PendingOffsetWrite>>,
     bytes_written: u64,
+    max_written_extent: u64,
     use_direct: bool,
 }
 
@@ -259,6 +261,7 @@ impl OffsetWriter {
             io_uring: IoUring::new(1024).map_err(io::Error::other)?,
             pending: std::iter::repeat_with(|| None).take(qd).collect(),
             bytes_written: 0,
+            max_written_extent: 0,
             use_direct: io_mode != IOMode::PageCache,
         })
     }
@@ -291,6 +294,7 @@ impl OffsetWriter {
         self.pending[slot] = Some(PendingOffsetWrite {
             buffer,
             len: data.len(),
+            end_offset: offset + data.len() as u64,
         });
         self.io_uring.submit_sqes().map_err(io::Error::other)?;
         Ok(())
@@ -298,6 +302,11 @@ impl OffsetWriter {
 
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+
+    #[allow(dead_code)]
+    pub fn written_extent(&self) -> u64 {
+        self.max_written_extent
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -324,7 +333,8 @@ impl OffsetWriter {
                 ),
             ));
         }
-        self.bytes_written += written as u64;
+        self.bytes_written += pending.len as u64;
+        self.max_written_extent = self.max_written_extent.max(pending.end_offset);
         Ok(())
     }
 }
@@ -332,37 +342,6 @@ impl OffsetWriter {
 #[allow(dead_code)]
 fn aligned_block_size(block_size: usize) -> usize {
     block_size.max(4096) / 4096 * 4096
-}
-
-fn direct_open_should_fallback(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE)
-    ) || err.kind() == io::ErrorKind::InvalidInput
-}
-
-fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
-        Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
-        Err(err) => Err(err),
-    }
-}
-
-fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
-        Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
-        Err(err) => Err(err),
-    }
 }
 
 #[allow(dead_code)]
@@ -1166,6 +1145,22 @@ mod tests {
         assert_eq!(&data[..a.len()], &a);
         assert_eq!(&data[a.len()..a.len() + b.len()], &b);
         assert_eq!(&data[a.len() + b.len()..], &c);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn offset_writer_tracks_written_extent_for_sparse_offsets() {
+        let path = unique_temp_file("fro-offset-writer-extent");
+        let mut writer =
+            OffsetWriter::create(path.to_str().unwrap(), 16, 2, IOMode::PageCache).unwrap();
+
+        writer.write_at(12, b"xy").unwrap();
+        writer.write_at(0, b"abcd").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.bytes_written(), 6);
+        assert_eq!(writer.written_extent(), 14);
 
         let _ = fs::remove_file(path);
     }

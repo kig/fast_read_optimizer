@@ -4,6 +4,7 @@ mod block_hash;
 mod common;
 mod config;
 mod differ;
+mod io_util;
 mod mincore;
 mod optimizer;
 mod reader;
