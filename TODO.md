@@ -38,6 +38,18 @@
 - [ ] Add golden-file tests for config selection precedence and mount override behavior.
 - [ ] Build a manual validation matrix for single NVMe, md RAID0, dm-crypt, tmpfs, and network filesystems.
 
+### I/O correctness and verification
+
+- [ ] Add checked arithmetic and checked `u64`→`usize` conversions for block/offset math in `reader`, `stream`, and writer offset paths, then test overflow boundaries explicitly.
+- [ ] Treat short `io_uring` reads in the read/map/load paths as retry-or-error conditions instead of accepting partial CQE results as complete logical blocks.
+- [ ] Decide and document the contract for sparse offset writes: either enforce completeness for fixed-size outputs or explicitly preserve "gaps are caller-defined" semantics and test that model.
+- [ ] Make direct-I/O fallback observable and testable so `--direct` users can tell when unsupported filesystems or unaligned tails silently took the page-cache path.
+- [ ] Define the durability contract for high-level write APIs (`flush` vs `sync`) and add explicit tests or APIs for the promised level.
+- [ ] Add property-based model tests for read partitioning, indexed/offset writer ordering, copy equivalence, and hash/verify/recover invariants.
+- [ ] Add fuzz targets for config/manifest parsing plus model-based fuzzing of read/write/copy/hash orchestration on small files.
+- [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani/Creusot/Prusti) for arithmetic and partition helpers.
+- [ ] Build a real-world compatibility matrix over file kind, access surface, and permission mode; run the meaningful Cartesian-product cases and assert documented success/failure behavior for each.
+
 ### Follow-on tuning ideas
 
 - [ ] Separate presets for cold vs hot page cache.
