@@ -106,6 +106,79 @@ Required hardening:
 - add explicit sync-capable APIs if durability is promised
 - test the documented contract, not an implicit one
 
+### 5a. Recommended durability model
+
+SQLite's main lesson is not just "call `fsync` a lot". The useful pattern is:
+
+- define a small number of named durability modes
+- place sync points deliberately
+- make the user's selected durability level explicit in both API and CLI semantics
+- treat metadata durability (directory entries, rename visibility) separately from file-content durability
+
+For `fro`, the most practical first model is:
+
+- `sync = full` (recommended default): explicit `fsync`/`sync_all` semantics for successful write/copy/replace flows
+- `sync = none` (explicit opt-out): performance mode with no durability guarantee beyond process-local completion
+
+Optionally later:
+
+- `sync = data`: file-data durability without the strongest metadata guarantees where the platform exposes that distinction cleanly
+
+The important point is not the exact names. The important point is that "completed write" must stop being an ambiguous term.
+
+### 5b. File and directory sync obligations
+
+If `fro` creates, truncates, replaces, or renames files, the proof needs separate obligations for:
+
+- file contents
+- file size
+- directory entry durability
+
+SQLite is exemplary here because it models the ordering assumptions explicitly. For `fro`, that translates into:
+
+- sync the file after durable write completion
+- sync the parent directory when create/replace/rename semantics matter
+- document which operations promise crash-safe replacement vs only durable file contents
+
+Without directory-sync semantics, a "successful" durable copy can still have a metadata hole after crash.
+
+### 5c. Proposed verified mode
+
+A useful higher-assurance user-facing mode would be a verified copy/write flow along the lines of:
+
+1. compute or load source block hashes
+2. copy the data
+3. `fsync` the destination
+4. if redundancy or manifests are available, run `recover`/repair logic if needed
+5. `fsync` again after any repair writes
+6. optionally `verify` as a final postcondition check
+
+As a user-facing shorthand, this could be exposed as a "verified" mode for copy/write-oriented operations.
+
+Conceptually:
+
+- `normal copy`: best-effort data movement
+- `durable copy`: copy + sync contract
+- `verified copy`: copy + sync + integrity postcondition
+
+For the library, the equivalent should likely be explicit APIs or options rather than hidden behavior.
+
+### 5d. Verification obligations for durable and verified modes
+
+For `sync = full`, the required proof obligations are:
+
+- successful return implies the file sync step completed
+- if the operation created/replaced/renamed a path, the required parent-directory sync step completed
+- failures surface whether they occurred before or after data reached the durable phase
+
+For `verified` mode, the required proof obligations are:
+
+- successful return implies destination bytes match the source bytes according to the documented verifier
+- if repair was needed, the repaired bytes also passed the same verification rule
+- intermediate artifacts and partial-failure states are documented
+
+This does not prove power-loss correctness against a broken kernel or device. It does prove that `fro` executed its side of the durability protocol.
+
 ### 6. Direct-I/O fallback is correctness-relevant and hard to observe
 
 Direct open helpers fall back to the page-cache file descriptor on unsupported `O_DIRECT` cases:
@@ -444,6 +517,7 @@ Expected result classes should be coarse and stable:
 - rejected with `InvalidInput`-class behavior
 - rejected with permission-denied behavior
 - rejected as unsupported direct-I/O / unsupported filesystem behavior
+- rejected with environment-specific transient or transport behavior where documented (for example `EWOULDBLOCK`, `ETIMEDOUT`, or similar remote-filesystem / network-storage failures)
 - skipped because the environment is unavailable
 
 ### Recommended execution layers
@@ -483,6 +557,8 @@ These should be treated as optional/manual or specialized CI:
 - `NVMeoF`
 
 The plan should record them as named obligations, even if not always runnable.
+
+For these environments, tests must not assume local-filesystem error behavior. The matrix needs an "environment-specific acceptable result" channel so transient or transport-flavored failures such as `EWOULDBLOCK` or `ETIMEDOUT` are classified separately from logic failures.
 
 ### How to combine this with property-based testing
 
@@ -534,6 +610,7 @@ We want the following argument:
 3. and model-based transformation tests show read/write/copy/hash/recover results match a reference model,
 4. and parser fuzzing plus Miri show the unsafe and input-decoding surfaces do not introduce undefined behavior or obvious malformed-input crashes,
 5. and the durability contract is explicit and tested,
+6. and durable / verified modes have explicit sync and postcondition obligations,
 
 then `fro` is valid for its documented Linux file-I/O semantics within the stated assumptions below.
 
@@ -556,6 +633,13 @@ We still trust:
 
 Without a dedicated crash harness or stronger API contract, we cannot fully prove power-loss behavior for general writes. We can only prove conformance to the documented sync contract.
 
+Even after adding `sync = full`, there is still a gap between:
+
+- "the program issued the required sync calls successfully"
+- and "the platform actually honored them correctly under sudden power loss"
+
+That gap is inherent unless the validation program includes crash-injection or platform-specific fault testing.
+
 ### Environment-specific direct-I/O hole
 
 Different filesystems and mounts may treat `O_DIRECT` support and alignment rules differently. We can reduce this with tests and observability, but not eliminate it in one portable proof.
@@ -573,7 +657,8 @@ If the project continues to care about non-64-bit targets or extremely large fil
 1. checked arithmetic and checked conversions
 2. short-read handling
 3. offset-writer semantics decision
-4. first property suites (`partitioning`, `offset writes`, `copy equivalence`)
-5. `cargo-fuzz` harnesses for config and manifests
-6. Miri in CI or janitor
-7. bounded-proof experiments on pure helpers
+4. explicit sync-mode and verified-mode contract design
+5. first property suites (`partitioning`, `offset writes`, `copy equivalence`)
+6. `cargo-fuzz` harnesses for config and manifests
+7. Miri in CI or janitor
+8. bounded-proof experiments on pure helpers
