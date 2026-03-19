@@ -28,6 +28,10 @@ fn evict_cache(path: &str) {
 
 fn pre_cache(path: &str) {
     if let Ok(mut file) = std::fs::File::open(path) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
         use std::io::Read;
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         while let Ok(n) = file.read(&mut buf) {
@@ -286,9 +290,9 @@ fn main() {
                 "1".into(),
                 target_file_cache.clone(),
             ],
-            target: 8.0,
+            target: 1.6,
             cache_state: CacheState::Cold,
-            files_to_prep: vec![target_file_dir.clone()],
+            files_to_prep: vec![target_file_cache.clone()],
         },
         TestCase {
             name: "write (page cache, hot)",
@@ -300,9 +304,9 @@ fn main() {
                 "1".into(),
                 target_file_cache.clone(),
             ],
-            target: 8.0,
+            target: 3.6,
             cache_state: CacheState::Hot,
-            files_to_prep: vec![target_file_dir.clone()],
+            files_to_prep: vec![target_file_cache.clone()],
         },
         TestCase {
             name: "write (auto, cold)",
@@ -315,7 +319,7 @@ fn main() {
             ],
             target: 8.0,
             cache_state: CacheState::Cold,
-            files_to_prep: vec![target_file_dir.clone()],
+            files_to_prep: vec![target_file_cache.clone()],
         },
         TestCase {
             name: "write (auto, hot)",
@@ -328,7 +332,7 @@ fn main() {
             ],
             target: 10.0,
             cache_state: CacheState::Hot,
-            files_to_prep: vec![target_file_dir.clone()],
+            files_to_prep: vec![target_file_cache.clone()],
         },
         TestCase {
             name: "read (direct)",
@@ -385,6 +389,20 @@ fn main() {
             files_to_prep: vec![source_file.clone()],
         },
         TestCase {
+            name: "read (to memory, hot)",
+            args: vec![
+                "read".into(),
+                "--to-memory".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+            ],
+            target: 5.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
             name: "copy (direct)",
             args: vec![
                 "copy".into(),
@@ -429,6 +447,23 @@ fn main() {
             target: 2.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (via memory, hot cache R, direct W)",
+            args: vec![
+                "copy".into(),
+                "--via-memory".into(),
+                "--no-direct".into(),
+                "--direct-write".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_dir.clone(),
+            ],
+            target: 0.8,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
         },
         TestCase {
             name: "copy (auto, cold)",
@@ -929,9 +964,17 @@ fn main() {
         }
     }
 
-    for filename in [source_file, target_file_cache, target_file_dir].iter() {
-        std::fs::remove_file(filename)
-            .unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));
+    for (filename, need) in [
+        (source_file, need_source),
+        (target_file_cache, need_target_cache),
+        (target_file_dir, need_target_dir),
+    ]
+    .iter()
+    {
+        if *need {
+            std::fs::remove_file(filename)
+                .unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));
+        }
     }
 
     if regressions {

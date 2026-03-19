@@ -23,6 +23,11 @@ This repo’s main automated verification is the benchmark runner binary:
   - `./target/release/fro-benchmark grep`
 - Choose where temp files are created (use a specific mount/device):
   - `./target/release/fro-benchmark --test-dir /mnt/nvme`
+- Use a large enough working set when validating read-side performance on fast storage:
+  - `./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB`
+  - On the NVMe array used during recent tuning, `4GB` was necessary to get stable and representative read-family numbers.
+- Re-run `fro-benchmark` after every hot-path edit before trusting optimizer output:
+  - if the code path slowed down, `fro-optimize` will happily tune the slower implementation and save bad parameters.
 
 ### Tuning / generating `fro.json`
 
@@ -59,3 +64,25 @@ This repo’s main automated verification is the benchmark runner binary:
 - Profiling/perf workflow is part of the project’s working style:
   - See `GEMINI.md` for rules like “no optimization without evidence” and how to back claims with `perf`/`strace`/assembly.
   - `perf/` contains helper scripts that run `perf stat` against `./target/release/fro ...` (paths inside those scripts may be environment-specific).
+  - See `docs/profiling.md` for the repo’s measurement workflow and the branch-specific caveats around hot page-cache tests, cold writes, and low-overhead tracing.
+
+## Profiling and optimization workflow
+
+- Measure first, then tune:
+  - run `cargo build --release`
+  - run `./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB --no-fail`
+  - identify which family regressed (`read` / `grep` / `diff` / `write` / `copy`) before touching code
+- Use the lightest tool that can answer the question:
+  - start with benchmark throughput and `perf stat`
+  - use `strace -f -c` to count syscall batching / `io_uring_enter`
+  - use `perf record` / `perf report` only after you know which path is slow
+- Beware observer effect:
+  - heavy tracing can distort IO measurements on modern NVMe arrays
+  - the linked Tanel Poder articles are the model here: always consider whether the instrumentation itself is consuming CPU, cache, or synchronization budget
+- Interpret hot vs cold carefully:
+  - hot page-cache read tests should prewarm the file and then measure the steady-state run
+  - cold cached writes often measure page-cache filling and writeback side effects more than raw device throughput
+  - if the goal is raw write-path throughput, force direct writes and compare that separately
+- Auto-write expectations:
+  - for cold write benchmarking, `auto` should land on the direct-write path when that is the faster mode for the target
+  - if `write (auto, cold)` behaves like cached writes, verify the code path before re-tuning config

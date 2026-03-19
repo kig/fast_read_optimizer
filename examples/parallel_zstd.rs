@@ -133,7 +133,9 @@ fn read_container_metadata(path: &str) -> std::io::Result<ContainerMetadata> {
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
     if file_size < FOOTER_SIZE {
-        return Err(std::io::Error::other("file too small to be a fro zstd container"));
+        return Err(std::io::Error::other(
+            "file too small to be a fro zstd container",
+        ));
     }
 
     let mut footer = vec![0u8; FOOTER_SIZE as usize];
@@ -148,7 +150,9 @@ fn read_container_metadata(path: &str) -> std::io::Result<ContainerMetadata> {
     let offsets_start = read_u64_le(&footer[32..40]);
     let offsets_len = block_count as u64 * 16;
     if offsets_start + offsets_len + FOOTER_SIZE != file_size {
-        return Err(std::io::Error::other("invalid offsets table placement in fro zstd container"));
+        return Err(std::io::Error::other(
+            "invalid offsets table placement in fro zstd container",
+        ));
     }
 
     let mut offsets = vec![0u8; offsets_len as usize];
@@ -180,16 +184,18 @@ fn compress_file(
         return Err(std::io::Error::other("block size must be greater than zero").into());
     }
     let block_count = input_file.block_count(block_size)?;
-    let output_stream = ParallelWriter::indexed(config, "write", &opts.output, opts.io_mode, block_count)?;
+    let output_stream =
+        ParallelWriter::indexed(config, "write", &opts.output, opts.io_mode, block_count)?;
 
     let compression_level = opts.compression_level;
     let start = Instant::now();
     let output_stream_for_blocks = output_stream.clone();
-    let read_report = input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
-        let compressed_data =
-            compress(raw_bytes, compression_level).map_err(std::io::Error::other)?;
-        output_stream_for_blocks.write_at_index(chunk_index, compressed_data)
-    })?;
+    let read_report =
+        input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
+            let compressed_data =
+                compress(raw_bytes, compression_level).map_err(std::io::Error::other)?;
+            output_stream_for_blocks.write_at_index(chunk_index, compressed_data)
+        })?;
     let write_report = output_stream.finish()?;
 
     let mut footer_writer = SequentialWriter::open_append(

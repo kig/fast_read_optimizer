@@ -9,6 +9,20 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::{mpsc, Arc, Mutex};
 
+fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> u64 {
+    let page_cache = config.get_params_for_path(mode, false, path);
+    let direct = config.get_params_for_path(mode, true, path);
+    page_cache.block_size.max(direct.block_size)
+}
+
+fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode {
+    if block_size % 4096 == 0 {
+        io_mode
+    } else {
+        IOMode::PageCache
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRange {
     pub offset: u64,
@@ -41,7 +55,8 @@ pub struct ParallelFile {
 #[derive(Clone)]
 pub struct ParallelWriter {
     tx: mpsc::Sender<WriteRequest>,
-    finish_handle: Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<ParallelWriteReport>>>>>,
+    finish_handle:
+        Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<ParallelWriteReport>>>>>,
 }
 
 enum WriteRequest {
@@ -51,7 +66,7 @@ enum WriteRequest {
 
 enum WriterMode {
     ByIndex { block_count: usize },
-    ByOffset { total_size: u64 },
+    ByOffset { total_size: u64, truncate: bool },
 }
 
 impl ParallelFile {
@@ -99,7 +114,7 @@ impl ParallelFile {
     {
         let path = self.path.clone();
         let config = self.config.clone();
-        let io_mode = self.io_mode;
+        let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
         let visit = Arc::new(visit);
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
         let direct = config.get_params_for_path(&self.mode, true, &path);
@@ -119,6 +134,21 @@ impl ParallelFile {
             file_size,
             params,
         })
+    }
+
+    pub fn block_size(&self) -> std::io::Result<u64> {
+        Ok(default_logical_block_size(
+            &self.config,
+            &self.mode,
+            &self.path,
+        ))
+    }
+
+    pub fn foreach_block<F>(&self, visit: F) -> std::io::Result<ParallelReadReport>
+    where
+        F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.foreach_block_parallel(self.block_size()?, visit)
     }
 
     pub fn foreach_index_parallel<F>(&self, job_count: usize, visit: F) -> std::io::Result<()>
@@ -153,7 +183,9 @@ impl ParallelFile {
         let mut bytes = vec![0u8; len];
         let mut filled = 0usize;
         while filled < len {
-            let read = self.file.read_at(&mut bytes[filled..], offset + filled as u64)?;
+            let read = self
+                .file
+                .read_at(&mut bytes[filled..], offset + filled as u64)?;
             if read == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -192,11 +224,25 @@ impl ParallelWriter {
         io_mode: IOMode,
         total_size: u64,
     ) -> std::io::Result<Self> {
+        Self::fixed_size_with_truncate(config, mode, path, io_mode, total_size, true)
+    }
+
+    pub fn fixed_size_with_truncate(
+        config: &LoadedConfig,
+        mode: &str,
+        path: &str,
+        io_mode: IOMode,
+        total_size: u64,
+        truncate: bool,
+    ) -> std::io::Result<Self> {
         Self::spawn(
             path,
             resolve_writer_params_for_mode(config, mode, path, io_mode),
             io_mode,
-            WriterMode::ByOffset { total_size },
+            WriterMode::ByOffset {
+                total_size,
+                truncate,
+            },
         )
     }
 
@@ -293,12 +339,16 @@ impl ParallelWriter {
                         write_params,
                     })
                 }
-                WriterMode::ByOffset { total_size } => {
-                    let mut out = OffsetWriter::create(
+                WriterMode::ByOffset {
+                    total_size,
+                    truncate,
+                } => {
+                    let mut out = OffsetWriter::with_truncate(
                         &output_path,
                         total_size,
                         write_params.qd,
                         io_mode,
+                        truncate,
                     )?;
                     for request in rx {
                         let (offset, data) = match request {
@@ -339,7 +389,9 @@ impl ParallelWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, LoadedConfig};
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_file(prefix: &str) -> String {
@@ -378,7 +430,8 @@ mod tests {
     fn offset_writer_writes_exact_offsets() {
         let cfg = crate::config::load_config(None);
         let path = unique_temp_file("fro-parallel-writer-offset");
-        let writer = ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 8).unwrap();
+        let writer =
+            ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 8).unwrap();
         writer.write_at_offset(4, b"efgh".to_vec()).unwrap();
         writer.write_at_offset(0, b"abcd".to_vec()).unwrap();
         let report = writer.finish().unwrap();
@@ -396,6 +449,57 @@ mod tests {
         writer.write_at_index(0, b"b".to_vec()).unwrap();
         let err = writer.finish().unwrap_err();
         assert!(err.to_string().contains("duplicate write"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn foreach_block_uses_stable_logical_block_size_across_io_modes() {
+        let path = unique_temp_file("fro-parallel-file-block-size");
+        fs::write(&path, (0..200).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+
+        let mut app = AppConfig::default();
+        app.read.page_cache.block_size = 64 * 1024;
+        app.read.direct.block_size = 1024 * 1024;
+        let cfg = LoadedConfig::Legacy {
+            path: PathBuf::from("unused.json"),
+            config: app,
+        };
+
+        let page_cache = ParallelFile::open(&cfg, "read", &path, IOMode::PageCache).unwrap();
+        let direct = ParallelFile::open(&cfg, "read", &path, IOMode::Direct).unwrap();
+
+        assert_eq!(page_cache.block_size().unwrap(), 1024 * 1024);
+        assert_eq!(direct.block_size().unwrap(), 1024 * 1024);
+
+        let page_cache_chunks = Arc::new(Mutex::new(Vec::new()));
+        let direct_chunks = Arc::new(Mutex::new(Vec::new()));
+
+        let page_cache_chunks_for_visit = page_cache_chunks.clone();
+        page_cache
+            .foreach_block(move |index, data| {
+                page_cache_chunks_for_visit
+                    .lock()
+                    .unwrap()
+                    .push((index, data.len()));
+                Ok(())
+            })
+            .unwrap();
+
+        let direct_chunks_for_visit = direct_chunks.clone();
+        direct
+            .foreach_block(move |index, data| {
+                direct_chunks_for_visit
+                    .lock()
+                    .unwrap()
+                    .push((index, data.len()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            *page_cache_chunks.lock().unwrap(),
+            *direct_chunks.lock().unwrap()
+        );
         let _ = fs::remove_file(path);
     }
 }

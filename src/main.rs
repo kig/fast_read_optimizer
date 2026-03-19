@@ -4,19 +4,21 @@ mod block_hash;
 mod common;
 mod config;
 mod differ;
+mod io_util;
 mod mincore;
 mod optimizer;
 mod reader;
 mod writer;
 
 use block_hash::{
-    default_hash_base, hash_file_to_replicas, recover_file_with_copies, verify_file_with_replicas,
-    RecoverMode,
+    default_hash_base, hash_file_to_replicas, hash_file_blocks, recover_file_with_copies, verify_file_with_replicas,
+    BlockHashAlgorithm, RecoverMode,
 };
-use differ::{bench_diff_memory, diff_files};
+use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use optimizer::run_optimizer;
-use reader::read_file;
-use writer::write_file;
+use reader::{load_file_to_memory, read_file};
+use std::io;
+use writer::{copy_file, write_buffer, write_file};
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -41,6 +43,90 @@ fn parse_size(s: &str) -> Option<u64> {
     num.checked_mul(mult)
 }
 
+const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
+const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
+
+fn mark_optimizer_params(mask: &mut [bool; 6], indices: &[usize], include_block_size: bool) {
+    for &index in indices {
+        if include_block_size || index % 3 != 1 {
+            mask[index] = true;
+        }
+    }
+}
+
+fn active_optimizer_param_mask(
+    mode: &str,
+    io_mode: common::IOMode,
+    io_mode_write: common::IOMode,
+    via_memory: bool,
+) -> Vec<bool> {
+    let mut mask = [false; 6];
+    match mode {
+        "read" | "grep" | "hash" | "diff" | "dual-read-bench" => match io_mode {
+            common::IOMode::Direct => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
+        "verify" | "recover" => match io_mode {
+            common::IOMode::Direct => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
+            }
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, false);
+            }
+            common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, false);
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
+            }
+        },
+        "write" => match io_mode_write {
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            common::IOMode::Direct | common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
+        "copy" => {
+            if io_mode_write == common::IOMode::PageCache || io_mode == common::IOMode::PageCache {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            if !(io_mode_write == common::IOMode::PageCache && io_mode == common::IOMode::PageCache)
+            {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        }
+        _ => mask.fill(true),
+    }
+    if mode == "copy" && via_memory {
+        mask.fill(false);
+    }
+    mask.to_vec()
+}
+
+fn print_verify_report(report: &block_hash::VerifyReport) {
+    println!(
+        "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
+        report.loaded_manifests,
+        report.ok_blocks,
+        report.bad_blocks.len()
+    );
+    for issue in &report.bad_blocks {
+        println!(
+            "block {}: {}",
+            issue.block_index,
+            issue.decision.status_message()
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CommandHelp {
     name: &'static str,
@@ -58,16 +144,23 @@ fn command_help(name: &str) -> Option<CommandHelp> {
     match name {
         "read" => Some(CommandHelp {
             name: "read",
-            usage: "read [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
+            usage: "read [--to-memory] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
             summary: "Striped multi-threaded file read for measuring raw throughput on one file.",
             notes: &[
                 "Use -n 1 for one measured run with the current tuned parameters.",
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
+                "--to-memory loads the whole file into RAM instead of only measuring the streaming read path.",
             ],
-            examples: &[(
-                "Measure direct-IO read throughput once",
-                "read --direct -n 1 /mnt/fast/bigfile.dat",
-            )],
+            examples: &[
+                (
+                    "Measure direct-IO read throughput once",
+                    "read --direct -n 1 /mnt/fast/bigfile.dat",
+                ),
+                (
+                    "Load a hot file all the way into memory",
+                    "read --to-memory --no-direct -n 1 /mnt/fast/bigfile.dat",
+                ),
+            ],
         }),
         "grep" => Some(CommandHelp {
             name: "grep",
@@ -101,22 +194,28 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 ),
             ],
         }),
-        "copy" => Some(CommandHelp {
+        "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            usage: "copy [--via-memory] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
             summary: "Copy one file to another using the same tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
+                "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
+                "When using --via-memory, tune read and write separately instead of saving copy params.",
             ],
             examples: &[
                 (
-                    "Do one copy run with current defaults",
-                    "copy -n 1 in.bin out.bin",
+                    "Copy in.bin to out.bin",
+                    "copy in.bin out.bin",
                 ),
                 (
                     "Read through page cache but force direct writes to the destination",
-                    "copy --no-direct --direct-write -n 1 in.bin out.bin",
+                    "copy --no-direct --direct-write in.bin out.bin",
+                ),
+                (
+                    "Load the whole source into RAM, then flush it with direct writes",
+                    "copy --via-memory --no-direct --direct-write in.bin out.bin",
                 ),
             ],
         }),
@@ -127,7 +226,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &["Exits nonzero on mismatch."],
             examples: &[(
                 "Check whether two large files are byte-identical",
-                "diff --direct -n 1 a.bin b.bin",
+                "diff --direct a.bin b.bin",
             )],
         }),
         "dual-read-bench" => Some(CommandHelp {
@@ -142,15 +241,21 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "hash" => Some(CommandHelp {
             name: "hash",
-            usage: "hash [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
-            summary: "Hash a file into fixed 1 MiB blocks and write three JSON sidecar replicas.",
+            usage: "hash [--auto|--no-direct|--direct] [--xxh3|--sha256] [--hash-only] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
+            summary: "Hash a file in parallel 1 MiB blocks, hash the hashes, and write three JSON sidecar replicas.",
             notes: &[
                 "Default sidecar base is <file>.fro-hash.",
+                "Use --xxh3 or --sha256 to choose the sidecar digest algorithm. (NB: this is not sha256sum-compatible.)",
+                "Use --hash-only to only print the filename and hash of hashes.",
                 "Default -n for hash is 1.",
             ],
             examples: &[(
                 "Create block-hash sidecars for one large file",
-                "hash --no-direct -n 1 bigfile.dat",
+                "hash --no-direct bigfile.dat",
+            ),
+            (
+                "Get a SHA256 hash of block hashes for easy file comparisons",
+                "hash --sha256 --hash-only bigfile.dat",
             )],
         }),
         "verify" => Some(CommandHelp {
@@ -159,11 +264,12 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Re-hash a file, compare it to its sidecars, and report bad blocks.",
             notes: &[
                 "Read-only command.",
+                "verify follows the hash type stored in the sidecar manifest.",
                 "On a clean file with intact sidecars, verify hashes the file once and stops.",
             ],
             examples: &[(
                 "Scrub one file against its block-hash sidecars",
-                "verify --no-direct -n 1 bigfile.dat",
+                "verify --no-direct bigfile.dat",
             )],
         }),
         "recover" => Some(CommandHelp {
@@ -174,15 +280,16 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "Default recover rewrites only the first file; later files are read-only sources.",
                 "--fast behaves like verify on the first file unless corruption forces a full multi-file scan.",
                 "--in-place-all attempts to repair every input file and refresh broken sidecars.",
+                "recover follows each file's stored sidecar hash type.",
             ],
             examples: &[
                 (
                     "Repair a target file from one clean copy",
-                    "recover --no-direct -n 1 target.bin backup.bin",
+                    "recover --no-direct target.bin backup.bin",
                 ),
                 (
                     "Use verify-like fast scrub behavior and only fall back to full recovery if needed",
-                    "recover --fast --no-direct -n 1 target.bin backup.bin",
+                    "recover --fast --no-direct target.bin backup.bin",
                 ),
             ],
         }),
@@ -192,6 +299,19 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "In-memory diff microbenchmark used by the benchmark harness.",
             notes: &["This is mainly for development and regression tracking."],
             examples: &[("Run the in-memory diff microbenchmark", "bench-diff")],
+        }),
+        "bench-memcpy" => Some(CommandHelp {
+            name: "bench-memcpy",
+            usage: "bench-memcpy [--size <bytes>] [--threads <count>]",
+            summary: "In-memory memcpy microbenchmark for establishing the RAM copy ceiling.",
+            notes: &[
+                "Defaults to --size 4GiB and --threads 32.",
+                "Reports effective bandwidth as source read plus destination write bytes.",
+            ],
+            examples: &[(
+                "Benchmark a 4 GiB to 4 GiB memcpy with 32 threads",
+                "bench-memcpy --size 4GiB --threads 32",
+            )],
         }),
         "bench-mmap-write" => Some(CommandHelp {
             name: "bench-mmap-write",
@@ -241,7 +361,9 @@ fn print_command_help(program: &str, help: CommandHelp) {
 
 fn print_general_help(program: &str) {
     println!("fast_read_optimizer (fro)");
-    println!("High-throughput Linux file IO utilities with companion benchmark and optimizer tooling.");
+    println!(
+        "High-throughput Linux file IO utilities with companion benchmark and optimizer tooling."
+    );
     println!();
     println!("USAGE:");
     println!("  {} <command> [options]", program);
@@ -250,12 +372,21 @@ fn print_general_help(program: &str) {
     println!("Utilities:");
     for (name, summary) in [
         ("grep", "search for a literal byte substring while reading"),
-        ("write", "rewrite or create a file through the tuned write path"),
-        ("copy", "copy one file to another with tuned read/write settings"),
+        (
+            "write",
+            "rewrite or create a file through the tuned write path",
+        ),
+        (
+            "copy",
+            "copy one file to another with tuned read/write settings",
+        ),
         ("diff", "compare two files and report the first mismatch"),
         ("hash", "write 1 MiB block-hash sidecars"),
         ("verify", "scrub a file against its block-hash sidecars"),
-        ("recover", "repair corrupted blocks from one or more replicas"),
+        (
+            "recover",
+            "repair corrupted blocks from one or more replicas",
+        ),
     ] {
         println!("  {:<16} {}", name, summary);
     }
@@ -266,6 +397,7 @@ fn print_general_help(program: &str) {
     println!("  fro-optimize       tune configs for one or more commands / mounts");
     println!("  fro-benchmark      run the regression benchmark suite");
     println!("  bench-diff         in-memory diff microbenchmark");
+    println!("  bench-memcpy       in-memory memcpy microbenchmark");
     println!("  bench-mmap-write   mmap write microbenchmark");
     println!("  bench-write        plain write microbenchmark");
     println!();
@@ -286,11 +418,11 @@ fn print_general_help(program: &str) {
     );
 }
 
-fn main() {
+fn try_main() -> io::Result<i32> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || is_help_flag(args[1].as_str()) {
         print_general_help(args[0].as_str());
-        return;
+        return Ok(0);
     }
     if args.len() >= 3 && is_help_flag(args[2].as_str()) {
         if let Some(help) = command_help(args[1].as_str()) {
@@ -300,11 +432,18 @@ fn main() {
             println!();
             print_general_help(args[0].as_str());
         }
-        return;
+        return Ok(0);
     }
-    let mode = args[1].as_str();
+    let legacy_copy_via_memory = args[1] == "copy-via-memory";
+    let mode = if legacy_copy_via_memory {
+        "copy"
+    } else {
+        args[1].as_str()
+    };
     let mut io_mode = common::IOMode::Auto;
     let mut io_mode_write = common::IOMode::Auto;
+    let mut to_memory = false;
+    let mut via_memory = legacy_copy_via_memory;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -312,65 +451,127 @@ fn main() {
     let mut extra_paths: Vec<String> = Vec::new();
     let mut hash_base: Option<&str> = None;
     let mut recover_mode = RecoverMode::Standard;
+    let mut hash_type = BlockHashAlgorithm::Xxh3;
+    let mut hash_only = false;
     let mut recover_fast_requested = false;
     let mut recover_in_place_all_requested = false;
     let mut create_size: Option<u64> = None;
     let mut iterations = if mode == "read" { 1000 } else { 1 };
     let mut save_config = false;
     let mut config_path: Option<&str> = None;
+    let mut bench_size: Option<u64> = None;
+    let mut bench_threads: Option<usize> = None;
 
     let mut i = 2;
+    let mut end_flags = false;
     while i < args.len() {
-        if args[i] == "-c" || args[i] == "--config" {
-            i += 1;
-            if i < args.len() {
-                config_path = Some(args[i].as_str());
-            }
-        } else if args[i] == "--hash-base" {
-            i += 1;
-            if i < args.len() {
-                hash_base = Some(args[i].as_str());
-            }
-        } else if args[i] == "--create" {
-            i += 1;
-            if i < args.len() {
-                create_size = parse_size(args[i].as_str()).or_else(|| {
-                    eprintln!("Invalid --create size: {}", args[i]);
-                    None
-                });
-                if create_size.is_none() {
-                    return;
+        let is_flag = !end_flags && args[i].starts_with("-");
+        if is_flag {
+            if args[i] == "--" {
+                end_flags = true;
+            } else if args[i] == "--help" {
+                if let Some(help) = command_help(args[1].as_str()) {
+                    print_command_help(args[0].as_str(), help);
+                } else {
+                    eprintln!("Unknown command: {}", args[1]);
+                    println!();
+                    print_general_help(args[0].as_str());
                 }
-            }
-        } else if args[i] == "--fast" {
-            recover_fast_requested = true;
-            recover_mode = RecoverMode::Fast;
-        } else if args[i] == "--in-place-all" {
-            recover_in_place_all_requested = true;
-            recover_mode = RecoverMode::InPlaceAll;
-        } else if args[i] == "--direct" {
-            io_mode = common::IOMode::Direct;
-            io_mode_write = common::IOMode::Direct;
-        } else if args[i] == "--no-direct" {
-            io_mode = common::IOMode::PageCache;
-            io_mode_write = common::IOMode::PageCache;
-        } else if args[i] == "--auto" {
-            io_mode = common::IOMode::Auto;
-            io_mode_write = common::IOMode::Auto;
-        } else if args[i] == "--direct-write" {
-            io_mode_write = common::IOMode::Direct;
-        } else if args[i] == "--no-direct-write" {
-            io_mode_write = common::IOMode::PageCache;
-        } else if args[i] == "--auto-write" {
-            io_mode_write = common::IOMode::Auto;
-        } else if args[i] == "-v" || args[i] == "--verbose" {
-            verbose = true;
-        } else if args[i] == "-s" || args[i] == "--save" {
-            save_config = true;
-        } else if args[i] == "-n" {
-            i += 1;
-            if i < args.len() {
-                iterations = args[i].parse().expect("Invalid number of iterations");
+                return Ok(0);
+            } else if args[i] == "-c" || args[i] == "--config" {
+                i += 1;
+                if i < args.len() {
+                    config_path = Some(args[i].as_str());
+                }
+            } else if args[i] == "--hash-base" {
+                i += 1;
+                if i < args.len() {
+                    hash_base = Some(args[i].as_str());
+                }
+            } else if args[i] == "--size" {
+                i += 1;
+                if i < args.len() {
+                    bench_size = parse_size(args[i].as_str()).or_else(|| {
+                        eprintln!("Invalid --size: {}", args[i]);
+                        None
+                    });
+                    if bench_size.is_none() {
+                        return Ok(1);
+                    }
+                }
+            } else if args[i] == "--threads" {
+                i += 1;
+                if i < args.len() {
+                    bench_threads = Some(args[i].parse().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid thread count: {}", err),
+                        )
+                    })?);
+                }
+            } else if args[i] == "--create" {
+                i += 1;
+                if i < args.len() {
+                    create_size = parse_size(args[i].as_str()).or_else(|| {
+                        eprintln!("Invalid --create size: {}", args[i]);
+                        None
+                    });
+                    if create_size.is_none() {
+                        return Ok(1);
+                    }
+                }
+            } else if args[i] == "--fast" {
+                recover_fast_requested = true;
+                recover_mode = RecoverMode::Fast;
+            } else if args[i] == "--in-place-all" {
+                recover_in_place_all_requested = true;
+                recover_mode = RecoverMode::InPlaceAll;
+            } else if args[i] == "--sha256" {
+                hash_type = BlockHashAlgorithm::Sha256;
+            } else if args[i] == "--xxh3" {
+                hash_type = BlockHashAlgorithm::Xxh3;            
+            } else if args[i] == "--hash-only" {
+                hash_only = true;
+            } else if args[i] == "--direct" {
+                io_mode = common::IOMode::Direct;
+                io_mode_write = common::IOMode::Direct;
+            } else if args[i] == "--no-direct" {
+                io_mode = common::IOMode::PageCache;
+                io_mode_write = common::IOMode::PageCache;
+            } else if args[i] == "--auto" {
+                io_mode = common::IOMode::Auto;
+                io_mode_write = common::IOMode::Auto;
+            } else if args[i] == "--direct-write" {
+                io_mode_write = common::IOMode::Direct;
+            } else if args[i] == "--no-direct-write" {
+                io_mode_write = common::IOMode::PageCache;
+            } else if args[i] == "--auto-write" {
+                io_mode_write = common::IOMode::Auto;
+            } else if args[i] == "--to-memory" {
+                to_memory = true;
+            } else if args[i] == "--via-memory" {
+                via_memory = true;
+            } else if args[i] == "-v" || args[i] == "--verbose" {
+                verbose = true;
+            } else if args[i] == "-s" || args[i] == "--save" {
+                save_config = true;
+            } else if args[i] == "-n" {
+                i += 1;
+                if i < args.len() {
+                    iterations = args[i].parse().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid number of iterations: {}", err),
+                        )
+                    })?;
+                }
+            } else {
+                eprintln!("Unknown flag for {}: {}", args[0], args[i]);
+                println!();
+                if let Some(help) = command_help(args[0].as_str()) {
+                    print_command_help(args[0].as_str(), help);
+                }
+                return Ok(0);
             }
         } else if mode == "copy" || mode == "diff" || mode == "dual-read-bench" {
             if source.is_none() {
@@ -397,41 +598,71 @@ fn main() {
     }
     if mode == "bench-diff" {
         bench_diff_memory(16, 1024 * 1024);
-        return;
+        return Ok(0);
+    }
+    if mode == "bench-memcpy" {
+        let total_size = bench_size.unwrap_or(4 * 1024 * 1024 * 1024);
+        let num_threads = bench_threads.unwrap_or(32);
+        if num_threads == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--threads must be greater than zero",
+            ));
+        }
+        let total_size = usize::try_from(total_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bench size does not fit in usize: {}", total_size),
+            )
+        })?;
+        bench_memcpy_memory(num_threads, total_size);
+        return Ok(0);
     }
     if mode == "bench-mmap-write" {
         if filename == "" {
             println!("Filename missing");
-            return;
+            return Ok(1);
         }
         writer::bench_mmap_write(filename);
-        return;
+        return Ok(0);
     }
     if mode == "bench-write" {
         if filename == "" {
             println!("Filename missing");
-            return;
+            return Ok(1);
         }
         writer::bench_write(filename);
-        return;
+        return Ok(0);
     }
 
     if filename == "" {
         println!("Filename missing");
-        return;
+        return Ok(1);
+    }
+    if to_memory && mode != "read" {
+        println!("--to-memory is only supported for read");
+        return Ok(1);
+    }
+    if via_memory && mode != "copy" {
+        println!("--via-memory is only supported for copy");
+        return Ok(1);
+    }
+    if via_memory && save_config {
+        println!("copy --via-memory does not support --save; tune read and write separately");
+        return Ok(1);
     }
 
     if mode == "recover" && extra_paths.is_empty() {
         println!("At least one recovery copy is required");
-        return;
+        return Ok(1);
     }
     if mode != "write" && create_size.is_some() {
         println!("--create is only supported for write");
-        return;
+        return Ok(1);
     }
     if mode == "recover" && recover_fast_requested && recover_in_place_all_requested {
         println!("--fast and --in-place-all cannot be used together");
-        return;
+        return Ok(1);
     }
 
     let mut config = config::load_config(config_path);
@@ -467,12 +698,8 @@ fn main() {
     let params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1];
 
     let mode_name = mode;
-    let verbose = verbose
-        || mode == "read"
-        || mode == "write"
-        || mode == "hash"
-        || mode == "verify"
-        || mode == "recover";
+    let optimizer_mask = active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory);
+    let verbose = verbose || mode == "read" || mode == "write";
     if verbose {
         eprintln!("Opening file {} for {}", filename, mode);
     }
@@ -482,7 +709,19 @@ fn main() {
     let extra_paths_owned = extra_paths;
 
     let mode_callback = |p: &[u64]| {
-        if mode == "read" || mode == "grep" {
+        if mode == "read" && to_memory {
+            let loaded = load_file_to_memory(
+                filename,
+                p[0],
+                p[1],
+                p[2] as usize,
+                p[3],
+                p[4],
+                p[5] as usize,
+                io_mode,
+            )?;
+            Ok(loaded.bytes_read)
+        } else if mode == "read" || mode == "grep" {
             read_file(
                 pattern,
                 filename,
@@ -495,27 +734,46 @@ fn main() {
                 io_mode,
             )
         } else if mode == "hash" {
-            let manifest = hash_file_to_replicas(
-                filename,
-                hash_base_owned.as_deref(),
-                p[0],
-                p[1],
-                p[2] as usize,
-                p[3],
-                p[4],
-                p[5] as usize,
-                io_mode,
-            )
-            .expect("Failed to hash file");
-            println!(
-                "wrote {} hash blocks ({} bytes each) to {}[0-2].json",
-                manifest.block_hashes.len(),
-                manifest.block_size,
-                hash_base_owned
-                    .as_deref()
-                    .unwrap_or(&default_hash_base(filename))
-            );
-            manifest.bytes_hashed
+            if hash_only || iterations > 1 {
+                let manifest = hash_file_blocks(
+                    filename,
+                    hash_type,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                )?;
+                if iterations == 1 {
+                    println!("{}  {}", manifest.hash_of_hashes, filename);
+                }
+                Ok(manifest.bytes_hashed)
+            } else {
+                let manifest = hash_file_to_replicas(
+                    filename,
+                    hash_base_owned.as_deref(),
+                    hash_type,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                )?;
+                println!(
+                    "wrote {} {:?} hash blocks ({} bytes each) to {}.[0-2].json",
+                    manifest.block_hashes.len(),
+                    manifest.hash_type,
+                    manifest.block_size,
+                    hash_base_owned
+                        .as_deref()
+                        .unwrap_or(&default_hash_base(filename))
+                );
+                Ok(manifest.bytes_hashed)
+            }
         } else if mode == "verify" {
             let report = verify_file_with_replicas(
                 filename,
@@ -527,25 +785,14 @@ fn main() {
                 p[4],
                 p[5] as usize,
                 io_mode,
-            )
-            .expect("Failed to verify file");
-            println!(
-                "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
-                report.loaded_manifests,
-                report.ok_blocks,
-                report.bad_blocks.len()
-            );
-            for issue in &report.bad_blocks {
-                println!(
-                    "block {}: {}",
-                    issue.block_index,
-                    issue.decision.status_message()
-                );
+            )?;
+            if iterations == 1 {
+                print_verify_report(&report);
             }
-            if !report.bad_blocks.is_empty() {
+            if iterations == 1 && !report.bad_blocks.is_empty() {
                 exit_code = 1;
             }
-            report.bytes_hashed
+            Ok(report.bytes_hashed)
         } else if mode == "recover" {
             let report = recover_file_with_copies(
                 filename,
@@ -559,8 +806,7 @@ fn main() {
                 p[5] as usize,
                 io_mode,
                 recover_mode,
-            )
-            .expect("Failed to recover file");
+            )?;
             println!(
                 "recover: repaired_blocks={}, repaired_files={}, sidecars_refreshed={}, failed_blocks={}, used_fast_path={}, fell_back_to_full_scan={}",
                 report.repaired_blocks,
@@ -588,10 +834,9 @@ fn main() {
             } else if report.repaired_blocks == 0 {
                 println!("recover: no block writes were needed");
             }
-            report.bytes_hashed
+            Ok(report.bytes_hashed)
         } else if mode == "write" {
             write_file(
-                source,
                 filename,
                 create_size,
                 p[0],
@@ -600,30 +845,57 @@ fn main() {
                 p[3],
                 p[4],
                 p[5] as usize,
-                io_mode,
                 io_mode_write,
             )
         } else if mode == "copy" {
-            write_file(
-                source,
-                filename,
-                create_size,
-                p[0],
-                p[1],
-                p[2] as usize,
-                p[3],
-                p[4],
-                p[5] as usize,
-                io_mode,
-                io_mode_write,
-            )
+            if let Some(src) = source {
+                if via_memory {
+                    let read_page_cache = config.get_params_for_path("read", false, src);
+                    let read_direct = config.get_params_for_path("read", true, src);
+                    let loaded = load_file_to_memory(
+                        src,
+                        read_page_cache.num_threads,
+                        read_page_cache.block_size,
+                        read_page_cache.qd,
+                        read_direct.num_threads,
+                        read_direct.block_size,
+                        read_direct.qd,
+                        io_mode,
+                    )?;
+                    let write_page_cache = config.get_params_for_path("write", false, filename);
+                    let write_direct = config.get_params_for_path("write", true, filename);
+                    write_buffer(
+                        filename,
+                        &loaded.data,
+                        write_page_cache.num_threads,
+                        write_page_cache.block_size,
+                        write_page_cache.qd,
+                        write_direct.num_threads,
+                        write_direct.block_size,
+                        write_direct.qd,
+                        io_mode_write,
+                    )
+                } else {
+                    copy_file(
+                        src,
+                        filename,
+                        p[0],
+                        p[1],
+                        p[2] as usize,
+                        p[3],
+                        p[4],
+                        p[5] as usize,
+                        io_mode,
+                        io_mode_write,
+                    )
+                }
+            } else {
+                eprintln!("Copy is missing a destination path.");
+                Ok(1)
+            }
         } else if mode == "diff" || mode == "dual-read-bench" {
-            let s1 = std::fs::metadata(source.unwrap())
-                .expect("Could not read file 1")
-                .len();
-            let s2 = std::fs::metadata(filename)
-                .expect("Could not read file 2")
-                .len();
+            let s1 = std::fs::metadata(source.unwrap())?.len();
+            let s2 = std::fs::metadata(filename)?.len();
             if s1 != s2 {
                 if verbose {
                     eprintln!("Files have different sizes: {} != {}", s1, s2);
@@ -635,11 +907,7 @@ fn main() {
 
             if exit_code == 0 {
                 let bench_only = mode == "dual-read-bench";
-                let size = std::fs::File::open(filename)
-                    .unwrap()
-                    .metadata()
-                    .unwrap()
-                    .len();
+                let size = std::fs::File::open(filename)?.metadata()?.len();
                 let res = diff_files(
                     source.unwrap(),
                     filename,
@@ -651,16 +919,19 @@ fn main() {
                     p[5] as usize,
                     io_mode,
                     bench_only,
-                );
+                )?;
                 if res != 0 && mode == "diff" {
                     exit_code = 1;
                 }
-                size * 2
+                Ok(size * 2)
             } else {
-                0
+                Ok(0)
             }
         } else {
-            panic!("Invalid mode {}", mode)
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid mode {}", mode),
+            ))
         }
     };
 
@@ -668,10 +939,29 @@ fn main() {
         mode_name,
         start_params,
         params_steps,
+        optimizer_mask,
         iterations,
         verbose,
         mode_callback,
-    );
+    )?;
+
+    if mode == "verify" && iterations > 1 {
+        let report = verify_file_with_replicas(
+            filename,
+            hash_base_owned.as_deref(),
+            best_params[0],
+            best_params[1],
+            best_params[2] as usize,
+            best_params[3],
+            best_params[4],
+            best_params[5] as usize,
+            io_mode,
+        )?;
+        print_verify_report(&report);
+        if !report.bad_blocks.is_empty() {
+            exit_code = 1;
+        }
+    }
 
     if save_config && io_mode != common::IOMode::Auto {
         let direct = io_mode == common::IOMode::Direct;
@@ -690,6 +980,56 @@ fn main() {
     }
 
     if exit_code != 0 {
-        std::process::exit(exit_code);
+        return Ok(exit_code);
+    }
+    Ok(0)
+}
+
+fn main() {
+    match try_main() {
+        Ok(code) if code == 0 => {}
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("Error: {}", err);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_optimizer_param_mask;
+    use crate::common::IOMode;
+
+    #[test]
+    fn verify_skips_block_size_mutations() {
+        assert_eq!(
+            active_optimizer_param_mask("verify", IOMode::PageCache, IOMode::Auto, false),
+            vec![true, false, true, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("verify", IOMode::Direct, IOMode::Auto, false),
+            vec![false, false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn write_only_mutates_write_side_params() {
+        assert_eq!(
+            active_optimizer_param_mask("write", IOMode::Auto, IOMode::PageCache, false),
+            vec![true, true, true, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Auto, false),
+            vec![true, true, true, true, true, true]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Auto, true),
+            vec![false, false, false, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Direct, true),
+            vec![false, false, false, false, false, false]
+        );
     }
 }

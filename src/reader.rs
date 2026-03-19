@@ -1,12 +1,14 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::{IOParams, LoadedConfig};
+use crate::io_util::open_reader_files;
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+use std::hint::black_box;
 use std::io::{Seek, SeekFrom};
+use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,12 +22,84 @@ pub struct ResolvedReadParams {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct LoadedFile {
-    pub data: Vec<u8>,
+    pub data: LoadedData,
     pub bytes_read: u64,
     pub params: ResolvedReadParams,
 }
+
+#[derive(Debug)]
+pub enum LoadedData {
+    Aligned(AlignedBuffer),
+    Mapped(MappedReadBuffer),
+}
+
+impl LoadedData {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            LoadedData::Aligned(buffer) => buffer.as_slice(),
+            LoadedData::Mapped(buffer) => buffer.as_slice(),
+        }
+    }
+}
+
+impl Deref for LoadedData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug)]
+pub struct MappedReadBuffer {
+    ptr: *const u8,
+    len: usize,
+    map_len: usize,
+}
+
+impl MappedReadBuffer {
+    fn map(file: &File, len: usize) -> std::io::Result<Self> {
+        let map_len = len.max(1);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+            map_len,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for MappedReadBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::munmap(self.ptr.cast_mut().cast(), self.map_len);
+        }
+    }
+}
+
+unsafe impl Send for MappedReadBuffer {}
+unsafe impl Sync for MappedReadBuffer {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderBlock<'a> {
@@ -35,6 +109,7 @@ pub struct ReaderBlock<'a> {
     pub data: &'a [u8],
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct MappedBlocks<T> {
     pub blocks: Vec<T>,
@@ -52,8 +127,51 @@ struct SharedOutput {
 unsafe impl Send for SharedOutput {}
 unsafe impl Sync for SharedOutput {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepScanBlock {
+    offset: u64,
+    len: usize,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    matches: Vec<u64>,
+}
+
 fn block_offset(thread_base: u64, block_id: u64, num_threads: u64, block_size: u64) -> u64 {
     thread_base + block_id * num_threads * block_size
+}
+
+fn collect_grep_scan_block(block: ReaderBlock<'_>, pattern: &[u8]) -> GrepScanBlock {
+    let overlap = pattern.len().saturating_sub(1);
+    let finder = Finder::new(pattern);
+    GrepScanBlock {
+        offset: block.offset,
+        len: block.data.len(),
+        prefix: block.data[..block.data.len().min(overlap)].to_vec(),
+        suffix: block.data[block.data.len().saturating_sub(overlap)..].to_vec(),
+        matches: finder
+            .find_iter(block.data)
+            .map(|idx| block.offset + idx as u64)
+            .collect(),
+    }
+}
+
+fn find_boundary_matches(prev: &GrepScanBlock, next: &GrepScanBlock, pattern: &[u8]) -> Vec<u64> {
+    if pattern.len() <= 1 || prev.suffix.is_empty() || next.prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut joined = Vec::with_capacity(prev.suffix.len() + next.prefix.len());
+    joined.extend_from_slice(&prev.suffix);
+    joined.extend_from_slice(&next.prefix);
+    let boundary = prev.suffix.len();
+    let start_offset = prev.offset + prev.len as u64 - prev.suffix.len() as u64;
+    let finder = Finder::new(pattern);
+
+    finder
+        .find_iter(&joined)
+        .filter(|idx| *idx < boundary && idx + pattern.len() > boundary)
+        .map(|idx| start_offset + idx as u64)
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -133,11 +251,13 @@ pub fn resolve_reader_params_for_mode(
 }
 
 fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
-    debug_assert_eq!(
-        len % 4096,
-        0,
-        "Direct I/O requires a 4096-byte aligned read length"
-    );
+    if use_direct && len % 4096 == 0 {
+        debug_assert_eq!(
+            len % 4096,
+            0,
+            "Direct I/O requires a 4096-byte aligned read length"
+        );
+    }
     use_direct && (offset % 4096 == 0) && (len % 4096 == 0) && (offset + len as u64 <= file_size)
 }
 
@@ -150,10 +270,12 @@ fn submit_read(
     block_id: u64,
     use_direct: bool,
     file_size: u64,
-) {
+) -> std::io::Result<()> {
     let direct = should_use_direct_io(use_direct, offset, buffer.as_slice().len(), file_size);
     unsafe {
-        let mut sqe = io_uring.prepare_sqe().unwrap();
+        let mut sqe = io_uring
+            .prepare_sqe()
+            .ok_or_else(|| std::io::Error::other("io_uring submission queue is full"))?;
         if direct {
             sqe.prep_read(file_direct.as_raw_fd(), buffer.as_mut_slice(), offset);
         } else {
@@ -161,22 +283,24 @@ fn submit_read(
         }
         sqe.set_user_data(block_id);
     }
+    Ok(())
 }
 
-fn open_reader_files(filename: &str, use_direct: bool) -> (File, File) {
-    let file = File::open(filename).unwrap();
-    let file_direct = if use_direct {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(filename)
-            .unwrap()
-    } else {
-        File::open(filename).unwrap()
-    };
-    (file, file_direct)
+fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
+    let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
+    let mut ready = vec![(cq.user_data(), cq.result()?)];
+
+    while io_uring.cq_ready() > 0 {
+        let cq = io_uring.peek_for_cqe().ok_or_else(|| {
+            std::io::Error::other("completion queue reported ready but no CQE was available")
+        })?;
+        ready.push((cq.user_data(), cq.result()?));
+    }
+
+    Ok(ready)
 }
 
+#[allow(dead_code)]
 fn thread_reader(
     thread_id: u64,
     pattern: String,
@@ -188,13 +312,13 @@ fn thread_reader(
     io_uring: &mut IoUring,
     read_count: Arc<AtomicU64>,
     use_direct: bool,
-) -> Vec<u64> {
+) -> std::io::Result<Vec<u64>> {
     let mut matches = Vec::new();
     let mut buffers = Vec::new();
     for _ in 0..qd {
         buffers.push(AlignedBuffer::new(block_size as usize));
     }
-    let file_size = file.seek(SeekFrom::End(0)).unwrap();
+    let file_size = file.seek(SeekFrom::End(0))?;
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
@@ -213,28 +337,20 @@ fn thread_reader(
             block_num as u64,
             use_direct,
             file_size,
-        );
+        )?;
         block_num += 1;
         inflight += 1;
     }
 
     if inflight == 0 {
-        return matches;
+        return Ok(matches);
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     let finder = Finder::new(pattern.as_bytes());
 
     loop {
-        let cq = io_uring.wait_for_cqe().unwrap();
-        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
-
-        while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
-            ready.push((cq.user_data() as u64, cq.result().unwrap()));
-        }
-
-        for (block_id, result) in ready {
+        for (block_id, result) in wait_for_ready(io_uring)? {
             if result > 0 {
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
                 if !pattern.is_empty() {
@@ -260,14 +376,14 @@ fn thread_reader(
                     block_num as u64,
                     use_direct,
                     file_size,
-                );
+                )?;
                 block_num += 1;
                 inflight += 1;
             }
         }
-        io_uring.submit_sqes().unwrap();
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
         if inflight == 0 {
-            return matches;
+            return Ok(matches);
         }
     }
 }
@@ -284,12 +400,8 @@ fn thread_loader(
     read_count: Arc<AtomicU64>,
     output: Arc<SharedOutput>,
     use_direct: bool,
-) {
-    let mut buffers = Vec::new();
-    for _ in 0..qd {
-        buffers.push(AlignedBuffer::new(block_size as usize));
-    }
-    let file_size = file.seek(SeekFrom::End(0)).unwrap();
+) -> std::io::Result<()> {
+    let file_size = file.seek(SeekFrom::End(0))?;
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
@@ -299,71 +411,69 @@ fn thread_loader(
         if current_offset >= file_size {
             break;
         }
-        submit_read(
-            io_uring,
-            file,
-            file_direct,
-            &mut buffers[block_num % qd],
-            current_offset,
-            block_num as u64,
-            use_direct,
-            file_size,
-        );
+        let len = ((file_size - current_offset).min(block_size)) as usize;
+        if current_offset as usize + len > output.len {
+            return Err(std::io::Error::other(
+                "read wrote beyond destination buffer",
+            ));
+        }
+        let direct = should_use_direct_io(use_direct, current_offset, len, file_size);
+        unsafe {
+            let dst = output_slice_mut(&output, current_offset as usize, len);
+            let mut sqe = io_uring
+                .prepare_sqe()
+                .ok_or_else(|| std::io::Error::other("io_uring submission queue is full"))?;
+            if direct {
+                sqe.prep_read(file_direct.as_raw_fd(), dst, current_offset);
+            } else {
+                sqe.prep_read(file.as_raw_fd(), dst, current_offset);
+            }
+            sqe.set_user_data(block_num as u64);
+        }
         block_num += 1;
         inflight += 1;
     }
 
     if inflight == 0 {
-        return;
+        return Ok(());
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        let cq = io_uring.wait_for_cqe().unwrap();
-        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
-
-        while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
-            ready.push((cq.user_data() as u64, cq.result().unwrap()));
-        }
-
-        for (block_id, result) in ready {
+        for (_block_id, result) in wait_for_ready(io_uring)? {
             if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size);
-                let result = result as usize;
-                let end = current_offset as usize + result;
-                assert!(end <= output.len, "read wrote beyond destination buffer");
-                let src = &buffers[block_id as usize % qd].as_slice()[..result];
-                unsafe {
-                    let dst = std::slice::from_raw_parts_mut(
-                        output.ptr.add(current_offset as usize),
-                        result,
-                    );
-                    dst.copy_from_slice(src);
-                }
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
             }
             inflight -= 1;
 
             let next_offset = block_offset(offset, block_num as u64, num_threads, block_size);
             if next_offset < file_size {
-                submit_read(
-                    io_uring,
-                    file,
-                    file_direct,
-                    &mut buffers[block_num % qd],
-                    next_offset,
-                    block_num as u64,
-                    use_direct,
-                    file_size,
-                );
+                let len = ((file_size - next_offset).min(block_size)) as usize;
+                if next_offset as usize + len > output.len {
+                    return Err(std::io::Error::other(
+                        "read wrote beyond destination buffer",
+                    ));
+                }
+                let direct = should_use_direct_io(use_direct, next_offset, len, file_size);
+                unsafe {
+                    let dst = output_slice_mut(&output, next_offset as usize, len);
+                    let mut sqe = io_uring.prepare_sqe().ok_or_else(|| {
+                        std::io::Error::other("io_uring submission queue is full")
+                    })?;
+                    if direct {
+                        sqe.prep_read(file_direct.as_raw_fd(), dst, next_offset);
+                    } else {
+                        sqe.prep_read(file.as_raw_fd(), dst, next_offset);
+                    }
+                    sqe.set_user_data(block_num as u64);
+                }
                 block_num += 1;
                 inflight += 1;
             }
         }
-        io_uring.submit_sqes().unwrap();
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
         if inflight == 0 {
-            return;
+            return Ok(());
         }
     }
 }
@@ -389,7 +499,7 @@ where
     for _ in 0..qd {
         buffers.push(AlignedBuffer::new(block_size as usize));
     }
-    let file_size = file.seek(SeekFrom::End(0)).unwrap();
+    let file_size = file.seek(SeekFrom::End(0))?;
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
@@ -408,7 +518,7 @@ where
             block_num as u64,
             use_direct,
             file_size,
-        );
+        )?;
         block_num += 1;
         inflight += 1;
     }
@@ -416,18 +526,10 @@ where
     if inflight == 0 {
         return Ok(());
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        let cq = io_uring.wait_for_cqe().unwrap();
-        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
-
-        while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
-            ready.push((cq.user_data() as u64, cq.result().unwrap()));
-        }
-
-        for (block_id, result) in ready {
+        for (block_id, result) in wait_for_ready(io_uring)? {
             if result > 0 {
                 let current_offset = block_offset(offset, block_id, num_threads, block_size);
                 let block_index = (current_offset / block_size) as usize;
@@ -455,12 +557,12 @@ where
                     block_num as u64,
                     use_direct,
                     file_size,
-                );
+                )?;
                 block_num += 1;
                 inflight += 1;
             }
         }
-        io_uring.submit_sqes().unwrap();
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
         if inflight == 0 {
             return Ok(());
         }
@@ -486,7 +588,7 @@ where
     for _ in 0..qd {
         buffers.push(AlignedBuffer::new(block_size as usize));
     }
-    let file_size = file.seek(SeekFrom::End(0)).unwrap();
+    let file_size = file.seek(SeekFrom::End(0))?;
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
@@ -505,7 +607,7 @@ where
             block_num as u64,
             use_direct,
             file_size,
-        );
+        )?;
         block_num += 1;
         inflight += 1;
     }
@@ -513,18 +615,10 @@ where
     if inflight == 0 {
         return Ok(());
     }
-    io_uring.submit_sqes().unwrap();
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        let cq = io_uring.wait_for_cqe().unwrap();
-        let mut ready = vec![(cq.user_data() as u64, cq.result().unwrap())];
-
-        while io_uring.cq_ready() > 0 {
-            let cq = io_uring.peek_for_cqe().unwrap();
-            ready.push((cq.user_data() as u64, cq.result().unwrap()));
-        }
-
-        for (block_id, result) in ready {
+        for (block_id, result) in wait_for_ready(io_uring)? {
             if result > 0 {
                 let current_offset = block_offset(offset, block_id, num_threads, block_size);
                 let block_index = (current_offset / block_size) as usize;
@@ -550,12 +644,12 @@ where
                     block_num as u64,
                     use_direct,
                     file_size,
-                );
+                )?;
                 block_num += 1;
                 inflight += 1;
             }
         }
-        io_uring.submit_sqes().unwrap();
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
         if inflight == 0 {
             return Ok(());
         }
@@ -592,21 +686,35 @@ pub fn load_file_to_memory(
     let file_len = usize::try_from(file_size).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("file is too large to fit in memory on this platform: {}", file_size),
+            format!(
+                "file is too large to fit in memory on this platform: {}",
+                file_size
+            ),
         )
     })?;
 
-    let mut data = vec![0u8; file_len];
     if file_len == 0 {
         return Ok(LoadedFile {
-            data,
+            data: LoadedData::Aligned(AlignedBuffer::new(0)),
             bytes_read: 0,
             params,
         });
     }
 
+    if !params.use_direct {
+        let file = File::open(filename)?;
+        let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len)?);
+        touch_pages(data.as_slice(), params.num_threads)?;
+        return Ok(LoadedFile {
+            data,
+            bytes_read: file_size,
+            params,
+        });
+    }
+
+    let mut data = AlignedBuffer::new_uninit(file_len)?;
     let output = Arc::new(SharedOutput {
-        ptr: data.as_mut_ptr(),
+        ptr: data.as_mut_slice().as_mut_ptr(),
         len: data.len(),
     });
     let read_count = Arc::new(AtomicU64::new(0));
@@ -616,9 +724,9 @@ pub fn load_file_to_memory(
         let output = output.clone();
         let read_count = read_count.clone();
         let filename = filename.to_string();
-        threads.push(std::thread::spawn(move || {
-            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct);
-            let mut io_uring = IoUring::new(1024).unwrap();
+        threads.push(std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
             thread_loader(
                 thread_id,
                 params.num_threads,
@@ -635,11 +743,13 @@ pub fn load_file_to_memory(
     }
 
     for thread in threads {
-        thread.join().unwrap();
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
     }
 
     Ok(LoadedFile {
-        data,
+        data: LoadedData::Aligned(data),
         bytes_read: read_count.load(Ordering::SeqCst),
         params,
     })
@@ -710,9 +820,12 @@ where
             params,
         });
     }
-
     let read_count = Arc::new(AtomicU64::new(0));
-    let results = Arc::new((0..block_count).map(|_| Mutex::new(None)).collect::<Vec<_>>());
+    let results = Arc::new(
+        (0..block_count)
+            .map(|_| Mutex::new(None))
+            .collect::<Vec<_>>(),
+    );
     let mapper = Arc::new(mapper);
 
     let mut threads = vec![];
@@ -722,8 +835,8 @@ where
         let results = results.clone();
         let mapper = mapper.clone();
         threads.push(std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct);
-            let mut io_uring = IoUring::new(1024).unwrap();
+            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
             thread_map_blocks(
                 thread_id,
                 params.num_threads,
@@ -741,7 +854,9 @@ where
     }
 
     for thread in threads {
-        thread.join().unwrap()?;
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
     }
 
     let mut blocks = Vec::with_capacity(block_count);
@@ -760,6 +875,7 @@ where
     })
 }
 
+#[allow(dead_code)]
 pub fn map_file_blocks_for_mode<T, F>(
     config: &LoadedConfig,
     mode: &str,
@@ -819,7 +935,6 @@ where
     if file_size == 0 {
         return Ok((0, 0, params));
     }
-
     let read_count = Arc::new(AtomicU64::new(0));
     let visitor = Arc::new(visitor);
 
@@ -829,8 +944,8 @@ where
         let read_count = read_count.clone();
         let visitor = visitor.clone();
         threads.push(std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct);
-            let mut io_uring = IoUring::new(1024).unwrap();
+            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
             thread_visit_blocks(
                 thread_id,
                 params.num_threads,
@@ -847,12 +962,15 @@ where
     }
 
     for thread in threads {
-        thread.join().unwrap()?;
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
     }
 
     Ok((read_count.load(Ordering::SeqCst), file_size, params))
 }
 
+#[allow(dead_code)]
 pub fn visit_file_blocks_for_mode<F>(
     config: &LoadedConfig,
     mode: &str,
@@ -888,60 +1006,53 @@ pub fn read_file(
     block_size_d: u64,
     qd_d: usize,
     io_mode: IOMode,
-) -> u64 {
-    let mut threads = vec![];
-    let read_count = Arc::new(AtomicU64::new(0));
-
-    let file_cached = match is_first_page_resident(filename) {
-        Ok(true) => true && io_mode != IOMode::Direct,
-        _ => false || io_mode == IOMode::PageCache,
-    };
-    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
-
-    let num_threads = if use_direct {
-        num_threads_d
-    } else {
-        num_threads_p
-    };
-    let block_size = if use_direct {
-        block_size_d
-    } else {
-        block_size_p
-    };
-    let qd = if use_direct { qd_d } else { qd_p };
-
-    for thread_id in 0..num_threads {
-        let read_count = read_count.clone();
-        let filename = filename.to_string();
-        let pattern = pattern.to_string();
-        threads.push(std::thread::spawn(move || {
-            let (mut file, mut file_direct) = open_reader_files(&filename, use_direct);
-            let mut io_uring = IoUring::new(1024).unwrap();
-            thread_reader(
-                thread_id,
-                pattern,
-                num_threads,
-                block_size,
-                qd,
-                &mut file,
-                &mut file_direct,
-                &mut io_uring,
-                read_count,
-                use_direct,
-            )
-        }));
-    }
-    let mut all_matches = Vec::new();
-    for thread in threads {
-        all_matches.extend(thread.join().unwrap());
-    }
+) -> std::io::Result<u64> {
     if !pattern.is_empty() {
-        all_matches.sort();
+        let blocks = map_file_blocks(
+            filename,
+            num_threads_p,
+            block_size_p,
+            qd_p,
+            num_threads_d,
+            block_size_d,
+            qd_d,
+            io_mode,
+            {
+                let pattern = pattern.as_bytes().to_vec();
+                move |block| Ok::<_, std::io::Error>(collect_grep_scan_block(block, &pattern))
+            },
+        )?;
+
+        let mut all_matches = Vec::new();
+        for block in &blocks.blocks {
+            all_matches.extend(block.matches.iter().copied());
+        }
+        for pair in blocks.blocks.windows(2) {
+            all_matches.extend(find_boundary_matches(
+                &pair[0],
+                &pair[1],
+                pattern.as_bytes(),
+            ));
+        }
+        all_matches.sort_unstable();
+        all_matches.dedup();
         for m in all_matches {
             println!("{}:{}", m, pattern);
         }
+        return Ok(blocks.bytes_read);
     }
-    read_count.load(Ordering::SeqCst)
+    let (bytes_read, _, _) = visit_file_blocks(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+        |_| Ok::<_, std::io::Error>(()),
+    )?;
+    Ok(bytes_read)
 }
 
 #[cfg(test)]
@@ -981,7 +1092,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(loaded.bytes_read, data.len() as u64);
-        assert_eq!(loaded.data, data);
+        assert_eq!(loaded.data.as_slice(), data.as_slice());
 
         let _ = fs::remove_file(path);
     }
@@ -1088,4 +1199,73 @@ mod tests {
 
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn boundary_match_finds_pattern_across_blocks() {
+        let prev = GrepScanBlock {
+            offset: 0,
+            len: 4,
+            prefix: b"ab".to_vec(),
+            suffix: b"cd".to_vec(),
+            matches: Vec::new(),
+        };
+        let next = GrepScanBlock {
+            offset: 4,
+            len: 4,
+            prefix: b"ef".to_vec(),
+            suffix: b"gh".to_vec(),
+            matches: Vec::new(),
+        };
+
+        assert_eq!(find_boundary_matches(&prev, &next, b"cdef"), vec![2]);
+    }
+}
+unsafe fn output_slice_mut(output: &SharedOutput, offset: usize, len: usize) -> &mut [u8] {
+    std::slice::from_raw_parts_mut(output.ptr.add(offset), len)
+}
+
+fn touch_pages(data: &[u8], num_threads: u64) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let checksum = Arc::new(AtomicU64::new(0));
+    let thread_count = num_threads.max(1) as usize;
+    let shared = Arc::new(SharedOutput {
+        ptr: data.as_ptr() as *mut u8,
+        len: data.len(),
+    });
+    let mut threads = Vec::new();
+    let scan_stride = 64usize;
+    let chunk_size = data.len().div_ceil(thread_count);
+
+    for thread_id in 0..thread_count {
+        let checksum = Arc::clone(&checksum);
+        let shared = Arc::clone(&shared);
+        threads.push(std::thread::spawn(move || {
+            let start = thread_id * chunk_size;
+            let end = shared.len.min(start + chunk_size);
+            let mut local = 0u64;
+            let mut offset = start;
+
+            while offset + scan_stride <= end {
+                let value = unsafe { *shared.ptr.add(offset) as u64 };
+                local = local.wrapping_add(value);
+                offset += scan_stride;
+            }
+            if offset < end {
+                let value = unsafe { *shared.ptr.add(end - 1) as u64 };
+                local = local.wrapping_add(value);
+            }
+            checksum.fetch_add(local, Ordering::Relaxed);
+        }));
+    }
+
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("page-touch worker thread panicked"))?;
+    }
+    black_box(checksum.load(Ordering::Relaxed));
+    Ok(())
 }

@@ -75,9 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(opts.config_path.as_deref());
 
     let start = Instant::now();
-    let mapped = map_file_blocks_for_mode(&config, "hash", &opts.filename, opts.io_mode, |block| {
-        Ok::<_, std::io::Error>(sha256_digest(block.data))
-    })?;
+    let mapped =
+        map_file_blocks_for_mode(&config, "hash", &opts.filename, opts.io_mode, |block| {
+            Ok::<_, std::io::Error>(sha256_digest(block.data))
+        })?;
     let elapsed = start.elapsed().as_secs_f64();
 
     let digest_summary = mapped.blocks.iter().fold(0u64, |acc, digest| {
