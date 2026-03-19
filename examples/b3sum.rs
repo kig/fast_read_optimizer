@@ -1,6 +1,5 @@
 use blake3::hazmat::{
-    left_subtree_len, merge_subtrees_non_root, merge_subtrees_root, ChainingValue, HasherExt,
-    Mode,
+    left_subtree_len, merge_subtrees_non_root, merge_subtrees_root, ChainingValue, HasherExt, Mode,
 };
 use blake3::{Hash, Hasher};
 use fro::IOMode;
@@ -21,11 +20,7 @@ struct Options {
 }
 
 fn usage(program: &str) {
-    eprintln!(
-        "USAGE: {} [--auto|--no-direct] <file> [file ...]",
-        program
-    );
-    eprintln!("       --direct is intentionally unsupported in this example");
+    eprintln!("USAGE: {} [--auto|--direct|--no-direct] <file> [file ...]", program);
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -42,12 +37,7 @@ fn parse_args() -> Result<Options, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--auto" => io_mode = IOMode::Auto,
-            "--direct" => {
-                return Err(
-                    "--direct is unsupported in this example; use the main fro CLI for direct-I/O experiments"
-                        .to_string(),
-                )
-            }
+            "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "-h" | "--help" => {
                 usage(&args[0]);
