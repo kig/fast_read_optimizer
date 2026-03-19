@@ -20,7 +20,10 @@ struct Options {
 }
 
 fn usage(program: &str) {
-    eprintln!("USAGE: {} [--auto|--direct|--no-direct] <file> [file ...]", program);
+    eprintln!(
+        "USAGE: {} [--auto|--direct|--no-direct] <file> [file ...]",
+        program
+    );
 }
 
 fn parse_args() -> Result<Options, String> {
