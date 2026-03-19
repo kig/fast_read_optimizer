@@ -39,6 +39,18 @@ Required hardening:
 - use checked `u64 -> usize` conversion before slicing/allocation
 - fail explicitly on overflow instead of wrapping
 
+Status:
+
+- implemented in `src/reader.rs`, `src/block_hash.rs`, `src/stream.rs`, and `src/writer.rs`
+- covered with explicit overflow-boundary tests for read offsets, destination-buffer offsets, hash offsets, and writer end offsets
+
+Formal contribution:
+
+- Premise 1: every derived offset is now computed with `checked_mul`/`checked_add`, and every `u64 -> usize` destination conversion is checked before unsafe slice construction.
+- Premise 2: each failure branch returns `InvalidInput` (or another explicit error) instead of continuing with wrapped arithmetic.
+- Therefore, for this arithmetic layer, `(successful return) -> (all derived offsets used by the operation were representable and in-bounds for the checked surface)`.
+- This discharges the main overflow hole for the partitioning and destination-slice arguments, so later proofs may reason over mathematical offsets instead of wrapped machine arithmetic at these call sites.
+
 ### 2. Partial-read acceptance in the read paths
 
 The read visitor/map/load loops currently treat a positive CQE result as a valid logical block completion:
@@ -225,6 +237,11 @@ Suggested approach:
 - use `proptest` for QuickCheck-style generation and shrinking
 - add a SmallCheck-style exhaustive test that enumerates tiny parameter sets (for example file sizes `0..=64 KiB`, threads `1..=4`, block sizes from a small set)
 
+Progress:
+
+- the arithmetic precondition for this property is now enforced in production code
+- remaining work is to prove coverage/non-overlap/ordering algebraically and with property/exhaustive tests
+
 ### B. Read completion semantics
 
 Property:
@@ -258,6 +275,7 @@ Suggested approach:
 
 - minimize the surface of raw slice creation
 - prove preconditions in safe wrappers and make the unsafe core tiny
+- this has started in `reader.rs` by funneling destination-offset validation through `checked_output_offset()` before `output_slice_mut()`
 
 ### D. Sequential and indexed writing
 

@@ -684,8 +684,27 @@ pub fn recover_block_hash(
     }
 }
 
-fn block_offset(thread_base: u64, block_id: u64, num_threads: u64, block_size: u64) -> u64 {
-    thread_base + block_id * num_threads * block_size
+fn block_offset(
+    thread_base: u64,
+    block_id: u64,
+    num_threads: u64,
+    block_size: u64,
+) -> std::io::Result<u64> {
+    let stride = block_id
+        .checked_mul(num_threads)
+        .and_then(|value| value.checked_mul(block_size))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hash offset calculation overflowed",
+            )
+        })?;
+    thread_base.checked_add(stride).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hash offset calculation overflowed",
+        )
+    })
 }
 
 fn use_direct_for_hashing(filename: &str, io_mode: IOMode) -> bool {
@@ -770,7 +789,7 @@ fn thread_hash_reader(
     let mut digests = Vec::new();
 
     for _ in 0..qd {
-        let current_offset = block_offset(offset, block_num as u64, num_threads, block_size);
+        let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
         if current_offset >= file_size {
             break;
         }
@@ -798,7 +817,7 @@ fn thread_hash_reader(
 
         for (block_id, result) in ready {
             if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size);
+                let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
                 let hash_index = (current_offset / block_size) as usize;
                 let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
                 digests.push((hash_index, hash_type.hash_block(buf)));
@@ -806,7 +825,7 @@ fn thread_hash_reader(
             }
             inflight -= 1;
 
-            let next_offset = block_offset(offset, block_num as u64, num_threads, block_size);
+            let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
                 submit_read(
                     io_uring,
@@ -1950,5 +1969,11 @@ mod tests {
                 decision.status_message()
             );
         }
+    }
+
+    #[test]
+    fn block_offset_rejects_overflow() {
+        let err = block_offset(u64::MAX - 3, 4, 8, 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
