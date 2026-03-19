@@ -270,7 +270,8 @@ Suggested approach:
 Progress:
 
 - the arithmetic precondition for this property is now enforced in production code
-- remaining work is to prove coverage/non-overlap/ordering algebraically and with property/exhaustive tests
+- initial property coverage now reconstructs small files from `visit_file_blocks()` results over randomized file sizes, block sizes, queue depths, and thread counts
+- remaining work is to prove coverage/non-overlap/ordering algebraically and with broader property/exhaustive tests
 
 ### B. Read completion semantics
 
@@ -329,6 +330,10 @@ Suggested approach:
 - use temp files plus a reference `Vec<u8>`
 - generate randomized block arrival orders and block sizes
 
+Progress:
+
+- indexed/sequential writer model checks are still open; the current property layer covers read partitioning and fixed-size offset writes first
+
 ### E. Offset writing / sparse semantics
 
 Property:
@@ -345,6 +350,10 @@ Suggested approach:
 
 - build a reference model using `Vec<Option<u8>>` or a byte vector plus initialization bitmap
 - compare temp-file bytes against the model after every generated sequence
+
+Progress:
+
+- randomized offset-write sequences are now checked against a zero-filled reference model for the default fixed-size writer path
 
 ### F. Copy equivalence
 

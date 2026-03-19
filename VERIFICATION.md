@@ -22,6 +22,9 @@ The following proof-relevant items are implemented and covered by tests:
 - documented and tested offset-writer gap semantics:
   - default fixed-size outputs zero-fill unwritten gaps
   - `truncate = false` preserves existing untouched bytes
+- initial property-based model tests for:
+  - read-partition reconstruction on small randomized files
+  - fixed-size offset writes against a reference byte-vector model
 - shared janitor checks and a tracked pre-commit hook
 
 ## Why these items matter
