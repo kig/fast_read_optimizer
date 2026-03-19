@@ -101,6 +101,19 @@ fro-optimize --help
 fro-benchmark --help
 ```
 
+For local guardrails, enable the shared pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs:
+
+```bash
+cargo test --quiet
+cargo run --quiet --manifest-path janitor/Cargo.toml -- all
+```
+
 For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
 
 ## Examples
