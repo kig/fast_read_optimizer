@@ -46,6 +46,7 @@ Formal logic summary:
 - If unwritten output ranges have a documented meaning, then successful offset writes imply every output byte is either caller-written data or data defined by the documented gap policy.
 - If each tested local path kind maps to an explicit result class, then successful execution or explicit rejection on that matrix point implies the high-level API classifies that real OS object according to the documented contract rather than by accident.
 - If the destination is verified against a source-derived manifest after copy and sync, then successful copy-verification return implies the destination matched the source bytes observed during source hashing, not merely a self-consistent post-copy target state.
+- If Kani proves the pure `expected_read_len()` helper implements the exact `min(file_size - offset, block_size)` rule and rejects `offset > file_size`, then successful read-length calculation implies tail sizing obeys the documented arithmetic contract rather than an accidentally passing subset of examples.
 
 Together, these close three high-value proof holes:
 
@@ -62,7 +63,7 @@ The main remaining verification items are:
 - add sync-policy coverage for file and parent-directory semantics
 - add property-based tests for partitioning, copy equivalence, and hash / verify / recover invariants
 - add fuzzing targets
-- run Miri and bounded-proof experiments
+- run Miri regularly and extend bounded-proof coverage beyond the initial `expected_read_len()` Kani slice
 - extend the real-world compatibility matrix beyond the first local API slice to FIFOs, stdio, procfs/sysfs, privileged device cases, and network-backed environments
 - tighten the durability contract further with parent-directory sync semantics and concurrent-source-mutation handling
 
@@ -81,6 +82,14 @@ Targeted Miri command surface, when a nightly toolchain with the `miri` componen
 cargo +nightly miri test --lib common::tests::aligned_buffer_page_storage_is_aligned_and_mutable -- --exact
 cargo +nightly miri test --lib reader::tests::output_slice_mut_writes_only_checked_window -- --exact
 cargo +nightly miri test --lib reader::tests::output_slice_mut_preserves_non_overlapping_regions -- --exact
+```
+
+Initial Kani command surface for the pure read-length helper:
+
+```bash
+cargo kani --harness io_util::kani_proofs::expected_read_len_matches_min_formula --exact
+cargo kani --harness io_util::kani_proofs::expected_read_len_rejects_offsets_past_end --exact
+cargo kani --harness io_util::kani_proofs::expected_read_len_is_monotonic_in_offset --exact
 ```
 
 ## Current reference document

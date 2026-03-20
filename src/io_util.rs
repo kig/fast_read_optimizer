@@ -190,3 +190,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::expected_read_len;
+    use std::io;
+
+    #[kani::proof]
+    fn expected_read_len_matches_min_formula() {
+        let file_size: u64 = kani::any();
+        let offset: u64 = kani::any();
+        let block_size: u64 = kani::any();
+
+        kani::assume(offset <= file_size);
+        let expected_u64 = (file_size - offset).min(block_size);
+        kani::assume(expected_u64 <= usize::MAX as u64);
+
+        let expected = usize::try_from(expected_u64).unwrap();
+        assert_eq!(
+            expected_read_len(file_size, offset, block_size).unwrap(),
+            expected
+        );
+    }
+
+    #[kani::proof]
+    fn expected_read_len_rejects_offsets_past_end() {
+        let file_size: u64 = kani::any();
+        let offset: u64 = kani::any();
+        let block_size: u64 = kani::any();
+
+        kani::assume(offset > file_size);
+
+        let err = expected_read_len(file_size, offset, block_size).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[kani::proof]
+    fn expected_read_len_is_monotonic_in_offset() {
+        let file_size: u64 = kani::any();
+        let offset_a: u64 = kani::any();
+        let offset_b: u64 = kani::any();
+        let block_size: u64 = kani::any();
+
+        kani::assume(offset_a <= offset_b);
+        kani::assume(offset_b <= file_size);
+
+        let expected_a = (file_size - offset_a).min(block_size);
+        let expected_b = (file_size - offset_b).min(block_size);
+        kani::assume(expected_a <= usize::MAX as u64);
+        kani::assume(expected_b <= usize::MAX as u64);
+
+        let len_a = expected_read_len(file_size, offset_a, block_size).unwrap();
+        let len_b = expected_read_len(file_size, offset_b, block_size).unwrap();
+        assert!(len_a >= len_b);
+    }
+}

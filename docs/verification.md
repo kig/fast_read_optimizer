@@ -280,7 +280,8 @@ Progress:
 
 - the arithmetic precondition for this property is now enforced in production code
 - initial property coverage now reconstructs small files from `visit_file_blocks()` results over randomized file sizes, block sizes, queue depths, and thread counts
-- remaining work is to prove coverage/non-overlap/ordering algebraically and with broader property/exhaustive tests
+- the first bounded-proof slice now proves `io_util::expected_read_len()` matches `min(file_size - offset, block_size)` on success, rejects offsets past EOF, and is monotonic in offset
+- remaining work is to prove coverage/non-overlap/ordering algebraically and with broader property/exhaustive tests, ideally by extracting the block-offset helper into a similarly pure proof target
 
 ### B. Read completion semantics
 
@@ -321,6 +322,7 @@ Suggested approach:
 - minimize the surface of raw slice creation
 - prove preconditions in safe wrappers and make the unsafe core tiny
 - this has started in `reader.rs` by funneling destination-offset validation through `checked_output_offset()` before `output_slice_mut()`
+- a natural next bounded-proof target after `expected_read_len()` is that same `checked_output_offset()` precondition helper, because it guards the unsafe destination slicing boundary
 
 ### D. Sequential and indexed writing
 
@@ -473,17 +475,32 @@ cargo +nightly miri test --lib reader::tests::output_slice_mut_preserves_non_ove
 
 ### Bounded proof experiments
 
-Most promising candidates:
+Completed initial slice:
 
-- checked offset/length arithmetic
-- file partition coverage/non-overlap helpers
-- small pure range-merging helpers for sparse write accounting
+- `io_util::expected_read_len()` now has Kani harnesses that prove three bounded properties:
+  - exact result on success: `result = min(file_size - offset, block_size)`
+  - explicit `InvalidInput` rejection for `offset > file_size`
+  - monotonicity in offset: if `offset_a <= offset_b <= file_size`, then `len(offset_a) >= len(offset_b)`
 
-Possible tools:
+Most promising next candidates:
 
-- Kani for bounded model checking of pure helper logic
+- `reader::block_offset()` after extraction into a pure helper, to prove partition ordering and overflow rejection directly
+- `reader::checked_output_offset()` after extraction into a reusable safe helper, to prove slice-bound preconditions for the unsafe destination writes
+- small pure range-merging helpers for sparse write accounting if that logic grows more algebraically interesting
 
-These tools are likely most useful once the hot-path arithmetic and partition logic are factored into small pure helpers.
+Current command surface:
+
+```bash
+cargo kani --harness io_util::kani_proofs::expected_read_len_matches_min_formula --exact
+cargo kani --harness io_util::kani_proofs::expected_read_len_rejects_offsets_past_end --exact
+cargo kani --harness io_util::kani_proofs::expected_read_len_is_monotonic_in_offset --exact
+```
+
+Formal logic summary:
+
+- Premise 1: `expected_read_len()` is the pure helper that defines how many bytes each logical read should request at a given offset.
+- Premise 2: Kani proves that, within the checked-success domain, the helper returns exactly `min(file_size - offset, block_size)`, rejects `offset > file_size`, and decreases monotonically as offset advances.
+- Conclusion: the implementation's read-tail sizing rule is now backed by a bounded proof of the helper itself, not only by sampled test cases.
 
 ## Real-world compatibility matrix
 
