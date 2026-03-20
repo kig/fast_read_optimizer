@@ -133,6 +133,40 @@ fn hash_verify_recover_round_trip() {
 }
 
 #[test]
+fn hash_verify_round_trip_with_default_cli_flags() {
+    let tmp = unique_temp_dir("fro-hash-default-cli");
+    let target = tmp.join("target.bin");
+
+    let block = 1024 * 1024;
+    let data = (0..(block * 2 + 333))
+        .map(|i| ((i * 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&["hash", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("wrote"));
+
+    for suffix in ["0", "1", "2"] {
+        assert!(sidecar_path(&target, suffix).exists());
+    }
+
+    let out = run_fro(&["verify", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+}
+
+#[test]
 fn hash_sha256_sidecars_verify_without_cli_override() {
     let tmp = unique_temp_dir("fro-hash-sha256-cli");
     let target = tmp.join("target.bin");
