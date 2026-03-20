@@ -1361,6 +1361,16 @@ fn main() {
                 &target_file_cache
             ),
             argsv!(
+                "copy",
+                "-s",
+                "--copy-file-range",
+                "--no-direct",
+                "-n",
+                &write_iters,
+                &source_file,
+                &target_file_cache
+            ),
+            argsv!(
                 "diff",
                 "-s",
                 "--direct",
@@ -1594,16 +1604,26 @@ fn main() {
 
         println!("Running optimizer for all modes... (This may take a while)");
 
-        for args in selected {
+        for args in &selected {
             println!("Optimizing: fro {:?}", args);
             let status = Command::new(&fro_exe)
-                .args(&args)
+                .args(args)
                 .status()
                 .expect("Failed to execute process");
 
             if !status.success() {
                 eprintln!("Warning: Optimization failed for {:?}", args);
             }
+        }
+
+        if selected
+            .iter()
+            .any(|cfg| cfg.first().is_some_and(|op| op == "copy"))
+        {
+            let mut cfg = fro::config::load_config(config_path);
+            cfg.update_copy_auto_mode_for_path(&target_file_cache, fro::CopyAutoMode::Heuristic);
+            cfg.save();
+            println!("Saved copy auto mode: {:?}", fro::CopyAutoMode::Heuristic);
         }
 
         let _ = fs::remove_file(source_file);

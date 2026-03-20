@@ -35,6 +35,20 @@ pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result
     }
 }
 
+#[allow(dead_code)]
+pub fn direct_writer_supported(path: &str) -> io::Result<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) if direct_open_should_fallback(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File)> {
     let file = File::open(path)?;
     let file_direct = if use_direct {

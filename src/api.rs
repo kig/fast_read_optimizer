@@ -224,6 +224,7 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     let guard = CopyOperationGuard::new(source, target, true)?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
+    let copy_range = config.get_copy_range_params_for_path(target);
     let copied = writer::copy_file(
         source,
         target,
@@ -233,6 +234,9 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         direct.num_threads,
         direct.block_size,
         direct.qd,
+        copy_range.num_threads,
+        copy_range.block_size,
+        copy_range.qd,
         io_mode_read,
         io_mode_write,
     )?;
@@ -255,6 +259,7 @@ pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     let target = path_str(target.as_ref())?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
+    let copy_range = config.get_copy_range_params_for_path(target);
     copy_range_internal(
         source,
         target,
@@ -268,6 +273,9 @@ pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         direct.num_threads,
         direct.block_size,
         direct.qd,
+        copy_range.num_threads,
+        copy_range.block_size,
+        copy_range.qd,
         io_mode_read,
         io_mode_write,
         CopyStrategy::Threaded,

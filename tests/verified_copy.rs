@@ -35,7 +35,11 @@ fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 }
 
 fn lock_exclusive(path: &std::path::Path) -> File {
-    let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     assert_eq!(rc, 0, "failed to lock {}", path.display());
     file
@@ -312,8 +316,36 @@ fn copy_file_range_cli_rejects_direct_modes() {
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stdout)
-            .contains("copy --copy-file-range does not support direct read/write modes")
+            .contains("copy --copy-file-range and --copy-file-range-single do not support direct read/write modes")
     );
+}
+
+#[test]
+fn copy_file_range_single_cli_copies_file() {
+    let tmp = unique_temp_dir("fro-copy-file-range-single-cli");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = (0..(1024 * 1024 + 129))
+        .map(|i| ((i * 5) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&source, &bytes).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--copy-file-range-single",
+        "--no-direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&target).unwrap(), bytes);
 }
 
 #[test]
@@ -333,10 +365,62 @@ fn reflink_cli_rejects_direct_modes() {
         target.to_str().unwrap(),
     ]);
     assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout)
+        .contains("copy --reflink does not support direct read/write modes"));
+}
+
+#[test]
+fn copy_cli_keep_target_size_preserves_existing_suffix() {
+    let tmp = unique_temp_dir("fro-copy-keep-target-size");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    fs::write(&source, b"abcdef").unwrap();
+    fs::write(&target, b"0123456789").unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--keep-target-size",
+        "--no-direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
     assert!(
-        String::from_utf8_lossy(&out.stdout)
-            .contains("copy --reflink does not support direct read/write modes")
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(fs::read(&target).unwrap(), b"abcdef6789");
+}
+
+#[test]
+fn copy_diff_cli_creates_missing_target_even_without_locks() {
+    let tmp = unique_temp_dir("fro-copy-diff-missing-target");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = (0..(1024 * 1024 + 17))
+        .map(|i| ((i * 11) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&source, &bytes).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--diff",
+        "--no-lock",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&target).unwrap(), bytes);
 }
 
 #[test]
@@ -364,7 +448,10 @@ fn copy_cli_blocks_on_existing_source_lock_by_default() {
     });
 
     thread::sleep(Duration::from_millis(150));
-    assert!(rx.try_recv().is_err(), "copy should still be waiting on the source lock");
+    assert!(
+        rx.try_recv().is_err(),
+        "copy should still be waiting on the source lock"
+    );
 
     drop(locked);
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), true);

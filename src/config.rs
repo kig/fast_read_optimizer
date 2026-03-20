@@ -1,3 +1,4 @@
+use crate::common::CopyAutoMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -24,6 +25,10 @@ pub struct AppConfig {
     pub read: ModeConfig,
     pub write: ModeConfig,
     pub copy: ModeConfig,
+    #[serde(default = "default_copy_range_params")]
+    pub copy_range: IOParams,
+    #[serde(default = "default_copy_auto_mode")]
+    pub copy_auto_mode: CopyAutoMode,
     pub grep: ModeConfig,
     pub diff: ModeConfig,
     pub dual_read_bench: ModeConfig,
@@ -59,6 +64,8 @@ pub struct AppConfigPatch {
     pub read: Option<ModeConfigPatch>,
     pub write: Option<ModeConfigPatch>,
     pub copy: Option<ModeConfigPatch>,
+    pub copy_range: Option<IOParams>,
+    pub copy_auto_mode: Option<CopyAutoMode>,
     pub grep: Option<ModeConfigPatch>,
     pub diff: Option<ModeConfigPatch>,
     pub dual_read_bench: Option<ModeConfigPatch>,
@@ -110,6 +117,22 @@ impl LoadedConfig {
         cfg.get_params(mode, direct)
     }
 
+    pub fn get_copy_range_params(&self) -> IOParams {
+        let cfg = match self {
+            LoadedConfig::Legacy { config, .. } => config,
+            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
+        };
+        cfg.copy_range.clone()
+    }
+
+    pub fn get_copy_auto_mode(&self) -> CopyAutoMode {
+        let cfg = match self {
+            LoadedConfig::Legacy { config, .. } => config,
+            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
+        };
+        cfg.copy_auto_mode
+    }
+
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
         let base = self.get_params(mode, direct);
 
@@ -140,9 +163,61 @@ impl LoadedConfig {
             .unwrap_or(base)
     }
 
+    pub fn get_copy_range_params_for_path(&self, path: &str) -> IOParams {
+        let base = self.get_copy_range_params();
+
+        let (bundle, mountpoint) = match self {
+            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
+            _ => return base,
+        };
+
+        let mp = match mountpoint {
+            Some(mp) => mp,
+            None => return base,
+        };
+
+        bundle
+            .mount_overrides
+            .by_mountpoint
+            .get(&mp)
+            .and_then(|patch| patch.copy_range.clone())
+            .unwrap_or(base)
+    }
+
+    pub fn get_copy_auto_mode_for_path(&self, path: &str) -> CopyAutoMode {
+        let base = self.get_copy_auto_mode();
+
+        let (bundle, mountpoint) = match self {
+            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
+            _ => return base,
+        };
+
+        let mp = match mountpoint {
+            Some(mp) => mp,
+            None => return base,
+        };
+
+        bundle
+            .mount_overrides
+            .by_mountpoint
+            .get(&mp)
+            .and_then(|patch| patch.copy_auto_mode)
+            .unwrap_or(base)
+    }
+
     #[allow(dead_code)]
     pub fn update_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         self.defaults_mut().update_params(mode, direct, params)
+    }
+
+    #[allow(dead_code)]
+    pub fn update_copy_range_params(&mut self, params: IOParams) {
+        self.defaults_mut().copy_range = params;
+    }
+
+    #[allow(dead_code)]
+    pub fn update_copy_auto_mode(&mut self, mode: CopyAutoMode) {
+        self.defaults_mut().copy_auto_mode = mode;
     }
 
     pub fn update_params_for_path(
@@ -164,6 +239,41 @@ impl LoadedConfig {
             }
             LoadedConfig::Legacy { config, .. } => {
                 config.update_params(mode, direct, params);
+            }
+        }
+    }
+
+    pub fn update_copy_range_params_for_path(&mut self, path: &str, params: IOParams) {
+        match self {
+            LoadedConfig::BundleV1 { bundle, .. } => {
+                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
+                let entry = bundle
+                    .mount_overrides
+                    .by_mountpoint
+                    .entry(mp)
+                    .or_insert_with(AppConfigPatch::default);
+                entry.copy_range = Some(params);
+            }
+            LoadedConfig::Legacy { config, .. } => {
+                config.copy_range = params;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn update_copy_auto_mode_for_path(&mut self, path: &str, mode: CopyAutoMode) {
+        match self {
+            LoadedConfig::BundleV1 { bundle, .. } => {
+                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
+                let entry = bundle
+                    .mount_overrides
+                    .by_mountpoint
+                    .entry(mp)
+                    .or_insert_with(AppConfigPatch::default);
+                entry.copy_auto_mode = Some(mode);
+            }
+            LoadedConfig::Legacy { config, .. } => {
+                config.copy_auto_mode = mode;
             }
         }
     }
@@ -401,6 +511,11 @@ impl Default for AppConfig {
             block_size: 1024 * 1024,
             qd: 2,
         };
+        let default_copy_range = IOParams {
+            num_threads: 4,
+            block_size: 512 * 1024,
+            qd: 4,
+        };
 
         let default_mode = ModeConfig {
             direct: default_direct.clone(),
@@ -435,6 +550,8 @@ impl Default for AppConfig {
             read: default_mode.clone(),
             write: default_write_mode.clone(),
             copy: default_write_mode.clone(),
+            copy_range: default_copy_range,
+            copy_auto_mode: CopyAutoMode::Heuristic,
             grep: default_mode.clone(),
             diff: ModeConfig {
                 direct: default_direct.clone(),
@@ -467,6 +584,9 @@ impl AppConfig {
             "dual-read-bench" => &self.dual_read_bench,
             "hash" => &self.hash,
             "verify" => &self.verify,
+            "copy_range" => {
+                return self.copy_range.clone();
+            }
             _ => {
                 return if direct {
                     self.read.direct.clone()
@@ -493,6 +613,10 @@ impl AppConfig {
             "dual-read-bench" => &mut self.dual_read_bench,
             "hash" => &mut self.hash,
             "verify" => &mut self.verify,
+            "copy_range" => {
+                self.copy_range = params;
+                return;
+            }
             _ => return,
         };
 
@@ -510,6 +634,14 @@ fn default_hash_mode_config() -> ModeConfig {
 
 fn default_verify_mode_config() -> ModeConfig {
     AppConfig::default().verify
+}
+
+fn default_copy_range_params() -> IOParams {
+    AppConfig::default().copy_range
+}
+
+fn default_copy_auto_mode() -> CopyAutoMode {
+    CopyAutoMode::Heuristic
 }
 
 #[cfg(test)]
@@ -632,6 +764,9 @@ mod tests {
 
         let p0 = loaded.get_params("read", true);
         assert_eq!(p0.num_threads, 16);
+        let copy_range0 = loaded.get_copy_range_params();
+        assert_eq!(copy_range0.block_size, 512 * 1024);
+        assert_eq!(loaded.get_copy_auto_mode(), CopyAutoMode::Heuristic);
 
         loaded.update_params(
             "read",
@@ -725,10 +860,13 @@ mod tests {
         let loaded = load_config(Some(cfg_path.to_str().unwrap()));
         let hash = loaded.get_params("hash", false);
         let verify = loaded.get_params("verify", false);
+        let copy_range = loaded.get_copy_range_params();
         assert_eq!(hash.block_size, crate::block_hash::BLOCK_HASH_SIZE);
         assert_eq!(verify.block_size, crate::block_hash::BLOCK_HASH_SIZE);
         assert_eq!(hash.num_threads, 31);
         assert_eq!(verify.qd, 1);
+        assert_eq!(copy_range.block_size, 512 * 1024);
+        assert_eq!(loaded.get_copy_auto_mode(), CopyAutoMode::Heuristic);
 
         restore_env_var("FRO_CONFIG", old_fro);
         restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
@@ -757,5 +895,33 @@ mod tests {
 
         let text = std::fs::read_to_string(&cfg_path).unwrap();
         assert_eq!(text, "{ definitely not json\n");
+    }
+
+    #[test]
+    fn bundle_mount_overrides_roundtrip_copy_range_and_auto_mode() {
+        let tmp = unique_temp_dir("fro-copy-range-config");
+        let cfg_path = tmp.join("fro.json");
+        let mut loaded = load_config(Some(cfg_path.to_str().unwrap()));
+
+        loaded.update_copy_range_params_for_path(
+            tmp.to_str().unwrap(),
+            IOParams {
+                num_threads: 7,
+                block_size: 2 * 1024 * 1024,
+                qd: 3,
+            },
+        );
+        loaded.update_copy_auto_mode_for_path(tmp.to_str().unwrap(), CopyAutoMode::CopyFileRange);
+        loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        let copy_range = reloaded.get_copy_range_params_for_path(tmp.to_str().unwrap());
+        assert_eq!(copy_range.num_threads, 7);
+        assert_eq!(copy_range.block_size, 2 * 1024 * 1024);
+        assert_eq!(copy_range.qd, 3);
+        assert_eq!(
+            reloaded.get_copy_auto_mode_for_path(tmp.to_str().unwrap()),
+            CopyAutoMode::CopyFileRange
+        );
     }
 }

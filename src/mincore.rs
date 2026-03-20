@@ -6,6 +6,9 @@ use std::ptr;
 pub fn is_first_page_resident(file_path: &str) -> Result<bool, String> {
     unsafe {
         let file = File::open(file_path).map_err(|e| e.to_string())?;
+        if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+            return Ok(true);
+        }
         let fd = file.as_raw_fd();
         let page_size = sysconf(_SC_PAGESIZE) as usize;
 
@@ -66,5 +69,31 @@ pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
 
         // Check if all pages in the range are resident
         vec.iter().all(|&b| (b & 1) != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_first_page_resident;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+        path
+    }
+
+    #[test]
+    fn empty_file_is_treated_as_page_cached() {
+        let path = unique_temp_file("fro-mincore-empty");
+        fs::write(&path, b"").unwrap();
+        assert_eq!(is_first_page_resident(path.to_str().unwrap()), Ok(true));
+        let _ = fs::remove_file(path);
     }
 }

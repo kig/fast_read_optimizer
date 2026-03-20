@@ -328,6 +328,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     } else {
         let copy_page_cache = config.get_params_for_path("copy", false, target);
         let copy_direct = config.get_params_for_path("copy", true, target);
+        let copy_range = config.get_copy_range_params_for_path(target);
         copy_file_inner(
             source,
             target,
@@ -337,6 +338,9 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
             copy_direct.num_threads,
             copy_direct.block_size,
             copy_direct.qd,
+            copy_range.num_threads,
+            copy_range.block_size,
+            copy_range.qd,
             io_mode_read,
             io_mode_write,
             copy_strategy,

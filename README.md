@@ -215,7 +215,9 @@ Use `copy` when you want a high-throughput single-file copy path with separate c
 fro copy in.bin out.bin
 ```
 
-Copy defaults to direct IO reads and writes, as that seemed to perform the best in testing.
+Plain `fro copy` uses the configured auto copy choice. By default, copy auto prefers the direct threaded path for cold/default cases, can diff hot similar-size cached source/destination files and overwrite only changed chunks with direct writes, and otherwise can switch to page-cache read plus direct write when the source is hot and the destination already exists at or above 70% of the required size. If direct writes are unsupported for that hot cached case, auto falls back to the one-call `copy_file_range(2)` path.
+
+Use `fro copy --diff ...` to force the chunked diff-and-overwrite path, or `fro copy --full ...` to disable diffing and always do a full rewrite.
 
 
 ```bash
@@ -225,10 +227,16 @@ fro copy --no-direct --direct-write in.bin out.bin
 This reads `in.bin` through the page cache but forces direct writes to `out.bin`, which is useful when experimenting with mixed cache / direct behavior.
 
 ```bash
-fro copy --copy-file-range --no-direct -n 1 in.bin out.bin
+fro copy --copy-file-range --no-direct -n 32 -s in.bin out.bin
 ```
 
-This forces the one-call `copy_file_range(2)` path so you can benchmark it explicitly against the existing threaded copy path.
+This uses the tunable multi-call `copy_file_range(2)` strategy and saves its separate `copy_range` optimizer params.
+
+```bash
+fro copy --copy-file-range-single --no-direct -n 1 in.bin out.bin
+```
+
+This forces the explicit one-call `copy_file_range(2)` baseline so you can benchmark it against the threaded and chunked `copy_file_range` paths.
 
 ```bash
 fro copy --reflink --no-direct -n 1 in.bin out.bin

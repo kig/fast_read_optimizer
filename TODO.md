@@ -70,6 +70,33 @@
 - [ ] Idea: small files bundled into processing bundles for efficient batching, large files dealt with separately (while large file data is streaming, small file inodes are streaming).
 - [ ] Process subtrees with io_uring by doing multi-tree parallel DFS (threads start traversing at nearest-to-root non-claimed subtree, claim it, add found dirs to "to-process" stack.)
 
+### More utils
+
+- [ ] sum, cksum, b2sum, md5sum, sha*sum
+  - add to examples/
+- [ ] shred (this is basically write)
+- [ ] wc
+  - counts the number of characters in the file (space, \n)
+- [ ] cat / tac
+- [ ] find, as part of dirwalk work
+- [ ] parallel zstd that produces archives that can be decompressed by zstd
+- [ ] multi-file versions
+  - [ ] diff
+  - [ ] copy with directory target
+  - [ ] after dirwalk work, copy -r
+- [ ] mv (across mounts using the optimized copy -r)
+
+### Streaming I/O for pipes & spinning disks
+
+- [ ] Read sequentially
+- [ ] Write sequentially
+- [ ] Sequential I/O preference if the accessed device is a HDD / array of HDDs.
+- [ ] Overlap processing and I/O
+
+### Integration with rdma-pipe
+
+- [ ] Use fro as the I/O backend for fast network file transfer utilities.
+
 ## Open questions
 
 - [x] Should `./fro.json` ever be auto-loaded, or only via explicit `-c`?
