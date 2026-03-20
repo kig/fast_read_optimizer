@@ -1,6 +1,10 @@
 use fro::block_hash::{default_hash_base, verify_file_with_replicas, BlockHashAlgorithm};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
@@ -28,6 +32,13 @@ fn run_fro(args: &[&str]) -> std::process::Output {
 
 fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     path.with_extension(format!("bin.fro-hash.{}.json", suffix))
+}
+
+fn lock_exclusive(path: &std::path::Path) -> File {
+    let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "failed to lock {}", path.display());
+    file
 }
 
 #[test]
@@ -222,4 +233,71 @@ fn copy_verify_cli_rejects_optimizer_iterations() {
     ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("copy verification modes require -n 1"));
+}
+
+#[test]
+fn copy_cli_blocks_on_existing_source_lock_by_default() {
+    let tmp = unique_temp_dir("fro-copy-lock-default");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = vec![7u8; 1024 * 1024];
+    fs::write(&source, &bytes).unwrap();
+
+    let locked = lock_exclusive(&source);
+    let (tx, rx) = mpsc::channel();
+    let source_owned = source.clone();
+    let target_owned = target.clone();
+    thread::spawn(move || {
+        let out = run_fro(&[
+            "copy",
+            "--no-direct",
+            "-n",
+            "1",
+            source_owned.to_str().unwrap(),
+            target_owned.to_str().unwrap(),
+        ]);
+        tx.send(out.status.success()).unwrap();
+    });
+
+    thread::sleep(Duration::from_millis(150));
+    assert!(rx.try_recv().is_err(), "copy should still be waiting on the source lock");
+
+    drop(locked);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), true);
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn copy_cli_no_lock_skips_advisory_source_locking() {
+    let tmp = unique_temp_dir("fro-copy-no-lock");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = vec![9u8; 1024 * 1024];
+    fs::write(&source, &bytes).unwrap();
+
+    let _locked = lock_exclusive(&source);
+    let (tx, rx) = mpsc::channel();
+    let source_owned = source.clone();
+    let target_owned = target.clone();
+    thread::spawn(move || {
+        let out = run_fro(&[
+            "copy",
+            "--no-lock",
+            "--no-direct",
+            "-n",
+            "1",
+            source_owned.to_str().unwrap(),
+            target_owned.to_str().unwrap(),
+        ]);
+        tx.send(out).unwrap();
+    });
+
+    let out = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&target).unwrap(), bytes);
 }

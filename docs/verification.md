@@ -212,7 +212,9 @@ Progress:
 - if the first verification pass finds bad blocks, the mode repairs the destination from the source using that source-derived manifest as the gold standard, `fsync`s again, and re-verifies before returning success
 - `copy --verify --hash` is the opt-in persistence layer: after successful verification, it leaves durable sidecars at the destination and at the source if the source did not already have them
 - this is intentionally stronger than "copy, then hash the destination" because the postcondition is tied to the source-derived oracle rather than the target's self-description
-- the current hole is still explicit: file contents and optional sidecar files are synced, but parent-directory sync and concurrent-source-mutation defenses remain outside the present contract
+- verified copy now uses advisory source/destination locks by default, but those locks are cooperative rather than mandatory
+- non-verified copy modes additionally compare source size/`mtime`/`ctime` before vs. after the copy and fail if they changed during the operation
+- the current hole is still explicit: file contents and optional sidecar files are synced, but parent-directory sync and protection against non-cooperating concurrent writers remain outside the present contract
 
 ### 5d. Verification obligations for durable and verified modes
 

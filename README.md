@@ -244,13 +244,14 @@ If you want a simpler postcondition check:
 fro copy --verify-diff --no-direct in.bin out.bin
 ```
 
-That copies, `fsync`s the destination file, and then runs a diff pass.
+That copies, `fsync`s the destination file, checks that the source metadata stayed stable, and then runs a diff pass.
 
 Current copy-verification limits:
 
 - it syncs the destination file and sidecar files, but not the parent directory
 - it verifies that the destination matches the source as observed during this run
-- it does not defend against concurrent mutation of the source while the command is running
+- copy now takes advisory locks by default (shared on the source, exclusive on the destination), but those locks only constrain cooperating processes
+- non-verified copy modes also fail if the source file's size, `mtime`, or `ctime` changes during the operation
 
 ### `fro diff`
 

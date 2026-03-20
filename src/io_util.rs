@@ -1,5 +1,7 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
@@ -65,6 +67,138 @@ pub fn validate_read_result(
     result: u32,
 ) -> io::Result<usize> {
     interpret_read_result(operation, offset, expected_len, i64::from(result))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMetadataSnapshot {
+    len: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+    dev: u64,
+    ino: u64,
+}
+
+fn snapshot_regular_metadata(metadata: &fs::Metadata) -> Option<FileMetadataSnapshot> {
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    Some(FileMetadataSnapshot {
+        len: metadata.len(),
+        mtime_sec: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime_sec: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn describe_snapshot(snapshot: Option<FileMetadataSnapshot>) -> String {
+    match snapshot {
+        Some(snapshot) => format!(
+            "len={}, mtime={}.{}, ctime={}.{}, dev={}, ino={}",
+            snapshot.len,
+            snapshot.mtime_sec,
+            snapshot.mtime_nsec,
+            snapshot.ctime_sec,
+            snapshot.ctime_nsec,
+            snapshot.dev,
+            snapshot.ino
+        ),
+        None => "non-regular-file-or-missing".to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct AdvisoryFileLock {
+    file: File,
+}
+
+impl AdvisoryFileLock {
+    fn lock(path: &str, exclusive: bool, create: bool) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        if exclusive {
+            options.read(true).write(true);
+        } else {
+            options.read(true);
+        }
+        if create {
+            options.create(true);
+        }
+        let file = options.open(path)?;
+        let operation = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("failed to lock {} for copy: {}", path, err),
+            ));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for AdvisoryFileLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub struct CopyOperationGuard {
+    source_path: String,
+    source_snapshot: Option<FileMetadataSnapshot>,
+    _locks: Vec<AdvisoryFileLock>,
+}
+
+impl CopyOperationGuard {
+    pub fn new(source: &str, target: &str, use_lock: bool) -> io::Result<Self> {
+        let mut locks = Vec::new();
+        if use_lock {
+            let mut entries = if source == target {
+                vec![(source, true, false)]
+            } else {
+                vec![(source, false, false), (target, true, true)]
+            };
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (path, exclusive, create) in entries {
+                locks.push(AdvisoryFileLock::lock(path, exclusive, create)?);
+            }
+        }
+
+        Ok(Self {
+            source_path: source.to_string(),
+            source_snapshot: snapshot_regular_metadata(&fs::metadata(source)?),
+            _locks: locks,
+        })
+    }
+
+    pub fn ensure_source_unchanged(&self) -> io::Result<()> {
+        let current = match fs::metadata(&self.source_path) {
+            Ok(metadata) => snapshot_regular_metadata(&metadata),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        if current != self.source_snapshot {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "source changed during copy: before [{}], after [{}]",
+                    describe_snapshot(self.source_snapshot),
+                    describe_snapshot(current)
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -152,6 +286,26 @@ fn interpret_read_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&base).unwrap();
+        base.join(format!(
+            "{}-{}-{}",
+            prefix,
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn expected_read_len_uses_tail_for_final_block() {
@@ -253,6 +407,27 @@ mod tests {
         slots.reserve(0, 7).unwrap();
         let err = slots.reserve(0, 8).unwrap_err();
         assert!(err.to_string().contains("reused"));
+    }
+
+    #[test]
+    fn copy_operation_guard_reports_source_metadata_drift() {
+        let tmp = unique_temp_dir("fro-copy-guard-drift");
+        fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("source.bin");
+        let target = tmp.join("target.bin");
+        fs::write(&source, b"abcdef").unwrap();
+        fs::write(&target, b"uvwxyz").unwrap();
+
+        let guard =
+            CopyOperationGuard::new(source.to_str().unwrap(), target.to_str().unwrap(), false)
+                .unwrap();
+        let mut source_file = OpenOptions::new().append(true).open(&source).unwrap();
+        source_file.write_all(b"!").unwrap();
+        source_file.sync_all().unwrap();
+
+        let err = guard.ensure_source_unchanged().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("source changed during copy"));
     }
 }
 

@@ -4,6 +4,7 @@ use crate::block_hash::{
 };
 use crate::common::IOMode;
 use crate::config::{load_config, IOParams};
+use crate::io_util::CopyOperationGuard;
 use crate::reader::load_file_to_memory_for_mode;
 use crate::writer::{copy_file as copy_file_inner, write_buffer};
 use std::fs::{File, OpenOptions};
@@ -241,13 +242,13 @@ fn persist_hashes_if_requested(
 /// Current limits:
 ///
 /// - this syncs the destination file and any requested sidecar files, but not the parent directory
-/// - this does not defend against concurrent mutation of the source while the operation runs
+/// - default locking is advisory only; non-cooperating writers can still mutate the source or target
 #[allow(dead_code)]
 pub fn copy_file_verified<S: AsRef<Path>, D: AsRef<Path>>(
     source: S,
     target: D,
 ) -> io::Result<VerifiedCopyReport> {
-    copy_file_verified_with_options(
+    copy_file_verified_with_options_and_lock(
         source,
         target,
         IOMode::Auto,
@@ -255,9 +256,11 @@ pub fn copy_file_verified<S: AsRef<Path>, D: AsRef<Path>>(
         BlockHashAlgorithm::Xxh3,
         false,
         None,
+        true,
     )
 }
 
+#[allow(dead_code)]
 pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
     source: S,
     target: D,
@@ -267,8 +270,31 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
     via_memory: bool,
     hash_base: Option<&str>,
 ) -> io::Result<VerifiedCopyReport> {
+    copy_file_verified_with_options_and_lock(
+        source,
+        target,
+        io_mode_read,
+        io_mode_write,
+        hash_type,
+        via_memory,
+        hash_base,
+        true,
+    )
+}
+
+pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<Path>>(
+    source: S,
+    target: D,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    hash_type: BlockHashAlgorithm,
+    via_memory: bool,
+    hash_base: Option<&str>,
+    use_lock: bool,
+) -> io::Result<VerifiedCopyReport> {
     let source = path_str(source.as_ref())?;
     let target = path_str(target.as_ref())?;
+    let _guard = CopyOperationGuard::new(source, target, use_lock)?;
     let config = load_config(None);
 
     let source_page_cache = config.get_params_for_path("verify", false, source);

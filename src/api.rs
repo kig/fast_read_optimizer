@@ -1,4 +1,5 @@
 use crate::config::load_config;
+use crate::io_util::CopyOperationGuard;
 use crate::reader::load_file_to_memory_for_mode;
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
@@ -200,8 +201,13 @@ pub fn copy_file_via_memory_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
+    let source = path_str(source.as_ref())?;
+    let target = path_str(target.as_ref())?;
+    let guard = CopyOperationGuard::new(source, target, true)?;
     let data = read_file_with_mode(source, io_mode_read)?;
-    write_file_with_mode(target, &data, io_mode_write)
+    let copied = write_file_with_mode(target, &data, io_mode_write)?;
+    guard.ensure_source_unchanged()?;
+    Ok(copied)
 }
 
 pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
@@ -213,9 +219,10 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     let config = load_config(None);
     let source = path_str(source.as_ref())?;
     let target = path_str(target.as_ref())?;
+    let guard = CopyOperationGuard::new(source, target, true)?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
-    writer::copy_file(
+    let copied = writer::copy_file(
         source,
         target,
         page_cache.num_threads,
@@ -226,7 +233,9 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         direct.qd,
         io_mode_read,
         io_mode_write,
-    )
+    )?;
+    guard.ensure_source_unchanged()?;
+    Ok(copied)
 }
 
 pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
