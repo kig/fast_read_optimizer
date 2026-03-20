@@ -236,6 +236,110 @@ fn copy_verify_cli_rejects_optimizer_iterations() {
 }
 
 #[test]
+fn copy_file_range_cli_copies_file() {
+    let tmp = unique_temp_dir("fro-copy-file-range-cli");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = (0..(1024 * 1024 + 777))
+        .map(|i| ((i * 13) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&source, &bytes).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--copy-file-range",
+        "--no-direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn copy_verify_cli_supports_copy_file_range() {
+    let tmp = unique_temp_dir("fro-copy-file-range-verify");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = (0..(1024 * 1024 + 321))
+        .map(|i| ((i * 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&source, &bytes).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--copy-file-range",
+        "--verify",
+        "--no-direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("copy verify: success"));
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn copy_file_range_cli_rejects_direct_modes() {
+    let tmp = unique_temp_dir("fro-copy-file-range-direct-reject");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    fs::write(&source, b"copy-file-range").unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--copy-file-range",
+        "--direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("copy --copy-file-range does not support direct read/write modes")
+    );
+}
+
+#[test]
+fn reflink_cli_rejects_direct_modes() {
+    let tmp = unique_temp_dir("fro-reflink-direct-reject");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    fs::write(&source, b"reflink").unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--reflink",
+        "--direct",
+        "-n",
+        "1",
+        source.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("copy --reflink does not support direct read/write modes")
+    );
+}
+
+#[test]
 fn copy_cli_blocks_on_existing_source_lock_by_default() {
     let tmp = unique_temp_dir("fro-copy-lock-default");
     let source = tmp.join("source.bin");

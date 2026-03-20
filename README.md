@@ -225,6 +225,18 @@ fro copy --no-direct --direct-write in.bin out.bin
 This reads `in.bin` through the page cache but forces direct writes to `out.bin`, which is useful when experimenting with mixed cache / direct behavior.
 
 ```bash
+fro copy --copy-file-range --no-direct -n 1 in.bin out.bin
+```
+
+This forces the one-call `copy_file_range(2)` path so you can benchmark it explicitly against the existing threaded copy path.
+
+```bash
+fro copy --reflink --no-direct -n 1 in.bin out.bin
+```
+
+This requests a CoW reflink/soft copy when the filesystem supports it. It is extremely fast, but it does **not** promise that `in.bin` and `out.bin` immediately occupy independent physical storage blocks.
+
+```bash
 fro copy --verify --sha256 --no-direct in.bin out.bin
 ```
 

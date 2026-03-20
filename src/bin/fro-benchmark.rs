@@ -1,6 +1,8 @@
 use std::env;
 use std::fs::OpenOptions;
+use std::process;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 enum CacheState {
@@ -253,10 +255,20 @@ fn main() {
     fro_exe.set_file_name("fro");
 
     let test_path = std::path::Path::new(test_dir);
+    let run_dir = test_path.join(format!(
+        "fro-bench-run-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&run_dir)
+        .unwrap_or_else(|e| panic!("Could not create benchmark temp dir {} {}", run_dir.display(), e));
 
-    let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
-    let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
-    let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
+    let source_file = run_dir.join("fro_bench_tmp_source").display().to_string();
+    let target_file_dir = run_dir.join("fro_bench_tmp_direct").display().to_string();
+    let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
 
     let tests = vec![
         TestCase {
@@ -418,9 +430,10 @@ fn main() {
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
-            name: "copy (page cache, cold)",
+            name: "copy (threaded, page cache, cold)",
             args: vec![
                 "copy".into(),
+                "--threaded-copy".into(),
                 "--no-direct".into(),
                 "-v".into(),
                 "-n".into(),
@@ -430,6 +443,38 @@ fn main() {
             ],
             target: 1.0,
             cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (copy_file_range, cold)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 1.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (copy_file_range, hot)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 1.0,
+            cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
@@ -964,18 +1009,8 @@ fn main() {
         }
     }
 
-    for (filename, need) in [
-        (source_file, need_source),
-        (target_file_cache, need_target_cache),
-        (target_file_dir, need_target_dir),
-    ]
-    .iter()
-    {
-        if *need {
-            std::fs::remove_file(filename)
-                .unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));
-        }
-    }
+    std::fs::remove_dir_all(&run_dir)
+        .unwrap_or_else(|e| println!("Failed to delete temp dir {} {}", run_dir.display(), e));
 
     if regressions {
         println!("\nWARNING: Some benchmarks showed regressions or failed.");

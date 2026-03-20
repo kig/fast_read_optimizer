@@ -2,11 +2,11 @@ use crate::block_hash::{
     default_hash_base, hash_file_blocks, load_manifest_replicas, save_manifest_replicas_durable,
     BlockHashAlgorithm, BlockHashManifest,
 };
-use crate::common::IOMode;
+use crate::common::{CopyStrategy, IOMode};
 use crate::config::{load_config, IOParams};
 use crate::io_util::CopyOperationGuard;
 use crate::reader::load_file_to_memory_for_mode;
-use crate::writer::{copy_file as copy_file_inner, write_buffer};
+use crate::writer::{copy_file_with_strategy as copy_file_inner, write_buffer};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -256,6 +256,7 @@ pub fn copy_file_verified<S: AsRef<Path>, D: AsRef<Path>>(
         BlockHashAlgorithm::Xxh3,
         false,
         None,
+        CopyStrategy::Threaded,
         true,
     )
 }
@@ -278,6 +279,7 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
         hash_type,
         via_memory,
         hash_base,
+        CopyStrategy::Threaded,
         true,
     )
 }
@@ -290,6 +292,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     hash_type: BlockHashAlgorithm,
     via_memory: bool,
     hash_base: Option<&str>,
+    copy_strategy: CopyStrategy,
     use_lock: bool,
 ) -> io::Result<VerifiedCopyReport> {
     let source = path_str(source.as_ref())?;
@@ -336,6 +339,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
             copy_direct.qd,
             io_mode_read,
             io_mode_write,
+            copy_strategy,
         )?
     };
 

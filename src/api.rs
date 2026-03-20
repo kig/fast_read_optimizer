@@ -1,9 +1,11 @@
+use crate::common::CopyStrategy;
 use crate::config::load_config;
 use crate::io_util::CopyOperationGuard;
 use crate::reader::load_file_to_memory_for_mode;
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
-    self, copy_file_range as copy_range_internal, resolve_writer_params_for_mode, SequentialWriter,
+    self, copy_file_range_with_strategy as copy_range_internal, resolve_writer_params_for_mode,
+    SequentialWriter,
 };
 use crate::IOMode;
 use std::io;
@@ -268,6 +270,7 @@ pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         direct.qd,
         io_mode_read,
         io_mode_write,
+        CopyStrategy::Threaded,
     )
 }
 

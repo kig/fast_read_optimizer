@@ -111,6 +111,13 @@ pub enum IOMode {
     PageCache,
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum CopyStrategy {
+    Threaded,
+    CopyFileRange,
+    Reflink,
+}
+
 #[cfg(test)]
 mod tests {
     use super::AlignedBuffer;

@@ -1,4 +1,4 @@
-use crate::common::{AlignedBuffer, IOMode};
+use crate::common::{AlignedBuffer, CopyStrategy, IOMode};
 use crate::config::LoadedConfig;
 use crate::io_util::{open_direct_reader_or_fallback, open_direct_writer_or_fallback};
 use crate::mincore::is_first_page_resident;
@@ -612,7 +612,183 @@ fn fill_write_buffer(
     ))
 }
 
-pub fn copy_file_range(
+fn prepare_copy_destination(
+    filename: &str,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+) -> io::Result<()> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(filename)?;
+    let metadata = f.metadata()?;
+    if metadata.file_type().is_file() {
+        let required_size = dest_offset.saturating_add(copy_size);
+        let current_len = metadata.len();
+        if truncate_target || current_len < required_size {
+            f.set_len(required_size)?;
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    dest_offset.try_into().unwrap(),
+                    copy_size.try_into().unwrap(),
+                    libc::POSIX_FADV_NOREUSE,
+                );
+                libc::posix_fallocate(f.as_raw_fd(), 0, required_size as i64);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn copy_file_range_syscall(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    if io_mode_read == IOMode::Direct || io_mode_write == IOMode::Direct {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy_file_range strategy does not support direct read/write modes",
+        ));
+    }
+
+    let source_file = File::open(source)?;
+    let source_meta = source_file.metadata()?;
+    if !source_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy_file_range strategy requires a regular-file source",
+        ));
+    }
+    let copy_size = copy_size.min(source_meta.len().saturating_sub(source_offset));
+    prepare_copy_destination(filename, dest_offset, copy_size, truncate_target)?;
+    let target_file = OpenOptions::new().read(true).write(true).open(filename)?;
+    let target_meta = target_file.metadata()?;
+    if !target_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy_file_range strategy requires a regular-file destination",
+        ));
+    }
+
+    let mut copied_total = 0_u64;
+    let mut source_position: libc::loff_t = source_offset.try_into().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "source offset does not fit in loff_t")
+    })?;
+    let mut target_position: libc::loff_t = dest_offset.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination offset does not fit in loff_t",
+        )
+    })?;
+
+    while copied_total < copy_size {
+        let remaining = copy_size - copied_total;
+        let chunk = remaining.min(usize::MAX as u64) as usize;
+        let copied = unsafe {
+            libc::copy_file_range(
+                source_file.as_raw_fd(),
+                &mut source_position,
+                target_file.as_raw_fd(),
+                &mut target_position,
+                chunk,
+                0,
+            )
+        };
+        if copied < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::new(
+                err.kind(),
+                format!("copy_file_range syscall failed: {}", err),
+            ));
+        }
+        if copied == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "copy_file_range stopped early after {} of {} bytes",
+                    copied_total, copy_size
+                ),
+            ));
+        }
+        copied_total = copied_total.saturating_add(copied as u64);
+    }
+
+    Ok(copied_total)
+}
+
+pub fn copy_file_reflink(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    if io_mode_read == IOMode::Direct || io_mode_write == IOMode::Direct {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reflink strategy does not support direct read/write modes",
+        ));
+    }
+
+    let source_file = File::open(source)?;
+    let source_meta = source_file.metadata()?;
+    if !source_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reflink strategy requires a regular-file source",
+        ));
+    }
+    let effective_copy_size = copy_size.min(source_meta.len().saturating_sub(source_offset));
+    if source_offset != 0 || dest_offset != 0 || !truncate_target || effective_copy_size != source_meta.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reflink strategy currently supports only whole-file copies into a truncated destination",
+        ));
+    }
+
+    let target_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(filename)?;
+    let target_meta = target_file.metadata()?;
+    if !target_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reflink strategy requires a regular-file destination",
+        ));
+    }
+
+    let rc = unsafe { libc::ioctl(target_file.as_raw_fd(), libc::FICLONE, source_file.as_raw_fd()) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("reflink clone failed: {}", err),
+        ));
+    }
+
+    Ok(source_meta.len())
+}
+
+pub fn copy_file_range_threaded(
     source: &str,
     filename: &str,
     source_offset: u64,
@@ -649,25 +825,7 @@ pub fn copy_file_range(
     };
     let qd = if direct_write { qd_d } else { qd_p };
 
-    {
-        let f = OpenOptions::new().write(true).create(true).open(filename)?;
-        if f.metadata()?.file_type().is_file() {
-            let required_size = dest_offset.saturating_add(copy_size);
-            let current_len = f.metadata()?.len();
-            if truncate_target || current_len < required_size {
-                f.set_len(required_size)?;
-                unsafe {
-                    libc::posix_fadvise(
-                        f.as_raw_fd(),
-                        dest_offset.try_into().unwrap(),
-                        copy_size.try_into().unwrap(),
-                        libc::POSIX_FADV_NOREUSE,
-                    );
-                    libc::posix_fallocate(f.as_raw_fd(), 0, required_size as i64);
-                }
-            }
-        }
-    }
+    prepare_copy_destination(filename, dest_offset, copy_size, truncate_target)?;
 
     for thread_id in 0..num_threads {
         let write_count = write_count.clone();
@@ -716,6 +874,63 @@ pub fn copy_file_range(
     Ok(write_count.load(Ordering::SeqCst))
 }
 
+pub fn copy_file_range_with_strategy(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    copy_strategy: CopyStrategy,
+) -> io::Result<u64> {
+    match copy_strategy {
+        CopyStrategy::Threaded => copy_file_range_threaded(
+            source,
+            filename,
+            source_offset,
+            dest_offset,
+            copy_size,
+            truncate_target,
+            num_threads_p,
+            block_size_p,
+            qd_p,
+            num_threads_d,
+            block_size_d,
+            qd_d,
+            io_mode_read,
+            io_mode_write,
+        ),
+        CopyStrategy::CopyFileRange => copy_file_range_syscall(
+            source,
+            filename,
+            source_offset,
+            dest_offset,
+            copy_size,
+            truncate_target,
+            io_mode_read,
+            io_mode_write,
+        ),
+        CopyStrategy::Reflink => copy_file_reflink(
+            source,
+            filename,
+            source_offset,
+            dest_offset,
+            copy_size,
+            truncate_target,
+            io_mode_read,
+            io_mode_write,
+        ),
+    }
+}
+
 /*
 write (direct)                      | 10.40        | 10.00        | PASS
 write (auto, hot)                   | 10.50        | 10.00        | PASS
@@ -759,6 +974,7 @@ copy (page cache, cold)             | 1.00         | 0.50         | PASS
 copy (hot cache R, direct W)        | 2.60         | 10.00        | REGRESSION
 copy (auto, hot)                    | 1.40         | 10.00        | REGRESSION
 */
+#[allow(dead_code)]
 pub fn copy_file(
     source_filename: &str,
     target_filename: &str,
@@ -771,7 +987,35 @@ pub fn copy_file(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
-    return copy_file_range(
+    return copy_file_with_strategy(
+        source_filename,
+        target_filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode_read,
+        io_mode_write,
+        CopyStrategy::Threaded,
+    );
+}
+
+pub fn copy_file_with_strategy(
+    source_filename: &str,
+    target_filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    copy_strategy: CopyStrategy,
+) -> io::Result<u64> {
+    return copy_file_range_with_strategy(
         source_filename,
         target_filename,
         0,
@@ -786,6 +1030,7 @@ pub fn copy_file(
         qd_d,
         io_mode_read,
         io_mode_write,
+        copy_strategy,
     );
 }
 

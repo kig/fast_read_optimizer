@@ -15,6 +15,7 @@ use block_hash::{
     default_hash_base, hash_file_blocks, hash_file_to_replicas, recover_file_with_copies,
     verify_file_with_replicas, BlockHashAlgorithm, RecoverMode,
 };
+use common::CopyStrategy;
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use io_util::CopyOperationGuard;
 use optimizer::run_optimizer;
@@ -22,7 +23,7 @@ use reader::{load_file_to_memory, read_file};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use verified_copy::copy_file_verified_with_options_and_lock;
-use writer::{copy_file, write_buffer, write_file};
+use writer::{copy_file_with_strategy, write_buffer, write_file};
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -71,6 +72,7 @@ fn active_optimizer_param_mask(
     io_mode: common::IOMode,
     io_mode_write: common::IOMode,
     via_memory: bool,
+    copy_strategy: CopyStrategy,
 ) -> Vec<bool> {
     let mut mask = [false; 6];
     match mode {
@@ -117,7 +119,7 @@ fn active_optimizer_param_mask(
         }
         _ => mask.fill(true),
     }
-    if mode == "copy" && via_memory {
+    if mode == "copy" && (via_memory || copy_strategy != CopyStrategy::Threaded) {
         mask.fill(false);
     }
     mask.to_vec()
@@ -226,11 +228,15 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--via-memory] [--no-lock] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            usage: "copy [--via-memory] [--copy-file-range|--threaded-copy|--reflink] [--no-lock] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
             summary: "Copy one file to another using the same tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
+                "--copy-file-range forces the Linux copy_file_range(2) syscall path for benchmarking and A/B comparison.",
+                "--threaded-copy forces the existing tuned striped io_uring copy path.",
+                "--reflink requests a CoW clone/reflink when the filesystem supports it; this is fast but does not promise physically independent storage blocks.",
+                "Without either flag, plain copy keeps the existing tuned threaded path; use --copy-file-range explicitly to benchmark the syscall path.",
                 "Copy takes an advisory shared lock on the source and an advisory exclusive lock on the destination by default; use --no-lock to skip that cooperative locking.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
                 "--verify hashes the source, copies the file, fsyncs the destination, and verifies the destination against the source-derived manifest without leaving sidecars by default.",
@@ -248,6 +254,18 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 (
                     "Read through page cache but force direct writes to the destination",
                     "copy --no-direct --direct-write in.bin out.bin",
+                ),
+                (
+                    "Benchmark the kernel copy_file_range syscall path directly",
+                    "copy --copy-file-range --no-direct -n 1 in.bin out.bin",
+                ),
+                (
+                    "Force the existing striped io_uring copy path for comparison",
+                    "copy --threaded-copy --no-direct -n 1 in.bin out.bin",
+                ),
+                (
+                    "Request a CoW reflink/soft copy when the filesystem supports it",
+                    "copy --reflink --no-direct -n 1 in.bin out.bin",
                 ),
                 (
                     "Load the whole source into RAM, then flush it with direct writes",
@@ -501,6 +519,9 @@ fn try_main() -> io::Result<i32> {
     let mut persist_verification_hashes = false;
     let mut quiet = false;
     let mut no_lock = false;
+    let mut force_copy_file_range = false;
+    let mut force_threaded_copy = false;
+    let mut force_reflink = false;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -616,6 +637,12 @@ fn try_main() -> io::Result<i32> {
                 persist_verification_hashes = true;
             } else if args[i] == "--no-lock" {
                 no_lock = true;
+            } else if args[i] == "--copy-file-range" {
+                force_copy_file_range = true;
+            } else if args[i] == "--threaded-copy" {
+                force_threaded_copy = true;
+            } else if args[i] == "--reflink" {
+                force_reflink = true;
             } else if args[i] == "-q" || args[i] == "--quiet" {
                 quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
@@ -714,8 +741,22 @@ fn try_main() -> io::Result<i32> {
         println!("--via-memory is only supported for copy");
         return Ok(1);
     }
+    if (force_copy_file_range || force_threaded_copy || force_reflink) && mode != "copy" {
+        println!("--copy-file-range, --threaded-copy, and --reflink are only supported for copy");
+        return Ok(1);
+    }
     if (verify_copy || verify_copy_diff) && mode != "copy" {
         println!("--verify and --verify-diff are only supported for copy");
+        return Ok(1);
+    }
+    if force_copy_file_range && force_threaded_copy {
+        println!("--copy-file-range and --threaded-copy cannot be used together");
+        return Ok(1);
+    }
+    if usize::from(force_copy_file_range) + usize::from(force_threaded_copy) + usize::from(force_reflink)
+        > 1
+    {
+        println!("--copy-file-range, --threaded-copy, and --reflink cannot be combined");
         return Ok(1);
     }
     if no_lock && mode != "copy" {
@@ -734,18 +775,57 @@ fn try_main() -> io::Result<i32> {
         println!("copy --via-memory does not support --save; tune read and write separately");
         return Ok(1);
     }
+    if force_copy_file_range && via_memory {
+        println!("copy --copy-file-range cannot be used with --via-memory");
+        return Ok(1);
+    }
+    if force_threaded_copy && via_memory {
+        println!("copy --threaded-copy cannot be used with --via-memory");
+        return Ok(1);
+    }
+    if force_reflink && via_memory {
+        println!("copy --reflink cannot be used with --via-memory");
+        return Ok(1);
+    }
     if (verify_copy || verify_copy_diff) && save_config {
         println!(
             "copy verification modes do not support --save; tune copy and verification separately"
         );
         return Ok(1);
     }
+    if force_copy_file_range && save_config {
+        println!("copy --copy-file-range does not support --save; benchmark it with -n 1");
+        return Ok(1);
+    }
+    if force_reflink && save_config {
+        println!("copy --reflink does not support --save; benchmark it with -n 1");
+        return Ok(1);
+    }
     if (verify_copy || verify_copy_diff) && iterations > 1 {
         println!("copy verification modes require -n 1");
         return Ok(1);
     }
+    if force_copy_file_range && iterations > 1 {
+        println!("copy --copy-file-range requires -n 1");
+        return Ok(1);
+    }
+    if force_reflink && iterations > 1 {
+        println!("copy --reflink requires -n 1");
+        return Ok(1);
+    }
     if verify_copy_diff && hash_base.is_some() {
         println!("copy --verify-diff does not use --hash-base");
+        return Ok(1);
+    }
+    if force_copy_file_range
+        && (io_mode == common::IOMode::Direct || io_mode_write == common::IOMode::Direct)
+    {
+        println!("copy --copy-file-range does not support direct read/write modes");
+        return Ok(1);
+    }
+    if force_reflink && (io_mode == common::IOMode::Direct || io_mode_write == common::IOMode::Direct)
+    {
+        println!("copy --reflink does not support direct read/write modes");
         return Ok(1);
     }
 
@@ -795,7 +875,17 @@ fn try_main() -> io::Result<i32> {
     let params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1];
 
     let mode_name = mode;
-    let optimizer_mask = active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory);
+    let copy_strategy = if force_copy_file_range {
+        CopyStrategy::CopyFileRange
+    } else if force_reflink {
+        CopyStrategy::Reflink
+    } else if force_threaded_copy || via_memory || iterations > 1 || save_config {
+        CopyStrategy::Threaded
+    } else {
+        CopyStrategy::Threaded
+    };
+    let optimizer_mask =
+        active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory, copy_strategy);
     let verbose = verbose || mode == "read" || mode == "write";
     if verbose {
         eprintln!("Opening file {} for {}", filename, mode);
@@ -964,6 +1054,7 @@ fn try_main() -> io::Result<i32> {
                         hash_type,
                         via_memory,
                         target_hash_base_owned.as_deref(),
+                        copy_strategy,
                         !no_lock,
                     )?;
                     if !quiet {
@@ -1006,7 +1097,7 @@ fn try_main() -> io::Result<i32> {
                             io_mode_write,
                         )?
                     } else {
-                        copy_file(
+                        copy_file_with_strategy(
                             src,
                             filename,
                             p[0],
@@ -1017,6 +1108,7 @@ fn try_main() -> io::Result<i32> {
                             p[5] as usize,
                             io_mode,
                             io_mode_write,
+                            copy_strategy,
                         )?
                     };
                     sync_path(filename)?;
@@ -1080,7 +1172,7 @@ fn try_main() -> io::Result<i32> {
                     Ok(copied)
                 } else {
                     let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
-                    let copied = copy_file(
+                    let copied = copy_file_with_strategy(
                         src,
                         filename,
                         p[0],
@@ -1091,6 +1183,7 @@ fn try_main() -> io::Result<i32> {
                         p[5] as usize,
                         io_mode,
                         io_mode_write,
+                        copy_strategy,
                     )?;
                     guard.ensure_source_unchanged()?;
                     Ok(copied)
@@ -1222,16 +1315,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::active_optimizer_param_mask;
-    use crate::common::IOMode;
+    use crate::common::{CopyStrategy, IOMode};
 
     #[test]
     fn verify_skips_block_size_mutations() {
         assert_eq!(
-            active_optimizer_param_mask("verify", IOMode::PageCache, IOMode::Auto, false),
+            active_optimizer_param_mask(
+                "verify",
+                IOMode::PageCache,
+                IOMode::Auto,
+                false,
+                CopyStrategy::Threaded
+            ),
             vec![true, false, true, false, false, false]
         );
         assert_eq!(
-            active_optimizer_param_mask("verify", IOMode::Direct, IOMode::Auto, false),
+            active_optimizer_param_mask(
+                "verify",
+                IOMode::Direct,
+                IOMode::Auto,
+                false,
+                CopyStrategy::Threaded
+            ),
             vec![false, false, false, true, false, true]
         );
     }
@@ -1239,19 +1344,53 @@ mod tests {
     #[test]
     fn write_only_mutates_write_side_params() {
         assert_eq!(
-            active_optimizer_param_mask("write", IOMode::Auto, IOMode::PageCache, false),
+            active_optimizer_param_mask(
+                "write",
+                IOMode::Auto,
+                IOMode::PageCache,
+                false,
+                CopyStrategy::Threaded
+            ),
             vec![true, true, true, false, false, false]
         );
         assert_eq!(
-            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Auto, false),
+            active_optimizer_param_mask(
+                "copy",
+                IOMode::PageCache,
+                IOMode::Auto,
+                false,
+                CopyStrategy::Threaded
+            ),
             vec![true, true, true, true, true, true]
         );
         assert_eq!(
-            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Auto, true),
+            active_optimizer_param_mask(
+                "copy",
+                IOMode::PageCache,
+                IOMode::Auto,
+                true,
+                CopyStrategy::Threaded
+            ),
             vec![false, false, false, false, false, false]
         );
         assert_eq!(
-            active_optimizer_param_mask("copy", IOMode::PageCache, IOMode::Direct, true),
+            active_optimizer_param_mask(
+                "copy",
+                IOMode::PageCache,
+                IOMode::Direct,
+                true,
+                CopyStrategy::Threaded
+            ),
+            vec![false, false, false, false, false, false]
+        );
+        assert_eq!(
+            active_optimizer_param_mask(
+                "copy",
+                IOMode::PageCache,
+                IOMode::PageCache,
+                false,
+                CopyStrategy::CopyFileRange
+            ),
             vec![false, false, false, false, false, false]
         );
     }
