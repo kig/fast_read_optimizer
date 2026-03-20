@@ -8,16 +8,20 @@ mod io_util;
 mod mincore;
 mod optimizer;
 mod reader;
+mod verified_copy;
 mod writer;
 
 use block_hash::{
-    default_hash_base, hash_file_to_replicas, hash_file_blocks, recover_file_with_copies, verify_file_with_replicas,
-    BlockHashAlgorithm, RecoverMode,
+    default_hash_base, hash_file_blocks, hash_file_to_replicas, recover_file_with_copies,
+    verify_file_with_replicas, BlockHashAlgorithm, RecoverMode,
 };
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
+use io_util::CopyOperationGuard;
 use optimizer::run_optimizer;
 use reader::{load_file_to_memory, read_file};
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{copy_file, write_buffer, write_file};
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -41,6 +45,14 @@ fn parse_size(s: &str) -> Option<u64> {
         _ => return None,
     };
     num.checked_mul(mult)
+}
+
+fn sync_path(path: &str) -> io::Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
@@ -127,6 +139,24 @@ fn print_verify_report(report: &block_hash::VerifyReport) {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        Some(message)
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        Some(message.as_str())
+    } else {
+        None
+    }
+}
+
+fn is_broken_pipe_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe
+}
+
+fn is_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    panic_payload_message(payload).is_some_and(|message| message.contains("Broken pipe"))
+}
+
 #[derive(Clone, Copy)]
 struct CommandHelp {
     name: &'static str,
@@ -196,13 +226,19 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--via-memory] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            usage: "copy [--via-memory] [--no-lock] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
             summary: "Copy one file to another using the same tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
+                "Copy takes an advisory shared lock on the source and an advisory exclusive lock on the destination by default; use --no-lock to skip that cooperative locking.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
+                "--verify hashes the source, copies the file, fsyncs the destination, and verifies the destination against the source-derived manifest without leaving sidecars by default.",
+                "--hash with --verify leaves durable sidecars at the destination and at the source if the source did not already have sidecars.",
+                "--verify-diff fsyncs the destination and then runs a diff pass instead of block-hash verification.",
+                "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
+                "Verification success is reported to stderr unless --quiet is used.",
             ],
             examples: &[
                 (
@@ -216,6 +252,22 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 (
                     "Load the whole source into RAM, then flush it with direct writes",
                     "copy --via-memory --no-direct --direct-write in.bin out.bin",
+                ),
+                (
+                    "Skip advisory locking when cooperating lock semantics would get in the way",
+                    "copy --no-lock --no-direct in.bin out.bin",
+                ),
+                (
+                    "Copy a file, fsync it, and verify the destination against the source manifest without leaving sidecars",
+                    "copy --verify --sha256 --no-direct in.bin out.bin",
+                ),
+                (
+                    "Copy a file, verify it, and leave source/destination sidecars",
+                    "copy --verify --hash --sha256 --no-direct in.bin out.bin",
+                ),
+                (
+                    "Copy a file and run a diff pass after fsync",
+                    "copy --verify-diff --no-direct in.bin out.bin",
                 ),
             ],
         }),
@@ -444,6 +496,11 @@ fn try_main() -> io::Result<i32> {
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
     let mut via_memory = legacy_copy_via_memory;
+    let mut verify_copy = false;
+    let mut verify_copy_diff = false;
+    let mut persist_verification_hashes = false;
+    let mut quiet = false;
+    let mut no_lock = false;
     let mut verbose = false;
     let mut source = None;
     let mut pattern = "";
@@ -529,7 +586,7 @@ fn try_main() -> io::Result<i32> {
             } else if args[i] == "--sha256" {
                 hash_type = BlockHashAlgorithm::Sha256;
             } else if args[i] == "--xxh3" {
-                hash_type = BlockHashAlgorithm::Xxh3;            
+                hash_type = BlockHashAlgorithm::Xxh3;
             } else if args[i] == "--hash-only" {
                 hash_only = true;
             } else if args[i] == "--direct" {
@@ -551,6 +608,16 @@ fn try_main() -> io::Result<i32> {
                 to_memory = true;
             } else if args[i] == "--via-memory" {
                 via_memory = true;
+            } else if args[i] == "--verify" || args[i] == "--verified" {
+                verify_copy = true;
+            } else if args[i] == "--verify-diff" {
+                verify_copy_diff = true;
+            } else if args[i] == "--hash" {
+                persist_verification_hashes = true;
+            } else if args[i] == "--no-lock" {
+                no_lock = true;
+            } else if args[i] == "-q" || args[i] == "--quiet" {
+                quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
                 verbose = true;
             } else if args[i] == "-s" || args[i] == "--save" {
@@ -647,8 +714,38 @@ fn try_main() -> io::Result<i32> {
         println!("--via-memory is only supported for copy");
         return Ok(1);
     }
+    if (verify_copy || verify_copy_diff) && mode != "copy" {
+        println!("--verify and --verify-diff are only supported for copy");
+        return Ok(1);
+    }
+    if no_lock && mode != "copy" {
+        println!("--no-lock is only supported for copy");
+        return Ok(1);
+    }
+    if verify_copy && verify_copy_diff {
+        println!("--verify and --verify-diff cannot be used together");
+        return Ok(1);
+    }
+    if persist_verification_hashes && !verify_copy {
+        println!("--hash is only supported for copy --verify");
+        return Ok(1);
+    }
     if via_memory && save_config {
         println!("copy --via-memory does not support --save; tune read and write separately");
+        return Ok(1);
+    }
+    if (verify_copy || verify_copy_diff) && save_config {
+        println!(
+            "copy verification modes do not support --save; tune copy and verification separately"
+        );
+        return Ok(1);
+    }
+    if (verify_copy || verify_copy_diff) && iterations > 1 {
+        println!("copy verification modes require -n 1");
+        return Ok(1);
+    }
+    if verify_copy_diff && hash_base.is_some() {
+        println!("copy --verify-diff does not use --hash-base");
         return Ok(1);
     }
 
@@ -849,7 +946,111 @@ fn try_main() -> io::Result<i32> {
             )
         } else if mode == "copy" {
             if let Some(src) = source {
-                if via_memory {
+                if verify_copy {
+                    let target_hash_base_owned = if persist_verification_hashes {
+                        Some(
+                            hash_base_owned
+                                .clone()
+                                .unwrap_or_else(|| default_hash_base(filename)),
+                        )
+                    } else {
+                        None
+                    };
+                    let report = copy_file_verified_with_options_and_lock(
+                        src,
+                        filename,
+                        io_mode,
+                        io_mode_write,
+                        hash_type,
+                        via_memory,
+                        target_hash_base_owned.as_deref(),
+                        !no_lock,
+                    )?;
+                    if !quiet {
+                        eprintln!(
+                            "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
+                            report.verified_blocks,
+                            report.repaired_blocks,
+                            report.used_recovery,
+                            report.hash_type,
+                            report.hashes_persisted
+                        );
+                    }
+                    Ok(report.bytes_copied)
+                } else if verify_copy_diff {
+                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
+                    let copied = if via_memory {
+                        let read_page_cache = config.get_params_for_path("read", false, src);
+                        let read_direct = config.get_params_for_path("read", true, src);
+                        let loaded = load_file_to_memory(
+                            src,
+                            read_page_cache.num_threads,
+                            read_page_cache.block_size,
+                            read_page_cache.qd,
+                            read_direct.num_threads,
+                            read_direct.block_size,
+                            read_direct.qd,
+                            io_mode,
+                        )?;
+                        let write_page_cache = config.get_params_for_path("write", false, filename);
+                        let write_direct = config.get_params_for_path("write", true, filename);
+                        write_buffer(
+                            filename,
+                            &loaded.data,
+                            write_page_cache.num_threads,
+                            write_page_cache.block_size,
+                            write_page_cache.qd,
+                            write_direct.num_threads,
+                            write_direct.block_size,
+                            write_direct.qd,
+                            io_mode_write,
+                        )?
+                    } else {
+                        copy_file(
+                            src,
+                            filename,
+                            p[0],
+                            p[1],
+                            p[2] as usize,
+                            p[3],
+                            p[4],
+                            p[5] as usize,
+                            io_mode,
+                            io_mode_write,
+                        )?
+                    };
+                    sync_path(filename)?;
+                    guard.ensure_source_unchanged()?;
+                    let diff_page_cache = config.get_params_for_path("diff", false, filename);
+                    let diff_direct = config.get_params_for_path("diff", true, filename);
+                    let diff_res = diff_files(
+                        src,
+                        filename,
+                        diff_page_cache.num_threads,
+                        diff_page_cache.block_size,
+                        diff_page_cache.qd,
+                        diff_direct.num_threads,
+                        diff_direct.block_size,
+                        diff_direct.qd,
+                        io_mode,
+                        false,
+                    )?;
+                    if diff_res != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "copy verify-diff found a mismatch at byte offset {}",
+                                diff_res
+                            ),
+                        ));
+                    }
+                    guard.ensure_source_unchanged()?;
+                    if !quiet {
+                        eprintln!("copy verify-diff: success");
+                    }
+                    Ok(copied)
+                } else if via_memory {
+                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
                     let read_page_cache = config.get_params_for_path("read", false, src);
                     let read_direct = config.get_params_for_path("read", true, src);
                     let loaded = load_file_to_memory(
@@ -864,7 +1065,7 @@ fn try_main() -> io::Result<i32> {
                     )?;
                     let write_page_cache = config.get_params_for_path("write", false, filename);
                     let write_direct = config.get_params_for_path("write", true, filename);
-                    write_buffer(
+                    let copied = write_buffer(
                         filename,
                         &loaded.data,
                         write_page_cache.num_threads,
@@ -874,9 +1075,12 @@ fn try_main() -> io::Result<i32> {
                         write_direct.block_size,
                         write_direct.qd,
                         io_mode_write,
-                    )
+                    )?;
+                    guard.ensure_source_unchanged()?;
+                    Ok(copied)
                 } else {
-                    copy_file(
+                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
+                    let copied = copy_file(
                         src,
                         filename,
                         p[0],
@@ -887,7 +1091,9 @@ fn try_main() -> io::Result<i32> {
                         p[5] as usize,
                         io_mode,
                         io_mode_write,
-                    )
+                    )?;
+                    guard.ensure_source_unchanged()?;
+                    Ok(copied)
                 }
             } else {
                 eprintln!("Copy is missing a destination path.");
@@ -986,12 +1192,29 @@ fn try_main() -> io::Result<i32> {
 }
 
 fn main() {
-    match try_main() {
-        Ok(code) if code == 0 => {}
-        Ok(code) => std::process::exit(code),
-        Err(err) => {
-            eprintln!("Error: {}", err);
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info.payload()) {
+            return;
+        }
+        default_hook(info);
+    }));
+
+    match std::panic::catch_unwind(try_main) {
+        Ok(Ok(code)) if code == 0 => {}
+        Ok(Ok(code)) => std::process::exit(code),
+        Ok(Err(err)) => {
+            if is_broken_pipe_error(&err) {
+                std::process::exit(0);
+            }
+            let _ = writeln!(io::stderr().lock(), "Error: {}", err);
             std::process::exit(1);
+        }
+        Err(payload) => {
+            if is_broken_pipe_panic(payload.as_ref()) {
+                std::process::exit(0);
+            }
+            std::panic::resume_unwind(payload);
         }
     }
 }

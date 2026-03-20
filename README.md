@@ -1,6 +1,6 @@
 # fast_read_optimizer (`fro`)
 
-`fro` is a Linux CLI and Rust crate for very fast large-file IO. On one observed release-mode run against a page-cached 5 GB file, it measured about **46.4 GB/s** for `hash`, **49.8 GB/s** for `verify`, **52.0 GB/s** for `recover --fast`, and **39.4 GB/s** for full two-file `recover`. On a 4x PCIe4 NVMe array, the performance was still **>20 GB/s** - good enough to act as a practical scrub / repair tool for disk images, archives, model checkpoints, and other large mostly-static blobs.
+`fro` is a Linux CLI and Rust crate for very fast large-file IO. On one observed release-mode run against a page-cached 5 GB file, it measured about **46.4 GB/s** for `hash`, **49.8 GB/s** for `verify`, **52.0 GB/s** for `recover --fast`, and **39.4 GB/s** for full two-file `recover`. On a 4x PCIe4 NVMe array, the performance was still **>20 GB/s**, making it a practical scrub / repair tool for disk images, archives, model checkpoints, and other large mostly-static blobs.
 
 It combines tuned striped IO, literal search, copy / diff utilities, a benchmark harness, an optimizer, and block-hash sidecars for verification and repair. If you work with big files and care whether direct IO, page cache, block size, queue depth, or replica scrubbing actually help on your machine, `fro` is built for that job.
 
@@ -27,7 +27,7 @@ cargo build --release --examples
 cargo install --path .
 ```
 
-Get some big numbers to impress the neighbors:
+Example runs:
 
 ```bash
 fro write -v --create 4GB some_huge_file 
@@ -63,6 +63,9 @@ fro copy -v some_huge_file copy_of_the_file
 # For comparison:
 # time cp some_huge_file copy_of_the_file
 # real    7.341s
+
+fro copy --verify --sha256 --no-direct some_huge_file verified_copy_of_the_file
+# stderr: copy verify: success; verified_blocks=4096, repaired_blocks=0, used_recovery=false, hash_type=Sha256, sidecars_written=false
 
 fro diff -v some_huge_file copy_of_the_file
 # Using direct IO: diff 8589934592 bytes in 0.4167 s, 20.6 GB/s
@@ -101,11 +104,24 @@ fro-optimize --help
 fro-benchmark --help
 ```
 
-For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
+For local guardrails, enable the shared pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs:
+
+```bash
+cargo test --quiet
+cargo run --quiet --manifest-path janitor/Cargo.toml -- all
+```
+
+For verification status and the current proof outline, see [`VERIFICATION.md`](VERIFICATION.md). For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
 
 ## Examples
 
-See `examples/` for some example programs that use the fro library (e.g. a 3x faster b3sum, faster dd, direct-IO sha256sum). 
+See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`.
 
 ## Rust crate API
 
@@ -117,6 +133,7 @@ fro::write_file("copy.bin", &bytes)?;
 fro::write_file_range("copy.part", &bytes, 4096, 1 << 20)?;
 fro::copy_file("checkpoint.bin", "checkpoint.backup")?;
 fro::copy_file_via_memory("checkpoint.bin", "checkpoint.ram-copy")?;
+fro::copy_file_verified("checkpoint.bin", "checkpoint.verified-copy")?;
 
 let reader = fro::open("checkpoint.bin")?;
 reader.foreach_block(|block_index, block| {
@@ -125,7 +142,7 @@ reader.foreach_block(|block_index, block| {
 })?;
 ```
 
-For stream-style writes, use `fro::create(...)` for sequential output or `fro::offset_writer(...)` for parallel offset writes. See `examples/dd.rs`, `examples/sha256sum.rs`, and `examples/b3sum.rs` for end-to-end usage.
+For stream-style writes, use `fro::create(...)` for sequential output or `fro::offset_writer(...)` for parallel offset writes. `offset_writer()` prepares a fixed-size output and zero-fills any unwritten gaps by default; use `offset_writer_with_options(..., truncate = false)` when you need to preserve existing bytes outside the written ranges. See `examples/dd.rs`, `examples/sha256sum.rs`, and `examples/b3sum.rs` for end-to-end usage.
 
 ### How `fro` utilities behave
 
@@ -206,6 +223,35 @@ fro copy --no-direct --direct-write in.bin out.bin
 ```
 
 This reads `in.bin` through the page cache but forces direct writes to `out.bin`, which is useful when experimenting with mixed cache / direct behavior.
+
+```bash
+fro copy --verify --sha256 --no-direct in.bin out.bin
+```
+
+This hashes `in.bin`, copies it to `out.bin`, `fsync`s the destination file, and then verifies `out.bin` against the **source-derived** manifest without leaving sidecars by default. If the first verification pass finds bad blocks, `fro` repairs `out.bin` from `in.bin` using the source-derived manifest as the gold standard, `fsync`s again, and verifies one final time before returning success.
+
+If you also want to leave sidecars behind:
+
+```bash
+fro copy --verify --hash --sha256 --no-direct in.bin out.bin
+```
+
+That writes durable sidecars for `out.bin` and, if `in.bin` did not already have them, also leaves durable sidecars at the source.
+
+If you want a simpler postcondition check:
+
+```bash
+fro copy --verify-diff --no-direct in.bin out.bin
+```
+
+That copies, `fsync`s the destination file, checks that the source metadata stayed stable, and then runs a diff pass.
+
+Current copy-verification limits:
+
+- it syncs the destination file and sidecar files, but not the parent directory
+- it verifies that the destination matches the source as observed during this run
+- copy now takes advisory locks by default (shared on the source, exclusive on the destination), but those locks only constrain cooperating processes
+- non-verified copy modes also fail if the source file's size, `mtime`, or `ctime` changes during the operation
 
 ### `fro diff`
 
@@ -294,20 +340,6 @@ cargo test document_block_recovery_decision_table -- --nocapture
 | one file copy agrees with a manifest witness | 555 | 0 | FileAndManifestAgreement | - | recovered block based on file+manifest agreement |
 | two manifest witnesses agree, but no file copy matches them | 111 | - | - | ManifestOnlyAgreement | failed to recover corrupt block [manifest+manifest hashes agree] |
 | all witnesses are missing | - | - | - | NoBlockHashFound | failed to recover corrupt block [no block hash found either] |
-
-### Recover demo scripts
-
-The repo includes a reproducible demo that creates a clean file, clones it, corrupts different blocks in different copies, repairs them, and proves they match again:
-
-```bash
-./perf/recover_demo.sh /mnt/fast/fro-test
-```
-
-The corruption helper is also available separately:
-
-```bash
-./perf/corrupt_recover_demo_copies.sh /mnt/fast/fro-test
-```
 
 ## Benchmarks
 

@@ -1,0 +1,18 @@
+src/
+  bin/
+    fro-benchmark.rs
+    fro-optimize.rs
+  api.rs
+  block_hash.rs
+  common.rs
+  config.rs
+  differ.rs
+  io_util.rs
+  lib.rs
+  main.rs
+  mincore.rs
+  optimizer.rs
+  reader.rs
+  stream.rs
+  verified_copy.rs
+  writer.rs

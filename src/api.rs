@@ -1,4 +1,5 @@
 use crate::config::load_config;
+use crate::io_util::CopyOperationGuard;
 use crate::reader::load_file_to_memory_for_mode;
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
@@ -56,10 +57,19 @@ pub fn indexed_writer_with_mode<P: AsRef<Path>>(
     )
 }
 
+/// Create a fixed-size offset writer.
+///
+/// The destination is prepared to `total_size` bytes up front. Any regions that
+/// are not explicitly written remain zero-filled on successful completion.
+/// `report.bytes_written` counts only caller-provided bytes, not the zero-filled gaps.
 pub fn offset_writer<P: AsRef<Path>>(path: P, total_size: u64) -> io::Result<ParallelWriter> {
     offset_writer_with_options(path, total_size, IOMode::Auto, true)
 }
 
+/// Create a fixed-size offset writer with an explicit I/O mode.
+///
+/// The destination is prepared to `total_size` bytes up front. Any regions that
+/// are not explicitly written remain zero-filled on successful completion.
 pub fn offset_writer_with_mode<P: AsRef<Path>>(
     path: P,
     total_size: u64,
@@ -68,6 +78,12 @@ pub fn offset_writer_with_mode<P: AsRef<Path>>(
     offset_writer_with_options(path, total_size, io_mode, true)
 }
 
+/// Create a fixed-size offset writer with explicit I/O mode and truncation policy.
+///
+/// When `truncate` is `true`, the file is recreated at exactly `total_size` bytes
+/// before writes begin, so unwritten regions read back as zeroes. When `truncate`
+/// is `false`, existing bytes outside the caller-written ranges are preserved,
+/// and the file is only extended to `total_size` if needed.
 pub fn offset_writer_with_options<P: AsRef<Path>>(
     path: P,
     total_size: u64,
@@ -185,8 +201,13 @@ pub fn copy_file_via_memory_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
+    let source = path_str(source.as_ref())?;
+    let target = path_str(target.as_ref())?;
+    let guard = CopyOperationGuard::new(source, target, true)?;
     let data = read_file_with_mode(source, io_mode_read)?;
-    write_file_with_mode(target, &data, io_mode_write)
+    let copied = write_file_with_mode(target, &data, io_mode_write)?;
+    guard.ensure_source_unchanged()?;
+    Ok(copied)
 }
 
 pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
@@ -198,9 +219,10 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     let config = load_config(None);
     let source = path_str(source.as_ref())?;
     let target = path_str(target.as_ref())?;
+    let guard = CopyOperationGuard::new(source, target, true)?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
-    writer::copy_file(
+    let copied = writer::copy_file(
         source,
         target,
         page_cache.num_threads,
@@ -211,7 +233,9 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
         direct.qd,
         io_mode_read,
         io_mode_write,
-    )
+    )?;
+    guard.ensure_source_unchanged()?;
+    Ok(copied)
 }
 
 pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(

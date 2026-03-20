@@ -110,3 +110,25 @@ pub enum IOMode {
     Direct,
     PageCache,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AlignedBuffer;
+
+    #[test]
+    fn aligned_buffer_page_storage_is_aligned_and_mutable() {
+        let mut buffer = AlignedBuffer::new(8193);
+        let ptr = buffer.as_slice().as_ptr() as usize;
+
+        assert_eq!(ptr % 4096, 0);
+        assert_eq!(buffer.len(), 8193);
+
+        buffer.as_mut_slice()[0] = 0x11;
+        buffer.as_mut_slice()[4096] = 0x22;
+        buffer.as_mut_slice()[8192] = 0x33;
+
+        assert_eq!(buffer.as_slice()[0], 0x11);
+        assert_eq!(buffer.as_slice()[4096], 0x22);
+        assert_eq!(buffer.as_slice()[8192], 0x33);
+    }
+}

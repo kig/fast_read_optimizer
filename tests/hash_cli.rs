@@ -1,8 +1,10 @@
 use fro::block_hash::{BlockHashAlgorithm, BlockHashManifest};
 use fro::config::{AppConfig, ConfigBundleV1, DeviceDbConfig, IOParams, MountOverrides};
 use std::fs;
+use std::io::BufRead;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
+use std::process::Stdio;
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
@@ -133,6 +135,69 @@ fn hash_verify_recover_round_trip() {
 }
 
 #[test]
+fn hash_verify_round_trip_with_default_cli_flags() {
+    let tmp = unique_temp_dir("fro-hash-default-cli");
+    let target = tmp.join("target.bin");
+
+    let block = 1024 * 1024;
+    let data = (0..(block * 2 + 333))
+        .map(|i| ((i * 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&["hash", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("wrote"));
+
+    for suffix in ["0", "1", "2"] {
+        assert!(sidecar_path(&target, suffix).exists());
+    }
+
+    let out = run_fro(&["verify", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+}
+
+#[test]
+fn hash_verify_round_trip_with_direct_cli_flags() {
+    let tmp = unique_temp_dir("fro-hash-direct-cli");
+    let target = tmp.join("target.bin");
+
+    let block = 1024 * 1024;
+    let data = (0..(block * 4 + 777))
+        .map(|i| ((i * 23) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&["hash", "--direct", "-n", "1", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_fro(&["verify", "--direct", "-n", "1", target.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+}
+
+#[test]
 fn hash_sha256_sidecars_verify_without_cli_override() {
     let tmp = unique_temp_dir("fro-hash-sha256-cli");
     let target = tmp.join("target.bin");
@@ -172,6 +237,57 @@ fn hash_sha256_sidecars_verify_without_cli_override() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("bad_blocks=0"));
+}
+
+#[test]
+fn verify_stops_cleanly_when_stdout_pipe_closes() {
+    let tmp = unique_temp_dir("fro-verify-broken-pipe");
+    let target = tmp.join("target.bin");
+
+    let block = 1024 * 1024;
+    let data = (0..(block * 3 + 123))
+        .map(|i| ((i * 31) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&target, &data).unwrap();
+
+    assert!(
+        run_fro(&["hash", "--no-direct", "-n", "1", target.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    for bad_block in [0_u64, 1, 2] {
+        let mut file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        file.seek(SeekFrom::Start(bad_block * block as u64 + 17))
+            .unwrap();
+        file.write_all(&[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        file.flush().unwrap();
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .args(["verify", "--no-direct", "-n", "1", target.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn fro verify");
+
+    {
+        let stdout = child.stdout.take().expect("missing stdout pipe");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut first_line = String::new();
+        let bytes = reader.read_line(&mut first_line).unwrap();
+        assert!(bytes > 0, "expected verify to emit at least one line");
+    }
+
+    let out = child
+        .wait_with_output()
+        .expect("failed waiting for fro verify");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "stderr should not report a broken-pipe panic:\n{}",
+        stderr
+    );
 }
 
 #[test]

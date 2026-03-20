@@ -359,7 +359,14 @@ impl ParallelWriter {
                                 ))
                             }
                         };
-                        if offset + data.len() as u64 > total_size {
+                        let end_offset =
+                            offset.checked_add(data.len() as u64).ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "write end offset overflowed",
+                                )
+                            })?;
+                        if end_offset > total_size {
                             return Err(std::io::Error::other(format!(
                                 "write past end of file: offset {} len {} total {}",
                                 offset,
@@ -437,6 +444,39 @@ mod tests {
         let report = writer.finish().unwrap();
         assert_eq!(report.bytes_written, 8);
         assert_eq!(fs::read(&path).unwrap(), b"abcdefgh".to_vec());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn offset_writer_rejects_end_offset_overflow() {
+        let cfg = crate::config::load_config(None);
+        let path = unique_temp_file("fro-parallel-writer-offset-overflow");
+        let writer =
+            ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 8).unwrap();
+        writer
+            .write_at_offset(u64::MAX - 1, b"abcd".to_vec())
+            .unwrap();
+
+        let err = writer.finish().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn fixed_size_offset_writer_zero_fills_unwritten_gaps() {
+        let cfg = crate::config::load_config(None);
+        let path = unique_temp_file("fro-parallel-writer-offset-gaps");
+        let writer =
+            ParallelWriter::fixed_size(&cfg, "write", &path, IOMode::PageCache, 16).unwrap();
+        writer.write_at_offset(0, b"abcd".to_vec()).unwrap();
+        writer.write_at_offset(12, b"xy".to_vec()).unwrap();
+
+        let report = writer.finish().unwrap();
+        assert_eq!(report.bytes_written, 6);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"abcd\0\0\0\0\0\0\0\0xy\0\0".to_vec()
+        );
         let _ = fs::remove_file(path);
     }
 

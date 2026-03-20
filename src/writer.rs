@@ -294,7 +294,9 @@ impl OffsetWriter {
         self.pending[slot] = Some(PendingOffsetWrite {
             buffer,
             len: data.len(),
-            end_offset: offset + data.len() as u64,
+            end_offset: offset.checked_add(data.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "write end offset overflowed")
+            })?,
         });
         self.io_uring.submit_sqes().map_err(io::Error::other)?;
         Ok(())
@@ -1161,6 +1163,18 @@ mod tests {
 
         assert_eq!(writer.bytes_written(), 6);
         assert_eq!(writer.written_extent(), 14);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn offset_writer_rejects_end_offset_overflow() {
+        let path = unique_temp_file("fro-offset-writer-overflow");
+        let mut writer =
+            OffsetWriter::create(path.to_str().unwrap(), 16, 2, IOMode::PageCache).unwrap();
+
+        let err = writer.write_at(u64::MAX - 1, b"abcd").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
         let _ = fs::remove_file(path);
     }

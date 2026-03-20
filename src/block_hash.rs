@@ -9,7 +9,9 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::common::{AlignedBuffer, IOMode};
-use crate::io_util::open_reader_files;
+use crate::io_util::{
+    expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
+};
 use crate::mincore::is_first_page_resident;
 
 #[link(name = "crypto")]
@@ -356,12 +358,35 @@ fn json_error_to_io(err: serde_json::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
-pub fn save_manifest_replicas(base: &str, manifest: &BlockHashManifest) -> std::io::Result<()> {
+fn write_manifest_replicas(
+    base: &str,
+    manifest: &BlockHashManifest,
+    sync: bool,
+) -> std::io::Result<()> {
     let data = serde_json::to_vec_pretty(manifest).map_err(json_error_to_io)?;
     for path in hash_replica_paths(base) {
-        std::fs::write(path, &data)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(&data)?;
+        if sync {
+            file.sync_all()?;
+        }
     }
     Ok(())
+}
+
+pub fn save_manifest_replicas(base: &str, manifest: &BlockHashManifest) -> std::io::Result<()> {
+    write_manifest_replicas(base, manifest, false)
+}
+
+pub fn save_manifest_replicas_durable(
+    base: &str,
+    manifest: &BlockHashManifest,
+) -> std::io::Result<()> {
+    write_manifest_replicas(base, manifest, true)
 }
 
 pub fn load_manifest_replicas(base: &str) -> Vec<Option<BlockHashManifest>> {
@@ -684,8 +709,27 @@ pub fn recover_block_hash(
     }
 }
 
-fn block_offset(thread_base: u64, block_id: u64, num_threads: u64, block_size: u64) -> u64 {
-    thread_base + block_id * num_threads * block_size
+fn block_offset(
+    thread_base: u64,
+    block_id: u64,
+    num_threads: u64,
+    block_size: u64,
+) -> std::io::Result<u64> {
+    let stride = block_id
+        .checked_mul(num_threads)
+        .and_then(|value| value.checked_mul(block_size))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hash offset calculation overflowed",
+            )
+        })?;
+    thread_base.checked_add(stride).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hash offset calculation overflowed",
+        )
+    })
 }
 
 fn use_direct_for_hashing(filename: &str, io_mode: IOMode) -> bool {
@@ -768,19 +812,21 @@ fn thread_hash_reader(
     let mut block_num = 0;
     let mut inflight = 0;
     let mut digests = Vec::new();
+    let mut pending = PendingReadSlots::new(qd);
 
-    for _ in 0..qd {
-        let current_offset = block_offset(offset, block_num as u64, num_threads, block_size);
+    for slot in 0..qd {
+        let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
         if current_offset >= file_size {
             break;
         }
+        pending.reserve(slot, block_num as u64)?;
         submit_read(
             io_uring,
             file,
             file_direct,
-            &mut buffers[block_num % qd],
+            &mut buffers[slot],
             current_offset,
-            block_num as u64,
+            slot as u64,
             use_direct,
             file_size,
         )?;
@@ -796,25 +842,33 @@ fn thread_hash_reader(
     loop {
         let ready = wait_for_ready(io_uring)?;
 
-        for (block_id, result) in ready {
-            if result > 0 {
-                let current_offset = block_offset(offset, block_id, num_threads, block_size);
+        for (slot_id, result) in ready {
+            let slot = usize::try_from(slot_id).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
+            })?;
+            let block_id = pending.complete(slot)?;
+            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
+            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("hash-file-blocks", current_offset, expected_len, result)?;
+            if actual_len > 0 {
                 let hash_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..result as usize];
+                let buf = &buffers[slot].as_slice()[..actual_len];
                 digests.push((hash_index, hash_type.hash_block(buf)));
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
             }
             inflight -= 1;
 
-            let next_offset = block_offset(offset, block_num as u64, num_threads, block_size);
+            let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
+                pending.reserve(slot, block_num as u64)?;
                 submit_read(
                     io_uring,
                     file,
                     file_direct,
-                    &mut buffers[block_num % qd],
+                    &mut buffers[slot],
                     next_offset,
-                    block_num as u64,
+                    slot as u64,
                     use_direct,
                     file_size,
                 )?;
@@ -1950,5 +2004,11 @@ mod tests {
                 decision.status_message()
             );
         }
+    }
+
+    #[test]
+    fn block_offset_rejects_overflow() {
+        let err = block_offset(u64::MAX - 3, 4, 8, 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
