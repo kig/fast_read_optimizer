@@ -6,7 +6,7 @@ use crate::common::IOMode;
 use crate::config::{load_config, IOParams};
 use crate::reader::load_file_to_memory_for_mode;
 use crate::writer::{copy_file as copy_file_inner, write_buffer};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -40,6 +40,22 @@ fn sync_file(path: &str) -> io::Result<()> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn ensure_copied_bytes_match_source(
+    source_manifest: &BlockHashManifest,
+    observed_source_size: u64,
+    bytes_copied: u64,
+) -> io::Result<()> {
+    let expected_size = source_manifest.file_size;
+    if bytes_copied != expected_size {
+        return Err(invalid_data(format!(
+            "verified copy expected to copy {} bytes but wrote {}",
+            expected_size, bytes_copied
+        )));
+    }
+    let _ = observed_source_size;
+    Ok(())
 }
 
 fn hash_with_params(
@@ -265,7 +281,6 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
         io_mode_read,
     )?;
 
-    let source_size = fs::metadata(source)?.len();
     let bytes_copied = if via_memory {
         let loaded = load_file_to_memory_for_mode(&config, "read", source, io_mode_read)?;
         let write_page_cache = config.get_params_for_path("write", false, target);
@@ -298,12 +313,7 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
         )?
     };
 
-    if bytes_copied != source_size {
-        return Err(invalid_data(format!(
-            "verified copy expected to copy {} bytes but wrote {}",
-            source_size, bytes_copied
-        )));
-    }
+    ensure_copied_bytes_match_source(&source_manifest, source_manifest.file_size, bytes_copied)?;
 
     sync_file(target)?;
 
@@ -364,6 +374,8 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::fs;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -381,6 +393,46 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn manifest_for_size(file_size: u64) -> BlockHashManifest {
+        BlockHashManifest {
+            hash_type: BlockHashAlgorithm::Xxh3,
+            file_size,
+            block_size: 1024 * 1024,
+            bytes_hashed: file_size,
+            block_hashes: Vec::new(),
+            hash_of_hashes: serde_json::from_str("\"0000000000000000\"").unwrap(),
+        }
+    }
+
+    struct ChangingLenMock {
+        next_len: Cell<u64>,
+        step: u64,
+    }
+
+    impl ChangingLenMock {
+        fn new(initial_len: u64, step: u64) -> Self {
+            Self {
+                next_len: Cell::new(initial_len),
+                step,
+            }
+        }
+
+        fn len(&self) -> u64 {
+            let current = self.next_len.get();
+            self.next_len.set(current + self.step);
+            current
+        }
+    }
+
+    #[test]
+    fn copied_byte_count_tracks_hashed_manifest_size_not_later_metadata() {
+        let source = ChangingLenMock::new(4096, 4096);
+        let source_manifest = manifest_for_size(source.len());
+        let later_metadata_len = source.len();
+
+        ensure_copied_bytes_match_source(&source_manifest, later_metadata_len, 4096).unwrap();
     }
 
     #[test]
