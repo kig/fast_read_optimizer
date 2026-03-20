@@ -10,7 +10,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::common::{AlignedBuffer, IOMode};
 use crate::io_util::{
-    expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
+    expected_read_len, open_reader_files, sync_parent_directory, validate_read_result,
+    PendingReadSlots,
 };
 use crate::mincore::is_first_page_resident;
 
@@ -364,7 +365,8 @@ fn write_manifest_replicas(
     sync: bool,
 ) -> std::io::Result<()> {
     let data = serde_json::to_vec_pretty(manifest).map_err(json_error_to_io)?;
-    for path in hash_replica_paths(base) {
+    let paths = hash_replica_paths(base);
+    for path in &paths {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -373,6 +375,11 @@ fn write_manifest_replicas(
         file.write_all(&data)?;
         if sync {
             file.sync_all()?;
+        }
+    }
+    if sync {
+        for path in &paths {
+            sync_parent_directory(path)?;
         }
     }
     Ok(())

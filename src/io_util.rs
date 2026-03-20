@@ -3,6 +3,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
+use std::path::Path;
 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     matches!(
@@ -35,6 +36,20 @@ pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result
     }
 }
 
+#[allow(dead_code)]
+pub fn direct_writer_supported(path: &str) -> io::Result<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) if direct_open_should_fallback(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File)> {
     let file = File::open(path)?;
     let file_direct = if use_direct {
@@ -43,6 +58,15 @@ pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File
         file.try_clone()?
     };
     Ok((file, file_direct))
+}
+
+pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
+    OpenOptions::new().read(true).open(path.as_ref())?.sync_all()
+}
+
+pub fn sync_parent_directory(path: impl AsRef<Path>) -> io::Result<()> {
+    let parent = path.as_ref().parent().unwrap_or_else(|| Path::new("."));
+    OpenOptions::new().read(true).open(parent)?.sync_all()
 }
 
 pub fn expected_read_len(file_size: u64, offset: u64, block_size: u64) -> io::Result<usize> {

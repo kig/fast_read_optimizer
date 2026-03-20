@@ -2,14 +2,16 @@ use crate::block_hash::{
     default_hash_base, hash_file_blocks, load_manifest_replicas, save_manifest_replicas_durable,
     BlockHashAlgorithm, BlockHashManifest,
 };
-use crate::common::IOMode;
+use crate::common::{CopyStrategy, IOMode};
 use crate::config::{load_config, IOParams};
-use crate::io_util::CopyOperationGuard;
+use crate::io_util::{sync_parent_directory, sync_path, CopyOperationGuard};
 use crate::reader::load_file_to_memory_for_mode;
-use crate::writer::{copy_file as copy_file_inner, write_buffer};
+use crate::writer::{copy_file_with_strategy as copy_file_inner, write_buffer};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedCopyReport {
@@ -31,16 +33,80 @@ fn path_str(path: &Path) -> io::Result<&str> {
     })
 }
 
-fn sync_file(path: &str) -> io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?
-        .sync_all()
-}
-
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+struct PendingVerifiedTarget {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    remove_final_on_drop: bool,
+    committed: bool,
+}
+
+impl PendingVerifiedTarget {
+    fn new(final_path: &Path, remove_final_on_drop: bool) -> io::Result<Self> {
+        Ok(Self {
+            final_path: final_path.to_path_buf(),
+            temp_path: verified_copy_temp_path(final_path)?,
+            remove_final_on_drop,
+            committed: false,
+        })
+    }
+
+    fn working_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    fn commit(mut self) -> io::Result<()> {
+        std::fs::rename(&self.temp_path, &self.final_path)?;
+        self.committed = true;
+        sync_parent_directory(&self.final_path)
+    }
+}
+
+impl Drop for PendingVerifiedTarget {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.temp_path);
+            if self.remove_final_on_drop {
+                let _ = std::fs::remove_file(&self.final_path);
+            }
+        }
+    }
+}
+
+fn verified_copy_temp_path(target: &Path) -> io::Result<PathBuf> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("target path must include a file name: {}", target.display()),
+        )
+    })?;
+    let file_name = file_name.to_string_lossy();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for attempt in 0..1024_u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.fro-verified-copy-tmp-{}-{}-{}",
+            process::id(),
+            nanos,
+            attempt
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a unique temporary target next to {}",
+            target.display()
+        ),
+    ))
 }
 
 fn ensure_copied_bytes_match_source(
@@ -227,8 +293,8 @@ fn persist_hashes_if_requested(
     Ok(true)
 }
 
-/// Copy one file to another, `fsync` the destination file, then verify that the
-/// destination matches a source-derived manifest captured before the copy.
+/// Copy one file to a temporary sibling, `fsync` and verify that temporary file,
+/// then rename it into place and sync the parent directory.
 ///
 /// If `hash_base` is `Some(...)`, successful verification also leaves durable
 /// sidecars at the destination and at the source if the source did not already
@@ -241,7 +307,6 @@ fn persist_hashes_if_requested(
 ///
 /// Current limits:
 ///
-/// - this syncs the destination file and any requested sidecar files, but not the parent directory
 /// - default locking is advisory only; non-cooperating writers can still mutate the source or target
 #[allow(dead_code)]
 pub fn copy_file_verified<S: AsRef<Path>, D: AsRef<Path>>(
@@ -256,6 +321,7 @@ pub fn copy_file_verified<S: AsRef<Path>, D: AsRef<Path>>(
         BlockHashAlgorithm::Xxh3,
         false,
         None,
+        CopyStrategy::Threaded,
         true,
     )
 }
@@ -278,6 +344,7 @@ pub fn copy_file_verified_with_options<S: AsRef<Path>, D: AsRef<Path>>(
         hash_type,
         via_memory,
         hash_base,
+        CopyStrategy::Threaded,
         true,
     )
 }
@@ -290,11 +357,16 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     hash_type: BlockHashAlgorithm,
     via_memory: bool,
     hash_base: Option<&str>,
+    copy_strategy: CopyStrategy,
     use_lock: bool,
 ) -> io::Result<VerifiedCopyReport> {
     let source = path_str(source.as_ref())?;
-    let target = path_str(target.as_ref())?;
+    let target_path = target.as_ref();
+    let target = path_str(target_path)?;
+    let target_missing_before_guard = !target_path.exists();
     let _guard = CopyOperationGuard::new(source, target, use_lock)?;
+    let pending_target = PendingVerifiedTarget::new(target_path, target_missing_before_guard)?;
+    let working_target = path_str(pending_target.working_path())?;
     let config = load_config(None);
 
     let source_page_cache = config.get_params_for_path("verify", false, source);
@@ -312,7 +384,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
         let write_page_cache = config.get_params_for_path("write", false, target);
         let write_direct = config.get_params_for_path("write", true, target);
         write_buffer(
-            target,
+            working_target,
             &loaded.data,
             write_page_cache.num_threads,
             write_page_cache.block_size,
@@ -325,28 +397,33 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     } else {
         let copy_page_cache = config.get_params_for_path("copy", false, target);
         let copy_direct = config.get_params_for_path("copy", true, target);
+        let copy_range = config.get_copy_range_params_for_path(target);
         copy_file_inner(
             source,
-            target,
+            working_target,
             copy_page_cache.num_threads,
             copy_page_cache.block_size,
             copy_page_cache.qd,
             copy_direct.num_threads,
             copy_direct.block_size,
             copy_direct.qd,
+            copy_range.num_threads,
+            copy_range.block_size,
+            copy_range.qd,
             io_mode_read,
             io_mode_write,
+            copy_strategy,
         )?
     };
 
     ensure_copied_bytes_match_source(&source_manifest, source_manifest.file_size, bytes_copied)?;
 
-    sync_file(target)?;
+    sync_path(pending_target.working_path())?;
 
     let target_page_cache = config.get_params_for_path("verify", false, target);
     let target_direct = config.get_params_for_path("verify", true, target);
     let initial_target = hash_with_params(
-        target,
+        working_target,
         source_manifest.hash_type,
         &target_page_cache,
         &target_direct,
@@ -359,7 +436,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     } else {
         repair_target_from_source_manifest(
             source,
-            target,
+            working_target,
             &source_manifest,
             &source_page_cache,
             &source_direct,
@@ -370,7 +447,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     };
 
     let final_target = hash_with_params(
-        target,
+        working_target,
         source_manifest.hash_type,
         &target_page_cache,
         &target_direct,
@@ -384,6 +461,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
         )));
     }
 
+    pending_target.commit()?;
     let hashes_persisted = persist_hashes_if_requested(source, &source_manifest, hash_base)?;
 
     Ok(VerifiedCopyReport {
@@ -430,6 +508,48 @@ mod tests {
             block_hashes: Vec::new(),
             hash_of_hashes: serde_json::from_str("\"0000000000000000\"").unwrap(),
         }
+    }
+
+    #[test]
+    fn pending_verified_target_promotes_temp_file_over_final_path() {
+        let tmp = unique_temp_dir("fro-verified-copy-pending-commit");
+        fs::create_dir_all(&tmp).unwrap();
+        let final_path = tmp.join("target.bin");
+        fs::write(&final_path, b"old target").unwrap();
+
+        let pending = PendingVerifiedTarget::new(&final_path, false).unwrap();
+        fs::write(pending.working_path(), b"new target").unwrap();
+        pending.commit().unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), b"new target");
+        let leftovers = fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".fro-verified-copy-tmp-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn pending_verified_target_cleans_up_temp_and_placeholder_on_drop() {
+        let tmp = unique_temp_dir("fro-verified-copy-pending-drop");
+        fs::create_dir_all(&tmp).unwrap();
+        let final_path = tmp.join("target.bin");
+
+        {
+            let pending = PendingVerifiedTarget::new(&final_path, true).unwrap();
+            fs::write(pending.working_path(), b"partial").unwrap();
+        }
+
+        assert!(!final_path.exists());
+        let leftovers = fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".fro-verified-copy-tmp-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     struct ChangingLenMock {

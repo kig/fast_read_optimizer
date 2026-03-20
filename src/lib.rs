@@ -18,7 +18,7 @@ pub use api::{
     visit_blocks_with_mode, write_file, write_file_range, write_file_range_with_mode,
     write_file_with_mode,
 };
-pub use common::IOMode;
+pub use common::{CopyAutoMode, CopyStrategy, IOMode};
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,
 };

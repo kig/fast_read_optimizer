@@ -112,7 +112,7 @@ fn optimize_all_writes_target_config_and_selection_uses_mount_overrides() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
     assert!(
-        combined.contains("[31, 131072, 1, 77, 262144, 9]"),
+        combined.contains("[31, 131072, 1, 77, 262144, 9, 4, 524288, 4]"),
         "expected to see overridden params in output, got:\n{}",
         combined
     );

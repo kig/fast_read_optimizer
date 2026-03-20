@@ -1,6 +1,9 @@
 use std::env;
 use std::fs::OpenOptions;
+use std::process;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 enum CacheState {
@@ -15,6 +18,18 @@ struct TestCase {
     target: f64,
     cache_state: CacheState,
     files_to_prep: Vec<String>,
+}
+
+fn parse_first_gbps(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        if let Some(idx) = line.find(" GB/s") {
+            let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
+            if let Ok(num) = line[start..idx].trim().parse::<f64>() {
+                return Some(num);
+            }
+        }
+    }
+    None
 }
 
 fn evict_cache(path: &str) {
@@ -171,17 +186,18 @@ fn main() {
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         println!(
-            "USAGE: {} [--plan] [--skip-build] [--no-fail] [--iters <n>] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
+            "USAGE: {} [--plan] [--skip-build] [--no-fail] [--iters <n>] [--repeat <n>] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
             args[0]
         );
         println!(
             "\nAuto sizing (default): chooses a temp file size based on free space and a wear budget.\n\
-             - --plan                  (print suggested test size + write load and exit)\n\
+              - --plan                  (print suggested test size + write load and exit)\n\
              - --test-size 1GiB         (force fixed size)\n\
-             - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)\n\
-             - --iters 5               (override internal -n for fro invocations; useful for quick runs/tests)\n\
-             - --skip-build            (do not run `cargo build --release`; assume binaries already built)\n\
-             - --no-fail               (do not exit nonzero on regressions; still prints PASS/REGRESSION)"
+              - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)\n\
+              - --iters 5               (override internal -n for fro invocations; useful for quick runs/tests)\n\
+              - --repeat 3              (run each benchmark multiple times; report min/max and judge by best steady-state run)\n\
+              - --skip-build            (do not run `cargo build --release`; assume binaries already built)\n\
+              - --no-fail               (do not exit nonzero on regressions; still prints PASS/REGRESSION)"
         );
         std::process::exit(0);
     }
@@ -192,6 +208,7 @@ fn main() {
     let mut max_drive_writes: f64 = 0.05;
     let mut plan = false;
     let mut iters: u64 = 1;
+    let mut repeat_count: usize = 3;
     let mut skip_build = false;
     let mut fail_on_regressions = true;
 
@@ -240,6 +257,17 @@ fn main() {
                 eprintln!("Invalid --iters: {}", v);
                 std::process::exit(2);
             });
+        } else if arg == "--repeat" {
+            let v = &args[i];
+            i += 1;
+            repeat_count = v.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid --repeat: {}", v);
+                std::process::exit(2);
+            });
+            if repeat_count == 0 {
+                eprintln!("Invalid --repeat: must be greater than zero");
+                std::process::exit(2);
+            }
         } else if arg == "--skip-build" {
             skip_build = true;
         } else if arg == "--no-fail" {
@@ -253,10 +281,25 @@ fn main() {
     fro_exe.set_file_name("fro");
 
     let test_path = std::path::Path::new(test_dir);
+    let run_dir = test_path.join(format!(
+        "fro-bench-run-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&run_dir).unwrap_or_else(|e| {
+        panic!(
+            "Could not create benchmark temp dir {} {}",
+            run_dir.display(),
+            e
+        )
+    });
 
-    let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
-    let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
-    let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
+    let source_file = run_dir.join("fro_bench_tmp_source").display().to_string();
+    let target_file_dir = run_dir.join("fro_bench_tmp_direct").display().to_string();
+    let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
 
     let tests = vec![
         TestCase {
@@ -418,9 +461,10 @@ fn main() {
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
         },
         TestCase {
-            name: "copy (page cache, cold)",
+            name: "copy (threaded, page cache, cold)",
             args: vec![
                 "copy".into(),
+                "--threaded-copy".into(),
                 "--no-direct".into(),
                 "-v".into(),
                 "-n".into(),
@@ -433,7 +477,71 @@ fn main() {
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
-            name: "copy (hot cache R, direct W)",
+            name: "copy (range, cold)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 1.0,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (range, hot)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 3.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (range 1T, cold)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range-single".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 0.8,
+            cache_state: CacheState::Cold,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (range 1T, hot)",
+            args: vec![
+                "copy".into(),
+                "--copy-file-range-single".into(),
+                "--no-direct".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_cache.clone(),
+            ],
+            target: 3.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+        },
+        TestCase {
+            name: "copy (hot R, direct W)",
             args: vec![
                 "copy".into(),
                 "--no-direct".into(),
@@ -449,7 +557,24 @@ fn main() {
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
         },
         TestCase {
-            name: "copy (via memory, hot cache R, direct W)",
+            name: "copy (hot R, direct W, pre-sized target)",
+            args: vec![
+                "copy".into(),
+                "--keep-target-size".into(),
+                "--no-direct".into(),
+                "--direct-write".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                source_file.clone(),
+                target_file_dir.clone(),
+            ],
+            target: 3.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
+            name: "copy (via-mem, hot R, direct W)",
             args: vec![
                 "copy".into(),
                 "--via-memory".into(),
@@ -847,6 +972,7 @@ fn main() {
         );
         println!("  est_user_writes: {}", format_bytes(est_user_writes));
         println!("  max_drive_writes: {}", max_drive_writes);
+        println!("  repeat_count: {}", repeat_count);
         println!("  selected_benchmarks:");
         for t in &selected_tests {
             println!("    {}", t.name);
@@ -903,50 +1029,59 @@ fn main() {
     let mut regressions = false;
 
     println!(
-        "{:<35} | {:<12} | {:<12} | {:<10}",
-        "Benchmark", "Speed (GB/s)", "Target", "Status"
+        "{:<35} | {:<12} | {:<12} | {:<12} | {:<12} | {:<10}",
+        "Benchmark", "Best (GB/s)", "Min", "Max", "Target", "Status"
     );
-    println!("{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<10}", "", "", "", "");
+    println!(
+        "{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<10}",
+        "", "", "", "", "", ""
+    );
 
     for t in selected_tests {
-        match t.cache_state {
-            CacheState::Cold => {
-                for f in &t.files_to_prep {
-                    evict_cache(f);
+        let mut min_speed = f64::INFINITY;
+        let mut max_speed = 0.0_f64;
+        let mut outputs = Vec::with_capacity(repeat_count);
+
+        for _ in 0..repeat_count {
+            match t.cache_state {
+                CacheState::Cold => {
+                    for f in &t.files_to_prep {
+                        evict_cache(f);
+                    }
                 }
-            }
-            CacheState::Hot => {
-                for f in &t.files_to_prep {
-                    pre_cache(f);
+                CacheState::Hot => {
+                    for f in &t.files_to_prep {
+                        pre_cache(f);
+                    }
                 }
+                CacheState::None => {}
             }
-            CacheState::None => {}
+
+            let output = Command::new(&fro_exe)
+                .args(&t.args)
+                .output()
+                .unwrap_or_else(|e| panic!("Failed to execute process for {}: {}", t.name, e));
+
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            let err_str = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{}\n{}", out_str, err_str);
+            let speed = parse_first_gbps(&combined).unwrap_or(0.0);
+            min_speed = min_speed.min(speed);
+            max_speed = max_speed.max(speed);
+            outputs.push(combined);
         }
 
-        let output = Command::new(&fro_exe)
-            .args(&t.args)
-            .output()
-            .unwrap_or_else(|e| panic!("Failed to execute process for {}: {}", t.name, e));
+        let best_speed = max_speed;
+        let min_speed = if min_speed.is_finite() {
+            min_speed
+        } else {
+            0.0
+        };
 
-        let out_str = String::from_utf8_lossy(&output.stdout);
-        let err_str = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}\n{}", out_str, err_str);
-
-        let mut speed = 0.0;
-        for line in combined.lines() {
-            if let Some(idx) = line.find(" GB/s") {
-                let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
-                if let Ok(num) = line[start..idx].trim().parse::<f64>() {
-                    speed = num;
-                    break;
-                }
-            }
-        }
-
-        let status = if speed == 0.0 {
+        let status = if best_speed == 0.0 {
             regressions = true;
             "FAILED"
-        } else if speed < t.target * 0.90 {
+        } else if best_speed < t.target * 0.90 {
             // Allow 10% variance before calling it a regression
             regressions = true;
             "REGRESSION"
@@ -955,27 +1090,21 @@ fn main() {
         };
 
         println!(
-            "{:<35} | {:<12.2} | {:<12.2} | {}",
-            t.name, speed, t.target, status
+            "{:<35} | {:<12.2} | {:<12.2} | {:<12.2} | {:<12.2} | {}",
+            t.name, best_speed, min_speed, max_speed, t.target, status
         );
 
-        if speed == 0.0 {
-            println!("--- Output ---\n{}", combined);
+        if best_speed == 0.0 {
+            for (idx, combined) in outputs.iter().enumerate() {
+                println!("--- Output run {} ---\n{}", idx + 1, combined);
+            }
         }
+
+        thread::sleep(Duration::from_millis(150));
     }
 
-    for (filename, need) in [
-        (source_file, need_source),
-        (target_file_cache, need_target_cache),
-        (target_file_dir, need_target_dir),
-    ]
-    .iter()
-    {
-        if *need {
-            std::fs::remove_file(filename)
-                .unwrap_or_else(|e| println!("Failed to delete temp file {} {}", filename, e));
-        }
-    }
+    std::fs::remove_dir_all(&run_dir)
+        .unwrap_or_else(|e| println!("Failed to delete temp dir {} {}", run_dir.display(), e));
 
     if regressions {
         println!("\nWARNING: Some benchmarks showed regressions or failed.");
@@ -1000,6 +1129,13 @@ mod tests {
         assert_eq!(parse_size("1g"), Some(1024 * 1024 * 1024));
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("nope"), None);
+    }
+
+    #[test]
+    fn parse_first_gbps_extracts_speed() {
+        let sample = "copy 1073741824 bytes in 0.1076 s, 10.0 GB/s, [1, 2, 3]";
+        assert_eq!(parse_first_gbps(sample), Some(10.0));
+        assert_eq!(parse_first_gbps("no throughput here"), None);
     }
 
     #[test]

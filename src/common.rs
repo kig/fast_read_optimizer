@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
@@ -109,6 +110,25 @@ pub enum IOMode {
     Auto,
     Direct,
     PageCache,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyStrategy {
+    Auto,
+    Threaded,
+    CopyFileRange,
+    CopyFileRangeSingle,
+    Reflink,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyAutoMode {
+    Heuristic,
+    PageCache,
+    Direct,
+    CopyFileRange,
 }
 
 #[cfg(test)]
