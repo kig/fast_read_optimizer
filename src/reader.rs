@@ -1,6 +1,8 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::{IOParams, LoadedConfig};
-use crate::io_util::{expected_read_len, open_reader_files, validate_read_result};
+use crate::io_util::{
+    expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
+};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
@@ -367,19 +369,21 @@ fn thread_reader(
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
+    let mut pending = PendingReadSlots::new(qd);
 
-    for _ in 0..qd {
+    for slot in 0..qd {
         let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
         if current_offset >= file_size {
             break;
         }
+        pending.reserve(slot, block_num as u64)?;
         submit_read(
             io_uring,
             file,
             file_direct,
-            &mut buffers[block_num % qd],
+            &mut buffers[slot],
             current_offset,
-            block_num as u64,
+            slot as u64,
             use_direct,
             file_size,
         )?;
@@ -395,14 +399,18 @@ fn thread_reader(
     let finder = Finder::new(pattern.as_bytes());
 
     loop {
-        for (block_id, result) in wait_for_ready(io_uring)? {
+        for (slot_id, result) in wait_for_ready(io_uring)? {
+            let slot = usize::try_from(slot_id).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
+            })?;
+            let block_id = pending.complete(slot)?;
             let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
             let expected_len = expected_read_len(file_size, current_offset, block_size)?;
             let actual_len = validate_read_result("read", current_offset, expected_len, result)?;
             if actual_len > 0 {
                 read_count.fetch_add(result as u64, Ordering::Relaxed);
                 if !pattern.is_empty() {
-                    let buf = &buffers[block_id as usize % qd].as_slice()
+                    let buf = &buffers[slot].as_slice()
                         [..std::cmp::min(actual_len, (block_size as usize) + pattern.len())];
                     for idx in finder.find_iter(buf) {
                         matches.push(current_offset.checked_add(idx as u64).ok_or_else(|| {
@@ -418,13 +426,14 @@ fn thread_reader(
 
             let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
+                pending.reserve(slot, block_num as u64)?;
                 submit_read(
                     io_uring,
                     file,
                     file_direct,
-                    &mut buffers[block_num % qd],
+                    &mut buffers[slot],
                     next_offset,
-                    block_num as u64,
+                    slot as u64,
                     use_direct,
                     file_size,
                 )?;
@@ -550,19 +559,21 @@ where
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
+    let mut pending = PendingReadSlots::new(qd);
 
-    for _ in 0..qd {
+    for slot in 0..qd {
         let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
         if current_offset >= file_size {
             break;
         }
+        pending.reserve(slot, block_num as u64)?;
         submit_read(
             io_uring,
             file,
             file_direct,
-            &mut buffers[block_num % qd],
+            &mut buffers[slot],
             current_offset,
-            block_num as u64,
+            slot as u64,
             use_direct,
             file_size,
         )?;
@@ -576,14 +587,18 @@ where
     io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        for (block_id, result) in wait_for_ready(io_uring)? {
+        for (slot_id, result) in wait_for_ready(io_uring)? {
+            let slot = usize::try_from(slot_id).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
+            })?;
+            let block_id = pending.complete(slot)?;
             let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
             let expected_len = expected_read_len(file_size, current_offset, block_size)?;
             let actual_len =
                 validate_read_result("map-file-blocks", current_offset, expected_len, result)?;
             if actual_len > 0 {
                 let block_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..actual_len];
+                let buf = &buffers[slot].as_slice()[..actual_len];
                 let mapped = mapper(ReaderBlock {
                     block_index,
                     offset: current_offset,
@@ -598,13 +613,14 @@ where
 
             let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
+                pending.reserve(slot, block_num as u64)?;
                 submit_read(
                     io_uring,
                     file,
                     file_direct,
-                    &mut buffers[block_num % qd],
+                    &mut buffers[slot],
                     next_offset,
-                    block_num as u64,
+                    slot as u64,
                     use_direct,
                     file_size,
                 )?;
@@ -642,19 +658,21 @@ where
     let offset = thread_id * block_size;
     let mut block_num = 0;
     let mut inflight = 0;
+    let mut pending = PendingReadSlots::new(qd);
 
-    for _ in 0..qd {
+    for slot in 0..qd {
         let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
         if current_offset >= file_size {
             break;
         }
+        pending.reserve(slot, block_num as u64)?;
         submit_read(
             io_uring,
             file,
             file_direct,
-            &mut buffers[block_num % qd],
+            &mut buffers[slot],
             current_offset,
-            block_num as u64,
+            slot as u64,
             use_direct,
             file_size,
         )?;
@@ -668,14 +686,18 @@ where
     io_uring.submit_sqes().map_err(std::io::Error::other)?;
 
     loop {
-        for (block_id, result) in wait_for_ready(io_uring)? {
+        for (slot_id, result) in wait_for_ready(io_uring)? {
+            let slot = usize::try_from(slot_id).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
+            })?;
+            let block_id = pending.complete(slot)?;
             let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
             let expected_len = expected_read_len(file_size, current_offset, block_size)?;
             let actual_len =
                 validate_read_result("visit-file-blocks", current_offset, expected_len, result)?;
             if actual_len > 0 {
                 let block_index = (current_offset / block_size) as usize;
-                let buf = &buffers[block_id as usize % qd].as_slice()[..actual_len];
+                let buf = &buffers[slot].as_slice()[..actual_len];
                 visitor(ReaderBlock {
                     block_index,
                     offset: current_offset,
@@ -688,13 +710,14 @@ where
 
             let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
+                pending.reserve(slot, block_num as u64)?;
                 submit_read(
                     io_uring,
                     file,
                     file_direct,
-                    &mut buffers[block_num % qd],
+                    &mut buffers[slot],
                     next_offset,
-                    block_num as u64,
+                    slot as u64,
                     use_direct,
                     file_size,
                 )?;

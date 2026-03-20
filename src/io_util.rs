@@ -67,6 +67,49 @@ pub fn validate_read_result(
     interpret_read_result(operation, offset, expected_len, i64::from(result))
 }
 
+#[derive(Debug)]
+pub struct PendingReadSlots {
+    pending_block_ids: Vec<Option<u64>>,
+}
+
+impl PendingReadSlots {
+    pub fn new(qd: usize) -> Self {
+        Self {
+            pending_block_ids: vec![None; qd],
+        }
+    }
+
+    pub fn reserve(&mut self, slot: usize, block_id: u64) -> io::Result<()> {
+        let entry = self.pending_block_ids.get_mut(slot).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read slot {slot} is out of range"),
+            )
+        })?;
+        if entry.replace(block_id).is_some() {
+            return Err(io::Error::other(format!(
+                "read slot {slot} was reused before its prior completion was observed"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn complete(&mut self, slot: usize) -> io::Result<u64> {
+        self.pending_block_ids
+            .get_mut(slot)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("read slot {slot} is out of range"),
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                io::Error::other(format!("read slot {slot} completed with no pending block"))
+            })
+    }
+}
+
 fn interpret_read_result(
     operation: &str,
     offset: u64,
@@ -188,6 +231,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pending_read_slots_allow_out_of_order_reuse_only_after_completion() {
+        let mut slots = PendingReadSlots::new(3);
+        slots.reserve(0, 10).unwrap();
+        slots.reserve(1, 11).unwrap();
+        slots.reserve(2, 12).unwrap();
+
+        assert_eq!(slots.complete(1).unwrap(), 11);
+        slots.reserve(1, 13).unwrap();
+        assert_eq!(slots.complete(0).unwrap(), 10);
+        assert_eq!(slots.complete(2).unwrap(), 12);
+        assert_eq!(slots.complete(1).unwrap(), 13);
+    }
+
+    #[test]
+    fn pending_read_slots_reject_reusing_live_slot() {
+        let mut slots = PendingReadSlots::new(2);
+        slots.reserve(0, 7).unwrap();
+        let err = slots.reserve(0, 8).unwrap_err();
+        assert!(err.to_string().contains("reused"));
     }
 }
 

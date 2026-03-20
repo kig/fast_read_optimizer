@@ -19,7 +19,7 @@ use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use optimizer::run_optimizer;
 use reader::{load_file_to_memory, read_file};
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use verified_copy::copy_file_verified_with_options;
 use writer::{copy_file, write_buffer, write_file};
 
@@ -132,6 +132,24 @@ fn print_verify_report(report: &block_hash::VerifyReport) {
             issue.decision.status_message()
         );
     }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        Some(message)
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        Some(message.as_str())
+    } else {
+        None
+    }
+}
+
+fn is_broken_pipe_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe
+}
+
+fn is_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    panic_payload_message(payload).is_some_and(|message| message.contains("Broken pipe"))
 }
 
 #[derive(Clone, Copy)]
@@ -1141,12 +1159,29 @@ fn try_main() -> io::Result<i32> {
 }
 
 fn main() {
-    match try_main() {
-        Ok(code) if code == 0 => {}
-        Ok(code) => std::process::exit(code),
-        Err(err) => {
-            eprintln!("Error: {}", err);
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info.payload()) {
+            return;
+        }
+        default_hook(info);
+    }));
+
+    match std::panic::catch_unwind(try_main) {
+        Ok(Ok(code)) if code == 0 => {}
+        Ok(Ok(code)) => std::process::exit(code),
+        Ok(Err(err)) => {
+            if is_broken_pipe_error(&err) {
+                std::process::exit(0);
+            }
+            let _ = writeln!(io::stderr().lock(), "Error: {}", err);
             std::process::exit(1);
+        }
+        Err(payload) => {
+            if is_broken_pipe_panic(payload.as_ref()) {
+                std::process::exit(0);
+            }
+            std::panic::resume_unwind(payload);
         }
     }
 }
