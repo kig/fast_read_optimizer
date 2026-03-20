@@ -17,11 +17,10 @@ use block_hash::{
 };
 use common::{CopyAutoMode, CopyStrategy};
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
-use io_util::{direct_writer_supported, CopyOperationGuard};
+use io_util::{direct_writer_supported, sync_path, CopyOperationGuard};
 use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
 use reader::{load_file_to_memory, read_file};
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{
@@ -50,14 +49,6 @@ fn parse_size(s: &str) -> Option<u64> {
         _ => return None,
     };
     num.checked_mul(mult)
-}
-
-fn sync_path(path: &str) -> io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?
-        .sync_all()
 }
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
@@ -547,8 +538,8 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "--keep-target-size preserves an already-sized destination instead of re-truncating/re-preallocating it; this is mainly useful for best-case benchmarking.",
                 "Copy takes an advisory shared lock on the source and an advisory exclusive lock on the destination by default; use --no-lock to skip that cooperative locking.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
-                "--verify hashes the source, copies the file, fsyncs the destination, and verifies the destination against the source-derived manifest without leaving sidecars by default.",
-                "--hash with --verify leaves durable sidecars at the destination and at the source if the source did not already have sidecars.",
+                "--verify hashes the source, copies into a temporary sibling, fsyncs and verifies that file, then renames it into place without leaving sidecars by default.",
+                "--hash with --verify leaves durable sidecars at the destination and at the source if the source did not already have sidecars, and syncs their parent directories too.",
                 "--verify-diff fsyncs the destination and then runs a diff pass instead of block-hash verification.",
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
@@ -588,7 +579,7 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                     "copy --no-lock --no-direct in.bin out.bin",
                 ),
                 (
-                    "Copy a file, fsync it, and verify the destination against the source manifest without leaving sidecars",
+                    "Copy a file through a verified temp target swap without leaving sidecars",
                     "copy --verify --sha256 --no-direct in.bin out.bin",
                 ),
                 (

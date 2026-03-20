@@ -3,6 +3,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
+use std::path::Path;
 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     matches!(
@@ -57,6 +58,15 @@ pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File
         file.try_clone()?
     };
     Ok((file, file_direct))
+}
+
+pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
+    OpenOptions::new().read(true).open(path.as_ref())?.sync_all()
+}
+
+pub fn sync_parent_directory(path: impl AsRef<Path>) -> io::Result<()> {
+    let parent = path.as_ref().parent().unwrap_or_else(|| Path::new("."));
+    OpenOptions::new().read(true).open(parent)?.sync_all()
 }
 
 pub fn expected_read_len(file_size: u64, offset: u64, block_size: u64) -> io::Result<usize> {

@@ -193,6 +193,39 @@ fn copy_verify_hash_cli_writes_sidecars() {
 }
 
 #[test]
+fn verified_copy_replaces_existing_target_without_leaking_temp_files() {
+    let tmp = unique_temp_dir("fro-verified-copy-atomic-swap");
+    let source = tmp.join("source.bin");
+    let target = tmp.join("target.bin");
+    let bytes = (0..(1024 * 1024 + 211))
+        .map(|i| ((i * 43) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&source, &bytes).unwrap();
+    fs::write(&target, b"stale-target").unwrap();
+
+    let report = fro::copy_file_verified_with_options(
+        &source,
+        &target,
+        fro::IOMode::PageCache,
+        fro::IOMode::PageCache,
+        BlockHashAlgorithm::Sha256,
+        false,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(report.bytes_copied, bytes.len() as u64);
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+    let leftovers = fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".fro-verified-copy-tmp-"))
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+}
+
+#[test]
 fn copy_verify_diff_cli_reports_success_to_stderr() {
     let tmp = unique_temp_dir("fro-copy-verify-diff-cli");
     let source = tmp.join("source.bin");

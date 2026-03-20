@@ -248,7 +248,7 @@ This requests a CoW reflink/soft copy when the filesystem supports it. It is ext
 fro copy --verify --sha256 --no-direct in.bin out.bin
 ```
 
-This hashes `in.bin`, copies it to `out.bin`, `fsync`s the destination file, and then verifies `out.bin` against the **source-derived** manifest without leaving sidecars by default. If the first verification pass finds bad blocks, `fro` repairs `out.bin` from `in.bin` using the source-derived manifest as the gold standard, `fsync`s again, and verifies one final time before returning success.
+This hashes `in.bin`, copies it to a temporary sibling of `out.bin`, `fsync`s and verifies that temporary file against the **source-derived** manifest, and only then renames it into place as `out.bin`. If the first verification pass finds bad blocks, `fro` repairs the temporary copy from `in.bin` using the source-derived manifest as the gold standard, `fsync`s again, and verifies one final time before swapping it into place.
 
 If you also want to leave sidecars behind:
 
@@ -256,7 +256,7 @@ If you also want to leave sidecars behind:
 fro copy --verify --hash --sha256 --no-direct in.bin out.bin
 ```
 
-That writes durable sidecars for `out.bin` and, if `in.bin` did not already have them, also leaves durable sidecars at the source.
+That writes durable sidecars for `out.bin` and, if `in.bin` did not already have them, also leaves durable sidecars at the source. The sidecar files themselves are `fsync`'d and their parent directories are synced too.
 
 If you want a simpler postcondition check:
 
@@ -268,7 +268,6 @@ That copies, `fsync`s the destination file, checks that the source metadata stay
 
 Current copy-verification limits:
 
-- it syncs the destination file and sidecar files, but not the parent directory
 - it verifies that the destination matches the source as observed during this run
 - copy now takes advisory locks by default (shared on the source, exclusive on the destination), but those locks only constrain cooperating processes
 - non-verified copy modes also fail if the source file's size, `mtime`, or `ctime` changes during the operation
