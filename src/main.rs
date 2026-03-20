@@ -47,7 +47,11 @@ fn parse_size(s: &str) -> Option<u64> {
 }
 
 fn sync_path(path: &str) -> io::Result<()> {
-    OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
@@ -717,7 +721,9 @@ fn try_main() -> io::Result<i32> {
         return Ok(1);
     }
     if (verify_copy || verify_copy_diff) && save_config {
-        println!("copy verification modes do not support --save; tune copy and verification separately");
+        println!(
+            "copy verification modes do not support --save; tune copy and verification separately"
+        );
         return Ok(1);
     }
     if (verify_copy || verify_copy_diff) && iterations > 1 {
@@ -1015,7 +1021,10 @@ fn try_main() -> io::Result<i32> {
                     if diff_res != 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("copy verify-diff found a mismatch at byte offset {}", diff_res),
+                            format!(
+                                "copy verify-diff found a mismatch at byte offset {}",
+                                diff_res
+                            ),
                         ));
                     }
                     if !quiet {

@@ -28,7 +28,7 @@
 ### Benchmark and optimizer safety
 
 - [ ] Add deterministic wear/space-based test sizing.
-- [ ] Only create temp files needed by the selected benchmark/optimization modes.
+- [x] Only create temp files needed by the selected benchmark/optimization modes.
 - [ ] Add CLI knobs for min/max test size and drive-write budget.
 - [ ] Optionally add probe-based time targeting after the deterministic sizing work lands.
 
@@ -57,10 +57,26 @@
 - [ ] Separate presets for cold vs hot page cache.
 - [ ] Estimate per-mount maximum performance and compare achieved throughput against it.
 - [ ] Store measured maximum performance per mount and use it to inform IO-path selection.
+- [ ] Application-level tuning with the optimizer (e.g. you have a database that uses fro as the I/O library, you'd drop your I/O hot paths into optimizer as part of the install process to find optimal settings for the hardware.)
+
+### Dirwalk optimization
+
+- [ ] Fast traversal of every byte in a directory tree.
+  - `find` is **very** fast, but even faster when run as multiple instances on subtrees (find dir/s1 & find dir/s2 & find dir/s3 ...)
+  - Look how rg does it for inodes?
+  - Would kinda like if directory trees could be GC'd into contiguous bags of bytes in memory and copied over with a seq-read + rewrite inode ids + seq-write.
+- [ ] Idea: sort files by block inode to get a more sequential access pattern. 
+- [ ] Idea: keep nearby-on-media files in the same thread, pin threads to cores (each core manages an area of memory -> higher cache hit rate).
+- [ ] Idea: small files bundled into processing bundles for efficient batching, large files dealt with separately (while large file data is streaming, small file inodes are streaming).
+- [ ] Process subtrees with io_uring by doing multi-tree parallel DFS (threads start traversing at nearest-to-root non-claimed subtree, claim it, add found dirs to "to-process" stack.)
 
 ## Open questions
 
-- [ ] Should `./fro.json` ever be auto-loaded, or only via explicit `-c`?
-- [ ] Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
-- [ ] How conservative should the default drive-write budget be?
-- [ ] How should `fro` behave on filesystems where direct I/O is unsupported or unreliable?
+- [x] Should `./fro.json` ever be auto-loaded, or only via explicit `-c`?
+    - Only via explicit `-c`.
+- [x] Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
+    - Filesystem UUID primarily. If only mountpoint string is defined, use that.
+- [x] How conservative should the default drive-write budget be?
+    - 0.05 DPWD (ok to do at least 20 optimize runs per day on 1 DPWD drive.)
+- [x] How should `fro` behave on filesystems where direct I/O is unsupported or unreliable? 
+    - Use non-direct I/O. Flag to user if --direct specified.

@@ -31,7 +31,11 @@ fn path_str(path: &Path) -> io::Result<&str> {
 }
 
 fn sync_file(path: &str) -> io::Result<()> {
-    OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -117,7 +121,12 @@ fn read_block_at(
     Ok(data)
 }
 
-fn write_block_at(file: &mut File, block_index: usize, block_size: u64, data: &[u8]) -> io::Result<()> {
+fn write_block_at(
+    file: &mut File,
+    block_index: usize,
+    block_size: u64,
+    data: &[u8],
+) -> io::Result<()> {
     let offset = block_index as u64 * block_size;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(data)
@@ -426,7 +435,9 @@ mod tests {
             IOMode::PageCache,
         )
         .unwrap();
-        assert!(mismatched_blocks(&source_manifest, &final_target).unwrap().is_empty());
+        assert!(mismatched_blocks(&source_manifest, &final_target)
+            .unwrap()
+            .is_empty());
         assert_eq!(fs::read(&target).unwrap(), bytes);
     }
 

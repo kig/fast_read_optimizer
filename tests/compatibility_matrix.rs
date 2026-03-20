@@ -28,10 +28,7 @@ mod unix_matrix {
             }
         }
 
-        const fn privilege_sensitive(
-            unprivileged: ResultClass,
-            privileged: ResultClass,
-        ) -> Self {
+        const fn privilege_sensitive(unprivileged: ResultClass, privileged: ResultClass) -> Self {
             Self {
                 unprivileged,
                 privileged,
@@ -88,10 +85,7 @@ mod unix_matrix {
     ) {
         match expected.resolve() {
             ResultClass::Success => {
-                assert!(
-                    result.is_ok(),
-                    "{name}: expected success, got {result:?}"
-                );
+                assert!(result.is_ok(), "{name}: expected success, got {result:?}");
             }
             ResultClass::PermissionDenied => {
                 let err = result.expect_err(name);
@@ -180,12 +174,10 @@ mod unix_matrix {
         for (name, path, expected, expected_bytes) in cases {
             match expected.resolve() {
                 ResultClass::Success => {
-                    let actual =
-                        fro::read_file_with_mode(path, fro::IOMode::PageCache).unwrap_or_else(
-                            |err| {
-                        panic!("{name}: expected success, got {err:?}");
-                            },
-                        );
+                    let actual = fro::read_file_with_mode(path, fro::IOMode::PageCache)
+                        .unwrap_or_else(|err| {
+                            panic!("{name}: expected success, got {err:?}");
+                        });
                     assert_eq!(Some(actual), expected_bytes, "{name}: byte mismatch");
                 }
                 _ => assert_error_class(
@@ -284,11 +276,15 @@ mod unix_matrix {
                 ResultClass::Success => {
                     let written = fro::write_file_with_mode(path, &bytes, fro::IOMode::PageCache)
                         .unwrap_or_else(|err| {
-                        panic!("{name}: expected success, got {err:?}");
+                            panic!("{name}: expected success, got {err:?}");
                         });
                     assert_eq!(written, bytes.len() as u64, "{name}: byte count mismatch");
                     let final_path = written_path.unwrap();
-                    assert_eq!(fs::read(final_path).unwrap(), bytes, "{name}: byte mismatch");
+                    assert_eq!(
+                        fs::read(final_path).unwrap(),
+                        bytes,
+                        "{name}: byte mismatch"
+                    );
                 }
                 _ => assert_error_class(
                     name,
