@@ -27,6 +27,21 @@ cargo build --release --examples
 cargo install --path .
 ```
 
+`fro` also supports a small BusyBox-style multicall surface via `argv[0]`. If you symlink the `fro` binary to names such as `cp`, `cmp`, `fgrep`, `cat`, `tac`, `wc`, `find`, `cksum`, `b3sum`, `b2sum`, `md5sum`, `sha256sum`, or `shred`, it dispatches to the corresponding `fro`-backed implementation.
+
+Current coreutils snapshot on `/data/ilmari_cache/fro-test/coreutils-1g.bin` (1 GiB, best of 3, hot page cache for non-direct runs):
+
+| Tool | `fro` hot-cache GiB/s | `fro` direct GiB/s | system GiB/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `cat` | 4.7 | 3.4 | 7.6 | Still below the tuned read-path ceiling; this wrapper needs more work. |
+| `cksum` | 0.115 | 0.114 | 0.325 | Known weak spot; planned fast-crc32-grade rewrite. |
+| `md5sum` | 0.553 | 0.554 | 0.531 | Roughly at parity. |
+| `b2sum` | 0.666 | 0.665 | 0.661 | Roughly at parity. |
+| `sha256sum` | 1.207 | 1.221 | 0.218 | Materially faster than system `sha256sum`. |
+| `fro read` reference | 16.7 | 23.0 | n/a | Shows current backend headroom on the same file/mount. |
+
+`wc -c` is omitted from the table because system `wc` can answer that case from file size metadata without a full data read, so it is not a fair streaming-I/O comparison.
+
 Example runs:
 
 ```bash

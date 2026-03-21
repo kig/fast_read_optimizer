@@ -1,8 +1,5 @@
-use fro::IOMode;
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use fro::{hash_file, HashAlgorithm, IOMode};
 use std::io;
-use std::sync::mpsc;
 
 struct Options {
     io_mode: IOMode,
@@ -56,50 +53,11 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
-fn hash_file(path: &str, io_mode: IOMode) -> io::Result<[u8; 32]> {
-    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
-
-    let hash_thread = std::thread::spawn(move || -> io::Result<[u8; 32]> {
-        let mut hasher = Sha256::new();
-        let mut next_block = 0usize;
-        let mut pending = BTreeMap::<usize, Vec<u8>>::new();
-
-        while let Ok((block_index, data)) = rx.recv() {
-            pending.insert(block_index, data);
-            while let Some(block) = pending.remove(&next_block) {
-                hasher.update(&block);
-                next_block += 1;
-            }
-        }
-
-        if !pending.is_empty() {
-            return Err(io::Error::other(
-                "missing block data while finalizing digest",
-            ));
-        }
-
-        Ok(hasher.finalize().into())
-    });
-
-    let sender = tx.clone();
-    let visit_result = fro::visit_blocks_with_mode(path, io_mode, move |block_index, data| {
-        sender
-            .send((block_index, data.to_vec()))
-            .map_err(|_| io::Error::other("failed to queue block for hashing"))
-    });
-    drop(tx);
-    let hash_result = hash_thread
-        .join()
-        .map_err(|_| io::Error::other("hash worker thread panicked"))?;
-    visit_result?;
-    Ok(hash_result?)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = parse_args().map_err(io::Error::other)?;
 
     for filename in &opts.filenames {
-        let digest = hash_file(filename, opts.io_mode)?;
+        let digest = hash_file(filename, HashAlgorithm::Sha256, opts.io_mode)?;
         println!("{}  {}", hex_digest(&digest), filename);
     }
 

@@ -61,7 +61,10 @@ pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File
 }
 
 pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
-    OpenOptions::new().read(true).open(path.as_ref())?.sync_all()
+    OpenOptions::new()
+        .read(true)
+        .open(path.as_ref())?
+        .sync_all()
 }
 
 pub fn sync_parent_directory(path: impl AsRef<Path>) -> io::Result<()> {

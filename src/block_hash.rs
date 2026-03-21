@@ -1,19 +1,14 @@
-use iou::IoUring;
 use libc::{c_uchar, size_t};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::common::{AlignedBuffer, IOMode};
-use crate::io_util::{
-    expected_read_len, open_reader_files, sync_parent_directory, validate_read_result,
-    PendingReadSlots,
-};
-use crate::mincore::is_first_page_resident;
+use crate::common::IOMode;
+use crate::config::{IOParams, LoadedConfig};
+use crate::io_util::sync_parent_directory;
+use crate::reader::{resolve_reader_params, ResolvedReadParams};
+use crate::stream::ParallelFile;
 
 #[link(name = "crypto")]
 unsafe extern "C" {
@@ -153,6 +148,11 @@ pub struct BlockHashManifest {
 }
 
 impl BlockHashManifest {
+    #[allow(dead_code)]
+    pub fn hash_of_hashes_bytes(&self) -> &[u8] {
+        &self.hash_of_hashes.bytes[..self.hash_type.digest_len()]
+    }
+
     pub fn verify_integrity(&self) -> bool {
         if self.bytes_hashed != self.file_size {
             return false;
@@ -716,6 +716,7 @@ pub fn recover_block_hash(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn block_offset(
     thread_base: u64,
     block_id: u64,
@@ -739,156 +740,32 @@ fn block_offset(
     })
 }
 
-fn use_direct_for_hashing(filename: &str, io_mode: IOMode) -> bool {
-    let file_cached = match is_first_page_resident(filename) {
-        Ok(true) => io_mode != IOMode::Direct,
-        _ => io_mode == IOMode::PageCache,
+fn resolve_block_hash_params(
+    filename: &str,
+    page_cache: &IOParams,
+    direct: &IOParams,
+    io_mode: IOMode,
+) -> std::io::Result<ResolvedReadParams> {
+    let params = resolve_reader_params(filename, page_cache, direct, io_mode)?;
+    validate_block_size(params.block_size)?;
+    Ok(params)
+}
+
+fn open_hash_file(filename: &str, use_direct: bool) -> std::io::Result<ParallelFile> {
+    let config = LoadedConfig::Legacy {
+        path: std::path::PathBuf::from("hash-file-blocks"),
+        config: crate::config::AppConfig::default(),
     };
-    (!file_cached) || io_mode == IOMode::Direct
-}
-
-fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
-    if use_direct {
-        debug_assert_eq!(
-            len % 4096,
-            0,
-            "Direct I/O requires a 4096-byte aligned read length"
-        );
-    }
-    use_direct && (offset % 4096 == 0) && (len % 4096 == 0) && (offset + len as u64 <= file_size)
-}
-
-fn submit_read(
-    io_uring: &mut IoUring,
-    file: &File,
-    file_direct: &File,
-    buffer: &mut AlignedBuffer,
-    offset: u64,
-    block_id: u64,
-    use_direct: bool,
-    file_size: u64,
-) -> std::io::Result<()> {
-    let direct = should_use_direct_io(use_direct, offset, buffer.as_slice().len(), file_size);
-    unsafe {
-        let mut sqe = io_uring
-            .prepare_sqe()
-            .ok_or_else(|| std::io::Error::other("io_uring submission queue is full"))?;
-        if direct {
-            sqe.prep_read(file_direct.as_raw_fd(), buffer.as_mut_slice(), offset);
+    ParallelFile::open(
+        &config,
+        "hash",
+        filename,
+        if use_direct {
+            IOMode::Direct
         } else {
-            sqe.prep_read(file.as_raw_fd(), buffer.as_mut_slice(), offset);
-        }
-        sqe.set_user_data(block_id);
-    }
-    Ok(())
-}
-
-fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
-    let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
-    let mut ready = vec![(cq.user_data(), cq.result()?)];
-
-    while io_uring.cq_ready() > 0 {
-        let cq = io_uring.peek_for_cqe().ok_or_else(|| {
-            std::io::Error::other("completion queue reported ready but no CQE was available")
-        })?;
-        ready.push((cq.user_data(), cq.result()?));
-    }
-
-    Ok(ready)
-}
-
-fn thread_hash_reader(
-    thread_id: u64,
-    num_threads: u64,
-    block_size: u64,
-    qd: usize,
-    file: &mut File,
-    file_direct: &mut File,
-    io_uring: &mut IoUring,
-    read_count: Arc<AtomicU64>,
-    hash_type: BlockHashAlgorithm,
-    use_direct: bool,
-) -> std::io::Result<Vec<(usize, BlockDigest)>> {
-    let mut buffers = Vec::new();
-    for _ in 0..qd {
-        buffers.push(AlignedBuffer::new(block_size as usize));
-    }
-
-    let file_size = file.seek(SeekFrom::End(0))?;
-    let offset = thread_id * block_size;
-    let mut block_num = 0;
-    let mut inflight = 0;
-    let mut digests = Vec::new();
-    let mut pending = PendingReadSlots::new(qd);
-
-    for slot in 0..qd {
-        let current_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
-        if current_offset >= file_size {
-            break;
-        }
-        pending.reserve(slot, block_num as u64)?;
-        submit_read(
-            io_uring,
-            file,
-            file_direct,
-            &mut buffers[slot],
-            current_offset,
-            slot as u64,
-            use_direct,
-            file_size,
-        )?;
-        block_num += 1;
-        inflight += 1;
-    }
-
-    if inflight == 0 {
-        return Ok(digests);
-    }
-    io_uring.submit_sqes().map_err(std::io::Error::other)?;
-
-    loop {
-        let ready = wait_for_ready(io_uring)?;
-
-        for (slot_id, result) in ready {
-            let slot = usize::try_from(slot_id).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
-            })?;
-            let block_id = pending.complete(slot)?;
-            let current_offset = block_offset(offset, block_id, num_threads, block_size)?;
-            let expected_len = expected_read_len(file_size, current_offset, block_size)?;
-            let actual_len =
-                validate_read_result("hash-file-blocks", current_offset, expected_len, result)?;
-            if actual_len > 0 {
-                let hash_index = (current_offset / block_size) as usize;
-                let buf = &buffers[slot].as_slice()[..actual_len];
-                digests.push((hash_index, hash_type.hash_block(buf)));
-                read_count.fetch_add(result as u64, Ordering::Relaxed);
-            }
-            inflight -= 1;
-
-            let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
-            if next_offset < file_size {
-                pending.reserve(slot, block_num as u64)?;
-                submit_read(
-                    io_uring,
-                    file,
-                    file_direct,
-                    &mut buffers[slot],
-                    next_offset,
-                    slot as u64,
-                    use_direct,
-                    file_size,
-                )?;
-                block_num += 1;
-                inflight += 1;
-            }
-        }
-
-        io_uring.submit_sqes().map_err(std::io::Error::other)?;
-        if inflight == 0 {
-            return Ok(digests);
-        }
-    }
+            IOMode::PageCache
+        },
+    )
 }
 
 fn hash_file_blocks_inner(
@@ -902,68 +779,35 @@ fn hash_file_blocks_inner(
     qd_d: usize,
     io_mode: IOMode,
 ) -> std::io::Result<BlockHashManifest> {
-    let read_count = Arc::new(AtomicU64::new(0));
-    let use_direct = use_direct_for_hashing(filename, io_mode);
-
-    let num_threads = if use_direct {
-        num_threads_d
-    } else {
-        num_threads_p
-    };
-    let block_size = if use_direct {
-        block_size_d
-    } else {
-        block_size_p
-    };
-    let qd = if use_direct { qd_d } else { qd_p };
-    validate_block_size(block_size)?;
-
-    let file_size = std::fs::metadata(filename)?.len();
-    let block_count = block_count_for_size(file_size, block_size)?;
-    let mut block_hashes = vec![BlockDigest::from_prefix(&[]); block_count];
-
-    let mut threads = vec![];
-    for thread_id in 0..num_threads {
-        let read_count = read_count.clone();
-        let filename = filename.to_string();
-        threads.push(std::thread::spawn(
-            move || -> std::io::Result<Vec<(usize, BlockDigest)>> {
-                let (mut file, mut file_direct) = open_reader_files(&filename, use_direct)?;
-                let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
-                thread_hash_reader(
-                    thread_id,
-                    num_threads,
-                    block_size,
-                    qd,
-                    &mut file,
-                    &mut file_direct,
-                    &mut io_uring,
-                    read_count,
-                    hash_type,
-                    use_direct,
-                )
-            },
-        ));
-    }
-
-    for thread in threads {
-        for (index, digest) in thread
-            .join()
-            .map_err(|_| std::io::Error::other("hash worker thread panicked"))??
-        {
-            block_hashes[index] = digest;
-        }
-    }
-    let hash_of_hashes = hash_hashes(hash_type, &block_hashes);
-
-    Ok(BlockHashManifest {
-        hash_type,
-        file_size,
-        block_size,
-        bytes_hashed: read_count.load(Ordering::SeqCst),
-        block_hashes,
-        hash_of_hashes,
-    })
+    let params = resolve_block_hash_params(
+        filename,
+        &IOParams {
+            num_threads: num_threads_p,
+            block_size: block_size_p,
+            qd: qd_p,
+        },
+        &IOParams {
+            num_threads: num_threads_d,
+            block_size: block_size_d,
+            qd: qd_d,
+        },
+        io_mode,
+    )?;
+    let file = open_hash_file(filename, params.use_direct)?;
+    file.map_reduce_blocks_with_params(
+        params,
+        move |_, data| Ok(hash_type.hash_block(data)),
+        move |block_hashes: Vec<BlockDigest>, report| {
+            Ok(BlockHashManifest {
+                hash_type,
+                file_size: report.file_size,
+                block_size: report.params.block_size,
+                bytes_hashed: report.bytes_read,
+                hash_of_hashes: hash_hashes(hash_type, &block_hashes),
+                block_hashes,
+            })
+        },
+    )
 }
 
 pub fn hash_file_blocks(

@@ -72,13 +72,19 @@
 
 ### More utils
 
-- [ ] sum, cksum, b2sum, md5sum, sha*sum
-  - add to examples/
-- [ ] shred (this is basically write)
-- [ ] wc
+- Goal: make the multicall coreutils a drop-in replacement that beats the system tools on performance.
+- [x] cksum, b2sum, md5sum, sha*sum
+  - [x] cksum
+  - [x] sha224sum / sha256sum / sha384sum / sha512sum
+  - [x] b3sum
+  - [x] b2sum
+  - [x] md5sum
+  - [ ] replace `cksum`'s CRC32 core with a fast-crc32-grade implementation (e.g. corsix/fast-crc32 approach)
+- [x] shred (this is basically write)
+- [x] wc
   - counts the number of characters in the file (space, \n)
-- [ ] cat / tac
-- [ ] find, as part of dirwalk work
+- [x] cat / tac
+- [x] find, as part of dirwalk work
 - [ ] parallel zstd that produces archives that can be decompressed by zstd
 - [ ] multi-file versions
   - [ ] diff
