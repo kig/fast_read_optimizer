@@ -19,6 +19,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
         "cat"
             | "cmp"
             | "fgrep"
+            | "find"
             | "tac"
             | "wc"
             | "cksum"
@@ -89,6 +90,10 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         }
         "cmp" => run_cmp(args)?,
         "fgrep" => run_fgrep(args)?,
+        "find" => {
+            run_find(args)?;
+            0
+        }
         "tac" => {
             run_tac(args)?;
             0
@@ -406,6 +411,29 @@ fn run_fgrep(args: &[String]) -> io::Result<i32> {
     }
     out.flush()?;
     Ok(if matched_any { 0 } else { 1 })
+}
+
+fn run_find(args: &[String]) -> io::Result<()> {
+    let roots = if args.len() > 1 {
+        args[1..].to_vec()
+    } else {
+        vec![".".to_string()]
+    };
+    for root in roots {
+        let mut stack = vec![Path::new(&root).to_path_buf()];
+        while let Some(path) = stack.pop() {
+            println!("{}", path.display());
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                let mut children = fs::read_dir(&path)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<io::Result<Vec<_>>>()?;
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_tac(args: &[String]) -> io::Result<()> {

@@ -524,6 +524,13 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &["Matches GNU grep -F visible behavior for the covered compatibility matrix."],
             examples: &[("Print matching lines with numbers", "fgrep -n needle notes.txt")],
         }),
+        "find" => Some(CommandHelp {
+            name: "find",
+            usage: "find [path ...]",
+            summary: "Walk one or more directory trees and print every encountered path.",
+            notes: &["This first correctness slice does not guarantee output ordering."],
+            examples: &[("Walk the current tree", "find ."), ("Walk two roots", "find src tests")],
+        }),
         "tac" => Some(CommandHelp {
             name: "tac",
             usage: "tac [--auto|--no-direct|--direct] <file> [file ...]",
@@ -845,6 +852,7 @@ fn print_general_help(program: &str) {
         ("cat", "print files using the fro read path"),
         ("cmp", "compare two files using the fro diff engine"),
         ("fgrep", "literal line-oriented grep compatibility wrapper"),
+        ("find", "walk directory trees and print every path"),
         ("grep", "search for a literal byte substring while reading"),
         ("tac", "print files in reverse line order"),
         ("wc", "count lines, words, and bytes"),
@@ -896,7 +904,7 @@ fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp fgrep cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp fgrep find cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

@@ -84,7 +84,7 @@
 - [x] wc
   - counts the number of characters in the file (space, \n)
 - [x] cat / tac
-- [ ] find, as part of dirwalk work
+- [x] find, as part of dirwalk work
 - [ ] parallel zstd that produces archives that can be decompressed by zstd
 - [ ] multi-file versions
   - [ ] diff
