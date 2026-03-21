@@ -111,9 +111,9 @@ fn multicall_aliases_cover_existing_copy_diff_and_grep_modes() {
 
     let grep = assert_success(run_alias(
         &fgrep,
-        &["-n", "1", "needle", grep_target.to_str().unwrap()],
+        &["-n", "needle", grep_target.to_str().unwrap()],
     ));
-    assert!(String::from_utf8_lossy(&grep.stdout).contains("needle"));
+    assert_eq!(String::from_utf8_lossy(&grep.stdout), "2:needle beta\n");
 }
 
 #[test]
@@ -170,10 +170,9 @@ fn multicall_hash_sums_print_expected_digests() {
     assert_eq!(
         String::from_utf8_lossy(&sum_out.stdout).trim(),
         format!(
-            "{} {} {}",
+            "{:>5} {:>5}",
             bsd_sum(&bytes),
-            (bytes.len() as u64).div_ceil(1024),
-            path.to_str().unwrap()
+            (bytes.len() as u64).div_ceil(1024)
         )
     );
 

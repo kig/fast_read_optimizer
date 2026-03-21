@@ -17,8 +17,6 @@ pub fn rewrite_alias_args(args: Vec<String>) -> Vec<String> {
     };
     let Some(mode) = (match invoked.as_str() {
         "cp" => Some("copy"),
-        "cmp" => Some("diff"),
-        "fgrep" => Some("grep"),
         _ => None,
     }) else {
         return args;
@@ -40,6 +38,8 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
             run_cat(args)?;
             0
         }
+        "cmp" => run_cmp(args)?,
+        "fgrep" => run_fgrep(args)?,
         "tac" => {
             run_tac(args)?;
             0
@@ -156,13 +156,115 @@ fn run_cat(args: &[String]) -> io::Result<()> {
     out.flush()
 }
 
+fn run_cmp(args: &[String]) -> io::Result<i32> {
+    let program = args[0].as_str();
+    let (io_mode, files) = parse_io_mode(&args[1..])?;
+    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file1> <file2>")?;
+    if files.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cmp requires exactly two file operands",
+        ));
+    }
+
+    let first = read_file_with_mode(&files[0], io_mode)?;
+    let second = read_file_with_mode(&files[1], io_mode)?;
+    let shared_len = first.len().min(second.len());
+    if let Some(index) = first
+        .iter()
+        .zip(second.iter())
+        .position(|(left, right)| left != right)
+    {
+        let line = 1 + first[..index].iter().filter(|&&byte| byte == b'\n').count();
+        println!(
+            "{} {} differ: byte {}, line {}",
+            files[0],
+            files[1],
+            index + 1,
+            line
+        );
+        return Ok(1);
+    }
+
+    if first.len() != second.len() {
+        let line = first[..shared_len.min(first.len())]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        eprintln!(
+            "cmp: EOF on {} after byte {}, line {}",
+            if first.len() < second.len() {
+                &files[0]
+            } else {
+                &files[1]
+            },
+            shared_len,
+            line
+        );
+        return Ok(1);
+    }
+
+    Ok(0)
+}
+
+fn run_fgrep(args: &[String]) -> io::Result<i32> {
+    let program = args[0].as_str();
+    let mut io_mode = IOMode::Auto;
+    let mut print_line_numbers = false;
+    let mut pattern = None::<String>;
+    let mut files = Vec::new();
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "-n" => print_line_numbers = true,
+            "--auto" => io_mode = IOMode::Auto,
+            "--direct" => io_mode = IOMode::Direct,
+            "--no-direct" => io_mode = IOMode::PageCache,
+            other if pattern.is_none() => pattern = Some(other.to_string()),
+            other => files.push(other.to_string()),
+        }
+    }
+    let pattern = pattern.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "fgrep requires a search pattern")
+    })?;
+    let files = ensure_files(
+        program,
+        files,
+        "[-n] [--auto|--no-direct|--direct] <pattern> <file> [file ...]",
+    )?;
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut matched_any = false;
+    let multi_file = files.len() > 1;
+    for file in files {
+        let data = read_file_with_mode(&file, io_mode)?;
+        let mut line_no = 0_u64;
+        for line in data.split_inclusive(|&byte| byte == b'\n') {
+            line_no += 1;
+            if !line.windows(pattern.len()).any(|window| window == pattern.as_bytes()) {
+                continue;
+            }
+            matched_any = true;
+            if multi_file {
+                write!(out, "{}:", file)?;
+            }
+            if print_line_numbers {
+                write!(out, "{}:", line_no)?;
+            }
+            out.write_all(line)?;
+        }
+    }
+    out.flush()?;
+    Ok(if matched_any { 0 } else { 1 })
+}
+
 fn run_tac(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
     let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    for file in files.iter().rev() {
+    for file in &files {
         let data = read_file_with_mode(file, io_mode)?;
         let mut parts = data.split_inclusive(|&byte| byte == b'\n').collect::<Vec<_>>();
         if parts.is_empty() && !data.is_empty() {
@@ -284,6 +386,7 @@ fn run_sum(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
     let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let multi_file = files.len() > 1;
     for file in files {
         let mut checksum = 0_u16;
         let mut bytes = 0_u64;
@@ -294,7 +397,11 @@ fn run_sum(args: &[String]) -> io::Result<()> {
             }
             Ok(())
         })?;
-        println!("{} {} {}", checksum, bytes.div_ceil(1024), file);
+        if multi_file {
+            println!("{:>5} {:>5} {}", checksum, bytes.div_ceil(1024), file);
+        } else {
+            println!("{:>5} {:>5}", checksum, bytes.div_ceil(1024));
+        }
     }
     Ok(())
 }
