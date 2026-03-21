@@ -3,6 +3,7 @@ use std::env;
 mod block_hash;
 mod common;
 mod config;
+mod coreutils;
 mod differ;
 mod io_util;
 mod mincore;
@@ -782,6 +783,10 @@ fn print_general_help(program: &str) {
     println!("  -c, --config PATH  override config path");
     println!("  -v, --verbose      print more about the current run");
     println!();
+    println!("Multicall aliases:");
+    println!("  cp cmp fgrep cat tac wc sum cksum b3sum sha224sum sha256sum sha384sum sha512sum shred");
+    println!("  (invoke via argv[0], e.g. by symlinking `fro` to one of those names)");
+    println!();
     println!("Related tools:");
     println!("  ./target/release/fro-optimize --help");
     println!("  ./target/release/fro-benchmark --help");
@@ -792,7 +797,11 @@ fn print_general_help(program: &str) {
 }
 
 fn try_main() -> io::Result<i32> {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
+        return Ok(code);
+    }
+    let args = coreutils::rewrite_alias_args(raw_args);
     if args.len() < 2 || is_help_flag(args[1].as_str()) {
         print_general_help(args[0].as_str());
         return Ok(0);

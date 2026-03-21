@@ -73,11 +73,16 @@
 ### More utils
 
 - [ ] sum, cksum, b2sum, md5sum, sha*sum
-  - add to examples/
-- [ ] shred (this is basically write)
-- [ ] wc
+  - [x] sum
+  - [x] cksum
+  - [x] sha224sum / sha256sum / sha384sum / sha512sum
+  - [x] b3sum
+  - [ ] b2sum
+  - [ ] md5sum
+- [x] shred (this is basically write)
+- [x] wc
   - counts the number of characters in the file (space, \n)
-- [ ] cat / tac
+- [x] cat / tac
 - [ ] find, as part of dirwalk work
 - [ ] parallel zstd that produces archives that can be decompressed by zstd
 - [ ] multi-file versions

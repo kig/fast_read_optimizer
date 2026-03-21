@@ -6,6 +6,7 @@ src/
   block_hash.rs
   common.rs
   config.rs
+  coreutils.rs
   differ.rs
   io_util.rs
   lib.rs
