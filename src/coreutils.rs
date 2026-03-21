@@ -21,9 +21,10 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "fgrep"
             | "tac"
             | "wc"
-            | "sum"
             | "cksum"
             | "b3sum"
+            | "b2sum"
+            | "md5sum"
             | "sha224sum"
             | "sha256sum"
             | "sha384sum"
@@ -96,16 +97,20 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             run_wc(args)?;
             0
         }
-        "sum" => {
-            run_sum(args)?;
-            0
-        }
         "cksum" => {
             run_cksum(args)?;
             0
         }
         "b3sum" => {
             run_hash_sum(args, HashAlgorithm::Blake3)?;
+            0
+        }
+        "b2sum" => {
+            run_hash_sum(args, HashAlgorithm::Blake2b512)?;
+            0
+        }
+        "md5sum" => {
+            run_hash_sum(args, HashAlgorithm::Md5)?;
             0
         }
         "sha224sum" => {
@@ -554,34 +559,6 @@ fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<()> {
             hex_digest(&hash_file(&file, algorithm, io_mode)?),
             file
         );
-    }
-    Ok(())
-}
-
-fn run_sum(args: &[String]) -> io::Result<()> {
-    let program = args[0].as_str();
-    let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(
-        program,
-        files,
-        "[--auto|--no-direct|--direct] <file> [file ...]",
-    )?;
-    let multi_file = files.len() > 1;
-    for file in files {
-        let mut checksum = 0_u16;
-        let mut bytes = 0_u64;
-        visit_ordered_blocks(&file, io_mode, |block| {
-            bytes += block.len() as u64;
-            for &byte in block {
-                checksum = checksum.rotate_right(1).wrapping_add(u16::from(byte));
-            }
-            Ok(())
-        })?;
-        if multi_file {
-            println!("{:>5} {:>5} {}", checksum, bytes.div_ceil(1024), file);
-        } else {
-            println!("{:>5} {:>5}", checksum, bytes.div_ceil(1024));
-        }
     }
     Ok(())
 }

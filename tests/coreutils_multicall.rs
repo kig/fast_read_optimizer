@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use blake3::Hasher as Blake3Hasher;
+use openssl::hash::{hash, MessageDigest};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -43,12 +44,13 @@ fn assert_success(output: Output) -> Output {
     output
 }
 
-fn bsd_sum(bytes: &[u8]) -> u16 {
-    let mut checksum = 0_u16;
-    for &byte in bytes {
-        checksum = checksum.rotate_right(1).wrapping_add(u16::from(byte));
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", byte);
     }
-    checksum
+    out
 }
 
 fn cksum_crc(bytes: &[u8]) -> u32 {
@@ -159,13 +161,23 @@ fn multicall_hash_sums_print_expected_digests() {
     let expected_b3 = format!("{}  {}", b3.finalize().to_hex(), path.to_str().unwrap());
     assert_eq!(String::from_utf8_lossy(&b3_out.stdout).trim(), expected_b3);
 
-    let sum_out = assert_success(run_fro("sum", &[path.to_str().unwrap()]));
+    let b2_out = assert_success(run_fro("b2sum", &[path.to_str().unwrap()]));
     assert_eq!(
-        String::from_utf8_lossy(&sum_out.stdout).trim(),
+        String::from_utf8_lossy(&b2_out.stdout).trim(),
         format!(
-            "{:>5} {:>5}",
-            bsd_sum(&bytes),
-            (bytes.len() as u64).div_ceil(1024)
+            "{}  {}",
+            hex_digest(&hash(MessageDigest::from_name("BLAKE2b512").unwrap(), &bytes).unwrap()),
+            path.to_str().unwrap()
+        )
+    );
+
+    let md5_out = assert_success(run_fro("md5sum", &[path.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&md5_out.stdout).trim(),
+        format!(
+            "{}  {}",
+            hex_digest(&hash(MessageDigest::md5(), &bytes).unwrap()),
+            path.to_str().unwrap()
         )
     );
 

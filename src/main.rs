@@ -538,18 +538,11 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &["Without -l/-w/-c, prints all three counts."],
             examples: &[("Count lines and words", "wc -l -w notes.txt")],
         }),
-        "sum" => Some(CommandHelp {
-            name: "sum",
-            usage: "sum [--auto|--no-direct|--direct] <file> [file ...]",
-            summary: "BSD sum compatibility wrapper on top of fro file reads.",
-            notes: &[],
-            examples: &[("Print BSD sum", "sum archive.tar")],
-        }),
         "cksum" => Some(CommandHelp {
             name: "cksum",
             usage: "cksum [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "POSIX cksum compatibility wrapper on top of fro file reads.",
-            notes: &[],
+            notes: &["TODO: replace the current CRC32 path with a fast-crc32-grade implementation."],
             examples: &[("Print POSIX CRC32 and size", "cksum archive.tar")],
         }),
         "b3sum" => Some(CommandHelp {
@@ -558,6 +551,20 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Print BLAKE3 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
+        }),
+        "b2sum" => Some(CommandHelp {
+            name: "b2sum",
+            usage: "b2sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print BLAKE2b-512 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with BLAKE2b-512", "b2sum bigfile.dat")],
+        }),
+        "md5sum" => Some(CommandHelp {
+            name: "md5sum",
+            usage: "md5sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print MD5 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with MD5", "md5sum bigfile.dat")],
         }),
         "sha224sum" => Some(CommandHelp {
             name: "sha224sum",
@@ -841,9 +848,10 @@ fn print_general_help(program: &str) {
         ("grep", "search for a literal byte substring while reading"),
         ("tac", "print files in reverse line order"),
         ("wc", "count lines, words, and bytes"),
-        ("sum", "BSD sum compatibility wrapper"),
         ("cksum", "POSIX cksum compatibility wrapper"),
         ("b3sum", "print BLAKE3 digests"),
+        ("b2sum", "print BLAKE2b-512 digests"),
+        ("md5sum", "print MD5 digests"),
         ("sha224sum", "print SHA-224 digests"),
         ("sha256sum", "print SHA-256 digests"),
         ("sha384sum", "print SHA-384 digests"),
@@ -888,7 +896,7 @@ fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp fgrep cat tac wc sum cksum b3sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp fgrep cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

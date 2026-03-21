@@ -9,6 +9,7 @@ use std::sync::mpsc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
     Md5,
+    Blake2b512,
     Sha224,
     Sha256,
     Sha384,
@@ -19,20 +20,24 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    fn message_digest(self) -> Option<MessageDigest> {
+    fn openssl_name(self) -> Option<&'static str> {
         match self {
-            Self::Md5 => Some(MessageDigest::md5()),
-            Self::Sha224 => Some(MessageDigest::sha224()),
-            Self::Sha256 => Some(MessageDigest::sha256()),
-            Self::Sha384 => Some(MessageDigest::sha384()),
-            Self::Sha512 => Some(MessageDigest::sha512()),
+            Self::Md5 => Some("MD5"),
+            Self::Blake2b512 => Some("BLAKE2b512"),
+            Self::Sha224 => Some("SHA224"),
+            Self::Sha256 => Some("SHA256"),
+            Self::Sha384 => Some("SHA384"),
+            Self::Sha512 => Some("SHA512"),
             Self::Blake3 | Self::FroBlockXxh3 | Self::FroBlockSha256 => None,
         }
     }
 }
 
 pub fn hash_file(path: &str, algorithm: HashAlgorithm, io_mode: IOMode) -> io::Result<Vec<u8>> {
-    if let Some(message_digest) = algorithm.message_digest() {
+    if let Some(name) = algorithm.openssl_name() {
+        let message_digest = MessageDigest::from_name(name).ok_or_else(|| {
+            io::Error::other(format!("OpenSSL digest algorithm not available: {name}"))
+        })?;
         return hash_file_ordered(path, message_digest, io_mode);
     }
     match algorithm {
@@ -44,6 +49,7 @@ pub fn hash_file(path: &str, algorithm: HashAlgorithm, io_mode: IOMode) -> io::R
             hash_file_block_digest(path, BlockHashAlgorithm::Sha256, io_mode)
         }
         HashAlgorithm::Md5
+        | HashAlgorithm::Blake2b512
         | HashAlgorithm::Sha224
         | HashAlgorithm::Sha256
         | HashAlgorithm::Sha384
@@ -156,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_matches_openssl_for_sha256_and_md5() {
+    fn hash_file_matches_openssl_for_sha256_md5_and_blake2b() {
         let path = unique_temp_file("fro-hash-file");
         let bytes = (0..(512 * 1024 + 123))
             .map(|i| ((i * 31) % 251) as u8)
@@ -175,12 +181,24 @@ mod tests {
             IOMode::PageCache,
         )
         .unwrap();
+        let blake2b = hash_file(
+            path.to_str().unwrap(),
+            HashAlgorithm::Blake2b512,
+            IOMode::PageCache,
+        )
+        .unwrap();
 
         assert_eq!(
             sha256,
             hash(MessageDigest::sha256(), &bytes).unwrap().to_vec()
         );
         assert_eq!(md5, hash(MessageDigest::md5(), &bytes).unwrap().to_vec());
+        assert_eq!(
+            blake2b,
+            hash(MessageDigest::from_name("BLAKE2b512").unwrap(), &bytes)
+                .unwrap()
+                .to_vec()
+        );
 
         let blake3 = hash_file(
             path.to_str().unwrap(),

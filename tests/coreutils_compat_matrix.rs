@@ -167,12 +167,13 @@ fn cartesian_hash_tools_match_system_output() {
     .unwrap();
 
     for (name, system_name) in [
-        ("sum", "sum"),
         ("cksum", "cksum"),
         ("sha224sum", "sha224sum"),
         ("sha256sum", "sha256sum"),
         ("sha384sum", "sha384sum"),
         ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
     ] {
         for flags in io_flag_sets() {
             for files in [
