@@ -1,7 +1,11 @@
-use blake3::Hasher as Blake3Hasher;
-use fro::{offset_writer_with_options, read_file_with_mode, visit_blocks_with_mode, IOMode};
-use rand::RngExt;
-use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+use crate::config::load_config;
+use crate::differ::diff_files;
+use crate::reader::{
+    grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode, LoadedFile,
+};
+use crate::writer::{write_generated_file, GeneratedWritePattern};
+use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};
+use memchr::memchr_iter;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -9,7 +13,24 @@ use std::path::Path;
 use std::sync::mpsc;
 
 const DEFAULT_SHRED_PASSES: usize = 1;
-const SHRED_BLOCK_SIZE: u64 = 1024 * 1024;
+pub fn is_coreutils_command(name: &str) -> bool {
+    matches!(
+        name,
+        "cat"
+            | "cmp"
+            | "fgrep"
+            | "tac"
+            | "wc"
+            | "sum"
+            | "cksum"
+            | "b3sum"
+            | "sha224sum"
+            | "sha256sum"
+            | "sha384sum"
+            | "sha512sum"
+            | "shred"
+    )
+}
 
 pub fn rewrite_alias_args(args: Vec<String>) -> Vec<String> {
     let Some(invoked) = invoked_name(args.first().map(String::as_str).unwrap_or_default()) else {
@@ -29,11 +50,38 @@ pub fn rewrite_alias_args(args: Vec<String>) -> Vec<String> {
     rewritten
 }
 
+pub fn rewrite_subcommand_alias(args: Vec<String>) -> Vec<String> {
+    if args.get(1).map(String::as_str) == Some("cp") {
+        let mut rewritten = args;
+        rewritten[1] = "copy".to_string();
+        return rewritten;
+    }
+    args
+}
+
 pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
     let Some(invoked) = invoked_name(args.first().map(String::as_str).unwrap_or_default()) else {
         return Ok(None);
     };
-    let code = match invoked.as_str() {
+    run_named_command(&invoked, args)
+}
+
+pub fn try_run_subcommand(
+    program: &str,
+    command: &str,
+    command_args: &[String],
+) -> io::Result<Option<i32>> {
+    if !is_coreutils_command(command) {
+        return Ok(None);
+    }
+    let mut args = Vec::with_capacity(command_args.len() + 1);
+    args.push(format!("{program} {command}"));
+    args.extend(command_args.iter().cloned());
+    run_named_command(command, &args)
+}
+
+fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
+    let code = match invoked {
         "cat" => {
             run_cat(args)?;
             0
@@ -57,23 +105,23 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
             0
         }
         "b3sum" => {
-            run_blake3_sum(args)?;
+            run_hash_sum(args, HashAlgorithm::Blake3)?;
             0
         }
         "sha224sum" => {
-            run_sha2_sum::<Sha224>(args)?;
+            run_hash_sum(args, HashAlgorithm::Sha224)?;
             0
         }
         "sha256sum" => {
-            run_sha2_sum::<Sha256>(args)?;
+            run_hash_sum(args, HashAlgorithm::Sha256)?;
             0
         }
         "sha384sum" => {
-            run_sha2_sum::<Sha384>(args)?;
+            run_hash_sum(args, HashAlgorithm::Sha384)?;
             0
         }
         "sha512sum" => {
-            run_sha2_sum::<Sha512>(args)?;
+            run_hash_sum(args, HashAlgorithm::Sha512)?;
             0
         }
         "shred" => {
@@ -108,9 +156,80 @@ fn parse_io_mode(args: &[String]) -> io::Result<(IOMode, Vec<String>)> {
 fn ensure_files(program: &str, files: Vec<String>, usage: &str) -> io::Result<Vec<String>> {
     if files.is_empty() {
         eprintln!("Usage: {} {}", program, usage);
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "missing file operand"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file operand",
+        ));
     }
     Ok(files)
+}
+
+fn internal_io_mode(io_mode: IOMode) -> crate::common::IOMode {
+    match io_mode {
+        IOMode::Auto => crate::common::IOMode::Auto,
+        IOMode::Direct => crate::common::IOMode::Direct,
+        IOMode::PageCache => crate::common::IOMode::PageCache,
+    }
+}
+
+fn load_file_bytes(path: &str, io_mode: IOMode, mode: &str) -> io::Result<LoadedFile> {
+    let config = load_config(None);
+    load_file_to_memory_for_mode(&config, mode, path, internal_io_mode(io_mode))
+}
+
+fn count_newlines_up_to(
+    path: &str,
+    io_mode: IOMode,
+    mode: &str,
+    end_offset: u64,
+) -> io::Result<u64> {
+    let data = load_file_bytes(path, io_mode, mode)?;
+    let bytes = data.data.as_slice();
+    let end = usize::try_from(end_offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?
+        .min(bytes.len());
+    Ok(memchr_iter(b'\n', &bytes[..end]).count() as u64)
+}
+
+fn write_matching_lines<W: Write>(
+    out: &mut W,
+    file: &str,
+    data: &[u8],
+    matches: &[u64],
+    multi_file: bool,
+    print_line_numbers: bool,
+) -> io::Result<()> {
+    let bytes = data;
+    let mut next_match = 0usize;
+    let mut line_start = 0usize;
+    let mut line_no = 1_u64;
+    while line_start < bytes.len() {
+        let rel_end = bytes[line_start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(bytes.len() - line_start);
+        let line_end = line_start + rel_end;
+        let mut matched = false;
+        while next_match < matches.len() && matches[next_match] < line_end as u64 {
+            if matches[next_match] >= line_start as u64 {
+                matched = true;
+            }
+            next_match += 1;
+        }
+        if matched {
+            if multi_file {
+                write!(out, "{}:", file)?;
+            }
+            if print_line_numbers {
+                write!(out, "{}:", line_no)?;
+            }
+            out.write_all(&bytes[line_start..line_end])?;
+        }
+        line_start = line_end;
+        line_no += 1;
+    }
+    Ok(())
 }
 
 fn visit_ordered_blocks<F>(path: &str, io_mode: IOMode, mut on_block: F) -> io::Result<()>
@@ -147,11 +266,16 @@ where
 fn run_cat(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file> [file ...]",
+    )?;
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     for file in files {
-        visit_ordered_blocks(&file, io_mode, |block| out.write_all(block))?;
+        let data = load_file_bytes(&file, io_mode, "read")?;
+        out.write_all(data.data.as_slice())?;
     }
     out.flush()
 }
@@ -159,7 +283,11 @@ fn run_cat(args: &[String]) -> io::Result<()> {
 fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file1> <file2>")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file1> <file2>",
+    )?;
     if files.len() != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -167,15 +295,25 @@ fn run_cmp(args: &[String]) -> io::Result<i32> {
         ));
     }
 
-    let first = read_file_with_mode(&files[0], io_mode)?;
-    let second = read_file_with_mode(&files[1], io_mode)?;
-    let shared_len = first.len().min(second.len());
-    if let Some(index) = first
-        .iter()
-        .zip(second.iter())
-        .position(|(left, right)| left != right)
-    {
-        let line = 1 + first[..index].iter().filter(|&&byte| byte == b'\n').count();
+    let config = load_config(None);
+    let diff_page_cache = config.get_params_for_path("diff", false, &files[0]);
+    let diff_direct = config.get_params_for_path("diff", true, &files[0]);
+    let mismatch = diff_files(
+        &files[0],
+        &files[1],
+        diff_page_cache.num_threads,
+        diff_page_cache.block_size,
+        diff_page_cache.qd,
+        diff_direct.num_threads,
+        diff_direct.block_size,
+        diff_direct.qd,
+        internal_io_mode(io_mode),
+        false,
+        false,
+    )?;
+    if mismatch != 0 {
+        let index = mismatch as usize - 1;
+        let line = 1 + count_newlines_up_to(&files[0], io_mode, "read", mismatch - 1)?;
         println!(
             "{} {} differ: byte {}, line {}",
             files[0],
@@ -186,20 +324,19 @@ fn run_cmp(args: &[String]) -> io::Result<i32> {
         return Ok(1);
     }
 
-    if first.len() != second.len() {
-        let line = first[..shared_len.min(first.len())]
-            .iter()
-            .filter(|&&byte| byte == b'\n')
-            .count();
+    let first_len = fs::metadata(&files[0])?.len();
+    let second_len = fs::metadata(&files[1])?.len();
+    let shared_len = first_len.min(second_len);
+    if first_len != second_len {
+        let eof_file = if first_len < second_len {
+            &files[0]
+        } else {
+            &files[1]
+        };
+        let line = count_newlines_up_to(eof_file, io_mode, "read", shared_len)?;
         eprintln!(
             "cmp: EOF on {} after byte {}, line {}",
-            if first.len() < second.len() {
-                &files[0]
-            } else {
-                &files[1]
-            },
-            shared_len,
-            line
+            eof_file, shared_len, line
         );
         return Ok(1);
     }
@@ -224,7 +361,10 @@ fn run_fgrep(args: &[String]) -> io::Result<i32> {
         }
     }
     let pattern = pattern.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "fgrep requires a search pattern")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fgrep requires a search pattern",
+        )
     })?;
     let files = ensure_files(
         program,
@@ -236,23 +376,28 @@ fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let mut out = BufWriter::new(stdout.lock());
     let mut matched_any = false;
     let multi_file = files.len() > 1;
+    let config = load_config(None);
     for file in files {
-        let data = read_file_with_mode(&file, io_mode)?;
-        let mut line_no = 0_u64;
-        for line in data.split_inclusive(|&byte| byte == b'\n') {
-            line_no += 1;
-            if !line.windows(pattern.len()).any(|window| window == pattern.as_bytes()) {
-                continue;
-            }
-            matched_any = true;
-            if multi_file {
-                write!(out, "{}:", file)?;
-            }
-            if print_line_numbers {
-                write!(out, "{}:", line_no)?;
-            }
-            out.write_all(line)?;
+        let (matches, _) = grep_match_offsets_for_mode(
+            &config,
+            "grep",
+            &file,
+            internal_io_mode(io_mode),
+            pattern.as_bytes(),
+        )?;
+        if matches.is_empty() {
+            continue;
         }
+        matched_any = true;
+        let data = load_file_bytes(&file, io_mode, "read")?;
+        write_matching_lines(
+            &mut out,
+            &file,
+            data.data.as_slice(),
+            &matches,
+            multi_file,
+            print_line_numbers,
+        )?;
     }
     out.flush()?;
     Ok(if matched_any { 0 } else { 1 })
@@ -261,12 +406,18 @@ fn run_fgrep(args: &[String]) -> io::Result<i32> {
 fn run_tac(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file> [file ...]",
+    )?;
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     for file in &files {
         let data = read_file_with_mode(file, io_mode)?;
-        let mut parts = data.split_inclusive(|&byte| byte == b'\n').collect::<Vec<_>>();
+        let mut parts = data
+            .split_inclusive(|&byte| byte == b'\n')
+            .collect::<Vec<_>>();
         if parts.is_empty() && !data.is_empty() {
             parts.push(data.as_slice());
         }
@@ -275,6 +426,41 @@ fn run_tac(args: &[String]) -> io::Result<()> {
         }
     }
     out.flush()
+}
+
+#[derive(Debug)]
+struct WcBlockCounts {
+    lines: u64,
+    words: u64,
+    bytes: u64,
+    starts_in_word: bool,
+    ends_in_word: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WcTotals {
+    lines: u64,
+    words: u64,
+    bytes: u64,
+}
+
+fn reduce_wc_counts(blocks: &[WcBlockCounts]) -> WcTotals {
+    let mut totals = WcTotals {
+        lines: 0,
+        words: 0,
+        bytes: 0,
+    };
+    let mut previous_ended_in_word = false;
+    for block in blocks {
+        totals.lines += block.lines;
+        totals.words += block.words;
+        totals.bytes += block.bytes;
+        if previous_ended_in_word && block.starts_in_word {
+            totals.words -= 1;
+        }
+        previous_ended_in_word = block.ends_in_word;
+    }
+    totals
 }
 
 fn run_wc(args: &[String]) -> io::Result<()> {
@@ -306,29 +492,41 @@ fn run_wc(args: &[String]) -> io::Result<()> {
         print_bytes = true;
     }
 
+    let config = load_config(None);
     for file in files {
-        let mut lines = 0_u64;
-        let mut words = 0_u64;
-        let mut bytes = 0_u64;
-        let mut in_word = false;
-        visit_ordered_blocks(&file, io_mode, |block| {
-            bytes += block.len() as u64;
-            for &byte in block {
-                if byte == b'\n' {
-                    lines += 1;
+        let blocks =
+            map_file_blocks_for_mode(&config, "read", &file, internal_io_mode(io_mode), |block| {
+                let mut words = 0_u64;
+                let mut prev_is_whitespace = true;
+                for &byte in block.data {
+                    let is_whitespace = byte.is_ascii_whitespace();
+                    if !is_whitespace && prev_is_whitespace {
+                        words += 1;
+                    }
+                    prev_is_whitespace = is_whitespace;
                 }
-                if byte.is_ascii_whitespace() {
-                    in_word = false;
-                } else if !in_word {
-                    words += 1;
-                    in_word = true;
-                }
-            }
-            Ok(())
-        })?;
+                Ok::<_, io::Error>(WcBlockCounts {
+                    lines: memchr_iter(b'\n', block.data).count() as u64,
+                    words,
+                    bytes: block.data.len() as u64,
+                    starts_in_word: block
+                        .data
+                        .first()
+                        .is_some_and(|byte| !byte.is_ascii_whitespace()),
+                    ends_in_word: block
+                        .data
+                        .last()
+                        .is_some_and(|byte| !byte.is_ascii_whitespace()),
+                })
+            })?;
+        let totals = reduce_wc_counts(&blocks.blocks);
 
         let mut first = true;
-        for (enabled, value) in [(print_lines, lines), (print_words, words), (print_bytes, bytes)] {
+        for (enabled, value) in [
+            (print_lines, totals.lines),
+            (print_words, totals.words),
+            (print_bytes, totals.bytes),
+        ] {
             if enabled {
                 if !first {
                     print!(" ");
@@ -342,42 +540,20 @@ fn run_wc(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn sha2_digest_hex<D>(path: &str, io_mode: IOMode) -> io::Result<String>
-where
-    D: Digest + Default,
-{
-    let mut hasher = D::default();
-    visit_ordered_blocks(path, io_mode, |block| {
-        hasher.update(block);
-        Ok(())
-    })?;
-    Ok(hex_digest(&hasher.finalize()))
-}
-
-fn run_sha2_sum<D>(args: &[String]) -> io::Result<()>
-where
-    D: Digest + Default,
-{
+fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file> [file ...]",
+    )?;
     for file in files {
-        println!("{}  {}", sha2_digest_hex::<D>(&file, io_mode)?, file);
-    }
-    Ok(())
-}
-
-fn run_blake3_sum(args: &[String]) -> io::Result<()> {
-    let program = args[0].as_str();
-    let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
-    for file in files {
-        let mut hasher = Blake3Hasher::new();
-        visit_ordered_blocks(&file, io_mode, |block| {
-            hasher.update(block);
-            Ok(())
-        })?;
-        println!("{}  {}", hex_digest(hasher.finalize().as_bytes()), file);
+        println!(
+            "{}  {}",
+            hex_digest(&hash_file(&file, algorithm, io_mode)?),
+            file
+        );
     }
     Ok(())
 }
@@ -385,7 +561,11 @@ fn run_blake3_sum(args: &[String]) -> io::Result<()> {
 fn run_sum(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file> [file ...]",
+    )?;
     let multi_file = files.len() > 1;
     for file in files {
         let mut checksum = 0_u16;
@@ -423,7 +603,11 @@ fn crc32_cksum_update(mut crc: u32, data: &[u8]) -> u32 {
 fn run_cksum(args: &[String]) -> io::Result<()> {
     let program = args[0].as_str();
     let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let files = ensure_files(program, files, "[--auto|--no-direct|--direct] <file> [file ...]")?;
+    let files = ensure_files(
+        program,
+        files,
+        "[--auto|--no-direct|--direct] <file> [file ...]",
+    )?;
     for file in files {
         let mut crc = 0_u32;
         let mut bytes = 0_u64;
@@ -502,17 +686,62 @@ fn overwrite_with_pattern(path: &str, size: u64, io_mode: IOMode, random: bool) 
     if size == 0 {
         return Ok(());
     }
-    let writer = offset_writer_with_options(path, size, io_mode, false)?;
-    let mut offset = 0_u64;
-    while offset < size {
-        let len = (size - offset).min(SHRED_BLOCK_SIZE) as usize;
-        let mut block = vec![0_u8; len];
+    let config = load_config(None);
+    let page_cache = config.get_params_for_path("write", false, path);
+    let direct = config.get_params_for_path("write", true, path);
+    write_generated_file(
+        path,
+        size,
+        page_cache.num_threads,
+        page_cache.block_size,
+        page_cache.qd,
+        direct.num_threads,
+        direct.block_size,
+        direct.qd,
+        internal_io_mode(io_mode),
         if random {
-            rand::rng().fill(&mut block[..]);
-        }
-        writer.write_at_offset(offset, block)?;
-        offset += len as u64;
+            GeneratedWritePattern::Random
+        } else {
+            GeneratedWritePattern::Zero
+        },
+    )?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reduce_wc_counts, WcBlockCounts, WcTotals};
+
+    #[test]
+    fn reduce_wc_counts_merges_cross_block_words() {
+        let blocks = [
+            WcBlockCounts {
+                lines: 0,
+                words: 1,
+                bytes: 3,
+                starts_in_word: true,
+                ends_in_word: true,
+            },
+            WcBlockCounts {
+                lines: 1,
+                words: 1,
+                bytes: 4,
+                starts_in_word: true,
+                ends_in_word: false,
+            },
+        ];
+
+        assert_eq!(
+            reduce_wc_counts(&blocks),
+            WcTotals {
+                lines: 1,
+                words: 1,
+                bytes: 7,
+            }
+        );
     }
-    writer.finish()?;
-    OpenOptions::new().read(true).write(true).open(path)?.sync_all()
 }

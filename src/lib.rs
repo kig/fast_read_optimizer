@@ -1,5 +1,7 @@
 mod api;
+mod blake3_hash;
 mod common;
+mod file_hash;
 mod io_util;
 mod mincore;
 mod verified_copy;
@@ -18,7 +20,9 @@ pub use api::{
     visit_blocks_with_mode, write_file, write_file_range, write_file_range_with_mode,
     write_file_with_mode,
 };
+pub use blake3_hash::hash_file_blake3;
 pub use common::{CopyAutoMode, CopyStrategy, IOMode};
+pub use file_hash::{hash_file, hash_file_sha256, HashAlgorithm};
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,
 };

@@ -3,11 +3,13 @@ src/
     fro-benchmark.rs
     fro-optimize.rs
   api.rs
+  blake3_hash.rs
   block_hash.rs
   common.rs
   config.rs
   coreutils.rs
   differ.rs
+  file_hash.rs
   io_util.rs
   lib.rs
   main.rs

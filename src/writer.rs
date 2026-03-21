@@ -19,6 +19,12 @@ pub struct ResolvedWriteParams {
     pub block_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedWritePattern {
+    Random,
+    Zero,
+}
+
 #[allow(dead_code)]
 struct PendingAppend {
     buffer: AlignedBuffer,
@@ -1196,9 +1202,14 @@ pub fn overwrite_changed_chunks_direct(
             "direct write block size does not fit in usize",
         )
     })?;
-    let stride = (num_threads as u64).checked_mul(scan_block_size as u64).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "changed-chunk stride overflowed")
-    })?;
+    let stride = (num_threads as u64)
+        .checked_mul(scan_block_size as u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "changed-chunk stride overflowed",
+            )
+        })?;
     let common_len = source_len.min(target_len);
     let mut threads = Vec::with_capacity(num_threads);
 
@@ -1226,7 +1237,10 @@ pub fn overwrite_changed_chunks_direct(
             let mut next_offset = (thread_id as u64)
                 .checked_mul(scan_block_size as u64)
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "changed-chunk offset overflowed")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "changed-chunk offset overflowed",
+                    )
                 })?;
 
             while next_offset < common_len && free_slots.last().is_some() {
@@ -1255,7 +1269,10 @@ pub fn overwrite_changed_chunks_direct(
                     sqe_target.set_user_data((slot as u64) | (1u64 << 40));
                 }
                 next_offset = next_offset.checked_add(stride).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "changed-chunk offset overflowed")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "changed-chunk offset overflowed",
+                    )
                 })?;
                 inflight += 2;
             }
@@ -1304,16 +1321,15 @@ pub fn overwrite_changed_chunks_direct(
                     ready_source[slot] = false;
                     ready_target[slot] = false;
                     let offset = buffer_offsets[slot];
-                    let len =
-                        usize::try_from((common_len - offset).min(scan_block_size as u64)).map_err(
-                            |_| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "changed-chunk length does not fit in usize",
-                                )
-                            },
-                        )?;
-                    if source_buffers[slot].as_slice()[..len] != target_buffers[slot].as_slice()[..len]
+                    let len = usize::try_from((common_len - offset).min(scan_block_size as u64))
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "changed-chunk length does not fit in usize",
+                            )
+                        })?;
+                    if source_buffers[slot].as_slice()[..len]
+                        != target_buffers[slot].as_slice()[..len]
                     {
                         let mut write_offset = 0usize;
                         while write_offset < len {
@@ -1354,7 +1370,10 @@ pub fn overwrite_changed_chunks_direct(
                         sqe_target.set_user_data((slot as u64) | (1u64 << 40));
                     }
                     next_offset = next_offset.checked_add(stride).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "changed-chunk offset overflowed")
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "changed-chunk offset overflowed",
+                        )
                     })?;
                     inflight += 2;
                     submitted = true;
@@ -1372,11 +1391,11 @@ pub fn overwrite_changed_chunks_direct(
             while tail_offset < source_len {
                 let len = usize::try_from((source_len - tail_offset).min(scan_block_size as u64))
                     .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "changed-chunk tail length does not fit in usize",
-                        )
-                    })?;
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "changed-chunk tail length does not fit in usize",
+                    )
+                })?;
                 let mut tail_buf = vec![0u8; len];
                 read_full_at(&source_file, &mut tail_buf, tail_offset)?;
                 let mut write_offset = 0usize;
@@ -1513,7 +1532,36 @@ pub fn write_file(
         qd_d,
         IOMode::Direct,
         io_mode_write,
+        GeneratedWritePattern::Random,
     );
+}
+
+pub fn write_generated_file(
+    filename: &str,
+    total_size: u64,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode_write: IOMode,
+    pattern: GeneratedWritePattern,
+) -> io::Result<u64> {
+    _write_file_internal(
+        None,
+        filename,
+        Some(total_size),
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        IOMode::Direct,
+        io_mode_write,
+        pattern,
+    )
 }
 
 /*
@@ -1763,6 +1811,7 @@ fn _write_file_internal(
     qd_d: usize,
     io_mode_read: IOMode,
     io_mode_write: IOMode,
+    generated_pattern: GeneratedWritePattern,
 ) -> io::Result<u64> {
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
@@ -1796,7 +1845,9 @@ fn _write_file_internal(
 
     let random_block = if source.is_none() {
         let mut block = vec![0u8; block_size as usize];
-        rand::rng().fill(&mut block[..]);
+        if generated_pattern == GeneratedWritePattern::Random {
+            rand::rng().fill(&mut block[..]);
+        }
         Some(Arc::new(block))
     } else {
         None

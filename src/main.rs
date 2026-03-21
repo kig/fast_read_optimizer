@@ -9,6 +9,8 @@ mod io_util;
 mod mincore;
 mod optimizer;
 mod reader;
+#[allow(dead_code)]
+mod stream;
 mod verified_copy;
 mod writer;
 
@@ -256,11 +258,11 @@ fn resolve_copy_execution(
                 inspect_copy_auto_state(source_path, path);
             let plan = if rewrite_mode != CopyRewriteMode::Full
                 && should_prefer_cached_diff_overwrite(
-                source_cached,
-                target_cached,
-                source_len,
-                target_len,
-            ) {
+                    source_cached,
+                    target_cached,
+                    source_len,
+                    target_len,
+                ) {
                 if direct_writer_supported(path)? {
                     HeuristicCopyPlan::DiffOverwrite
                 } else {
@@ -341,10 +343,7 @@ fn target_is_similar_size(source_len: Option<u64>, target_len: Option<u64>) -> b
         return target_len == 0;
     }
 
-    target_len
-        .saturating_mul(100)
-        .saturating_div(source_len)
-        >= TARGET_SIZE_THRESHOLD_PERCENT
+    target_len.saturating_mul(100).saturating_div(source_len) >= TARGET_SIZE_THRESHOLD_PERCENT
 }
 
 #[cfg(kani)]
@@ -503,6 +502,97 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "Scan a file in page cache for a literal marker string",
                 "grep --no-direct -n 1 needle /mnt/fast/bigfile.dat",
             )],
+        }),
+        "cat" => Some(CommandHelp {
+            name: "cat",
+            usage: "cat [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print one or more files using fro's fast read path.",
+            notes: &["Useful as a compatibility wrapper over the same IO-mode flags as fro reads."],
+            examples: &[("Print two files", "cat a.txt b.txt")],
+        }),
+        "cmp" => Some(CommandHelp {
+            name: "cmp",
+            usage: "cmp [--auto|--no-direct|--direct] <file1> <file2>",
+            summary: "Compare two files using fro's diff engine and GNU cmp-style reporting.",
+            notes: &["Exits nonzero on mismatch or size difference."],
+            examples: &[("Compare two files", "cmp a.bin b.bin")],
+        }),
+        "fgrep" => Some(CommandHelp {
+            name: "fgrep",
+            usage: "fgrep [-n] [--auto|--no-direct|--direct] <pattern> <file> [file ...]",
+            summary: "Literal line-oriented grep on top of fro's fast substring scanner.",
+            notes: &["Matches GNU grep -F visible behavior for the covered compatibility matrix."],
+            examples: &[("Print matching lines with numbers", "fgrep -n needle notes.txt")],
+        }),
+        "tac" => Some(CommandHelp {
+            name: "tac",
+            usage: "tac [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print files with line order reversed within each file.",
+            notes: &[],
+            examples: &[("Reverse one file by line", "tac notes.txt")],
+        }),
+        "wc" => Some(CommandHelp {
+            name: "wc",
+            usage: "wc [-l] [-w] [-c] [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Count lines, words, and bytes using fro block visitors.",
+            notes: &["Without -l/-w/-c, prints all three counts."],
+            examples: &[("Count lines and words", "wc -l -w notes.txt")],
+        }),
+        "sum" => Some(CommandHelp {
+            name: "sum",
+            usage: "sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "BSD sum compatibility wrapper on top of fro file reads.",
+            notes: &[],
+            examples: &[("Print BSD sum", "sum archive.tar")],
+        }),
+        "cksum" => Some(CommandHelp {
+            name: "cksum",
+            usage: "cksum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "POSIX cksum compatibility wrapper on top of fro file reads.",
+            notes: &[],
+            examples: &[("Print POSIX CRC32 and size", "cksum archive.tar")],
+        }),
+        "b3sum" => Some(CommandHelp {
+            name: "b3sum",
+            usage: "b3sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print BLAKE3 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
+        }),
+        "sha224sum" => Some(CommandHelp {
+            name: "sha224sum",
+            usage: "sha224sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print SHA-224 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with SHA-224", "sha224sum bigfile.dat")],
+        }),
+        "sha256sum" => Some(CommandHelp {
+            name: "sha256sum",
+            usage: "sha256sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print SHA-256 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with SHA-256", "sha256sum bigfile.dat")],
+        }),
+        "sha384sum" => Some(CommandHelp {
+            name: "sha384sum",
+            usage: "sha384sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print SHA-384 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with SHA-384", "sha384sum bigfile.dat")],
+        }),
+        "sha512sum" => Some(CommandHelp {
+            name: "sha512sum",
+            usage: "sha512sum [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print SHA-512 digests for one or more files.",
+            notes: &[],
+            examples: &[("Hash one file with SHA-512", "sha512sum bigfile.dat")],
+        }),
+        "shred" => Some(CommandHelp {
+            name: "shred",
+            usage: "shred [-n passes] [-z] [-u] [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Overwrite files with random or zero patterns, optionally removing them.",
+            notes: &["This compatibility surface currently focuses on the covered basic flags."],
+            examples: &[("Zero a file once and keep it", "shred -n 0 -z scratch.bin")],
         }),
         "write" => Some(CommandHelp {
             name: "write",
@@ -745,7 +835,20 @@ fn print_general_help(program: &str) {
     println!();
     println!("Utilities:");
     for (name, summary) in [
+        ("cat", "print files using the fro read path"),
+        ("cmp", "compare two files using the fro diff engine"),
+        ("fgrep", "literal line-oriented grep compatibility wrapper"),
         ("grep", "search for a literal byte substring while reading"),
+        ("tac", "print files in reverse line order"),
+        ("wc", "count lines, words, and bytes"),
+        ("sum", "BSD sum compatibility wrapper"),
+        ("cksum", "POSIX cksum compatibility wrapper"),
+        ("b3sum", "print BLAKE3 digests"),
+        ("sha224sum", "print SHA-224 digests"),
+        ("sha256sum", "print SHA-256 digests"),
+        ("sha384sum", "print SHA-384 digests"),
+        ("sha512sum", "print SHA-512 digests"),
+        ("shred", "overwrite files with patterns"),
         (
             "write",
             "rewrite or create a file through the tuned write path",
@@ -783,9 +886,11 @@ fn print_general_help(program: &str) {
     println!("  -c, --config PATH  override config path");
     println!("  -v, --verbose      print more about the current run");
     println!();
-    println!("Multicall aliases:");
-    println!("  cp cmp fgrep cat tac wc sum cksum b3sum sha224sum sha256sum sha384sum sha512sum shred");
-    println!("  (invoke via argv[0], e.g. by symlinking `fro` to one of those names)");
+    println!("Coreutils compatibility names:");
+    println!(
+        "  cp cmp fgrep cat tac wc sum cksum b3sum sha224sum sha256sum sha384sum sha512sum shred"
+    );
+    println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();
     println!("Related tools:");
     println!("  ./target/release/fro-optimize --help");
@@ -801,7 +906,7 @@ fn try_main() -> io::Result<i32> {
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
         return Ok(code);
     }
-    let args = coreutils::rewrite_alias_args(raw_args);
+    let args = coreutils::rewrite_subcommand_alias(coreutils::rewrite_alias_args(raw_args));
     if args.len() < 2 || is_help_flag(args[1].as_str()) {
         print_general_help(args[0].as_str());
         return Ok(0);
@@ -815,6 +920,11 @@ fn try_main() -> io::Result<i32> {
             print_general_help(args[0].as_str());
         }
         return Ok(0);
+    }
+    if let Some(code) =
+        coreutils::try_run_subcommand(args[0].as_str(), args[1].as_str(), &args[2..])?
+    {
+        return Ok(code);
     }
     let legacy_copy_via_memory = args[1] == "copy-via-memory";
     let mode = if legacy_copy_via_memory {
@@ -1523,6 +1633,7 @@ fn try_main() -> io::Result<i32> {
                         diff_direct.qd,
                         io_mode,
                         false,
+                        true,
                     )?;
                     if diff_res != 0 {
                         return Err(io::Error::new(
@@ -1633,6 +1744,7 @@ fn try_main() -> io::Result<i32> {
                     p[5] as usize,
                     io_mode,
                     bench_only,
+                    true,
                 )?;
                 if res != 0 && mode == "diff" {
                     exit_code = 1;
@@ -1858,9 +1970,21 @@ mod tests {
             Some(1024),
             Some(1024)
         ));
-        assert!(should_prefer_cached_read_direct_write(true, Some(1024), Some(900)));
-        assert!(should_prefer_cached_read_direct_write(true, Some(1024), Some(2048)));
-        assert!(should_prefer_cached_read_direct_write(true, Some(0), Some(0)));
+        assert!(should_prefer_cached_read_direct_write(
+            true,
+            Some(1024),
+            Some(900)
+        ));
+        assert!(should_prefer_cached_read_direct_write(
+            true,
+            Some(1024),
+            Some(2048)
+        ));
+        assert!(should_prefer_cached_read_direct_write(
+            true,
+            Some(0),
+            Some(0)
+        ));
         assert!(!should_prefer_cached_read_direct_write(
             false,
             Some(1024),
@@ -1966,6 +2090,9 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(path, "copy path: via-memory [read=page-cache, write=direct]");
+        assert_eq!(
+            path,
+            "copy path: via-memory [read=page-cache, write=direct]"
+        );
     }
 }

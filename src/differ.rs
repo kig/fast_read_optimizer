@@ -20,6 +20,7 @@ fn thread_differ(
     total_size: u64,
     mismatch: Arc<AtomicU64>,
     bench_only: bool,
+    report_mismatch: bool,
     use_direct: bool,
 ) -> io::Result<()> {
     let mut buffers1 = Vec::new();
@@ -132,12 +133,14 @@ fn thread_differ(
                         for j in 0..len {
                             if buffers1[idx].as_slice()[j] != buffers2[idx].as_slice()[j] {
                                 let absolute_offset = off + j as u64;
-                                println!(
-                                    "Mismatch at offset {}: {:02x} != {:02x}",
-                                    absolute_offset,
-                                    buffers1[idx].as_slice()[j],
-                                    buffers2[idx].as_slice()[j]
-                                );
+                                if report_mismatch {
+                                    println!(
+                                        "Mismatch at offset {}: {:02x} != {:02x}",
+                                        absolute_offset,
+                                        buffers1[idx].as_slice()[j],
+                                        buffers2[idx].as_slice()[j]
+                                    );
+                                }
                                 mismatch
                                     .compare_exchange(
                                         0,
@@ -224,6 +227,7 @@ pub fn diff_files(
     qd_d: usize,
     io_mode: IOMode,
     bench_only: bool,
+    report_mismatch: bool,
 ) -> io::Result<u64> {
     let mismatch = Arc::new(AtomicU64::new(0));
     let mut threads = vec![];
@@ -274,6 +278,7 @@ pub fn diff_files(
                 file_size,
                 mismatch,
                 bench_only,
+                report_mismatch,
                 use_direct,
             )
         }));

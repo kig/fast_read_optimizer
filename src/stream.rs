@@ -1,9 +1,12 @@
+use crate::common::IOMode;
 use crate::config::LoadedConfig;
-use crate::reader::{resolve_reader_params_for_mode, visit_file_blocks};
+use crate::reader::{
+    resolve_reader_params, resolve_reader_params_for_mode, visit_file_blocks,
+    visit_file_blocks_with_resolved_params, ResolvedReadParams,
+};
 use crate::writer::{
     resolve_writer_params_for_mode, OffsetWriter, ResolvedWriteParams, SequentialWriter,
 };
-use crate::IOMode;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -149,6 +152,95 @@ impl ParallelFile {
         F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
     {
         self.foreach_block_parallel(self.block_size()?, visit)
+    }
+
+    pub fn map_reduce_blocks<T, M, R, U>(
+        &self,
+        block_size: u64,
+        map: M,
+        reduce: R,
+    ) -> std::io::Result<U>
+    where
+        T: Send + 'static,
+        M: Fn(usize, &[u8]) -> std::io::Result<T> + Send + Sync + 'static,
+        R: FnOnce(Vec<T>, ParallelReadReport) -> std::io::Result<U>,
+    {
+        let path = self.path.clone();
+        let config = self.config.clone();
+        let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
+        let page_cache = config.get_params_for_path(&self.mode, false, &path);
+        let direct = config.get_params_for_path(&self.mode, true, &path);
+        let params = resolve_reader_params(
+            &path,
+            &crate::config::IOParams {
+                num_threads: page_cache.num_threads,
+                block_size,
+                qd: page_cache.qd,
+            },
+            &crate::config::IOParams {
+                num_threads: direct.num_threads,
+                block_size,
+                qd: direct.qd,
+            },
+            io_mode,
+        )?;
+        self.map_reduce_blocks_with_params(params, map, reduce)
+    }
+
+    pub fn map_reduce_blocks_with_params<T, M, R, U>(
+        &self,
+        params: ResolvedReadParams,
+        map: M,
+        reduce: R,
+    ) -> std::io::Result<U>
+    where
+        T: Send + 'static,
+        M: Fn(usize, &[u8]) -> std::io::Result<T> + Send + Sync + 'static,
+        R: FnOnce(Vec<T>, ParallelReadReport) -> std::io::Result<U>,
+    {
+        if params.block_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "block_size must be greater than zero",
+            ));
+        }
+
+        let block_count = self.block_count(params.block_size)?;
+        let mapped = Arc::new(Mutex::new(
+            std::iter::repeat_with(|| None)
+                .take(block_count)
+                .collect::<Vec<Option<T>>>(),
+        ));
+        let mapped_slots = Arc::clone(&mapped);
+        let path = self.path.clone();
+
+        let (bytes_read, file_size) =
+            visit_file_blocks_with_resolved_params(&path, params, move |block| {
+                let value = map(block.block_index, block.data)?;
+                mapped_slots.lock().unwrap()[block.block_index] = Some(value);
+                Ok(())
+            })?;
+
+        let mapped = Arc::into_inner(mapped)
+            .ok_or_else(|| std::io::Error::other("mapped block storage still shared"))?
+            .into_inner()
+            .map_err(|_| std::io::Error::other("mapped block storage poisoned"))?;
+        let values = mapped
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.ok_or_else(|| std::io::Error::other(format!("missing mapped block {index}")))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        reduce(
+            values,
+            ParallelReadReport {
+                bytes_read,
+                file_size,
+                params,
+            },
+        )
     }
 
     pub fn foreach_index_parallel<F>(&self, job_count: usize, visit: F) -> std::io::Result<()>
@@ -539,6 +631,40 @@ mod tests {
         assert_eq!(
             *page_cache_chunks.lock().unwrap(),
             *direct_chunks.lock().unwrap()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn map_reduce_blocks_preserves_block_order_for_reducer() {
+        let path = unique_temp_file("fro-parallel-file-map-reduce");
+        fs::write(&path, b"abcdefghijkl").unwrap();
+
+        let cfg = crate::config::load_config(None);
+        let file = ParallelFile::open(&cfg, "read", &path, IOMode::PageCache).unwrap();
+        let parts = file
+            .map_reduce_blocks_with_params(
+                ResolvedReadParams {
+                    use_direct: false,
+                    num_threads: 2,
+                    block_size: 4,
+                    qd: 1,
+                },
+                |block_index, data| Ok((block_index, data.to_vec())),
+                |parts, report| {
+                    assert_eq!(report.file_size, 12);
+                    Ok(parts)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            parts,
+            vec![
+                (0, b"abcd".to_vec()),
+                (1, b"efgh".to_vec()),
+                (2, b"ijkl".to_vec()),
+            ]
         );
         let _ = fs::remove_file(path);
     }

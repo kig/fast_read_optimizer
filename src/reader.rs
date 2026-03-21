@@ -221,6 +221,66 @@ fn find_boundary_matches(prev: &GrepScanBlock, next: &GrepScanBlock, pattern: &[
         .collect()
 }
 
+fn grep_match_offsets(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    pattern: &[u8],
+) -> std::io::Result<(Vec<u64>, u64)> {
+    let blocks = map_file_blocks(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+        {
+            let pattern = pattern.to_vec();
+            move |block| Ok::<_, std::io::Error>(collect_grep_scan_block(block, &pattern))
+        },
+    )?;
+
+    let mut all_matches = Vec::new();
+    for block in &blocks.blocks {
+        all_matches.extend(block.matches.iter().copied());
+    }
+    for pair in blocks.blocks.windows(2) {
+        all_matches.extend(find_boundary_matches(&pair[0], &pair[1], pattern));
+    }
+    all_matches.sort_unstable();
+    all_matches.dedup();
+    Ok((all_matches, blocks.bytes_read))
+}
+
+pub fn grep_match_offsets_for_mode(
+    config: &LoadedConfig,
+    mode: &str,
+    filename: &str,
+    io_mode: IOMode,
+    pattern: &[u8],
+) -> std::io::Result<(Vec<u64>, u64)> {
+    let page_cache = config.get_params_for_path(mode, false, filename);
+    let direct = config.get_params_for_path(mode, true, filename);
+    grep_match_offsets(
+        filename,
+        page_cache.num_threads,
+        page_cache.block_size,
+        page_cache.qd,
+        direct.num_threads,
+        direct.block_size,
+        direct.qd,
+        io_mode,
+        pattern,
+    )
+}
+
 #[allow(dead_code)]
 fn validate_read_params(params: ResolvedReadParams) -> std::io::Result<()> {
     if params.num_threads == 0 {
@@ -1007,9 +1067,24 @@ where
         io_mode,
     )?;
 
+    let (bytes_read, file_size) =
+        visit_file_blocks_with_resolved_params(filename, params, visitor)?;
+    Ok((bytes_read, file_size, params))
+}
+
+pub fn visit_file_blocks_with_resolved_params<F>(
+    filename: &str,
+    params: ResolvedReadParams,
+    visitor: F,
+) -> std::io::Result<(u64, u64)>
+where
+    F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    validate_read_params(params)?;
+
     let file_size = std::fs::metadata(filename)?.len();
     if file_size == 0 {
-        return Ok((0, 0, params));
+        return Ok((0, 0));
     }
     let read_count = Arc::new(AtomicU64::new(0));
     let visitor = Arc::new(visitor);
@@ -1043,7 +1118,7 @@ where
             .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
     }
 
-    Ok((read_count.load(Ordering::SeqCst), file_size, params))
+    Ok((read_count.load(Ordering::SeqCst), file_size))
 }
 
 #[allow(dead_code)]
@@ -1084,7 +1159,7 @@ pub fn read_file(
     io_mode: IOMode,
 ) -> std::io::Result<u64> {
     if !pattern.is_empty() {
-        let blocks = map_file_blocks(
+        let (all_matches, bytes_read) = grep_match_offsets(
             filename,
             num_threads_p,
             block_size_p,
@@ -1093,29 +1168,12 @@ pub fn read_file(
             block_size_d,
             qd_d,
             io_mode,
-            {
-                let pattern = pattern.as_bytes().to_vec();
-                move |block| Ok::<_, std::io::Error>(collect_grep_scan_block(block, &pattern))
-            },
+            pattern.as_bytes(),
         )?;
-
-        let mut all_matches = Vec::new();
-        for block in &blocks.blocks {
-            all_matches.extend(block.matches.iter().copied());
-        }
-        for pair in blocks.blocks.windows(2) {
-            all_matches.extend(find_boundary_matches(
-                &pair[0],
-                &pair[1],
-                pattern.as_bytes(),
-            ));
-        }
-        all_matches.sort_unstable();
-        all_matches.dedup();
         for m in all_matches {
             println!("{}:{}", m, pattern);
         }
-        return Ok(blocks.bytes_read);
+        return Ok(bytes_read);
     }
     let (bytes_read, _, _) = visit_file_blocks(
         filename,

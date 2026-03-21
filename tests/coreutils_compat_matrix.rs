@@ -1,8 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,17 +23,12 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     path
 }
 
-fn alias_path(tmp: &Path, name: &str) -> PathBuf {
-    let path = tmp.join(name);
-    symlink(env!("CARGO_BIN_EXE_fro"), &path).unwrap();
-    path
-}
-
-fn run_alias(alias: &Path, args: &[&str]) -> Output {
-    Command::new(alias)
+fn run_fro(command: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_fro"))
+        .arg(command)
         .args(args)
         .output()
-        .expect("failed to run alias")
+        .expect("failed to run fro subcommand")
 }
 
 fn run_system(program: &str, args: &[&str]) -> Output {
@@ -97,8 +91,6 @@ fn io_flag_sets() -> Vec<Vec<&'static str>> {
 #[test]
 fn cartesian_cat_and_tac_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-cat-matrix");
-    let cat = alias_path(&tmp, "cat");
-    let tac = alias_path(&tmp, "tac");
     let a = tmp.join("a.txt");
     let b = tmp.join("b.txt");
     fs::write(&a, b"alpha\nbeta\n").unwrap();
@@ -112,12 +104,12 @@ fn cartesian_cat_and_tac_match_system_output() {
             let mut args = flags.clone();
             args.extend(files.iter().copied());
             assert_same_result(
-                run_alias(&cat, &args),
+                run_fro("cat", &args),
                 run_system("cat", &files),
                 &format!("cat {:?}", args),
             );
             assert_same_result(
-                run_alias(&tac, &args),
+                run_fro("tac", &args),
                 run_system("tac", &files),
                 &format!("tac {:?}", args),
             );
@@ -128,7 +120,6 @@ fn cartesian_cat_and_tac_match_system_output() {
 #[test]
 fn cartesian_wc_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-wc-matrix");
-    let wc = alias_path(&tmp, "wc");
     let path = tmp.join("text.txt");
     fs::write(&path, b"one two\nthree four\n").unwrap();
 
@@ -149,7 +140,7 @@ fn cartesian_wc_matches_system_output() {
             let mut sys_args = wc_flags;
             sys_args.push(path.to_str().unwrap());
             assert_same_wc(
-                run_alias(&wc, &args),
+                run_fro("wc", &args),
                 run_system("wc", &sys_args),
                 &format!("wc {:?}", args),
             );
@@ -162,8 +153,18 @@ fn cartesian_hash_tools_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-hash-matrix");
     let path_a = tmp.join("a.bin");
     let path_b = tmp.join("b.bin");
-    fs::write(&path_a, (0..65599).map(|i| (i % 251) as u8).collect::<Vec<_>>()).unwrap();
-    fs::write(&path_b, (0..32791).map(|i| ((i * 7) % 251) as u8).collect::<Vec<_>>()).unwrap();
+    fs::write(
+        &path_a,
+        (0..65599).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &path_b,
+        (0..32791)
+            .map(|i| ((i * 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
 
     for (name, system_name) in [
         ("sum", "sum"),
@@ -173,7 +174,6 @@ fn cartesian_hash_tools_match_system_output() {
         ("sha384sum", "sha384sum"),
         ("sha512sum", "sha512sum"),
     ] {
-        let alias = alias_path(&tmp, name);
         for flags in io_flag_sets() {
             for files in [
                 vec![path_a.to_str().unwrap()],
@@ -182,7 +182,7 @@ fn cartesian_hash_tools_match_system_output() {
                 let mut args = flags.clone();
                 args.extend(files.iter().copied());
                 assert_same_result(
-                    run_alias(&alias, &args),
+                    run_fro(name, &args),
                     run_system(system_name, &files),
                     &format!("{name} {:?}", args),
                 );
@@ -194,8 +194,6 @@ fn cartesian_hash_tools_match_system_output() {
 #[test]
 fn cartesian_cmp_and_fgrep_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-cmp-grep-matrix");
-    let cmp = alias_path(&tmp, "cmp");
-    let fgrep = alias_path(&tmp, "fgrep");
     let equal_a = tmp.join("equal-a.txt");
     let equal_b = tmp.join("equal-b.txt");
     let diff_a = tmp.join("diff-a.txt");
@@ -223,7 +221,7 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
             let mut args = flags.clone();
             args.extend(files.iter().copied());
             assert_same_result(
-                run_alias(&cmp, &args),
+                run_fro("cmp", &args),
                 run_system("cmp", &files),
                 &format!("cmp {:?}", args),
             );
@@ -241,7 +239,7 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
             let mut system_args = vec!["-F"];
             system_args.extend(grep_args.iter().copied());
             assert_same_result(
-                run_alias(&fgrep, &args),
+                run_fro("fgrep", &args),
                 run_system(system_program, &system_args),
                 &format!("fgrep {:?}", args),
             );
@@ -252,25 +250,32 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
 #[test]
 fn cartesian_cp_and_shred_match_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-copy-shred-matrix");
-    let cp = alias_path(&tmp, "cp");
-    let shred = alias_path(&tmp, "shred");
 
     for flags in io_flag_sets() {
         let source = tmp.join(format!("cp-src-{}.bin", flags.join("_")));
         let fro_target = tmp.join(format!("cp-fro-{}.bin", flags.join("_")));
         let sys_target = tmp.join(format!("cp-sys-{}.bin", flags.join("_")));
-        fs::write(&source, (0..131072).map(|i| ((i * 5) % 251) as u8).collect::<Vec<_>>()).unwrap();
+        fs::write(
+            &source,
+            (0..131072)
+                .map(|i| ((i * 5) % 251) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
         let mut fro_args = flags.clone();
         fro_args.push(source.to_str().unwrap());
         fro_args.push(fro_target.to_str().unwrap());
         let sys_args = [source.to_str().unwrap(), sys_target.to_str().unwrap()];
         assert_same_result(
-            run_alias(&cp, &fro_args),
+            run_fro("cp", &fro_args),
             run_system("cp", &sys_args),
             &format!("cp {:?}", fro_args),
         );
-        assert_eq!(fs::read(&fro_target).unwrap(), fs::read(&sys_target).unwrap());
+        assert_eq!(
+            fs::read(&fro_target).unwrap(),
+            fs::read(&sys_target).unwrap()
+        );
 
         let fro_zero = tmp.join(format!("shred-fro-zero-{}.bin", flags.join("_")));
         let sys_zero = tmp.join(format!("shred-sys-zero-{}.bin", flags.join("_")));
@@ -280,7 +285,7 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
         fro_zero_args.extend(["-n", "0", "-z", fro_zero.to_str().unwrap()]);
         let sys_zero_args = ["-n", "0", "-z", sys_zero.to_str().unwrap()];
         assert_same_result(
-            run_alias(&shred, &fro_zero_args),
+            run_fro("shred", &fro_zero_args),
             run_system("shred", &sys_zero_args),
             &format!("shred zero {:?}", fro_zero_args),
         );
@@ -294,7 +299,7 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
         fro_remove_args.extend(["-n", "0", "-u", fro_remove.to_str().unwrap()]);
         let sys_remove_args = ["-n", "0", "-u", sys_remove.to_str().unwrap()];
         assert_same_result(
-            run_alias(&shred, &fro_remove_args),
+            run_fro("shred", &fro_remove_args),
             run_system("shred", &sys_remove_args),
             &format!("shred remove {:?}", fro_remove_args),
         );
