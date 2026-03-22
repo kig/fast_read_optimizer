@@ -483,6 +483,11 @@ Completed initial slice:
   - exact result on success: `result = min(file_size - offset, block_size)`
   - explicit `InvalidInput` rejection for `offset > file_size`
   - monotonicity in offset: if `offset_a <= offset_b <= file_size`, then `len(offset_a) >= len(offset_b)`
+- `coreutils::permission_denied_components()` now has Kani harnesses that prove:
+  - `PermissionDenied`, `EACCES`, and `EPERM` are all classified as permission failures
+  - unrelated kinds / errnos are rejected
+- `coreutils::du_node_ready()` now has a Kani harness that proves the node-completion predicate is exactly:
+  - `scanned && own_stat_done && pending_children == 0 && pending_file_stats == 0 && !completed`
 
 Most promising next candidates:
 
@@ -496,13 +501,17 @@ Current command surface:
 cargo kani --harness io_util::kani_proofs::expected_read_len_matches_min_formula --exact
 cargo kani --harness io_util::kani_proofs::expected_read_len_rejects_offsets_past_end --exact
 cargo kani --harness io_util::kani_proofs::expected_read_len_is_monotonic_in_offset --exact
+cargo kani --harness coreutils::kani_proofs::permission_denied_components_accepts_permission_cases --exact
+cargo kani --harness coreutils::kani_proofs::permission_denied_components_rejects_non_permission_cases --exact
+cargo kani --harness coreutils::kani_proofs::du_node_ready_matches_completion_formula --exact
 ```
 
 Formal logic summary:
 
 - Premise 1: `expected_read_len()` is the pure helper that defines how many bytes each logical read should request at a given offset.
 - Premise 2: Kani proves that, within the checked-success domain, the helper returns exactly `min(file_size - offset, block_size)`, rejects `offset > file_size`, and decreases monotonically as offset advances.
-- Conclusion: the implementation's read-tail sizing rule is now backed by a bounded proof of the helper itself, not only by sampled test cases.
+- Premise 3: the dirwalk permission and node-completion paths are routed through small pure helpers whose boolean contracts are now also Kani-checked.
+- Conclusion: the implementation's read-tail sizing rule and the new dirwalk permission/completion predicates are now backed by bounded proofs of their helpers, not only by sampled test cases.
 
 ## Real-world compatibility matrix
 

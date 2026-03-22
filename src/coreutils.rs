@@ -100,14 +100,8 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         }
         "cmp" => run_cmp(args)?,
         "fgrep" => run_fgrep(args)?,
-        "find" => {
-            run_find(args)?;
-            0
-        }
-        "du" => {
-            run_du(args)?;
-            0
-        }
+        "find" => run_find(args)?,
+        "du" => run_du(args)?,
         "tac" => {
             run_tac(args)?;
             0
@@ -155,6 +149,20 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         _ => return Ok(None),
     };
     Ok(Some(code))
+}
+
+fn permission_denied_components(kind: io::ErrorKind, raw_os_error: Option<i32>) -> bool {
+    matches!(kind, io::ErrorKind::PermissionDenied)
+        || matches!(raw_os_error, Some(libc::EACCES | libc::EPERM))
+}
+
+fn is_permission_denied(err: &io::Error) -> bool {
+    permission_denied_components(err.kind(), err.raw_os_error())
+}
+
+fn write_warning_line(tool: &str, path: &Path, err: &io::Error, message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{tool}: {message} '{}': {err}", path.display());
 }
 
 fn invoked_name(program: &str) -> Option<String> {
@@ -923,7 +931,7 @@ fn run_fgrep(args: &[String]) -> io::Result<i32> {
     Ok(if matched_any { 0 } else { 1 })
 }
 
-fn run_find(args: &[String]) -> io::Result<()> {
+fn run_find(args: &[String]) -> io::Result<i32> {
     let roots = if args.len() > 1 {
         args[1..].to_vec()
     } else {
@@ -939,11 +947,20 @@ fn run_find(args: &[String]) -> io::Result<()> {
     )?);
     let queue = Arc::new(WorkQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let had_warnings = Arc::new(AtomicBool::new(false));
 
     for root in roots {
         let path = PathBuf::from(root);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("find", &path, &err, "cannot access");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         write_find_path(&output, &path)?;
-        let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_dir() {
             queue.enqueue_one(path);
         }
@@ -951,11 +968,13 @@ fn run_find(args: &[String]) -> io::Result<()> {
 
     run_parallel_work_queue(queue, stop, worker_count, {
         let output = output.clone();
-        move |start_dir, queue, stop| walk_find_subtree(start_dir, queue, &output, stop)
+        let had_warnings = had_warnings.clone();
+        move |start_dir, queue, stop| walk_find_subtree(start_dir, queue, &output, stop, &had_warnings)
     })?;
     let output = Arc::into_inner(output)
         .ok_or_else(|| io::Error::other("find output writer still has active references"))?;
-    output.into_inner()
+    output.into_inner()?;
+    Ok(if had_warnings.load(Ordering::SeqCst) { 1 } else { 0 })
 }
 
 struct WorkQueue<T> {
@@ -1032,6 +1051,7 @@ fn walk_find_subtree(
     queue: &WorkQueue<PathBuf>,
     output: &BufWriter,
     stop: &AtomicBool,
+    had_warnings: &AtomicBool,
 ) -> io::Result<()> {
     let mut stack = vec![start_dir];
     let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
@@ -1040,14 +1060,40 @@ fn walk_find_subtree(
             break;
         }
         let mut child_dirs = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("find", &dir, &err, "cannot read directory");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("find", &dir, &err, "cannot read directory");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let path = entry.path();
             append_find_path(&mut chunk, &path);
             if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
                 output.write_all(&std::mem::take(&mut chunk))?;
             }
-            if entry.file_type()?.is_dir() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("find", &path, &err, "cannot access");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if file_type.is_dir() {
                 child_dirs.push(path);
             }
         }
@@ -1257,6 +1303,16 @@ struct DuTraversalTask {
     node_id: usize,
 }
 
+fn du_node_ready(
+    scanned: bool,
+    own_stat_done: bool,
+    pending_children: usize,
+    pending_file_stats: usize,
+    completed: bool,
+) -> bool {
+    scanned && own_stat_done && pending_children == 0 && pending_file_stats == 0 && !completed
+}
+
 fn finish_du_node(node_id: usize, state: &DuSharedState) {
     let mut current = Some(node_id);
     let mut completed_lines = Vec::new();
@@ -1264,12 +1320,13 @@ fn finish_du_node(node_id: usize, state: &DuSharedState) {
         let mut next = None;
         {
             let mut nodes = state.nodes.lock().unwrap();
-            if !nodes[id].scanned
-                || !nodes[id].own_stat_done
-                || nodes[id].pending_children != 0
-                || nodes[id].pending_file_stats != 0
-                || nodes[id].completed
-            {
+            if !du_node_ready(
+                nodes[id].scanned,
+                nodes[id].own_stat_done,
+                nodes[id].pending_children,
+                nodes[id].pending_file_stats,
+                nodes[id].completed,
+            ) {
                 break;
             }
             let total_kib = nodes[id].total_kib;
@@ -1284,12 +1341,13 @@ fn finish_du_node(node_id: usize, state: &DuSharedState) {
                 nodes[parent_id].total_kib += total_kib;
                 nodes[parent_id].pending_children =
                     nodes[parent_id].pending_children.saturating_sub(1);
-                if nodes[parent_id].scanned
-                    && nodes[parent_id].own_stat_done
-                    && nodes[parent_id].pending_children == 0
-                    && nodes[parent_id].pending_file_stats == 0
-                    && !nodes[parent_id].completed
-                {
+                if du_node_ready(
+                    nodes[parent_id].scanned,
+                    nodes[parent_id].own_stat_done,
+                    nodes[parent_id].pending_children,
+                    nodes[parent_id].pending_file_stats,
+                    nodes[parent_id].completed,
+                ) {
                     next = Some(parent_id);
                 }
             }
@@ -1306,6 +1364,7 @@ fn walk_du_subtree(
     dir_queue: &WorkQueue<DuTraversalTask>,
     state: &DuSharedState,
     stop: &AtomicBool,
+    had_warnings: &AtomicBool,
     summarize: bool,
     all: bool,
 ) -> io::Result<()> {
@@ -1314,14 +1373,45 @@ fn walk_du_subtree(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let mut dir = DirHandle::open(&task.path)?;
+        let mut dir = match DirHandle::open(&task.path) {
+            Ok(dir) => dir,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("du", &task.path, &err, "cannot read directory");
+                had_warnings.store(true, Ordering::SeqCst);
+                {
+                    let mut nodes = state.nodes.lock().unwrap();
+                    nodes[task.node_id].scanned = true;
+                }
+                finish_du_node(task.node_id, state);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let dirfd = dir.fd();
         let mut child_dirs = Vec::new();
         let mut file_lines = Vec::new();
         let mut file_total_kib = 0u64;
-        while let Some(entry) = dir.next_entry()? {
+        loop {
+            let entry = match dir.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("du", &task.path, &err, "cannot read directory");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
             let child_path = task.path.join(&entry.name);
-            let stat = fstatat_no_follow(dirfd, &entry.name)?;
+            let stat = match fstatat_no_follow(dirfd, &entry.name) {
+                Ok(stat) => stat,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("du", &child_path, &err, "cannot access");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let kib = disk_usage_kib(stat.st_blocks as u64);
             if stat_is_dir(&stat) {
                 let child_id = {
@@ -1380,7 +1470,13 @@ fn parallel_du_worker_count() -> usize {
         .max(1)
 }
 
-fn append_du_output(path: &Path, summarize: bool, all: bool, output: &mut Vec<u8>) -> io::Result<()> {
+fn append_du_output(
+    path: &Path,
+    summarize: bool,
+    all: bool,
+    output: &mut Vec<u8>,
+    had_warnings: Arc<AtomicBool>,
+) -> io::Result<()> {
     let stat = lstat_no_follow(path)?;
     let root_kib = disk_usage_kib(stat.st_blocks as u64);
     if !stat_is_dir(&stat) {
@@ -1414,8 +1510,9 @@ fn append_du_output(path: &Path, summarize: bool, all: bool, output: &mut Vec<u8
         parallel_du_worker_count(),
         {
             let state = state.clone();
+            let had_warnings = had_warnings.clone();
             move |task, dir_queue, stop| {
-                walk_du_subtree(task, dir_queue, &state, stop, summarize, all)
+                walk_du_subtree(task, dir_queue, &state, stop, &had_warnings, summarize, all)
             }
         },
     )?;
@@ -1456,9 +1553,94 @@ mod du_tests {
         let err = cstring_from_os_str(&value).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
+
+    #[test]
+    fn permission_denied_components_accepts_permission_kind_and_errnos() {
+        assert!(permission_denied_components(
+            io::ErrorKind::PermissionDenied,
+            None
+        ));
+        assert!(permission_denied_components(io::ErrorKind::Other, Some(libc::EACCES)));
+        assert!(permission_denied_components(io::ErrorKind::Other, Some(libc::EPERM)));
+        assert!(!permission_denied_components(
+            io::ErrorKind::NotFound,
+            Some(libc::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn du_node_ready_requires_exact_completion_state() {
+        assert!(du_node_ready(true, true, 0, 0, false));
+        assert!(!du_node_ready(false, true, 0, 0, false));
+        assert!(!du_node_ready(true, false, 0, 0, false));
+        assert!(!du_node_ready(true, true, 1, 0, false));
+        assert!(!du_node_ready(true, true, 0, 1, false));
+        assert!(!du_node_ready(true, true, 0, 0, true));
+    }
 }
 
-fn run_du(args: &[String]) -> io::Result<()> {
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{du_node_ready, permission_denied_components};
+    use std::io;
+
+    #[kani::proof]
+    fn permission_denied_components_accepts_permission_cases() {
+        let use_permission_kind: bool = kani::any();
+        let errno_is_permission: bool = kani::any();
+        let kind = if use_permission_kind {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::Other
+        };
+        let raw = if errno_is_permission {
+            Some(if kani::any() { libc::EACCES } else { libc::EPERM })
+        } else {
+            None
+        };
+        assert_eq!(
+            permission_denied_components(kind, raw),
+            use_permission_kind || errno_is_permission
+        );
+    }
+
+    #[kani::proof]
+    fn permission_denied_components_rejects_non_permission_cases() {
+        let kind = if kani::any() {
+            io::ErrorKind::NotFound
+        } else {
+            io::ErrorKind::Other
+        };
+        let raw = if kani::any() { Some(libc::ENOENT) } else { None };
+        assert!(!permission_denied_components(kind, raw));
+    }
+
+    #[kani::proof]
+    fn du_node_ready_matches_completion_formula() {
+        let scanned: bool = kani::any();
+        let own_stat_done: bool = kani::any();
+        let pending_children: usize = kani::any();
+        let pending_file_stats: usize = kani::any();
+        let completed: bool = kani::any();
+
+        assert_eq!(
+            du_node_ready(
+                scanned,
+                own_stat_done,
+                pending_children,
+                pending_file_stats,
+                completed
+            ),
+            scanned
+                && own_stat_done
+                && pending_children == 0
+                && pending_file_stats == 0
+                && !completed
+        );
+    }
+}
+
+fn run_du(args: &[String]) -> io::Result<i32> {
     let mut summarize = false;
     let mut all = false;
     let mut paths = Vec::new();
@@ -1487,12 +1669,28 @@ fn run_du(args: &[String]) -> io::Result<()> {
     }
 
     let out = stdout_buf_writer()?;
+    let had_warnings = Arc::new(AtomicBool::new(false));
     for path in paths {
         let mut chunk = Vec::new();
-        append_du_output(Path::new(&path), summarize, all, &mut chunk)?;
+        match append_du_output(
+            Path::new(&path),
+            summarize,
+            all,
+            &mut chunk,
+            had_warnings.clone(),
+        ) {
+            Ok(()) => {}
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("du", Path::new(&path), &err, "cannot access");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
         out.write_all(&chunk)?;
     }
-    out.into_inner()
+    out.into_inner()?;
+    Ok(if had_warnings.load(Ordering::SeqCst) { 1 } else { 0 })
 }
 
 fn run_tac(args: &[String]) -> io::Result<()> {

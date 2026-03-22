@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +36,12 @@ fn run_system(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to run system find")
+}
+
+fn make_fifo(path: &std::path::Path) {
+    let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 }
 
 fn assert_success(output: Output) -> Output {
@@ -109,6 +116,59 @@ fn find_matches_system_for_wide_tree_ignoring_order() {
         fs::write(branch.join("root.txt"), format!("root-{i}\n")).unwrap();
         fs::write(nested.join("leaf.txt"), format!("leaf-{i}\n")).unwrap();
     }
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap()]));
+    let system = assert_success(run_system(&[root.to_str().unwrap()]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_warns_and_continues_on_permission_denied_directory() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let tmp = unique_temp_dir("fro-find-perms");
+    let root = tmp.join("root");
+    let blocked = root.join("blocked");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(root.join("visible.txt"), b"visible").unwrap();
+    fs::write(blocked.join("hidden.txt"), b"hidden").unwrap();
+
+    let mut perms = fs::metadata(&blocked).unwrap().permissions();
+    perms.set_mode(0);
+    fs::set_permissions(&blocked, perms).unwrap();
+
+    let fro = run_fro(&["find", root.to_str().unwrap()]);
+    let system = run_system(&[root.to_str().unwrap()]);
+
+    let mut restore = fs::metadata(&blocked).unwrap().permissions();
+    restore.set_mode(0o755);
+    fs::set_permissions(&blocked, restore).unwrap();
+
+    assert_eq!(fro.status.code(), system.status.code());
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert!(String::from_utf8_lossy(&fro.stderr).contains("Permission denied"));
+    assert!(String::from_utf8_lossy(&system.stderr).contains("Permission denied"));
+}
+
+#[test]
+fn find_matches_system_for_symlinks_broken_symlinks_and_fifos() {
+    let tmp = unique_temp_dir("fro-find-special");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let regular = root.join("regular.txt");
+    let symlink_path = root.join("regular-link");
+    let broken_symlink = root.join("broken-link");
+    let fifo = root.join("events.fifo");
+    fs::write(&regular, b"regular").unwrap();
+    std::os::unix::fs::symlink(&regular, &symlink_path).unwrap();
+    std::os::unix::fs::symlink(root.join("missing-target"), &broken_symlink).unwrap();
+    make_fifo(&fifo);
+    fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
 
     let fro = assert_success(run_fro(&["find", root.to_str().unwrap()]));
     let system = assert_success(run_system(&[root.to_str().unwrap()]));

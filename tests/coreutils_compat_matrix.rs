@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -812,4 +812,75 @@ fn cartesian_du_matches_system_output() {
             &format!("du {:?}", du_args),
         );
     }
+}
+
+#[test]
+fn du_matches_system_for_symlinks_broken_symlinks_and_fifos() {
+    let tmp = unique_temp_dir("fro-coreutils-du-special");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let regular = tree.join("regular.txt");
+    let symlink_path = tree.join("regular-link");
+    let broken_symlink = tree.join("broken-link");
+    let fifo = tree.join("events.fifo");
+    fs::write(&regular, vec![0x55; 4096]).unwrap();
+    symlink(&regular, &symlink_path).unwrap();
+    symlink(tree.join("missing-target"), &broken_symlink).unwrap();
+    make_fifo(&fifo);
+    fs::write(nested.join("leaf.bin"), vec![0x33; 8192]).unwrap();
+
+    for du_args in [
+        vec![tree.to_str().unwrap()],
+        vec!["-a", tree.to_str().unwrap()],
+        vec![symlink_path.to_str().unwrap()],
+        vec![broken_symlink.to_str().unwrap()],
+        vec![fifo.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du special {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_warns_and_continues_on_permission_denied_directory() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let tmp = unique_temp_dir("fro-coreutils-du-perms");
+    let root = tmp.join("tree");
+    let blocked = root.join("blocked");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(root.join("visible.txt"), vec![0x55; 4096]).unwrap();
+    fs::write(blocked.join("hidden.bin"), vec![0x33; 8192]).unwrap();
+
+    let mut perms = fs::metadata(&blocked).unwrap().permissions();
+    perms.set_mode(0);
+    fs::set_permissions(&blocked, perms).unwrap();
+
+    let fro = run_fro("du", &[root.to_str().unwrap()]);
+    let system = run_system("du", &[root.to_str().unwrap()]);
+
+    let mut restore = fs::metadata(&blocked).unwrap().permissions();
+    restore.set_mode(0o755);
+    fs::set_permissions(&blocked, restore).unwrap();
+
+    assert_eq!(fro.status.code(), system.status.code(), "du status mismatch");
+    let mut fro_lines = String::from_utf8_lossy(&fro.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut sys_lines = String::from_utf8_lossy(&system.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fro_lines.sort();
+    sys_lines.sort();
+    assert_eq!(fro_lines, sys_lines, "du stdout mismatch");
+    assert!(String::from_utf8_lossy(&fro.stderr).contains("Permission denied"));
+    assert!(String::from_utf8_lossy(&system.stderr).contains("Permission denied"));
 }
