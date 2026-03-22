@@ -1,9 +1,15 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::io::Write;
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static FIFO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,6 +42,74 @@ fn run_system(program: &str, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+}
+
+fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .arg(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn fro command");
+    child
+        .stdin
+        .take()
+        .expect("missing fro stdin")
+        .write_all(stdin_bytes)
+        .expect("failed to write fro stdin");
+    child
+        .wait_with_output()
+        .expect("failed to collect fro output")
+}
+
+fn run_system_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn {program}: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("missing system stdin")
+        .write_all(stdin_bytes)
+        .expect("failed to write system stdin");
+    child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("failed to collect {program} output: {err}"))
+}
+
+fn make_fifo(path: &Path) {
+    let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+}
+
+fn with_fifo_input<F, T>(path: &Path, data: &[u8], run: F) -> T
+where
+    F: FnOnce(&str) -> T,
+{
+    make_fifo(path);
+    let fifo_path = path.to_string_lossy().into_owned();
+    let data = data.to_vec();
+    let writer = thread::spawn({
+        let fifo_path = fifo_path.clone();
+        move || {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo_path)
+                .expect("failed to open fifo for writing");
+            file.write_all(&data).expect("failed to write fifo data");
+        }
+    });
+    let output = run(&fifo_path);
+    writer.join().expect("fifo writer panicked");
+    fs::remove_file(path).unwrap();
+    output
 }
 
 fn assert_same_result(fro: Output, system: Output, label: &str) {
@@ -86,6 +160,16 @@ fn assert_same_wc(fro: Output, system: Output, label: &str) {
 
 fn io_flag_sets() -> Vec<Vec<&'static str>> {
     vec![vec![], vec!["--no-direct"], vec!["--direct"]]
+}
+
+fn wc_flag_sets() -> Vec<Vec<&'static str>> {
+    vec![
+        vec![],
+        vec!["-l"],
+        vec!["-w"],
+        vec!["-c"],
+        vec!["-l", "-w", "-c"],
+    ]
 }
 
 #[test]
@@ -145,6 +229,281 @@ fn cartesian_wc_matches_system_output() {
                 &format!("wc {:?}", args),
             );
         }
+    }
+}
+
+#[test]
+fn cartesian_stream_coreutils_match_system_for_input_kinds() {
+    let tmp = unique_temp_dir("fro-coreutils-stream-matrix");
+    let text = b"alpha\nneedle beta\nomega\n".to_vec();
+    let binary = (0..65557)
+        .map(|i| ((i * 17) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    let text_path = tmp.join("text.txt");
+    let text_symlink = tmp.join("text-link.txt");
+    let binary_path = tmp.join("binary.bin");
+    let binary_symlink = tmp.join("binary-link.bin");
+    fs::write(&text_path, &text).unwrap();
+    fs::write(&binary_path, &binary).unwrap();
+    symlink(&text_path, &text_symlink).unwrap();
+    symlink(&binary_path, &binary_symlink).unwrap();
+
+    for flags in io_flag_sets() {
+        for path in [&text_path, &text_symlink] {
+            let file = path.to_str().unwrap();
+            let mut args = flags.clone();
+            args.push(file);
+            assert_same_result(
+                run_fro("cat", &args),
+                run_system("cat", &[file]),
+                &format!("cat path {:?}", args),
+            );
+            assert_same_result(
+                run_fro("tac", &args),
+                run_system("tac", &[file]),
+                &format!("tac path {:?}", args),
+            );
+            for wc_flags in wc_flag_sets() {
+                let mut fro_args = flags.clone();
+                fro_args.extend(wc_flags.iter().copied());
+                fro_args.push(file);
+                let mut sys_args = wc_flags;
+                sys_args.push(file);
+                assert_same_wc(
+                    run_fro("wc", &fro_args),
+                    run_system("wc", &sys_args),
+                    &format!("wc path {:?}", fro_args),
+                );
+            }
+            for grep_args in [vec!["needle", file], vec!["-n", "needle", file]] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(grep_args.iter().copied());
+                let mut sys_args = vec!["-F"];
+                sys_args.extend(grep_args.iter().copied());
+                assert_same_result(
+                    run_fro("fgrep", &fro_args),
+                    run_system("grep", &sys_args),
+                    &format!("fgrep path {:?}", fro_args),
+                );
+            }
+        }
+
+        for path in [&binary_path, &binary_symlink] {
+            let file = path.to_str().unwrap();
+            let mut args = flags.clone();
+            args.push(file);
+            assert_same_result(
+                run_fro("cksum", &args),
+                run_system("cksum", &[file]),
+                &format!("cksum path {:?}", args),
+            );
+            assert_same_result(
+                run_fro("sha256sum", &args),
+                run_system("sha256sum", &[file]),
+                &format!("sha256sum path {:?}", args),
+            );
+        }
+    }
+
+    assert_same_result(
+        run_fro_with_stdin("cat", &[], &text),
+        run_system_with_stdin("cat", &[], &text),
+        "cat stdin []",
+    );
+    assert_same_result(
+        run_fro_with_stdin("cat", &["-"], &text),
+        run_system_with_stdin("cat", &["-"], &text),
+        "cat dash",
+    );
+    assert_same_result(
+        run_fro_with_stdin("tac", &[], &text),
+        run_system_with_stdin("tac", &[], &text),
+        "tac stdin []",
+    );
+    assert_same_result(
+        run_fro_with_stdin("tac", &["-"], &text),
+        run_system_with_stdin("tac", &["-"], &text),
+        "tac dash",
+    );
+
+    for wc_flags in wc_flag_sets() {
+        assert_same_wc(
+            run_fro_with_stdin("wc", &wc_flags, &text),
+            run_system_with_stdin("wc", &wc_flags, &text),
+            &format!("wc stdin {:?}", wc_flags),
+        );
+        let mut dash_args = wc_flags.clone();
+        dash_args.push("-");
+        assert_same_wc(
+            run_fro_with_stdin("wc", &dash_args, &text),
+            run_system_with_stdin("wc", &dash_args, &text),
+            &format!("wc dash {:?}", dash_args),
+        );
+    }
+
+    for grep_args in [vec!["needle"], vec!["-n", "needle"]] {
+        let mut sys_args = vec!["-F"];
+        sys_args.extend(grep_args.iter().copied());
+        assert_same_result(
+            run_fro_with_stdin("fgrep", &grep_args, &text),
+            run_system_with_stdin("grep", &sys_args, &text),
+            &format!("fgrep stdin {:?}", grep_args),
+        );
+
+        let mut dash_args = grep_args.clone();
+        dash_args.push("-");
+        let mut sys_dash_args = vec!["-F"];
+        sys_dash_args.extend(grep_args.iter().copied());
+        sys_dash_args.push("-");
+        assert_same_result(
+            run_fro_with_stdin("fgrep", &dash_args, &text),
+            run_system_with_stdin("grep", &sys_dash_args, &text),
+            &format!("fgrep dash {:?}", dash_args),
+        );
+    }
+
+    assert_same_result(
+        run_fro_with_stdin("cksum", &[], &binary),
+        run_system_with_stdin("cksum", &[], &binary),
+        "cksum stdin []",
+    );
+    assert_same_result(
+        run_fro_with_stdin("cksum", &["-"], &binary),
+        run_system_with_stdin("cksum", &["-"], &binary),
+        "cksum dash",
+    );
+    assert_same_result(
+        run_fro_with_stdin("sha256sum", &[], &binary),
+        run_system_with_stdin("sha256sum", &[], &binary),
+        "sha256sum stdin []",
+    );
+    assert_same_result(
+        run_fro_with_stdin("sha256sum", &["-"], &binary),
+        run_system_with_stdin("sha256sum", &["-"], &binary),
+        "sha256sum dash",
+    );
+}
+
+#[test]
+fn wc_matches_system_for_bash_process_substitution() {
+    let payload = "alpha beta\\ngamma delta\\n";
+    let fro_output = Command::new("bash")
+        .arg("-lc")
+        .arg(format!(
+            "{} wc <(printf '%b' '{payload}')",
+            env!("CARGO_BIN_EXE_fro"),
+        ))
+        .output()
+        .expect("failed to run bash process substitution for fro");
+    let sys_output = Command::new("bash")
+        .arg("-lc")
+        .arg(format!("wc <(printf '%b' '{payload}')"))
+        .output()
+        .expect("failed to run bash process substitution for wc");
+    assert_same_wc(fro_output, sys_output, "wc process substitution");
+}
+
+#[test]
+fn fifo_text_inputs_match_system_output() {
+    let _lock = FIFO_TEST_LOCK.lock().unwrap();
+    let tmp = unique_temp_dir("fro-coreutils-fifo-matrix");
+    let text = b"alpha\nneedle beta\nomega\n".to_vec();
+    let text_fifo = tmp.join("text-default.fifo");
+
+    let fro = with_fifo_input(&text_fifo, &text, |fifo_path| run_fro("cat", &[fifo_path]));
+    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| run_system("cat", &[fifo_path]));
+    assert_same_result(fro, sys, "cat fifo");
+
+    let fro = with_fifo_input(&text_fifo, &text, |fifo_path| run_fro("tac", &[fifo_path]));
+    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| run_system("tac", &[fifo_path]));
+    assert_same_result(fro, sys, "tac fifo");
+
+    for wc_flags in wc_flag_sets() {
+        let fro = with_fifo_input(&text_fifo, &text, |fifo_path| {
+            let mut args = wc_flags.clone();
+            args.push(fifo_path);
+            run_fro("wc", &args)
+        });
+        let sys = with_fifo_input(&text_fifo, &text, |fifo_path| {
+            let mut args = wc_flags.clone();
+            args.push(fifo_path);
+            run_system("wc", &args)
+        });
+        let mut label_args = wc_flags.clone();
+        label_args.push("FIFO");
+        assert_same_wc(fro, sys, &format!("wc fifo {:?}", label_args));
+    }
+
+    for grep_prefix in [vec!["needle"], vec!["-n", "needle"]] {
+        let fro = with_fifo_input(&text_fifo, &text, |fifo_path| {
+            let mut args = grep_prefix.clone();
+            args.push(fifo_path);
+            run_fro("fgrep", &args)
+        });
+        let sys = with_fifo_input(&text_fifo, &text, |fifo_path| {
+            let mut grep_args = grep_prefix.clone();
+            grep_args.push(fifo_path);
+            let mut args = vec!["-F"];
+            args.extend(grep_args.iter().copied());
+            run_system("grep", &args)
+        });
+        let mut label_args = grep_prefix.clone();
+        label_args.push("FIFO");
+        assert_same_result(fro, sys, &format!("fgrep fifo {:?}", label_args));
+    }
+}
+
+#[test]
+fn fifo_hash_inputs_match_system_output() {
+    let _lock = FIFO_TEST_LOCK.lock().unwrap();
+    let tmp = unique_temp_dir("fro-coreutils-fifo-hash");
+    let binary = (0..65557)
+        .map(|i| ((i * 17) % 251) as u8)
+        .collect::<Vec<_>>();
+    let binary_fifo = tmp.join("binary-default.fifo");
+
+    let fro = with_fifo_input(&binary_fifo, &binary, |fifo_path| run_fro("cksum", &[fifo_path]));
+    let sys = with_fifo_input(&binary_fifo, &binary, |fifo_path| run_system("cksum", &[fifo_path]));
+    assert_same_result(fro, sys, "cksum fifo");
+
+    let fro =
+        with_fifo_input(&binary_fifo, &binary, |fifo_path| run_fro("sha256sum", &[fifo_path]));
+    let sys = with_fifo_input(&binary_fifo, &binary, |fifo_path| {
+        run_system("sha256sum", &[fifo_path])
+    });
+    assert_same_result(fro, sys, "sha256sum fifo");
+}
+
+#[test]
+fn wc_matches_system_on_binary_whitespace_boundaries() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-binary");
+    let path = tmp.join("binary.bin");
+    let parts: &[&[u8]] = &[
+        b"alpha",
+        &[0x0b],
+        b"beta gamma",
+        &[0x0c, b'\r'],
+        b"delta",
+        &[0x00, 0x80, b' '],
+        b"epsilon",
+        &[b'\n', 0x0b],
+        b"zeta",
+    ];
+    let bytes = parts
+        .iter()
+        .flat_map(|part| part.iter().copied())
+        .collect::<Vec<_>>();
+    fs::write(&path, bytes).unwrap();
+
+    for flags in io_flag_sets() {
+        let mut args = flags.clone();
+        args.push(path.to_str().unwrap());
+        assert_same_wc(
+            run_fro("wc", &args),
+            run_system("wc", &[path.to_str().unwrap()]),
+            &format!("wc binary {:?}", args),
+        );
     }
 }
 

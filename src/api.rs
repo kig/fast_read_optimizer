@@ -110,7 +110,7 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 pub fn read_file_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<Vec<u8>> {
     let config = load_config(None);
     Ok(
-        load_file_to_memory_for_mode(&config, "read", path_str(path.as_ref())?, io_mode)?
+        load_file_to_memory_for_mode(&config, "read_to_memory", path_str(path.as_ref())?, io_mode)?
             .data
             .as_slice()
             .to_vec(),

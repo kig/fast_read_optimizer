@@ -8,11 +8,63 @@ use iou::IoUring;
 use memchr::memmem::Finder;
 use std::fs::File;
 use std::hint::black_box;
-use std::io::{Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::ops::Deref;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub struct BufReader<R> {
+    inner: std::io::BufReader<R>,
+}
+
+impl<R: Read> BufReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self::with_capacity(1 << 20, inner)
+    }
+
+    pub fn with_capacity(capacity: usize, inner: R) -> Self {
+        Self {
+            inner: std::io::BufReader::with_capacity(capacity, inner),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_ref(&self) -> &R {
+        self.inner.get_ref()
+    }
+
+    #[allow(dead_code)]
+    pub fn into_inner(self) -> R {
+        self.inner.into_inner()
+    }
+}
+
+impl BufReader<File> {
+    pub fn stdin() -> io::Result<Self> {
+        let stdin_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+        if stdin_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self::new(unsafe { File::from_raw_fd(stdin_fd) }))
+    }
+}
+
+impl<R: Read> Read for BufReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read> BufRead for BufReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +73,51 @@ pub struct ResolvedReadParams {
     pub num_threads: u64,
     pub block_size: u64,
     pub qd: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadToMemoryMode {
+    Auto,
+    PagedSharedBuffer,
+    Mmap,
+    MmapReadPages,
+    MultipleTargetBuffers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadToMemoryOptions {
+    pub hugepages: bool,
+    pub measure_unmap_time: bool,
+}
+
+impl Default for ReadToMemoryOptions {
+    fn default() -> Self {
+        Self {
+            hugepages: true,
+            measure_unmap_time: false,
+        }
+    }
+}
+
+pub fn resolve_to_memory_mode(
+    filename: &str,
+    io_mode: IOMode,
+    requested_mode: ReadToMemoryMode,
+) -> ReadToMemoryMode {
+    match requested_mode {
+        ReadToMemoryMode::Auto => match io_mode {
+            IOMode::Direct => ReadToMemoryMode::PagedSharedBuffer,
+            IOMode::PageCache => ReadToMemoryMode::Mmap,
+            IOMode::Auto => {
+                if is_first_page_resident(filename).unwrap_or(false) {
+                    ReadToMemoryMode::Mmap
+                } else {
+                    ReadToMemoryMode::PagedSharedBuffer
+                }
+            }
+        },
+        other => other,
+    }
 }
 
 #[allow(dead_code)]
@@ -58,11 +155,12 @@ impl Deref for LoadedData {
 pub struct MappedReadBuffer {
     ptr: *const u8,
     len: usize,
+    map_ptr: *mut libc::c_void,
     map_len: usize,
 }
 
 impl MappedReadBuffer {
-    fn map(file: &File, len: usize) -> std::io::Result<Self> {
+    fn map(file: &File, len: usize, options: ReadToMemoryOptions) -> std::io::Result<Self> {
         let map_len = len.max(1);
         let ptr = unsafe {
             libc::mmap(
@@ -77,9 +175,16 @@ impl MappedReadBuffer {
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
+        if let Err(err) = advise_mapped_read_region(ptr, map_len, options) {
+            unsafe {
+                let _ = libc::munmap(ptr, map_len);
+            }
+            return Err(err);
+        }
         Ok(Self {
             ptr: ptr.cast(),
             len,
+            map_ptr: ptr,
             map_len,
         })
     }
@@ -90,18 +195,75 @@ impl MappedReadBuffer {
         }
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    pub fn mapped_len(&self) -> usize {
+        self.map_len
+    }
+
+    pub fn unmap_prefix(&mut self, bytes: usize) -> std::io::Result<usize> {
+        if bytes == 0 || self.map_len == 0 {
+            return Ok(0);
+        }
+        let page_size = 4096usize;
+        let unmap_len = (bytes / page_size) * page_size;
+        if unmap_len == 0 {
+            return Ok(0);
+        }
+        let unmap_len = unmap_len.min(self.map_len);
+        let rc = unsafe { libc::munmap(self.map_ptr, unmap_len) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.map_ptr = unsafe { self.map_ptr.add(unmap_len) };
+        self.ptr = self.map_ptr.cast();
+        self.map_len -= unmap_len;
+        self.len = self.len.saturating_sub(unmap_len);
+        Ok(unmap_len)
+    }
 }
 
 impl Drop for MappedReadBuffer {
     fn drop(&mut self) {
+        if self.map_len == 0 {
+            return;
+        }
         unsafe {
-            let _ = libc::munmap(self.ptr.cast_mut().cast(), self.map_len);
+            let _ = libc::munmap(self.map_ptr, self.map_len);
         }
     }
 }
 
+fn madvise_best_effort(ptr: *mut libc::c_void, len: usize, advice: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::madvise(ptr, len, advice) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+fn advise_mapped_read_region(
+    ptr: *mut libc::c_void,
+    len: usize,
+    options: ReadToMemoryOptions,
+) -> io::Result<()> {
+    madvise_best_effort(ptr, len, libc::MADV_RANDOM)?;
+    if options.hugepages {
+        madvise_best_effort(ptr, len, libc::MADV_HUGEPAGE)?;
+    }
+    Ok(())
+}
+
 unsafe impl Send for MappedReadBuffer {}
 unsafe impl Sync for MappedReadBuffer {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockSpan {
+    start_offset: u64,
+    len: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderBlock<'a> {
@@ -594,6 +756,288 @@ fn thread_loader(
     }
 }
 
+fn thread_loader_range(
+    start_offset: u64,
+    len: usize,
+    block_size: u64,
+    qd: usize,
+    file: &mut File,
+    file_direct: &mut File,
+    io_uring: &mut IoUring,
+    read_count: Arc<AtomicU64>,
+    output: Arc<SharedOutput>,
+    use_direct: bool,
+) -> std::io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    let mut buffers = Vec::new();
+    for _ in 0..qd {
+        buffers.push(AlignedBuffer::new(block_size as usize));
+    }
+
+    let end_offset = start_offset
+        .checked_add(len as u64)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed"))?;
+    let mut block_num = 0u64;
+    let mut inflight = 0usize;
+    let mut pending = PendingReadSlots::new(qd);
+
+    for slot in 0..qd {
+        let current_offset = start_offset
+            .checked_add(block_num.checked_mul(block_size).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+            })?;
+        if current_offset >= end_offset {
+            break;
+        }
+        pending.reserve(slot, block_num)?;
+        submit_read(
+            io_uring,
+            file,
+            file_direct,
+            &mut buffers[slot],
+            current_offset,
+            slot as u64,
+            use_direct,
+            end_offset,
+        )?;
+        block_num += 1;
+        inflight += 1;
+    }
+
+    if inflight == 0 {
+        return Ok(());
+    }
+    io_uring.submit_sqes().map_err(std::io::Error::other)?;
+
+    loop {
+        for (slot_id, result) in wait_for_ready(io_uring)? {
+            let slot = usize::try_from(slot_id).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
+            })?;
+            let block_id = pending.complete(slot)?;
+            let current_offset = start_offset
+                .checked_add(block_id.checked_mul(block_size).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+                })?)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+                })?;
+            let expected_len = expected_read_len(end_offset, current_offset, block_size)?;
+            let actual_len =
+                validate_read_result("load-file-range", current_offset, expected_len, result)?;
+            if actual_len > 0 {
+                let output_offset = checked_output_offset(
+                    current_offset.saturating_sub(start_offset),
+                    actual_len,
+                    output.len,
+                )?;
+                unsafe {
+                    let dst = output_slice_mut(&output, output_offset, actual_len);
+                    dst.copy_from_slice(&buffers[slot].as_slice()[..actual_len]);
+                }
+                read_count.fetch_add(actual_len as u64, Ordering::Relaxed);
+            }
+            inflight -= 1;
+
+            let next_offset = start_offset
+                .checked_add(block_num.checked_mul(block_size).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+                })?)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
+                })?;
+            if next_offset < end_offset {
+                pending.reserve(slot, block_num)?;
+                submit_read(
+                    io_uring,
+                    file,
+                    file_direct,
+                    &mut buffers[slot],
+                    next_offset,
+                    slot as u64,
+                    use_direct,
+                    end_offset,
+                )?;
+                block_num += 1;
+                inflight += 1;
+            }
+        }
+        io_uring.submit_sqes().map_err(std::io::Error::other)?;
+        if inflight == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn resolve_load_file_request(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+) -> std::io::Result<(ResolvedReadParams, u64, usize)> {
+    let params = resolve_reader_params(
+        filename,
+        &IOParams {
+            num_threads: num_threads_p,
+            block_size: block_size_p,
+            qd: qd_p,
+        },
+        &IOParams {
+            num_threads: num_threads_d,
+            block_size: block_size_d,
+            qd: qd_d,
+        },
+        io_mode,
+    )?;
+
+    let file_size = std::fs::metadata(filename)?.len();
+    let file_len = usize::try_from(file_size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "file is too large to fit in memory on this platform: {}",
+                file_size
+            ),
+        )
+    })?;
+    Ok((params, file_size, file_len))
+}
+
+fn load_file_to_shared_buffer(
+    filename: &str,
+    params: ResolvedReadParams,
+    file_len: usize,
+    options: ReadToMemoryOptions,
+) -> std::io::Result<LoadedFile> {
+    let mut data = AlignedBuffer::new_uninit(file_len)?;
+    if options.hugepages {
+        madvise_best_effort(
+            data.as_mut_slice().as_mut_ptr().cast(),
+            file_len.max(1),
+            libc::MADV_HUGEPAGE,
+        )?;
+    }
+    let output = Arc::new(SharedOutput {
+        ptr: data.as_mut_slice().as_mut_ptr(),
+        len: data.len(),
+    });
+    let read_count = Arc::new(AtomicU64::new(0));
+
+    let mut threads = vec![];
+    for thread_id in 0..params.num_threads {
+        let output = output.clone();
+        let read_count = read_count.clone();
+        let filename = filename.to_string();
+        threads.push(std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
+            thread_loader(
+                thread_id,
+                params.num_threads,
+                params.block_size,
+                params.qd,
+                &mut file,
+                &mut file_direct,
+                &mut io_uring,
+                read_count,
+                output,
+                params.use_direct,
+            )
+        }));
+    }
+
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
+    }
+
+    Ok(LoadedFile {
+        data: LoadedData::Aligned(data),
+        bytes_read: read_count.load(Ordering::SeqCst),
+        params,
+    })
+}
+
+fn block_spans_for_threads(file_size: u64, block_size: u64, thread_count: usize) -> Vec<BlockSpan> {
+    if file_size == 0 || thread_count == 0 {
+        return Vec::new();
+    }
+    let block_count = file_size.div_ceil(block_size);
+    let blocks_per_thread = block_count.div_ceil(thread_count as u64);
+    let mut spans = Vec::new();
+    for thread_id in 0..thread_count {
+        let start_block = thread_id as u64 * blocks_per_thread;
+        if start_block >= block_count {
+            break;
+        }
+        let end_block = ((thread_id as u64 + 1) * blocks_per_thread).min(block_count);
+        let start_offset = start_block * block_size;
+        let end_offset = (end_block * block_size).min(file_size);
+        spans.push(BlockSpan {
+            start_offset,
+            len: (end_offset - start_offset) as usize,
+        });
+    }
+    spans
+}
+
+fn measure_file_load_multiple_targets(
+    filename: &str,
+    params: ResolvedReadParams,
+    file_size: u64,
+) -> std::io::Result<u64> {
+    let spans = block_spans_for_threads(file_size, params.block_size, params.num_threads as usize);
+    let read_count = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+
+    for span in spans {
+        let read_count = Arc::clone(&read_count);
+        let filename = filename.to_string();
+        threads.push(std::thread::spawn(move || -> std::io::Result<()> {
+            let mut target = AlignedBuffer::new_uninit(span.len)?;
+            let output = Arc::new(SharedOutput {
+                ptr: target.as_mut_slice().as_mut_ptr(),
+                len: target.len(),
+            });
+            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
+            thread_loader_range(
+                span.start_offset,
+                span.len,
+                params.block_size,
+                params.qd,
+                &mut file,
+                &mut file_direct,
+                &mut io_uring,
+                read_count,
+                output,
+                params.use_direct,
+            )?;
+            black_box(target);
+            Ok(())
+        }));
+    }
+
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("multi-target read worker thread panicked"))??;
+    }
+
+    Ok(read_count.load(Ordering::SeqCst))
+}
+
 fn thread_map_blocks<T, F>(
     thread_id: u64,
     num_threads: u64,
@@ -803,31 +1247,42 @@ pub fn load_file_to_memory(
     qd_d: usize,
     io_mode: IOMode,
 ) -> std::io::Result<LoadedFile> {
-    let params = resolve_reader_params(
+    load_file_to_memory_with_mode(
         filename,
-        &IOParams {
-            num_threads: num_threads_p,
-            block_size: block_size_p,
-            qd: qd_p,
-        },
-        &IOParams {
-            num_threads: num_threads_d,
-            block_size: block_size_d,
-            qd: qd_d,
-        },
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+        ReadToMemoryMode::Auto,
+        ReadToMemoryOptions::default(),
+    )
+}
+
+pub fn load_file_to_memory_with_mode(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    mode: ReadToMemoryMode,
+    options: ReadToMemoryOptions,
+) -> std::io::Result<LoadedFile> {
+    let (params, file_size, file_len) = resolve_load_file_request(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
         io_mode,
     )?;
-
-    let file_size = std::fs::metadata(filename)?.len();
-    let file_len = usize::try_from(file_size).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "file is too large to fit in memory on this platform: {}",
-                file_size
-            ),
-        )
-    })?;
 
     if file_len == 0 {
         return Ok(LoadedFile {
@@ -837,58 +1292,56 @@ pub fn load_file_to_memory(
         });
     }
 
-    if !params.use_direct {
-        let file = File::open(filename)?;
-        let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len)?);
-        touch_pages(data.as_slice(), params.num_threads)?;
-        return Ok(LoadedFile {
-            data,
-            bytes_read: file_size,
-            params,
-        });
+    let mode = resolve_to_memory_mode(filename, io_mode, mode);
+    let loaded = match mode {
+        ReadToMemoryMode::Auto => unreachable!("auto mode should be resolved before loading"),
+        ReadToMemoryMode::PagedSharedBuffer => {
+            load_file_to_shared_buffer(filename, params, file_len, options)?
+        }
+        ReadToMemoryMode::Mmap => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            LoadedFile {
+                data: LoadedData::Mapped(MappedReadBuffer::map(&file, file_len, options)?),
+                bytes_read: file_size,
+                params,
+            }
+        }
+        ReadToMemoryMode::MmapReadPages => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap-read-pages is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len, options)?);
+            read_all_bytes(data.as_slice(), params.num_threads)?;
+            LoadedFile {
+                data,
+                bytes_read: file_size,
+                params,
+            }
+        }
+        ReadToMemoryMode::MultipleTargetBuffers => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "load_file_to_memory does not support --multiple-target-buffers; use measure_file_load_to_memory for that benchmarking mode",
+            ));
+        }
+    };
+    if loaded.bytes_read != file_size {
+        return Err(std::io::Error::other(format!(
+            "read loaded {} bytes but expected {}",
+            loaded.bytes_read, file_size
+        )));
     }
-
-    let mut data = AlignedBuffer::new_uninit(file_len)?;
-    let output = Arc::new(SharedOutput {
-        ptr: data.as_mut_slice().as_mut_ptr(),
-        len: data.len(),
-    });
-    let read_count = Arc::new(AtomicU64::new(0));
-
-    let mut threads = vec![];
-    for thread_id in 0..params.num_threads {
-        let output = output.clone();
-        let read_count = read_count.clone();
-        let filename = filename.to_string();
-        threads.push(std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
-            let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
-            thread_loader(
-                thread_id,
-                params.num_threads,
-                params.block_size,
-                params.qd,
-                &mut file,
-                &mut file_direct,
-                &mut io_uring,
-                read_count,
-                output,
-                params.use_direct,
-            )
-        }));
-    }
-
-    for thread in threads {
-        thread
-            .join()
-            .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
-    }
-
-    Ok(LoadedFile {
-        data: LoadedData::Aligned(data),
-        bytes_read: read_count.load(Ordering::SeqCst),
-        params,
-    })
+    Ok(loaded)
 }
 
 #[allow(dead_code)]
@@ -910,6 +1363,125 @@ pub fn load_file_to_memory_for_mode(
         direct.qd,
         io_mode,
     )
+}
+
+pub fn measure_file_load_to_memory(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    mode: ReadToMemoryMode,
+    options: ReadToMemoryOptions,
+) -> std::io::Result<u64> {
+    let (params, file_size, file_len) = resolve_load_file_request(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )?;
+
+    if file_len == 0 {
+        return Ok(0);
+    }
+
+    match resolve_to_memory_mode(filename, io_mode, mode) {
+        ReadToMemoryMode::Auto => unreachable!("auto mode should be resolved before measuring"),
+        ReadToMemoryMode::PagedSharedBuffer => {
+            Ok(load_file_to_shared_buffer(filename, params, file_len, options)?.bytes_read)
+        }
+        ReadToMemoryMode::Mmap => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len, options)?);
+            black_box(data.as_slice().len());
+            Ok(file_size)
+        }
+        ReadToMemoryMode::MmapReadPages => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap-read-pages is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len, options)?);
+            read_all_bytes(data.as_slice(), params.num_threads)?;
+            Ok(file_size)
+        }
+        ReadToMemoryMode::MultipleTargetBuffers => {
+            measure_file_load_multiple_targets(filename, params, file_size)
+        }
+    }
+}
+
+pub fn prepare_file_load_to_memory(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    mode: ReadToMemoryMode,
+    options: ReadToMemoryOptions,
+) -> std::io::Result<Option<LoadedData>> {
+    let (params, _file_size, file_len) = resolve_load_file_request(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )?;
+
+    if file_len == 0 {
+        return Ok(None);
+    }
+
+    match resolve_to_memory_mode(filename, io_mode, mode) {
+        ReadToMemoryMode::Auto => unreachable!("auto mode should be resolved before preparing"),
+        ReadToMemoryMode::Mmap => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            Ok(Some(LoadedData::Mapped(MappedReadBuffer::map(
+                &file, file_len, options,
+            )?)))
+        }
+        ReadToMemoryMode::MmapReadPages => {
+            if io_mode == IOMode::Direct {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mmap-read-pages is not supported with --direct",
+                ));
+            }
+            let file = File::open(filename)?;
+            let data = LoadedData::Mapped(MappedReadBuffer::map(&file, file_len, options)?);
+            read_all_bytes(data.as_slice(), params.num_threads)?;
+            Ok(Some(data))
+        }
+        ReadToMemoryMode::PagedSharedBuffer | ReadToMemoryMode::MultipleTargetBuffers => Ok(None),
+    }
 }
 
 pub fn map_file_blocks<T, F>(
@@ -1232,6 +1804,113 @@ mod tests {
     }
 
     #[test]
+    fn measure_file_load_to_memory_mmap_reports_full_length() {
+        let path = unique_temp_file("fro-load-mmap");
+        let data = (0..(256 * 1024 + 321))
+            .map(|i| ((i * 13) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).unwrap();
+
+        let bytes = measure_file_load_to_memory(
+            path.to_str().unwrap(),
+            2,
+            128 * 1024,
+            2,
+            2,
+            256 * 1024,
+            2,
+            IOMode::PageCache,
+            ReadToMemoryMode::Mmap,
+            ReadToMemoryOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bytes, data.len() as u64);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn measure_file_load_to_memory_multiple_targets_reports_full_length() {
+        let path = unique_temp_file("fro-load-multi-target");
+        let data = (0..(512 * 1024 + 777))
+            .map(|i| ((i * 29) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &data).unwrap();
+
+        let bytes = measure_file_load_to_memory(
+            path.to_str().unwrap(),
+            4,
+            128 * 1024,
+            2,
+            2,
+            256 * 1024,
+            2,
+            IOMode::PageCache,
+            ReadToMemoryMode::MultipleTargetBuffers,
+            ReadToMemoryOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bytes, data.len() as u64);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mapped_read_buffer_unmaps_prefix_in_page_chunks() {
+        let path = unique_temp_file("fro-load-mmap-unmap");
+        let data = vec![0x5A; 8192];
+        fs::write(&path, &data).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let mut mapped =
+            MappedReadBuffer::map(&file, data.len(), ReadToMemoryOptions::default()).unwrap();
+        assert_eq!(mapped.as_slice().len(), 8192);
+
+        let unmapped = mapped.unmap_prefix(5000).unwrap();
+        assert_eq!(unmapped, 4096);
+        assert_eq!(mapped.as_slice().len(), 4096);
+        assert!(mapped.as_slice().iter().all(|&b| b == 0x5A));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_to_memory_defaults_enable_hugepages() {
+        let options = ReadToMemoryOptions::default();
+        assert!(options.hugepages);
+        assert!(!options.measure_unmap_time);
+    }
+
+    #[test]
+    fn auto_to_memory_mode_uses_direct_loader_when_direct_is_forced() {
+        assert_eq!(
+            resolve_to_memory_mode("/dev/null", IOMode::Direct, ReadToMemoryMode::Auto),
+            ReadToMemoryMode::PagedSharedBuffer
+        );
+    }
+
+    #[test]
+    fn auto_to_memory_mode_uses_mmap_when_page_cache_is_forced() {
+        assert_eq!(
+            resolve_to_memory_mode("/dev/null", IOMode::PageCache, ReadToMemoryMode::Auto),
+            ReadToMemoryMode::Mmap
+        );
+    }
+
+    #[test]
+    fn auto_to_memory_mode_treats_empty_files_as_cached() {
+        let path = unique_temp_file("fro-load-auto-empty");
+        fs::write(&path, b"").unwrap();
+        assert_eq!(
+            resolve_to_memory_mode(path.to_str().unwrap(), IOMode::Auto, ReadToMemoryMode::Auto),
+            ReadToMemoryMode::Mmap
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn resolve_reader_params_for_mode_uses_config_mode() {
         let path = unique_temp_file("fro-load-config");
         fs::write(&path, b"hello world").unwrap();
@@ -1414,7 +2093,7 @@ unsafe fn output_slice_mut(output: &SharedOutput, offset: usize, len: usize) -> 
     std::slice::from_raw_parts_mut(output.ptr.add(offset), len)
 }
 
-fn touch_pages(data: &[u8], num_threads: u64) -> std::io::Result<()> {
+fn read_all_bytes(data: &[u8], num_threads: u64) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -1426,7 +2105,6 @@ fn touch_pages(data: &[u8], num_threads: u64) -> std::io::Result<()> {
         len: data.len(),
     });
     let mut threads = Vec::new();
-    let scan_stride = 64usize;
     let chunk_size = data.len().div_ceil(thread_count);
 
     for thread_id in 0..thread_count {
@@ -1436,15 +2114,8 @@ fn touch_pages(data: &[u8], num_threads: u64) -> std::io::Result<()> {
             let start = thread_id * chunk_size;
             let end = shared.len.min(start + chunk_size);
             let mut local = 0u64;
-            let mut offset = start;
-
-            while offset + scan_stride <= end {
+            for offset in start..end {
                 let value = unsafe { *shared.ptr.add(offset) as u64 };
-                local = local.wrapping_add(value);
-                offset += scan_stride;
-            }
-            if offset < end {
-                let value = unsafe { *shared.ptr.add(end - 1) as u64 };
                 local = local.wrapping_add(value);
             }
             checksum.fetch_add(local, Ordering::Relaxed);

@@ -4,8 +4,9 @@ use blake3::Hasher as Blake3Hasher;
 use openssl::hash::{hash, MessageDigest};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -32,6 +33,26 @@ fn run_fro(command: &str, args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to run fro coreutils command")
+}
+
+fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .arg(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn fro coreutils command");
+    child
+        .stdin
+        .take()
+        .expect("missing child stdin")
+        .write_all(stdin_bytes)
+        .expect("failed to write child stdin");
+    child
+        .wait_with_output()
+        .expect("failed to read child output")
 }
 
 fn assert_success(output: Output) -> Output {
@@ -130,6 +151,23 @@ fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
 }
 
 #[test]
+fn multicall_cat_and_wc_accept_stdin_and_dash() {
+    let bytes = b"one two\nthree\n";
+
+    let cat_stdin = assert_success(run_fro_with_stdin("cat", &[], bytes));
+    assert_eq!(cat_stdin.stdout, bytes);
+
+    let cat_dash = assert_success(run_fro_with_stdin("cat", &["-"], bytes));
+    assert_eq!(cat_dash.stdout, bytes);
+
+    let wc_stdin = assert_success(run_fro_with_stdin("wc", &[], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_stdin.stdout).trim(), "2 3 14");
+
+    let wc_dash = assert_success(run_fro_with_stdin("wc", &["-"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_dash.stdout).trim(), "2 3 14 -");
+}
+
+#[test]
 fn multicall_fgrep_prints_matching_line_once() {
     let tmp = unique_temp_dir("fro-coreutils-fgrep");
     let path = tmp.join("grep.txt");
@@ -137,6 +175,20 @@ fn multicall_fgrep_prints_matching_line_once() {
 
     let out = assert_success(run_fro("fgrep", &["needle", path.to_str().unwrap()]));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "needle needle\n");
+}
+
+#[test]
+fn multicall_fgrep_and_tac_accept_stdin() {
+    let grep_input = b"alpha\nneedle beta\nomega\n";
+    let grep = assert_success(run_fro_with_stdin("fgrep", &["needle"], grep_input));
+    assert_eq!(String::from_utf8_lossy(&grep.stdout), "needle beta\n");
+
+    let grep_dash = assert_success(run_fro_with_stdin("fgrep", &["needle", "-"], grep_input));
+    assert_eq!(String::from_utf8_lossy(&grep_dash.stdout), "needle beta\n");
+
+    let tac_input = b"one\ntwo\n";
+    let tac = assert_success(run_fro_with_stdin("tac", &[], tac_input));
+    assert_eq!(String::from_utf8_lossy(&tac.stdout), "two\none\n");
 }
 
 #[test]

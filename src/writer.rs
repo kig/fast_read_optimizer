@@ -7,8 +7,9 @@ use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -51,6 +52,17 @@ pub struct SequentialWriter {
     staging: Vec<u8>,
 }
 
+pub struct BufWriter {
+    tx: SyncSender<BufWriteRequest>,
+    finish_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+enum BufWriteRequest {
+    Data(Vec<u8>),
+    Flush(mpsc::Sender<std::io::Result<()>>),
+    Shutdown(mpsc::Sender<std::io::Result<()>>),
+}
+
 #[allow(dead_code)]
 pub struct OffsetWriter {
     file_page_cache: File,
@@ -90,6 +102,31 @@ impl SequentialWriter {
         io_mode: IOMode,
         truncate: bool,
     ) -> std::io::Result<Self> {
+        let (file_page_cache, file_direct, bytes_written) =
+            open_writer_files(path, truncate, None)?;
+        Self::from_open_files(
+            file_page_cache,
+            file_direct,
+            bytes_written,
+            qd,
+            block_size,
+            io_mode != IOMode::PageCache,
+        )
+    }
+
+    pub fn from_file(file: File, qd: usize, block_size: u64) -> std::io::Result<Self> {
+        let file_direct = file.try_clone()?;
+        Self::from_open_files(file, file_direct, 0, qd, block_size, false)
+    }
+
+    fn from_open_files(
+        file_page_cache: File,
+        file_direct: File,
+        bytes_written: u64,
+        qd: usize,
+        block_size: u64,
+        use_direct: bool,
+    ) -> std::io::Result<Self> {
         if qd == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -102,8 +139,6 @@ impl SequentialWriter {
                 "block_size must be greater than zero",
             ));
         }
-        let (file_page_cache, file_direct, bytes_written) =
-            open_writer_files(path, truncate, None)?;
         Ok(Self {
             file_page_cache,
             file_direct,
@@ -111,7 +146,7 @@ impl SequentialWriter {
             pending: std::iter::repeat_with(|| None).take(qd).collect(),
             bytes_written,
             bytes_submitted: bytes_written,
-            use_direct: io_mode != IOMode::PageCache,
+            use_direct,
             block_size: aligned_block_size(block_size as usize),
             staging: Vec::new(),
         })
@@ -234,6 +269,133 @@ impl SequentialWriter {
         }
         Ok(())
     }
+}
+
+impl Write for SequentialWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.append(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        SequentialWriter::flush(self)
+    }
+}
+
+impl BufWriter {
+    pub fn stdout(qd: usize, block_size: u64, channel_depth: usize) -> io::Result<Self> {
+        let stdout_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if stdout_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(stdout_fd) };
+        let _ = qd;
+        Self::with_capacity(channel_depth, file, 1, block_size)
+    }
+
+    #[allow(dead_code)]
+    pub fn new(file: File, qd: usize, block_size: u64) -> io::Result<Self> {
+        Self::with_capacity(4, file, qd, block_size)
+    }
+
+    pub fn with_capacity(
+        channel_capacity: usize,
+        file: File,
+        qd: usize,
+        block_size: u64,
+    ) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<BufWriteRequest>(channel_capacity.max(1));
+        let finish_handle = std::thread::spawn(move || -> io::Result<()> {
+            let mut writer = SequentialWriter::from_file(file, qd, block_size)?;
+            run_buf_writer_loop(&mut writer, rx)
+        });
+        Ok(Self {
+            tx,
+            finish_handle: Some(finish_handle),
+        })
+    }
+
+    pub fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(BufWriteRequest::Data(buf.to_vec()))
+            .map_err(|err| io::Error::other(err.to_string()))
+    }
+
+    pub fn flush_shared(&self) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(BufWriteRequest::Flush(reply_tx))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|err| io::Error::other(err.to_string()))?
+    }
+
+    pub fn into_inner(mut self) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(BufWriteRequest::Shutdown(reply_tx))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let shutdown_result = reply_rx
+            .recv()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let handle = self
+            .finish_handle
+            .take()
+            .ok_or_else(|| io::Error::other("buf writer already finished"))?;
+        shutdown_result?;
+        handle
+            .join()
+            .map_err(|_| io::Error::other("buf writer thread panicked"))?
+    }
+}
+
+impl Write for BufWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.tx
+            .send(BufWriteRequest::Data(buf.to_vec()))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_shared()
+    }
+}
+
+fn run_buf_writer_loop(
+    writer: &mut SequentialWriter,
+    rx: Receiver<BufWriteRequest>,
+) -> io::Result<()> {
+    while let Ok(request) = rx.recv() {
+        match request {
+            BufWriteRequest::Data(chunk) => writer.write_all(&chunk)?,
+            BufWriteRequest::Flush(reply_tx) => {
+                let result = writer.flush();
+                let is_err = result.is_err();
+                let _ = reply_tx.send(result);
+                if is_err {
+                    return Err(io::Error::other("buf writer flush failed"));
+                }
+            }
+            BufWriteRequest::Shutdown(reply_tx) => {
+                let result = writer.flush();
+                let flush_ok = result.is_ok();
+                let _ = reply_tx.send(result);
+                if flush_ok {
+                    return Ok(());
+                }
+                return Err(io::Error::other("buf writer shutdown flush failed"));
+            }
+        }
+    }
+    writer.flush()
 }
 
 #[allow(dead_code)]
@@ -2042,6 +2204,31 @@ mod tests {
         assert_eq!(&data[..a.len()], &a);
         assert_eq!(&data[a.len()..a.len() + b.len()], &b);
         assert_eq!(&data[a.len() + b.len()..], &c);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn buf_writer_batches_chunks_into_output_file() {
+        let path = unique_temp_file("fro-buf-writer");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let writer = BufWriter::with_capacity(2, file, 2, 4096).unwrap();
+
+        writer.write_all(&vec![b'a'; 3000]).unwrap();
+        writer.write_all(&vec![b'b'; 5000]).unwrap();
+        writer.write_all(&vec![b'c'; 17]).unwrap();
+        writer.into_inner().unwrap();
+
+        let data = fs::read(&path).unwrap();
+        assert_eq!(data.len(), 8017);
+        assert!(data[..3000].iter().all(|&byte| byte == b'a'));
+        assert!(data[3000..8000].iter().all(|&byte| byte == b'b'));
+        assert!(data[8000..].iter().all(|&byte| byte == b'c'));
 
         let _ = fs::remove_file(path);
     }

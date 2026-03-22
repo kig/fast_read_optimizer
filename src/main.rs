@@ -23,7 +23,10 @@ use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use io_util::{direct_writer_supported, sync_path, CopyOperationGuard};
 use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
-use reader::{load_file_to_memory, read_file};
+use reader::{
+    load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory, read_file,
+    resolve_to_memory_mode, ReadToMemoryMode, ReadToMemoryOptions,
+};
 use std::io::{self, Write};
 use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{
@@ -57,6 +60,19 @@ fn parse_size(s: &str) -> Option<u64> {
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
 const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
 const COPY_RANGE_PARAM_INDICES: [usize; 3] = [6, 7, 8];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ManualReadOverrides {
+    threads: Option<u64>,
+    block_size: Option<u64>,
+    qd: Option<usize>,
+}
+
+impl ManualReadOverrides {
+    fn any(self) -> bool {
+        self.threads.is_some() || self.block_size.is_some() || self.qd.is_some()
+    }
+}
 
 fn mark_optimizer_params(mask: &mut [bool], indices: &[usize], include_block_size: bool) {
     for &index in indices {
@@ -142,6 +158,55 @@ fn active_optimizer_param_mask(
         mask.fill(false);
     }
     mask.to_vec()
+}
+
+fn freeze_read_override(
+    start_params: &mut [u64],
+    params_steps: &mut [u64],
+    optimizer_mask: &mut [bool],
+    indices: [usize; 2],
+    value: u64,
+) {
+    for index in indices {
+        start_params[index] = value;
+        params_steps[index] = 1;
+        optimizer_mask[index] = false;
+    }
+}
+
+fn apply_manual_read_overrides(
+    start_params: &mut [u64],
+    params_steps: &mut [u64],
+    optimizer_mask: &mut [bool],
+    overrides: ManualReadOverrides,
+) {
+    if let Some(threads) = overrides.threads {
+        freeze_read_override(
+            start_params,
+            params_steps,
+            optimizer_mask,
+            [PAGE_CACHE_PARAM_INDICES[0], DIRECT_PARAM_INDICES[0]],
+            threads,
+        );
+    }
+    if let Some(block_size) = overrides.block_size {
+        freeze_read_override(
+            start_params,
+            params_steps,
+            optimizer_mask,
+            [PAGE_CACHE_PARAM_INDICES[1], DIRECT_PARAM_INDICES[1]],
+            block_size,
+        );
+    }
+    if let Some(qd) = overrides.qd {
+        freeze_read_override(
+            start_params,
+            params_steps,
+            optimizer_mask,
+            [PAGE_CACHE_PARAM_INDICES[2], DIRECT_PARAM_INDICES[2]],
+            qd as u64,
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -472,12 +537,18 @@ fn command_help(name: &str) -> Option<CommandHelp> {
     match name {
         "read" => Some(CommandHelp {
             name: "read",
-            usage: "read [--to-memory] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
+            usage: "read [--to-memory] [--paged-shared-buffer|--mmap|--mmap-read-pages|--multiple-target-buffers] [--threads N] [--qd N] [--blocksize SIZE] [--disable-hugepages] [--measure-unmap-time] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
             summary: "Striped multi-threaded file read for measuring raw throughput on one file.",
             notes: &[
                 "Use -n 1 for one measured run with the current tuned parameters.",
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
-                "--to-memory loads the whole file into RAM instead of only measuring the streaming read path.",
+                "--to-memory defaults to an auto backend: mmap when the first page looks cached, otherwise the direct/shared-buffer loader.",
+                "--paged-shared-buffer forces the old shared destination-buffer loader for read --to-memory.",
+                "--mmap maps the file instead of reading into a destination buffer; --mmap-read-pages also walks the mapped bytes.",
+                "--multiple-target-buffers gives each reader thread its own destination buffer with no consolidation step.",
+                "--to-memory enables hugepage advice by default; --disable-hugepages turns that off for the mapped or destination buffer backing.",
+                "--measure-unmap-time keeps mmap teardown inside the timed region for --mmap and --mmap-read-pages.",
+                "--threads, --qd, and --blocksize override the read-side tuned params so you can do one-off perf sweeps without editing fro.json.",
             ],
             examples: &[
                 (
@@ -485,8 +556,12 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                     "read --direct -n 1 /mnt/fast/bigfile.dat",
                 ),
                 (
-                    "Load a hot file all the way into memory",
-                    "read --to-memory --no-direct -n 1 /mnt/fast/bigfile.dat",
+                    "Let read --to-memory auto-pick mmap vs direct based on cache state",
+                    "read --to-memory -n 1 /mnt/fast/bigfile.dat",
+                ),
+                (
+                    "Map a hot file and read all mapped bytes",
+                    "read --to-memory --mmap-read-pages --no-direct -n 1 /mnt/fast/bigfile.dat",
                 ),
             ],
         }),
@@ -951,6 +1026,9 @@ fn try_main() -> io::Result<i32> {
     let mut io_mode = common::IOMode::Auto;
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
+    let mut to_memory_mode = ReadToMemoryMode::Auto;
+    let mut to_memory_options = ReadToMemoryOptions::default();
+    let mut manual_read_overrides = ManualReadOverrides::default();
     let mut via_memory = legacy_copy_via_memory;
     let mut verify_copy = false;
     let mut verify_copy_diff = false;
@@ -1022,12 +1100,39 @@ fn try_main() -> io::Result<i32> {
             } else if args[i] == "--threads" {
                 i += 1;
                 if i < args.len() {
-                    bench_threads = Some(args[i].parse().map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("invalid thread count: {}", err),
-                        )
+                    if mode == "bench-memcpy" {
+                        bench_threads = Some(args[i].parse().map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid thread count: {}", err),
+                            )
+                        })?);
+                    } else {
+                        manual_read_overrides.threads = Some(args[i].parse().map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid thread count: {}", err),
+                            )
+                        })?);
+                    }
+                }
+            } else if args[i] == "--qd" {
+                i += 1;
+                if i < args.len() {
+                    manual_read_overrides.qd = Some(args[i].parse().map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid qd: {}", err))
                     })?);
+                }
+            } else if args[i] == "--blocksize" {
+                i += 1;
+                if i < args.len() {
+                    manual_read_overrides.block_size = parse_size(args[i].as_str()).or_else(|| {
+                        eprintln!("Invalid --blocksize: {}", args[i]);
+                        None
+                    });
+                    if manual_read_overrides.block_size.is_none() {
+                        return Ok(1);
+                    }
                 }
             } else if args[i] == "--create" {
                 i += 1;
@@ -1069,6 +1174,18 @@ fn try_main() -> io::Result<i32> {
                 io_mode_write = common::IOMode::Auto;
             } else if args[i] == "--to-memory" {
                 to_memory = true;
+            } else if args[i] == "--paged-shared-buffer" {
+                to_memory_mode = ReadToMemoryMode::PagedSharedBuffer;
+            } else if args[i] == "--mmap" {
+                to_memory_mode = ReadToMemoryMode::Mmap;
+            } else if args[i] == "--mmap-read-pages" {
+                to_memory_mode = ReadToMemoryMode::MmapReadPages;
+            } else if args[i] == "--multiple-target-buffers" {
+                to_memory_mode = ReadToMemoryMode::MultipleTargetBuffers;
+            } else if args[i] == "--disable-hugepages" {
+                to_memory_options.hugepages = false;
+            } else if args[i] == "--measure-unmap-time" {
+                to_memory_options.measure_unmap_time = true;
             } else if args[i] == "--via-memory" {
                 via_memory = true;
             } else if args[i] == "--verify" || args[i] == "--verified" {
@@ -1185,6 +1302,30 @@ fn try_main() -> io::Result<i32> {
     }
     if to_memory && mode != "read" {
         println!("--to-memory is only supported for read");
+        return Ok(1);
+    }
+    if to_memory_mode != ReadToMemoryMode::Auto && !to_memory {
+        println!(
+            "--paged-shared-buffer, --mmap, --mmap-read-pages, and --multiple-target-buffers require read --to-memory"
+        );
+        return Ok(1);
+    }
+    if !to_memory_options.hugepages && !to_memory {
+        println!("--disable-hugepages requires read --to-memory");
+        return Ok(1);
+    }
+    if to_memory_options.measure_unmap_time && !to_memory {
+        println!("--measure-unmap-time requires read --to-memory");
+        return Ok(1);
+    }
+    if matches!(to_memory_mode, ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages)
+        && io_mode == common::IOMode::Direct
+    {
+        println!("--mmap and --mmap-read-pages are not supported with --direct");
+        return Ok(1);
+    }
+    if manual_read_overrides.any() && mode != "read" {
+        println!("--threads, --qd, and --blocksize overrides are only supported for read");
         return Ok(1);
     }
     if via_memory && mode != "copy" {
@@ -1335,6 +1476,7 @@ fn try_main() -> io::Result<i32> {
 
     let mut config = config::load_config(config_path);
     let config_mode = match mode {
+        "read" if to_memory => "read_to_memory",
         "recover" => "verify",
         "hash" | "verify" => mode,
         _ => mode,
@@ -1357,7 +1499,7 @@ fn try_main() -> io::Result<i32> {
     let base_block_size_direct = params_direct.block_size / (256 * 1024);
     let base_block_size_copy_range = params_copy_range.block_size / (256 * 1024);
 
-    let start_params = vec![
+    let mut start_params = vec![
         num_threads_pc,
         base_block_size_pc,
         qd_pc as u64,
@@ -1368,7 +1510,7 @@ fn try_main() -> io::Result<i32> {
         base_block_size_copy_range,
         params_copy_range.qd as u64,
     ];
-    let params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1, 1, 256 * 1024, 1];
+    let mut params_steps = vec![1, 4 * 1024, 1, 1, 256 * 1024, 1, 1, 256 * 1024, 1];
 
     let mode_name = mode;
     let copy_strategy = if force_copy_file_range {
@@ -1389,8 +1531,16 @@ fn try_main() -> io::Result<i32> {
     } else {
         CopyRewriteMode::Auto
     };
-    let optimizer_mask =
+    let mut optimizer_mask =
         active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory, copy_strategy);
+    if mode == "read" {
+        apply_manual_read_overrides(
+            &mut start_params,
+            &mut params_steps,
+            &mut optimizer_mask,
+            manual_read_overrides,
+        );
+    }
     let verbose = verbose || mode == "read" || mode == "write";
     if verbose {
         eprintln!("Opening file {} for {}", filename, mode);
@@ -1402,7 +1552,7 @@ fn try_main() -> io::Result<i32> {
 
     let mode_callback = |p: &[u64]| {
         if mode == "read" && to_memory {
-            let loaded = load_file_to_memory(
+            measure_file_load_to_memory(
                 filename,
                 p[0],
                 p[1],
@@ -1411,8 +1561,9 @@ fn try_main() -> io::Result<i32> {
                 p[4],
                 p[5] as usize,
                 io_mode,
-            )?;
-            Ok(loaded.bytes_read)
+                to_memory_mode,
+                to_memory_options,
+            )
         } else if mode == "read" || mode == "grep" {
             read_file(
                 pattern,
@@ -1591,8 +1742,10 @@ fn try_main() -> io::Result<i32> {
                 } else if verify_copy_diff {
                     let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
                     let copied = if via_memory {
-                        let read_page_cache = config.get_params_for_path("read", false, src);
-                        let read_direct = config.get_params_for_path("read", true, src);
+                        let read_page_cache =
+                            config.get_params_for_path("read_to_memory", false, src);
+                        let read_direct =
+                            config.get_params_for_path("read_to_memory", true, src);
                         let loaded = load_file_to_memory(
                             src,
                             read_page_cache.num_threads,
@@ -1667,8 +1820,8 @@ fn try_main() -> io::Result<i32> {
                     Ok(copied)
                 } else if via_memory {
                     let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
-                    let read_page_cache = config.get_params_for_path("read", false, src);
-                    let read_direct = config.get_params_for_path("read", true, src);
+                    let read_page_cache = config.get_params_for_path("read_to_memory", false, src);
+                    let read_direct = config.get_params_for_path("read_to_memory", true, src);
                     let loaded = load_file_to_memory(
                         src,
                         read_page_cache.num_threads,
@@ -1777,6 +1930,72 @@ fn try_main() -> io::Result<i32> {
         }
     };
 
+    let effective_to_memory_mode = if mode == "read" && to_memory {
+        Some(resolve_to_memory_mode(filename, io_mode, to_memory_mode))
+    } else {
+        None
+    };
+
+    if mode == "read"
+        && to_memory
+        && iterations == 1
+        && effective_to_memory_mode.is_some_and(|mode| {
+            matches!(mode, ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages)
+        })
+        && !to_memory_options.measure_unmap_time
+    {
+        let single_run_params = start_params
+            .iter()
+            .zip(params_steps.iter())
+            .map(|(value, scale)| value * scale)
+            .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
+        let prepared = prepare_file_load_to_memory(
+            filename,
+            single_run_params[0],
+            single_run_params[1],
+            single_run_params[2] as usize,
+            single_run_params[3],
+            single_run_params[4],
+            single_run_params[5] as usize,
+            io_mode,
+            to_memory_mode,
+            to_memory_options,
+        )?;
+        let bytes = std::fs::metadata(filename)?.len();
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{} {} bytes in {:.4} s, {:.1} GB/s, {:?}",
+            mode_name,
+            bytes,
+            elapsed,
+            bytes as f64 / elapsed / 1e9,
+            &single_run_params[..6]
+        );
+        drop(prepared);
+        if save_config {
+            match io_mode {
+                common::IOMode::Auto => {}
+                _ => {
+                    let direct = io_mode == common::IOMode::Direct;
+                    let off = if direct { 3 } else { 0 };
+                    config.update_params_for_path(
+                        config_mode,
+                        direct,
+                        context_path,
+                        config::IOParams {
+                            num_threads: single_run_params[off],
+                            block_size: single_run_params[off + 1],
+                            qd: single_run_params[off + 2] as usize,
+                        },
+                    );
+                    config.save();
+                }
+            }
+        }
+        return Ok(0);
+    }
+
     let best_params = run_optimizer(
         mode_name,
         start_params,
@@ -1874,9 +2093,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_optimizer_param_mask, describe_copy_path, should_prefer_cached_diff_overwrite,
-        should_prefer_cached_read_direct_write, target_is_similar_size, HeuristicCopyPlan,
-        ResolvedCopyExecution,
+        active_optimizer_param_mask, apply_manual_read_overrides, describe_copy_path,
+        should_prefer_cached_diff_overwrite, should_prefer_cached_read_direct_write,
+        target_is_similar_size, HeuristicCopyPlan, ManualReadOverrides, ResolvedCopyExecution,
     };
     use crate::common::{CopyStrategy, IOMode};
 
@@ -1977,6 +2196,26 @@ mod tests {
             ),
             vec![false, false, false, false, false, false, true, true, true]
         );
+    }
+
+    #[test]
+    fn manual_read_overrides_freeze_both_read_param_sets() {
+        let mut start_params = vec![8, 16, 2, 12, 32, 4, 1, 64, 1];
+        let mut params_steps = vec![1, 4096, 1, 1, 262144, 1, 1, 262144, 1];
+        let mut mask = vec![true; 9];
+        apply_manual_read_overrides(
+            &mut start_params,
+            &mut params_steps,
+            &mut mask,
+            ManualReadOverrides {
+                threads: Some(5),
+                block_size: Some(131072),
+                qd: Some(7),
+            },
+        );
+        assert_eq!(&start_params[..6], &[5, 131072, 7, 5, 131072, 7]);
+        assert_eq!(&params_steps[..6], &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(&mask[..6], &[false, false, false, false, false, false]);
     }
 
     #[test]

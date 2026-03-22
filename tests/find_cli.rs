@@ -96,3 +96,23 @@ fn find_matches_system_for_multiple_roots_ignoring_order() {
     assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
     assert_eq!(fro.stderr, system.stderr);
 }
+
+#[test]
+fn find_matches_system_for_wide_tree_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-wide");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    for i in 0..24 {
+        let branch = root.join(format!("branch-{i}"));
+        let nested = branch.join("nested").join("leaf");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(branch.join("root.txt"), format!("root-{i}\n")).unwrap();
+        fs::write(nested.join("leaf.txt"), format!("leaf-{i}\n")).unwrap();
+    }
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap()]));
+    let system = assert_success(run_system(&[root.to_str().unwrap()]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}

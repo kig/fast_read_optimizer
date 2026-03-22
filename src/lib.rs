@@ -23,8 +23,9 @@ pub use api::{
 pub use blake3_hash::hash_file_blake3;
 pub use common::{CopyAutoMode, CopyStrategy, IOMode};
 pub use file_hash::{hash_file, hash_file_sha256, HashAlgorithm};
+pub use reader::{BufReader, MappedReadBuffer};
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,
 };
 pub use verified_copy::{copy_file_verified, copy_file_verified_with_options, VerifiedCopyReport};
-pub use writer::{OffsetWriter, SequentialWriter};
+pub use writer::{BufWriter, OffsetWriter, SequentialWriter};

@@ -23,6 +23,8 @@ pub struct ModeConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
     pub read: ModeConfig,
+    #[serde(default = "default_read_to_memory_mode_config")]
+    pub read_to_memory: ModeConfig,
     pub write: ModeConfig,
     pub copy: ModeConfig,
     #[serde(default = "default_copy_range_params")]
@@ -62,6 +64,7 @@ pub struct MountOverrides {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AppConfigPatch {
     pub read: Option<ModeConfigPatch>,
+    pub read_to_memory: Option<ModeConfigPatch>,
     pub write: Option<ModeConfigPatch>,
     pub copy: Option<ModeConfigPatch>,
     pub copy_range: Option<IOParams>,
@@ -296,6 +299,7 @@ impl AppConfigPatch {
     fn get_mode_patch(&self, mode: &str) -> Option<&ModeConfigPatch> {
         match mode {
             "read" => self.read.as_ref(),
+            "read-to-memory" | "read_to_memory" => self.read_to_memory.as_ref(),
             "write" => self.write.as_ref(),
             "copy" => self.copy.as_ref(),
             "grep" => self.grep.as_ref(),
@@ -310,6 +314,7 @@ impl AppConfigPatch {
     fn set_mode_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         let m = match mode {
             "read" => &mut self.read,
+            "read-to-memory" | "read_to_memory" => &mut self.read_to_memory,
             "write" => &mut self.write,
             "copy" => &mut self.copy,
             "grep" => &mut self.grep,
@@ -548,6 +553,7 @@ impl Default for AppConfig {
 
         AppConfig {
             read: default_mode.clone(),
+            read_to_memory: default_mode.clone(),
             write: default_write_mode.clone(),
             copy: default_write_mode.clone(),
             copy_range: default_copy_range,
@@ -577,6 +583,7 @@ impl AppConfig {
     pub fn get_params(&self, mode: &str, direct: bool) -> IOParams {
         let mode_config = match mode {
             "read" => &self.read,
+            "read-to-memory" | "read_to_memory" => &self.read_to_memory,
             "write" => &self.write,
             "copy" => &self.copy,
             "grep" => &self.grep,
@@ -606,6 +613,7 @@ impl AppConfig {
     pub fn update_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         let mode_config = match mode {
             "read" => &mut self.read,
+            "read-to-memory" | "read_to_memory" => &mut self.read_to_memory,
             "write" => &mut self.write,
             "copy" => &mut self.copy,
             "grep" => &mut self.grep,
@@ -630,6 +638,10 @@ impl AppConfig {
 
 fn default_hash_mode_config() -> ModeConfig {
     AppConfig::default().hash
+}
+
+fn default_read_to_memory_mode_config() -> ModeConfig {
+    AppConfig::default().read_to_memory
 }
 
 fn default_verify_mode_config() -> ModeConfig {
@@ -764,6 +776,8 @@ mod tests {
 
         let p0 = loaded.get_params("read", true);
         assert_eq!(p0.num_threads, 16);
+        let p_to_mem = loaded.get_params("read_to_memory", true);
+        assert_eq!(p_to_mem.num_threads, 16);
         let copy_range0 = loaded.get_copy_range_params();
         assert_eq!(copy_range0.block_size, 512 * 1024);
         assert_eq!(loaded.get_copy_auto_mode(), CopyAutoMode::Heuristic);

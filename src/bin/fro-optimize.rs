@@ -1309,6 +1309,25 @@ fn main() {
             argsv!("read", "-s", "--direct", "-n", &read_iters, &source_file),
             argsv!("read", "-s", "--no-direct", "-n", &read_iters, &source_file),
             argsv!(
+                "read",
+                "--to-memory",
+                "-s",
+                "--direct",
+                "-n",
+                &read_iters,
+                &source_file
+            ),
+            argsv!(
+                "read",
+                "--to-memory",
+                "--paged-shared-buffer",
+                "-s",
+                "--no-direct",
+                "-n",
+                &read_iters,
+                &source_file
+            ),
+            argsv!(
                 "grep",
                 "-s",
                 "--direct",
@@ -1422,8 +1441,13 @@ fn main() {
                 continue;
             }
             let mut ok = false;
+            let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
             for p in patterns.iter() {
-                if cfg[0].starts_with(p.as_str()) {
+                let pattern = p.as_str();
+                if cfg[0].starts_with(pattern)
+                    || ((pattern == "read-to-memory" || pattern == "read_to_memory")
+                        && is_to_memory)
+                {
                     ok = true;
                     break;
                 }
