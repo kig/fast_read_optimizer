@@ -9,6 +9,12 @@
   - grep finds matches across block boundaries
   - malformed config files are preserved instead of being overwritten
   - more io_uring failures propagate as regular CLI errors
+- Coretools progress is materially better than the earlier snapshot:
+  - `du` now exists as a real multicall/subcommand and no longer uses a naive recursive metadata walk
+  - `find` keeps the coarse subtree-stealing traversal that measures about `0.06-0.07 s` on `/data/repos/formalanswer`
+  - `du` now uses split scheduling: coarse `find`-style traversal plus a wider metadata-stat worker pool, measuring about `0.09-0.10 s` on the same tree
+  - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, and read-to-memory flows are all wired into the main tool surface
+  - `io_uring` `GETDENTS` remains blocked in this environment because the shipped kernel headers and current Rust crate surfaces do not expose `IORING_OP_GETDENTS`
 
 ## Current active items
 
@@ -65,6 +71,9 @@
   - `find` is **very** fast, but even faster when run as multiple instances on subtrees (find dir/s1 & find dir/s2 & find dir/s3 ...)
   - Look how rg does it for inodes?
   - Would kinda like if directory trees could be GC'd into contiguous bags of bytes in memory and copied over with a seq-read + rewrite inode ids + seq-write.
+- [ ] Revisit `io_uring` dirwalk once the environment exposes `IORING_OP_GETDENTS` / usable Rust bindings.
+  - Current blocker: this host's `/usr/include/linux/io_uring.h` and the pinned `io-uring` / `iou` crate surfaces do not expose the opcode yet.
+  - Current best-known fallback is split scheduling: coarse subtree traversal for `find`, and coarse traversal plus wide stat workers for `du`.
 - [ ] Idea: sort files by block inode to get a more sequential access pattern. 
 - [ ] Idea: keep nearby-on-media files in the same thread, pin threads to cores (each core manages an area of memory -> higher cache hit rate).
 - [ ] Idea: small files bundled into processing bundles for efficient batching, large files dealt with separately (while large file data is streaming, small file inodes are streaming).

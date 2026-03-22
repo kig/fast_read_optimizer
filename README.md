@@ -14,7 +14,21 @@ It combines tuned striped IO, literal search, copy / diff utilities, a benchmark
 - tuning read / write / copy / diff parameters for a specific machine or mount
 - running repeatable performance regressions
 
-It is **not** a recursive file copier, a regex engine, or a parity / erasure-coding system.
+## Target real-world use cases and current progress
+
+The current product direction is NVMe- and page-cache-optimized replacements for I/O-bound Unix tools and adjacent data-movement workflows.
+
+| Area | Goal | Current state |
+| --- | --- | --- |
+| Hashing / verification (`hash`, `verify`, `recover`, `cksum`, `sha*sum`, `b3sum`, `b2sum`, `md5sum`) | Fast large-file integrity, replica checking, and repair | Strongest area today. Core hash/verify/recover paths are mature; some multicall checksum variants are still at parity rather than clear wins. |
+| Tree walk (`find`, `du`) | Fast metadata-heavy traversal on large trees | Implemented and actively optimized. `du` now shares the same concurrent directory-walk machinery as `find`. |
+| Literal search (`fgrep`, `fro grep`) | Hot-cache and NVMe-friendly fixed-string search | Implemented for single-file scans. This is a good candidate for adapting `rg`-style UX to `fro` I/O over time. |
+| Copy / move (`cp`, `fro copy`, future `mv`) | High-throughput large-file copy and practical tree copy | Single-file copy and recursive `cp -r` exist; `mv` is still a target area rather than a delivered multicall tool. |
+| Stream processing (`cat`, `wc`, future `dd`, other pipe-heavy tools) | Page-cache and pipe-throughput-optimized stream utilities | `cat` and `wc` exist and have improved materially, but they are still below the long-term hot-cache pipeline target. `dd` and other streaming utils remain roadmap work. |
+| Read file to memory (`read --to-memory`) | Lift a file into RAM quickly with tunable backends | Implemented, benchmarked, and separately tunable via `read_to_memory` config entries. |
+| Populate page cache for shared mmap consumers | Warm shared model/data files for multi-process `mmap` reuse | Still exploratory. Plain `mmap` and `--mmap-read-pages` exist; the dedicated `--mmap-willneed` branch was removed because it did not earn its keep. |
+
+It is **not** a regex engine, a parity / erasure-coding system, or yet a complete replacement for the whole coreutils surface.
 
 ## Utilities
 
