@@ -73,6 +73,435 @@
 ### More utils
 
 - Goal: make the multicall coreutils a drop-in replacement that beats the system tools on performance.
+- [ ] Coreutils flag compatibility
+  - [ ] For each implemented utility, run GNU `--help`, snapshot the current flag surface, and keep the checklist below in sync as new commands land.
+  - [ ] If this section gets unwieldy, split compatibility work by utility family into separate source files/tests while keeping this TODO as the index.
+  - [ ] `cat`
+    - [ ] `-A`, `--show-all`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-b`, `--number-nonblank`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-e`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-E`, `--show-ends`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-n`, `--number`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--squeeze-blank`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-t`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-T`, `--show-tabs`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-u`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-v`, `--show-nonprinting`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `cmp`
+    - [ ] `-b`, `--print-bytes`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-i`, `--ignore-initial=SKIP`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-i`, `--ignore-initial=SKIP1:SKIP2`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--verbose`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-n`, `--bytes=LIMIT`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--quiet`, `--silent`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `cp` / `fro copy`
+    - [ ] `-a`, `--archive`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--attributes-only`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--backup[=CONTROL]`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-b`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--copy-contents`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-d`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-f`, `--force`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-i`, `--interactive`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-H`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--link`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-L`, `--dereference`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-n`, `--no-clobber`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-P`, `--no-dereference`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-p`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--preserve[=ATTR_LIST]`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--no-preserve=ATTR_LIST`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--parents`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-R`, `-r`, `--recursive`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--reflink[=WHEN]`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--remove-destination`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--sparse=WHEN`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--strip-trailing-slashes`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--symbolic-link`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-S`, `--suffix=SUFFIX`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-t`, `--target-directory=DIRECTORY`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-T`, `--no-target-directory`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-u`, `--update`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-v`, `--verbose`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-x`, `--one-file-system`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-Z`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--context[=CTX]`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `cksum`
+    - [ ] default no-flag output contract
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `find`
+    - [ ] traversal / expression options already listed by `find --help`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] predicates listed by `find --help` (`-name`, `-path`, `-type`, `-size`, `-mtime`, `-perm`, `-user`, `-group`, `-regex`, etc.)
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] actions listed by `find --help` (`-print*`, `-ls`, `-prune`, `-quit`, `-exec*`, `-ok*`)
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `fgrep`
+    - [ ] `-E`, `--extended-regexp`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-F`, `--fixed-strings`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-G`, `--basic-regexp`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-P`, `--perl-regexp`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-e`, `--regexp=PATTERNS`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-f`, `--file=FILE`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-i`, `--ignore-case`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--no-ignore-case`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-w`, `--word-regexp`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-x`, `--line-regexp`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-z`, `--null-data`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--no-messages`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-v`, `--invert-match`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-m`, `--max-count=NUM`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-b`, `--byte-offset`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-n`, `--line-number`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--line-buffered`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-H`, `--with-filename`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-h`, `--no-filename`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--label=LABEL`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-o`, `--only-matching`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-q`, `--quiet`, `--silent`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--binary-files=TYPE`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-a`, `--text`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-I`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-d`, `--directories=ACTION`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-D`, `--devices=ACTION`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-r`, `--recursive`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-R`, `--dereference-recursive`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--include=GLOB`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--exclude=GLOB`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--exclude-from=FILE`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--exclude-dir=GLOB`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-L`, `--files-without-match`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--files-with-matches`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-c`, `--count`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-T`, `--initial-tab`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-Z`, `--null`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-B`, `--before-context=NUM`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-A`, `--after-context=NUM`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-C`, `--context=NUM`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-NUM`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--group-separator=SEP`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--no-group-separator`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--color[=WHEN]`, `--colour[=WHEN]`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-U`, `--binary`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] digest family shared compatibility (`md5sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`)
+    - [ ] `-b`, `--binary`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-c`, `--check`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--tag`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-t`, `--text`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-z`, `--zero`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--ignore-missing`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--quiet`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--status`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--strict`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-w`, `--warn`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `b2sum`
+    - [ ] all digest-family shared flags above
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--length`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `b3sum`
+    - [ ] `--keyed`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--derive-key <CONTEXT>`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--length <LEN>`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--seek <SEEK>`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--num-threads <NUM>`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--no-mmap`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--no-names`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--raw`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--tag`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-c`, `--check`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--quiet`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `shred`
+    - [ ] `-f`, `--force`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-n`, `--iterations=N`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--random-source=FILE`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--size=N`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-u`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--remove[=HOW]`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-v`, `--verbose`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-x`, `--exact`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-z`, `--zero`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `tac`
+    - [ ] `-b`, `--before`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-r`, `--regex`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-s`, `--separator=STRING`
+      - [ ] equality test
+      - [ ] implementation
+  - [ ] `wc`
+    - [ ] `-c`, `--bytes`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-m`, `--chars`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-l`, `--lines`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `--files0-from=F`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-L`, `--max-line-length`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-w`, `--words`
+      - [ ] equality test
+      - [ ] implementation
 - [x] cksum, b2sum, md5sum, sha*sum
   - [x] cksum
   - [x] sha224sum / sha256sum / sha384sum / sha512sum
