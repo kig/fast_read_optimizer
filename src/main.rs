@@ -23,11 +23,20 @@ use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use io_util::{direct_writer_supported, sync_path, CopyOperationGuard};
 use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
+use reader::visit_file_blocks;
 use reader::{
-    load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory, read_file,
-    resolve_to_memory_mode, ReadToMemoryMode, ReadToMemoryOptions,
+    HugepageAdvice, load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory,
+    read_file, resolve_to_memory_mode, ReadToMemoryMode, ReadToMemoryOptions,
 };
+use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{
     copy_file_with_strategy, copy_file_with_strategy_and_truncate, overwrite_changed_chunks_direct,
@@ -60,6 +69,90 @@ fn parse_size(s: &str) -> Option<u64> {
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
 const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
 const COPY_RANGE_PARAM_INDICES: [usize; 3] = [6, 7, 8];
+const RECURSIVE_COPY_LARGE_FILE_THRESHOLD: u64 = 8 << 20;
+const RECURSIVE_COPY_PREALLOC_WORKERS: usize = 2;
+
+#[derive(Clone)]
+struct RecursiveCopyContext {
+    config: config::LoadedConfig,
+    source_root: PathBuf,
+    target_root: PathBuf,
+    optimizer_params: [u64; 9],
+    requested_strategy: CopyStrategy,
+    rewrite_mode: CopyRewriteMode,
+    io_mode_read: common::IOMode,
+    io_mode_write: common::IOMode,
+    keep_target_size: bool,
+    use_lock: bool,
+}
+
+#[derive(Clone)]
+struct RecursiveDirectoryTask {
+    source_dir: PathBuf,
+    target_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct RecursiveFileTask {
+    source_path: PathBuf,
+    target_path: PathBuf,
+    source_len: u64,
+    source_mode: u32,
+    resolved_copy: ResolvedCopyExecution,
+    preallocated: bool,
+}
+
+#[derive(Default)]
+struct RecursiveDirectoryQueue {
+    state: Mutex<RecursiveDirectoryQueueState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct RecursiveDirectoryQueueState {
+    queue: VecDeque<RecursiveDirectoryTask>,
+    active_workers: usize,
+}
+
+struct RecursiveTaskQueue<T> {
+    state: Mutex<RecursiveTaskQueueState<T>>,
+    ready: Condvar,
+}
+
+struct RecursiveTaskQueueState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+}
+
+struct RecursiveCopyStats {
+    files_copied: AtomicU64,
+    dirs_created: AtomicU64,
+    symlinks_created: AtomicU64,
+    bytes_copied: AtomicU64,
+}
+
+impl Default for RecursiveCopyStats {
+    fn default() -> Self {
+        Self {
+            files_copied: AtomicU64::new(0),
+            dirs_created: AtomicU64::new(0),
+            symlinks_created: AtomicU64::new(0),
+            bytes_copied: AtomicU64::new(0),
+        }
+    }
+}
+
+impl<T> Default for RecursiveTaskQueue<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RecursiveTaskQueueState {
+                queue: VecDeque::new(),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ManualReadOverrides {
@@ -91,18 +184,20 @@ fn active_optimizer_param_mask(
 ) -> Vec<bool> {
     let mut mask = [false; 9];
     match mode {
-        "read" | "grep" | "hash" | "diff" | "dual-read-bench" => match io_mode {
-            common::IOMode::Direct => {
-                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+        "read" | "grep" | "hash" | "diff" | "dual-read-bench" | "recursive-read-bench" => {
+            match io_mode {
+                common::IOMode::Direct => {
+                    mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+                }
+                common::IOMode::PageCache => {
+                    mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+                }
+                common::IOMode::Auto => {
+                    mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+                    mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+                }
             }
-            common::IOMode::PageCache => {
-                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
-            }
-            common::IOMode::Auto => {
-                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
-                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
-            }
-        },
+        }
         "verify" | "recover" => match io_mode {
             common::IOMode::Direct => {
                 mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);
@@ -227,6 +322,26 @@ enum HeuristicCopyPlan {
     CopyFileRangeSingle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageRedundancy {
+    Redundant,
+    NonRedundant,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfoBrief {
+    mount_point: String,
+    fstype: String,
+    mount_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZpoolLeafState {
+    state: Option<String>,
+    vdev_path: Vec<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CopyRewriteMode {
     Auto,
@@ -321,6 +436,27 @@ fn resolve_copy_execution(
         CopyAutoMode::Heuristic => {
             let (source_cached, target_cached, source_len, target_len) =
                 inspect_copy_auto_state(source_path, path);
+            let (redundancy, reflink_possible) = detect_copy_storage_policy(source_path, path);
+            if rewrite_mode == CopyRewriteMode::Auto
+                && redundancy == StorageRedundancy::Redundant
+                && reflink_possible
+            {
+                return Ok(ResolvedCopyExecution {
+                    copy_strategy: CopyStrategy::Reflink,
+                    io_mode_read: common::IOMode::PageCache,
+                    io_mode_write: common::IOMode::PageCache,
+                    diff_overwrite: false,
+                    full_rewrite: false,
+                    path_label: "auto redundant reflink",
+                });
+            }
+            if redundancy == StorageRedundancy::NonRedundant {
+                return Ok(choose_nonredundant_full_copy_plan(
+                    source_cached,
+                    source_len,
+                    target_len,
+                ));
+            }
             let plan = if rewrite_mode != CopyRewriteMode::Full
                 && should_prefer_cached_diff_overwrite(
                     source_cached,
@@ -448,6 +584,302 @@ fn should_prefer_cached_read_direct_write(
     source_cached && target_is_similar_size(source_len, target_len)
 }
 
+fn path_starts_with_mount(path: &str, mount_point: &str) -> bool {
+    if mount_point == "/" {
+        return path.starts_with('/');
+    }
+    if path == mount_point {
+        return true;
+    }
+    path.strip_prefix(mount_point)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn path_for_mount_lookup(path: &Path) -> Option<String> {
+    let absolute = if path.exists() {
+        fs::canonicalize(path).ok()?
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(absolute.to_string_lossy().into_owned())
+}
+
+fn mount_info_for_path(path: &Path) -> Option<MountInfoBrief> {
+    let path = path_for_mount_lookup(path)?;
+    let data = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<MountInfoBrief> = None;
+    let mut best_len = 0usize;
+    for line in data.lines() {
+        let (lhs, rhs) = line.split_once(" - ")?;
+        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
+        if left_fields.len() < 5 {
+            continue;
+        }
+        let mount_point = left_fields[4];
+        if !path_starts_with_mount(&path, mount_point) {
+            continue;
+        }
+        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
+        if right_fields.len() < 2 {
+            continue;
+        }
+        if mount_point.len() > best_len {
+            best_len = mount_point.len();
+            best = Some(MountInfoBrief {
+                mount_point: mount_point.to_string(),
+                fstype: right_fields[0].to_string(),
+                mount_source: right_fields[1].to_string(),
+            });
+        }
+    }
+    best
+}
+
+fn filesystem_supports_reflink(fstype: &str) -> bool {
+    matches!(fstype, "btrfs" | "xfs" | "ocfs2" | "bcachefs")
+}
+
+fn base_block_name_from_devpath(devpath: &Path) -> Option<String> {
+    let canon = fs::canonicalize(devpath).ok()?;
+    let name = canon.file_name()?.to_string_lossy().to_string();
+    let sys = Path::new("/sys/class/block").join(&name);
+    if sys.join("partition").exists() {
+        let real = fs::read_link(&sys).ok()?;
+        let real_abs = if real.is_absolute() {
+            real
+        } else {
+            Path::new("/sys/class/block").join(real)
+        };
+        let parent = real_abs.parent()?;
+        return Some(parent.file_name()?.to_string_lossy().to_string());
+    }
+    Some(name)
+}
+
+fn read_sysfs_trimmed(path: &Path) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn md_storage_redundancy(base_block: &str) -> StorageRedundancy {
+    let md = Path::new("/sys/class/block").join(base_block).join("md");
+    let Some(level) = read_sysfs_trimmed(&md.join("level")) else {
+        return StorageRedundancy::Unknown;
+    };
+    let degraded = read_sysfs_trimmed(&md.join("degraded"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let redundant = match level.as_str() {
+        "raid0" | "linear" => return StorageRedundancy::NonRedundant,
+        "raid1" | "raid4" | "raid5" | "raid6" | "raid10" => true,
+        _ => false,
+    };
+    if !redundant {
+        return StorageRedundancy::Unknown;
+    }
+    if degraded == 0 {
+        StorageRedundancy::Redundant
+    } else {
+        StorageRedundancy::NonRedundant
+    }
+}
+
+fn is_zpool_group_name(name: &str) -> bool {
+    name.starts_with("mirror-")
+        || name.starts_with("raidz")
+        || name == "logs"
+        || name == "log"
+        || name == "cache"
+        || name == "spares"
+        || name.starts_with("spare-")
+        || name == "special"
+        || name.starts_with("replacing")
+}
+
+fn parse_zpool_status_leaves(out: &str) -> Vec<ZpoolLeafState> {
+    let mut in_config = false;
+    let mut in_table = false;
+    let mut saw_pool = false;
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut leaves = Vec::new();
+
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed == "config:" {
+            in_config = true;
+            continue;
+        }
+        if !in_config {
+            continue;
+        }
+        if trimmed.starts_with("errors:") {
+            break;
+        }
+        if trimmed.starts_with("NAME") && trimmed.contains("STATE") {
+            in_table = true;
+            continue;
+        }
+        if !in_table || trimmed.is_empty() {
+            continue;
+        }
+
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        let mut parts = trimmed.split_whitespace();
+        let Some(name) = parts.next().map(str::to_string) else {
+            continue;
+        };
+        let state = parts.next().map(str::to_string);
+
+        while let Some((last_indent, _)) = stack.last() {
+            if *last_indent >= indent {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+
+        if !saw_pool {
+            saw_pool = true;
+            stack.push((indent, name));
+            continue;
+        }
+
+        if is_zpool_group_name(&name) {
+            stack.push((indent, name));
+            continue;
+        }
+
+        leaves.push(ZpoolLeafState {
+            state,
+            vdev_path: stack.iter().skip(1).map(|(_, name)| name.clone()).collect(),
+        });
+    }
+
+    leaves
+}
+
+fn zfs_storage_redundancy_from_status(out: &str) -> StorageRedundancy {
+    let leaves = parse_zpool_status_leaves(out);
+    if leaves.is_empty() {
+        return StorageRedundancy::Unknown;
+    }
+    let has_mirror = leaves.iter().any(|leaf| {
+        leaf.vdev_path
+            .iter()
+            .any(|name| name.starts_with("mirror-"))
+    });
+    if has_mirror {
+        return if leaves.iter().any(|leaf| {
+            leaf.vdev_path
+                .iter()
+                .any(|name| name.starts_with("mirror-"))
+                && leaf.state.as_deref() != Some("ONLINE")
+        }) {
+            StorageRedundancy::NonRedundant
+        } else {
+            StorageRedundancy::Redundant
+        };
+    }
+
+    let has_raidz = leaves
+        .iter()
+        .any(|leaf| leaf.vdev_path.iter().any(|name| name.starts_with("raidz")));
+    if has_raidz {
+        return if leaves.iter().any(|leaf| {
+            leaf.vdev_path.iter().any(|name| name.starts_with("raidz"))
+                && leaf.state.as_deref() != Some("ONLINE")
+        }) {
+            StorageRedundancy::NonRedundant
+        } else {
+            StorageRedundancy::Redundant
+        };
+    }
+
+    StorageRedundancy::NonRedundant
+}
+
+fn zfs_storage_redundancy(dataset: &str) -> StorageRedundancy {
+    let pool = dataset.split('/').next().unwrap_or(dataset);
+    let output = Command::new("zpool")
+        .args(["status", "-P", pool])
+        .output()
+        .ok();
+    let Some(output) = output else {
+        return StorageRedundancy::Unknown;
+    };
+    if !output.status.success() {
+        return StorageRedundancy::Unknown;
+    }
+    zfs_storage_redundancy_from_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn mount_storage_redundancy(info: &MountInfoBrief) -> StorageRedundancy {
+    if info.fstype == "zfs" {
+        return zfs_storage_redundancy(&info.mount_source);
+    }
+    if info.mount_source.starts_with("/dev/") {
+        if let Some(base) = base_block_name_from_devpath(Path::new(&info.mount_source)) {
+            if base.starts_with("md") {
+                return md_storage_redundancy(&base);
+            }
+        }
+    }
+    StorageRedundancy::Unknown
+}
+
+fn detect_copy_storage_policy(source_path: &str, target_path: &str) -> (StorageRedundancy, bool) {
+    let source_mount = mount_info_for_path(Path::new(source_path));
+    let target_mount = mount_info_for_path(Path::new(target_path));
+    let redundancy = target_mount
+        .as_ref()
+        .map(mount_storage_redundancy)
+        .unwrap_or(StorageRedundancy::Unknown);
+    let reflink_possible = match (source_mount.as_ref(), target_mount.as_ref()) {
+        (Some(source), Some(target))
+            if source.mount_point == target.mount_point
+                && source.fstype == target.fstype
+                && filesystem_supports_reflink(&target.fstype) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    (redundancy, reflink_possible)
+}
+
+fn choose_nonredundant_full_copy_plan(
+    source_cached: bool,
+    source_len: Option<u64>,
+    target_len: Option<u64>,
+) -> ResolvedCopyExecution {
+    if should_prefer_cached_read_direct_write(source_cached, source_len, target_len) {
+        ResolvedCopyExecution {
+            copy_strategy: CopyStrategy::Threaded,
+            io_mode_read: common::IOMode::PageCache,
+            io_mode_write: common::IOMode::Direct,
+            diff_overwrite: false,
+            full_rewrite: true,
+            path_label: "auto nonredundant cached-read direct-write",
+        }
+    } else {
+        ResolvedCopyExecution {
+            copy_strategy: CopyStrategy::Threaded,
+            io_mode_read: common::IOMode::Direct,
+            io_mode_write: common::IOMode::Direct,
+            diff_overwrite: false,
+            full_rewrite: true,
+            path_label: "auto nonredundant direct threaded",
+        }
+    }
+}
+
 fn io_mode_label(io_mode: common::IOMode) -> &'static str {
     match io_mode {
         common::IOMode::Auto => "auto",
@@ -484,6 +916,642 @@ fn describe_copy_path(
         details.push("target=keep-size".to_string());
     }
     format!("copy path: {}", details.join(", "))
+}
+
+impl RecursiveDirectoryQueue {
+    fn enqueue(&self, tasks: impl IntoIterator<Item = RecursiveDirectoryTask>) {
+        let mut state = self.state.lock().unwrap();
+        let mut added = false;
+        for task in tasks {
+            state.queue.push_back(task);
+            added = true;
+        }
+        if added {
+            self.ready.notify_all();
+        }
+    }
+
+    fn enqueue_one(&self, task: RecursiveDirectoryTask) {
+        let mut state = self.state.lock().unwrap();
+        state.queue.push_back(task);
+        self.ready.notify_one();
+    }
+
+    fn claim(&self, stop: &AtomicBool) -> Option<RecursiveDirectoryTask> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(task) = state.queue.pop_front() {
+                state.active_workers += 1;
+                return Some(task);
+            }
+            if state.active_workers == 0 {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    fn complete_claim(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.active_workers = state.active_workers.saturating_sub(1);
+        self.ready.notify_all();
+    }
+
+    fn wake_all(&self) {
+        self.ready.notify_all();
+    }
+}
+
+impl<T> RecursiveTaskQueue<T> {
+    fn enqueue(&self, task: T) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return Err(io::Error::other("recursive copy queue closed"));
+        }
+        state.queue.push_back(task);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn claim(&self, stop: &AtomicBool) -> Option<T> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            if let Some(task) = state.queue.pop_front() {
+                return Some(task);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.ready.notify_all();
+    }
+
+    fn wake_all(&self) {
+        self.ready.notify_all();
+    }
+}
+
+fn current_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn prospective_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize();
+    }
+    let absolute = current_absolute_path(path)?;
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.canonicalize()?.join(
+        absolute
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing target name"))?,
+    ))
+}
+
+fn resolve_recursive_copy_root(source_root: &Path, target: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(target.join(
+            source_root
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source root has no final path component"))?,
+        )),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy target must be a directory or a missing path when copying a directory recursively",
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(target.to_path_buf()),
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_recursive_target_not_inside_source(
+    source_root: &Path,
+    target_root: &Path,
+) -> io::Result<()> {
+    let source_abs = source_root.canonicalize()?;
+    let target_abs = prospective_absolute_path(target_root)?;
+    if target_abs == source_abs || target_abs.starts_with(&source_abs) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to copy directory {} into itself via {}",
+                source_root.display(),
+                target_root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+}
+
+fn ensure_removed_non_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("target path {} is a directory", path.display()),
+        )),
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_directory_like(
+    source_mode: u32,
+    target_dir: &Path,
+    stats: &RecursiveCopyStats,
+) -> io::Result<()> {
+    match fs::symlink_metadata(target_dir) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "target path {} exists and is not a directory",
+                        target_dir.display()
+                    ),
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(target_dir)?;
+            stats.dirs_created.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(err) => return Err(err),
+    }
+    fs::set_permissions(target_dir, fs::Permissions::from_mode(source_mode))
+}
+
+fn copy_symlink_entry(
+    source_path: &Path,
+    target_path: &Path,
+    stats: &RecursiveCopyStats,
+) -> io::Result<()> {
+    ensure_parent_directory(target_path)?;
+    ensure_removed_non_directory(target_path)?;
+    let link_target = fs::read_link(source_path)?;
+    symlink(&link_target, target_path)?;
+    stats.symlinks_created.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn prepare_regular_copy_target(target_path: &Path, source_len: u64) -> io::Result<()> {
+    ensure_parent_directory(target_path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(target_path)?;
+    file.set_len(source_len)?;
+    unsafe {
+        libc::posix_fallocate(file.as_raw_fd(), 0, source_len as i64);
+    }
+    Ok(())
+}
+
+fn execute_recursive_file_copy(
+    task: &RecursiveFileTask,
+    ctx: &RecursiveCopyContext,
+    stats: &RecursiveCopyStats,
+) -> io::Result<()> {
+    let source_path = task.source_path.to_string_lossy();
+    let target_path = task.target_path.to_string_lossy();
+    let guard = CopyOperationGuard::new(&source_path, &target_path, ctx.use_lock)?;
+    let copied = if task.resolved_copy.diff_overwrite && !ctx.keep_target_size {
+        let diff_scan = ctx
+            .config
+            .get_params_for_path("diff", false, target_path.as_ref());
+        overwrite_changed_chunks_direct(
+            &source_path,
+            &target_path,
+            diff_scan.num_threads,
+            diff_scan.block_size,
+            diff_scan.qd,
+            ctx.optimizer_params[3],
+            ctx.optimizer_params[4],
+            ctx.optimizer_params[5] as usize,
+        )?
+    } else {
+        copy_file_with_strategy_and_truncate(
+            &source_path,
+            &target_path,
+            ctx.optimizer_params[0],
+            ctx.optimizer_params[1],
+            ctx.optimizer_params[2] as usize,
+            ctx.optimizer_params[3],
+            ctx.optimizer_params[4],
+            ctx.optimizer_params[5] as usize,
+            ctx.optimizer_params[6],
+            ctx.optimizer_params[7],
+            ctx.optimizer_params[8] as usize,
+            task.resolved_copy.io_mode_read,
+            task.resolved_copy.io_mode_write,
+            task.resolved_copy.copy_strategy,
+            !(ctx.keep_target_size || task.preallocated),
+        )?
+    };
+    guard.ensure_source_unchanged()?;
+    fs::set_permissions(
+        &task.target_path,
+        fs::Permissions::from_mode(task.source_mode),
+    )?;
+    stats.files_copied.fetch_add(1, Ordering::Relaxed);
+    stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+    Ok(())
+}
+
+fn walk_recursive_copy_subtree(
+    start: RecursiveDirectoryTask,
+    dir_queue: &RecursiveDirectoryQueue,
+    small_queue: &RecursiveTaskQueue<RecursiveFileTask>,
+    prealloc_queue: &RecursiveTaskQueue<RecursiveFileTask>,
+    large_queue: &RecursiveTaskQueue<RecursiveFileTask>,
+    ctx: &RecursiveCopyContext,
+    stats: &RecursiveCopyStats,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let mut stack = vec![start];
+    while let Some(task) = stack.pop() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut child_dirs = Vec::new();
+        for entry in fs::read_dir(&task.source_dir)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let target_path = task.target_dir.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path)?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                let mode = metadata.permissions().mode();
+                create_directory_like(mode, &target_path, stats)?;
+                child_dirs.push(RecursiveDirectoryTask {
+                    source_dir: source_path,
+                    target_dir: target_path,
+                });
+                continue;
+            }
+            if file_type.is_symlink() {
+                copy_symlink_entry(&source_path, &target_path, stats)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "recursive copy only supports regular files, directories, and symlinks (saw {})",
+                        source_path.display()
+                    ),
+                ));
+            }
+
+            let source_str = source_path.to_string_lossy();
+            let target_str = target_path.to_string_lossy();
+            let resolved_copy = resolve_copy_execution(
+                &ctx.config,
+                &source_str,
+                &target_str,
+                ctx.requested_strategy,
+                ctx.rewrite_mode,
+                ctx.io_mode_read,
+                ctx.io_mode_write,
+            )?;
+            let file_task = RecursiveFileTask {
+                source_path,
+                target_path,
+                source_len: metadata.len(),
+                source_mode: metadata.permissions().mode(),
+                resolved_copy,
+                preallocated: false,
+            };
+            if file_task.source_len >= RECURSIVE_COPY_LARGE_FILE_THRESHOLD {
+                if !ctx.keep_target_size && !file_task.resolved_copy.diff_overwrite {
+                    prealloc_queue.enqueue(file_task)?;
+                } else {
+                    large_queue.enqueue(file_task)?;
+                }
+            } else {
+                small_queue.enqueue(file_task)?;
+            }
+        }
+        if let Some(local_dir) = child_dirs.pop() {
+            dir_queue.enqueue(child_dirs);
+            stack.push(local_dir);
+        }
+    }
+    Ok(())
+}
+
+fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
+    let source_meta = fs::symlink_metadata(&ctx.source_root)?;
+    if !source_meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recursive copy requires a directory source",
+        ));
+    }
+    ensure_recursive_target_not_inside_source(&ctx.source_root, &ctx.target_root)?;
+    let stats = Arc::new(RecursiveCopyStats::default());
+    create_directory_like(source_meta.permissions().mode(), &ctx.target_root, &stats)?;
+    let dir_queue = Arc::new(RecursiveDirectoryQueue::default());
+    let small_queue = Arc::new(RecursiveTaskQueue::default());
+    let prealloc_queue = Arc::new(RecursiveTaskQueue::default());
+    let large_queue = Arc::new(RecursiveTaskQueue::default());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    dir_queue.enqueue_one(RecursiveDirectoryTask {
+        source_dir: ctx.source_root.clone(),
+        target_dir: ctx.target_root.clone(),
+    });
+
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1);
+    let small_worker_count = worker_count.clamp(1, 8);
+    let large_worker_count = worker_count.clamp(1, 4);
+
+    let mut walk_threads = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let dir_queue = dir_queue.clone();
+        let small_queue = small_queue.clone();
+        let prealloc_queue = prealloc_queue.clone();
+        let large_queue = large_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = dir_queue.claim(&stop) {
+                let result = walk_recursive_copy_subtree(
+                    task,
+                    &dir_queue,
+                    &small_queue,
+                    &prealloc_queue,
+                    &large_queue,
+                    &ctx,
+                    &stats,
+                    &stop,
+                );
+                dir_queue.complete_claim();
+                if let Err(err) = result {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    small_queue.wake_all();
+                    prealloc_queue.wake_all();
+                    large_queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut small_threads = Vec::with_capacity(small_worker_count);
+    for _ in 0..small_worker_count {
+        let queue = small_queue.clone();
+        let dir_queue = dir_queue.clone();
+        let prealloc_queue = prealloc_queue.clone();
+        let large_queue = large_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = queue.claim(&stop) {
+                if let Err(err) = execute_recursive_file_copy(&task, &ctx, &stats) {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    queue.wake_all();
+                    prealloc_queue.wake_all();
+                    large_queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut large_threads = Vec::with_capacity(large_worker_count);
+    for _ in 0..large_worker_count {
+        let queue = large_queue.clone();
+        let dir_queue = dir_queue.clone();
+        let small_queue = small_queue.clone();
+        let prealloc_queue = prealloc_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        large_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = queue.claim(&stop) {
+                if let Err(err) = execute_recursive_file_copy(&task, &ctx, &stats) {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    small_queue.wake_all();
+                    prealloc_queue.wake_all();
+                    queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut prealloc_threads = Vec::with_capacity(RECURSIVE_COPY_PREALLOC_WORKERS);
+    for _ in 0..RECURSIVE_COPY_PREALLOC_WORKERS {
+        let input = prealloc_queue.clone();
+        let output = large_queue.clone();
+        let dir_queue = dir_queue.clone();
+        let small_queue = small_queue.clone();
+        let stop = stop.clone();
+        prealloc_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(mut task) = input.claim(&stop) {
+                if let Err(err) = prepare_regular_copy_target(&task.target_path, task.source_len) {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    small_queue.wake_all();
+                    input.wake_all();
+                    output.wake_all();
+                    return Err(err);
+                }
+                task.preallocated = true;
+                if let Err(err) = output.enqueue(task) {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    small_queue.wake_all();
+                    input.wake_all();
+                    output.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in walk_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive copy walk worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    prealloc_queue.close();
+    small_queue.close();
+
+    for thread in prealloc_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive copy prealloc worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    large_queue.close();
+
+    for thread in small_threads.into_iter().chain(large_threads) {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive copy file worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
+    if verbose {
+        eprintln!(
+            "recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, bytes_copied={}",
+            stats.dirs_created.load(Ordering::Relaxed),
+            stats.files_copied.load(Ordering::Relaxed),
+            stats.symlinks_created.load(Ordering::Relaxed),
+            bytes_copied
+        );
+    }
+    Ok(bytes_copied)
+}
+
+fn collect_regular_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_file() {
+        out.push(root.to_path_buf());
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        return Ok(());
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                stack.push(path);
+            } else if metadata.file_type().is_file() {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bench_recursive_read(
+    path: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: common::IOMode,
+    verbose: bool,
+) -> io::Result<u64> {
+    let root = Path::new(path);
+    let mut files = Vec::new();
+    collect_regular_files_recursive(root, &mut files)?;
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no regular files found under {}", root.display()),
+        ));
+    }
+
+    let start = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
+    for file in &files {
+        let file_str = file.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path is not valid UTF-8: {}", file.display()),
+            )
+        })?;
+        let (bytes_read, _file_size, _params) = visit_file_blocks(
+            file_str,
+            num_threads_p,
+            block_size_p,
+            qd_p,
+            num_threads_d,
+            block_size_d,
+            qd_d,
+            io_mode,
+            |_block| Ok(()),
+        )?;
+        total_bytes = total_bytes.saturating_add(bytes_read);
+        if bytes_read == 0 && fs::metadata(file)?.len() != 0 {
+            return Err(io::Error::other(format!(
+                "recursive-read-bench observed zero bytes for non-empty file {}",
+                file.display()
+            )));
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    if verbose {
+        eprintln!(
+            "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
+            total_bytes,
+            files.len(),
+            elapsed,
+            total_bytes as f64 / elapsed / 1e9
+        );
+    } else {
+        println!(
+            "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
+            total_bytes,
+            files.len(),
+            elapsed,
+            total_bytes as f64 / elapsed / 1e9
+        );
+    }
+    Ok(total_bytes)
 }
 
 fn print_verify_report(report: &block_hash::VerifyReport) {
@@ -544,9 +1612,9 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
                 "--to-memory defaults to an auto backend: mmap when the first page looks cached, otherwise the direct/shared-buffer loader.",
                 "--paged-shared-buffer forces the old shared destination-buffer loader for read --to-memory.",
-                "--mmap maps the file instead of reading into a destination buffer; --mmap-read-pages also walks the mapped bytes.",
+                "--mmap maps the file instead of reading into a destination buffer; --mmap-read-pages also walks the mapped bytes in userspace.",
                 "--multiple-target-buffers gives each reader thread its own destination buffer with no consolidation step.",
-                "--to-memory enables hugepage advice by default; --disable-hugepages turns that off for the mapped or destination buffer backing.",
+                "--to-memory uses hugepage advice automatically for files >= 64 MiB; smaller files default to non-hugepages. --disable-hugepages turns advice off entirely for the mapped or destination buffer backing.",
                 "--measure-unmap-time keeps mmap teardown inside the timed region for --mmap and --mmap-read-pages.",
                 "--threads, --qd, and --blocksize override the read-side tuned params so you can do one-off perf sweeps without editing fro.json.",
             ],
@@ -605,6 +1673,16 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Walk one or more directory trees and print every encountered path.",
             notes: &["This first correctness slice does not guarantee output ordering."],
             examples: &[("Walk the current tree", "find ."), ("Walk two roots", "find src tests")],
+        }),
+        "du" => Some(CommandHelp {
+            name: "du",
+            usage: "du [-s] [-a] [path ...]",
+            summary: "Report disk usage from filesystem block counts for files and directories.",
+            notes: &[
+                "Without -s, directory arguments print descendant directory totals plus the root total.",
+                "-a includes non-directory entries in the output.",
+            ],
+            examples: &[("Summarize one tree", "du -s ."), ("Print all entries in src", "du -a src")],
         }),
         "tac" => Some(CommandHelp {
             name: "tac",
@@ -704,17 +1782,18 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "copy" | "copy-via-memory" => Some(CommandHelp {
             name: "copy",
-            usage: "copy [--via-memory] [--keep-target-size] [--diff|--full] [--copy-file-range|--copy-file-range-single|--threaded-copy|--reflink] [--no-lock] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
-            summary: "Copy one file to another using the same tuned read/write pipeline.",
+            usage: "copy [--recursive|-r|-R] [--via-memory] [--keep-target-size] [--diff|--full] [--copy-file-range|--copy-file-range-single|--threaded-copy|--reflink] [--no-lock] [--verify|--verify-diff] [--hash] [--xxh3|--sha256] [--hash-base path] [-q|--quiet] [--auto|--no-direct|--direct] [--auto-write|--no-direct-write|--direct-write] [-v] [-n iterations] [-s] [-c config.json] <source> <target>",
+            summary: "Copy one file, or recursively copy one directory tree, using the tuned read/write pipeline.",
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
+                "--recursive (or -r/-R) enables directory-tree copies; the destination behaves like cp -r, so an existing destination directory receives the source basename as a child.",
                 "--copy-file-range uses the tunable multi-call copy_file_range(2) strategy with its own optimizer params.",
                 "--copy-file-range-single forces the one-call copy_file_range(2) baseline for benchmarking.",
                 "--threaded-copy forces the existing tuned striped io_uring copy path.",
                 "--reflink requests a CoW clone/reflink when the filesystem supports it; this is fast but does not promise physically independent storage blocks.",
                 "--diff forces chunked diff-and-overwrite copy when supported; --full disables diffing and always rewrites the full file.",
-                "Without either flag, plain copy uses copy auto mode: cold/default paths prefer direct threaded copy; hot similar-size cached files can diff-and-overwrite only changed chunks with direct writes, and otherwise a hot source plus a near-sized target can switch to page-cache read with direct write.",
+                "Without either flag, plain copy uses copy auto mode: when source and target share a reflink-capable filesystem and the target storage topology is positively identified as redundant, auto prefers reflink; when the target topology is positively identified as non-redundant (for example RAID0, ZFS stripe, or a degraded mirror), auto forces a real full copy; otherwise it falls back to the existing cache-aware threaded heuristic.",
                 "--keep-target-size preserves an already-sized destination instead of re-truncating/re-preallocating it; this is mainly useful for best-case benchmarking.",
                 "Copy takes an advisory shared lock on the source and an advisory exclusive lock on the destination by default; use --no-lock to skip that cooperative locking.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",
@@ -729,6 +1808,10 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 (
                     "Copy in.bin to out.bin",
                     "copy in.bin out.bin",
+                ),
+                (
+                    "Recursively copy a tree into an existing destination directory",
+                    "copy --recursive srcdir outdir",
                 ),
                 (
                     "Read through page cache but force direct writes to the destination",
@@ -790,6 +1873,19 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             examples: &[(
                 "Benchmark reading two files from page cache",
                 "dual-read-bench --no-direct -n 1 a.bin b.bin",
+            )],
+        }),
+        "recursive-read-bench" => Some(CommandHelp {
+            name: "recursive-read-bench",
+            usage: "recursive-read-bench [--auto|--no-direct|--direct] [-v] <directory>",
+            summary: "Read every byte of every regular file in a directory tree and report aggregate throughput.",
+            notes: &[
+                "This is intended as a read-side roofline for recursive copy/cp measurements.",
+                "Symlinks and non-regular files are skipped.",
+            ],
+            examples: &[(
+                "Benchmark the page-cache read roofline of a source tree",
+                "recursive-read-bench --no-direct /data/tree",
             )],
         }),
         "hash" => Some(CommandHelp {
@@ -928,6 +2024,7 @@ fn print_general_help(program: &str) {
         ("cmp", "compare two files using the fro diff engine"),
         ("fgrep", "literal line-oriented grep compatibility wrapper"),
         ("find", "walk directory trees and print every path"),
+        ("du", "report disk usage from filesystem block counts"),
         ("grep", "search for a literal byte substring while reading"),
         ("tac", "print files in reverse line order"),
         ("wc", "count lines, words, and bytes"),
@@ -949,6 +2046,10 @@ fn print_general_help(program: &str) {
             "copy one file to another with tuned read/write settings",
         ),
         ("diff", "compare two files and report the first mismatch"),
+        (
+            "recursive-read-bench",
+            "read every byte of every file in a tree",
+        ),
         ("hash", "write 1 MiB block-hash sidecars"),
         ("verify", "scrub a file against its block-hash sidecars"),
         (
@@ -962,6 +2063,7 @@ fn print_general_help(program: &str) {
     println!("Benchmarks:");
     println!("  read               measure striped file read throughput");
     println!("  dual-read-bench    benchmark the read pressure of diff");
+    println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
     println!("  fro-optimize       tune configs for one or more commands / mounts");
     println!("  fro-benchmark      run the regression benchmark suite");
     println!("  bench-diff         in-memory diff microbenchmark");
@@ -979,7 +2081,7 @@ fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp fgrep find cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp fgrep find du cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();
@@ -1032,6 +2134,7 @@ fn try_main() -> io::Result<i32> {
     let mut via_memory = legacy_copy_via_memory;
     let mut verify_copy = false;
     let mut verify_copy_diff = false;
+    let mut recursive_copy = false;
     let mut persist_verification_hashes = false;
     let mut quiet = false;
     let mut no_lock = false;
@@ -1183,11 +2286,13 @@ fn try_main() -> io::Result<i32> {
             } else if args[i] == "--multiple-target-buffers" {
                 to_memory_mode = ReadToMemoryMode::MultipleTargetBuffers;
             } else if args[i] == "--disable-hugepages" {
-                to_memory_options.hugepages = false;
+                to_memory_options.hugepages = HugepageAdvice::Disabled;
             } else if args[i] == "--measure-unmap-time" {
                 to_memory_options.measure_unmap_time = true;
             } else if args[i] == "--via-memory" {
                 via_memory = true;
+            } else if args[i] == "-r" || args[i] == "-R" || args[i] == "--recursive" {
+                recursive_copy = true;
             } else if args[i] == "--verify" || args[i] == "--verified" {
                 verify_copy = true;
             } else if args[i] == "--verify-diff" {
@@ -1310,7 +2415,7 @@ fn try_main() -> io::Result<i32> {
         );
         return Ok(1);
     }
-    if !to_memory_options.hugepages && !to_memory {
+    if matches!(to_memory_options.hugepages, HugepageAdvice::Disabled) && !to_memory {
         println!("--disable-hugepages requires read --to-memory");
         return Ok(1);
     }
@@ -1318,8 +2423,10 @@ fn try_main() -> io::Result<i32> {
         println!("--measure-unmap-time requires read --to-memory");
         return Ok(1);
     }
-    if matches!(to_memory_mode, ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages)
-        && io_mode == common::IOMode::Direct
+    if matches!(
+        to_memory_mode,
+        ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages
+    ) && io_mode == common::IOMode::Direct
     {
         println!("--mmap and --mmap-read-pages are not supported with --direct");
         return Ok(1);
@@ -1330,6 +2437,10 @@ fn try_main() -> io::Result<i32> {
     }
     if via_memory && mode != "copy" {
         println!("--via-memory is only supported for copy");
+        return Ok(1);
+    }
+    if recursive_copy && mode != "copy" {
+        println!("--recursive is only supported for copy");
         return Ok(1);
     }
     if (force_copy_file_range
@@ -1436,6 +2547,10 @@ fn try_main() -> io::Result<i32> {
         println!("copy verification modes require -n 1");
         return Ok(1);
     }
+    if recursive_copy && iterations > 1 {
+        println!("copy --recursive currently requires -n 1");
+        return Ok(1);
+    }
     if force_reflink && iterations > 1 {
         println!("copy --reflink requires -n 1");
         return Ok(1);
@@ -1460,6 +2575,18 @@ fn try_main() -> io::Result<i32> {
         println!("copy --reflink does not support direct read/write modes");
         return Ok(1);
     }
+    if recursive_copy && via_memory {
+        println!("copy --recursive does not support --via-memory yet");
+        return Ok(1);
+    }
+    if recursive_copy && (verify_copy || verify_copy_diff) {
+        println!("copy --recursive does not support verification modes yet");
+        return Ok(1);
+    }
+    if recursive_copy && save_config {
+        println!("copy --recursive does not support --save yet");
+        return Ok(1);
+    }
 
     if mode == "recover" && extra_paths.is_empty() {
         println!("At least one recovery copy is required");
@@ -1477,6 +2604,7 @@ fn try_main() -> io::Result<i32> {
     let mut config = config::load_config(config_path);
     let config_mode = match mode {
         "read" if to_memory => "read_to_memory",
+        "recursive-read-bench" => "read",
         "recover" => "verify",
         "hash" | "verify" => mode,
         _ => mode,
@@ -1533,7 +2661,7 @@ fn try_main() -> io::Result<i32> {
     };
     let mut optimizer_mask =
         active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory, copy_strategy);
-    if mode == "read" {
+    if mode == "read" || mode == "recursive-read-bench" {
         apply_manual_read_overrides(
             &mut start_params,
             &mut params_steps,
@@ -1575,6 +2703,18 @@ fn try_main() -> io::Result<i32> {
                 p[4],
                 p[5] as usize,
                 io_mode,
+            )
+        } else if mode == "recursive-read-bench" {
+            bench_recursive_read(
+                filename,
+                p[0],
+                p[1],
+                p[2] as usize,
+                p[3],
+                p[4],
+                p[5] as usize,
+                io_mode,
+                verbose,
             )
         } else if mode == "hash" {
             if hash_only || iterations > 1 {
@@ -1692,44 +2832,70 @@ fn try_main() -> io::Result<i32> {
             )
         } else if mode == "copy" {
             if let Some(src) = source {
-                let resolved_copy = resolve_copy_execution(
-                    &config,
-                    src,
-                    filename,
-                    copy_strategy,
-                    copy_rewrite_mode,
-                    io_mode,
-                    io_mode_write,
-                )?;
-                if verbose {
-                    eprintln!(
-                        "{}",
-                        describe_copy_path(resolved_copy, via_memory, keep_target_size)
-                    );
-                }
-                if verify_copy {
-                    let target_hash_base_owned = if persist_verification_hashes {
-                        Some(
-                            hash_base_owned
-                                .clone()
-                                .unwrap_or_else(|| default_hash_base(filename)),
-                        )
-                    } else {
-                        None
+                if recursive_copy {
+                    let source_root = PathBuf::from(src);
+                    let source_metadata = fs::symlink_metadata(&source_root)?;
+                    if !source_metadata.file_type().is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "copy --recursive requires a directory source",
+                        ));
+                    }
+                    let target_root =
+                        resolve_recursive_copy_root(&source_root, Path::new(filename))?;
+                    let optimizer_params = std::array::from_fn(|index| p[index]);
+                    let recursive_ctx = RecursiveCopyContext {
+                        config: config.clone(),
+                        source_root,
+                        target_root,
+                        optimizer_params,
+                        requested_strategy: copy_strategy,
+                        rewrite_mode: copy_rewrite_mode,
+                        io_mode_read: io_mode,
+                        io_mode_write,
+                        keep_target_size,
+                        use_lock: !no_lock,
                     };
-                    let report = copy_file_verified_with_options_and_lock(
+                    run_recursive_copy(recursive_ctx, verbose)
+                } else {
+                    let resolved_copy = resolve_copy_execution(
+                        &config,
                         src,
                         filename,
-                        resolved_copy.io_mode_read,
-                        resolved_copy.io_mode_write,
-                        hash_type,
-                        via_memory,
-                        target_hash_base_owned.as_deref(),
-                        resolved_copy.copy_strategy,
-                        !no_lock,
+                        copy_strategy,
+                        copy_rewrite_mode,
+                        io_mode,
+                        io_mode_write,
                     )?;
-                    if !quiet {
+                    if verbose {
                         eprintln!(
+                            "{}",
+                            describe_copy_path(resolved_copy, via_memory, keep_target_size)
+                        );
+                    }
+                    if verify_copy {
+                        let target_hash_base_owned = if persist_verification_hashes {
+                            Some(
+                                hash_base_owned
+                                    .clone()
+                                    .unwrap_or_else(|| default_hash_base(filename)),
+                            )
+                        } else {
+                            None
+                        };
+                        let report = copy_file_verified_with_options_and_lock(
+                            src,
+                            filename,
+                            resolved_copy.io_mode_read,
+                            resolved_copy.io_mode_write,
+                            hash_type,
+                            via_memory,
+                            target_hash_base_owned.as_deref(),
+                            resolved_copy.copy_strategy,
+                            !no_lock,
+                        )?;
+                        if !quiet {
+                            eprintln!(
                             "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
                             report.verified_blocks,
                             report.repaired_blocks,
@@ -1737,15 +2903,93 @@ fn try_main() -> io::Result<i32> {
                             report.hash_type,
                             report.hashes_persisted
                         );
-                    }
-                    Ok(report.bytes_copied)
-                } else if verify_copy_diff {
-                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
-                    let copied = if via_memory {
+                        }
+                        Ok(report.bytes_copied)
+                    } else if verify_copy_diff {
+                        let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
+                        let copied = if via_memory {
+                            let read_page_cache =
+                                config.get_params_for_path("read_to_memory", false, src);
+                            let read_direct =
+                                config.get_params_for_path("read_to_memory", true, src);
+                            let loaded = load_file_to_memory(
+                                src,
+                                read_page_cache.num_threads,
+                                read_page_cache.block_size,
+                                read_page_cache.qd,
+                                read_direct.num_threads,
+                                read_direct.block_size,
+                                read_direct.qd,
+                                io_mode,
+                            )?;
+                            let write_page_cache =
+                                config.get_params_for_path("write", false, filename);
+                            let write_direct = config.get_params_for_path("write", true, filename);
+                            write_buffer(
+                                filename,
+                                &loaded.data,
+                                write_page_cache.num_threads,
+                                write_page_cache.block_size,
+                                write_page_cache.qd,
+                                write_direct.num_threads,
+                                write_direct.block_size,
+                                write_direct.qd,
+                                resolved_copy.io_mode_write,
+                            )?
+                        } else {
+                            copy_file_with_strategy(
+                                src,
+                                filename,
+                                p[0],
+                                p[1],
+                                p[2] as usize,
+                                p[3],
+                                p[4],
+                                p[5] as usize,
+                                p[6],
+                                p[7],
+                                p[8] as usize,
+                                resolved_copy.io_mode_read,
+                                resolved_copy.io_mode_write,
+                                resolved_copy.copy_strategy,
+                            )?
+                        };
+                        sync_path(filename)?;
+                        guard.ensure_source_unchanged()?;
+                        let diff_page_cache = config.get_params_for_path("diff", false, filename);
+                        let diff_direct = config.get_params_for_path("diff", true, filename);
+                        let diff_res = diff_files(
+                            src,
+                            filename,
+                            diff_page_cache.num_threads,
+                            diff_page_cache.block_size,
+                            diff_page_cache.qd,
+                            diff_direct.num_threads,
+                            diff_direct.block_size,
+                            diff_direct.qd,
+                            io_mode,
+                            false,
+                            true,
+                        )?;
+                        if diff_res != 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "copy verify-diff found a mismatch at byte offset {}",
+                                    diff_res
+                                ),
+                            ));
+                        }
+                        guard.ensure_source_unchanged()?;
+                        if !quiet {
+                            eprintln!("copy verify-diff: success");
+                        }
+                        Ok(copied)
+                    } else if via_memory {
+                        let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
                         let read_page_cache =
                             config.get_params_for_path("read_to_memory", false, src);
-                        let read_direct =
-                            config.get_params_for_path("read_to_memory", true, src);
+                        let read_direct = config.get_params_for_path("read_to_memory", true, src);
                         let loaded = load_file_to_memory(
                             src,
                             read_page_cache.num_threads,
@@ -1758,7 +3002,7 @@ fn try_main() -> io::Result<i32> {
                         )?;
                         let write_page_cache = config.get_params_for_path("write", false, filename);
                         let write_direct = config.get_params_for_path("write", true, filename);
-                        write_buffer(
+                        let copied = write_buffer(
                             filename,
                             &loaded.data,
                             write_page_cache.num_threads,
@@ -1768,120 +3012,45 @@ fn try_main() -> io::Result<i32> {
                             write_direct.block_size,
                             write_direct.qd,
                             resolved_copy.io_mode_write,
-                        )?
+                        )?;
+                        guard.ensure_source_unchanged()?;
+                        Ok(copied)
                     } else {
-                        copy_file_with_strategy(
-                            src,
-                            filename,
-                            p[0],
-                            p[1],
-                            p[2] as usize,
-                            p[3],
-                            p[4],
-                            p[5] as usize,
-                            p[6],
-                            p[7],
-                            p[8] as usize,
-                            resolved_copy.io_mode_read,
-                            resolved_copy.io_mode_write,
-                            resolved_copy.copy_strategy,
-                        )?
-                    };
-                    sync_path(filename)?;
-                    guard.ensure_source_unchanged()?;
-                    let diff_page_cache = config.get_params_for_path("diff", false, filename);
-                    let diff_direct = config.get_params_for_path("diff", true, filename);
-                    let diff_res = diff_files(
-                        src,
-                        filename,
-                        diff_page_cache.num_threads,
-                        diff_page_cache.block_size,
-                        diff_page_cache.qd,
-                        diff_direct.num_threads,
-                        diff_direct.block_size,
-                        diff_direct.qd,
-                        io_mode,
-                        false,
-                        true,
-                    )?;
-                    if diff_res != 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "copy verify-diff found a mismatch at byte offset {}",
-                                diff_res
-                            ),
-                        ));
+                        let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
+                        let copied = if resolved_copy.diff_overwrite && !keep_target_size {
+                            let diff_scan = config.get_params_for_path("diff", false, filename);
+                            overwrite_changed_chunks_direct(
+                                src,
+                                filename,
+                                diff_scan.num_threads,
+                                diff_scan.block_size,
+                                diff_scan.qd,
+                                p[3],
+                                p[4],
+                                p[5] as usize,
+                            )?
+                        } else {
+                            copy_file_with_strategy_and_truncate(
+                                src,
+                                filename,
+                                p[0],
+                                p[1],
+                                p[2] as usize,
+                                p[3],
+                                p[4],
+                                p[5] as usize,
+                                p[6],
+                                p[7],
+                                p[8] as usize,
+                                resolved_copy.io_mode_read,
+                                resolved_copy.io_mode_write,
+                                resolved_copy.copy_strategy,
+                                !keep_target_size,
+                            )?
+                        };
+                        guard.ensure_source_unchanged()?;
+                        Ok(copied)
                     }
-                    guard.ensure_source_unchanged()?;
-                    if !quiet {
-                        eprintln!("copy verify-diff: success");
-                    }
-                    Ok(copied)
-                } else if via_memory {
-                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
-                    let read_page_cache = config.get_params_for_path("read_to_memory", false, src);
-                    let read_direct = config.get_params_for_path("read_to_memory", true, src);
-                    let loaded = load_file_to_memory(
-                        src,
-                        read_page_cache.num_threads,
-                        read_page_cache.block_size,
-                        read_page_cache.qd,
-                        read_direct.num_threads,
-                        read_direct.block_size,
-                        read_direct.qd,
-                        io_mode,
-                    )?;
-                    let write_page_cache = config.get_params_for_path("write", false, filename);
-                    let write_direct = config.get_params_for_path("write", true, filename);
-                    let copied = write_buffer(
-                        filename,
-                        &loaded.data,
-                        write_page_cache.num_threads,
-                        write_page_cache.block_size,
-                        write_page_cache.qd,
-                        write_direct.num_threads,
-                        write_direct.block_size,
-                        write_direct.qd,
-                        resolved_copy.io_mode_write,
-                    )?;
-                    guard.ensure_source_unchanged()?;
-                    Ok(copied)
-                } else {
-                    let guard = CopyOperationGuard::new(src, filename, !no_lock)?;
-                    let copied = if resolved_copy.diff_overwrite && !keep_target_size {
-                        let diff_scan = config.get_params_for_path("diff", false, filename);
-                        overwrite_changed_chunks_direct(
-                            src,
-                            filename,
-                            diff_scan.num_threads,
-                            diff_scan.block_size,
-                            diff_scan.qd,
-                            p[3],
-                            p[4],
-                            p[5] as usize,
-                        )?
-                    } else {
-                        copy_file_with_strategy_and_truncate(
-                            src,
-                            filename,
-                            p[0],
-                            p[1],
-                            p[2] as usize,
-                            p[3],
-                            p[4],
-                            p[5] as usize,
-                            p[6],
-                            p[7],
-                            p[8] as usize,
-                            resolved_copy.io_mode_read,
-                            resolved_copy.io_mode_write,
-                            resolved_copy.copy_strategy,
-                            !keep_target_size,
-                        )?
-                    };
-                    guard.ensure_source_unchanged()?;
-                    Ok(copied)
                 }
             } else {
                 eprintln!("Copy is missing a destination path.");
@@ -1940,7 +3109,10 @@ fn try_main() -> io::Result<i32> {
         && to_memory
         && iterations == 1
         && effective_to_memory_mode.is_some_and(|mode| {
-            matches!(mode, ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages)
+            matches!(
+                mode,
+                ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages
+            )
         })
         && !to_memory_options.measure_unmap_time
     {
@@ -2093,9 +3265,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_optimizer_param_mask, apply_manual_read_overrides, describe_copy_path,
+        active_optimizer_param_mask, apply_manual_read_overrides,
+        choose_nonredundant_full_copy_plan, describe_copy_path, parse_zpool_status_leaves,
         should_prefer_cached_diff_overwrite, should_prefer_cached_read_direct_write,
-        target_is_similar_size, HeuristicCopyPlan, ManualReadOverrides, ResolvedCopyExecution,
+        target_is_similar_size, zfs_storage_redundancy_from_status, HeuristicCopyPlan,
+        ManualReadOverrides, ResolvedCopyExecution, StorageRedundancy,
     };
     use crate::common::{CopyStrategy, IOMode};
 
@@ -2118,6 +3292,60 @@ mod tests {
         } else {
             HeuristicCopyPlan::DirectReadDirectWrite
         }
+    }
+
+    #[test]
+    fn nonredundant_policy_forces_full_copy_path() {
+        let cached = choose_nonredundant_full_copy_plan(true, Some(1024), Some(1024));
+        assert!(cached.copy_strategy == CopyStrategy::Threaded);
+        assert!(cached.io_mode_read == IOMode::PageCache);
+        assert!(cached.io_mode_write == IOMode::Direct);
+        assert!(cached.full_rewrite);
+        assert!(!cached.diff_overwrite);
+
+        let cold = choose_nonredundant_full_copy_plan(false, Some(1024), Some(1024));
+        assert!(cold.copy_strategy == CopyStrategy::Threaded);
+        assert!(cold.io_mode_read == IOMode::Direct);
+        assert!(cold.io_mode_write == IOMode::Direct);
+        assert!(cold.full_rewrite);
+        assert!(!cold.diff_overwrite);
+    }
+
+    #[test]
+    fn parse_zpool_status_tracks_vdev_paths() {
+        let leaves = parse_zpool_status_leaves(
+            "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          mirror-0                  ONLINE       0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       ONLINE       0     0     0\n\nerrors: No known data errors\n",
+        );
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].vdev_path, vec!["mirror-0".to_string()]);
+        assert_eq!(leaves[0].state.as_deref(), Some("ONLINE"));
+    }
+
+    #[test]
+    fn zfs_redundancy_marks_healthy_mirror_redundant() {
+        let status = "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          mirror-0                  ONLINE       0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       ONLINE       0     0     0\n\nerrors: No known data errors\n";
+        assert_eq!(
+            zfs_storage_redundancy_from_status(status),
+            StorageRedundancy::Redundant
+        );
+    }
+
+    #[test]
+    fn zfs_redundancy_marks_degraded_mirror_nonredundant() {
+        let status = "  pool: tank\n state: DEGRADED\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        DEGRADED     0     0     0\n          mirror-0                  DEGRADED     0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       UNAVAIL      0     0     0  was /dev/disk/by-id/b\n\nerrors: No known data errors\n";
+        assert_eq!(
+            zfs_storage_redundancy_from_status(status),
+            StorageRedundancy::NonRedundant
+        );
+    }
+
+    #[test]
+    fn zfs_redundancy_marks_stripe_nonredundant() {
+        let status = "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          /dev/disk/by-id/a         ONLINE       0     0     0\n          /dev/disk/by-id/b         ONLINE       0     0     0\n\nerrors: No known data errors\n";
+        assert_eq!(
+            zfs_storage_redundancy_from_status(status),
+            StorageRedundancy::NonRedundant
+        );
     }
 
     #[test]

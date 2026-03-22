@@ -85,16 +85,33 @@ pub enum ReadToMemoryMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HugepageAdvice {
+    Auto,
+    Disabled,
+}
+
+const HUGEPAGE_MIN_FILE_LEN: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadToMemoryOptions {
-    pub hugepages: bool,
+    pub hugepages: HugepageAdvice,
     pub measure_unmap_time: bool,
 }
 
 impl Default for ReadToMemoryOptions {
     fn default() -> Self {
         Self {
-            hugepages: true,
+            hugepages: HugepageAdvice::Auto,
             measure_unmap_time: false,
+        }
+    }
+}
+
+impl ReadToMemoryOptions {
+    fn use_hugepages_for_len(self, len: usize) -> bool {
+        match self.hugepages {
+            HugepageAdvice::Auto => len >= HUGEPAGE_MIN_FILE_LEN,
+            HugepageAdvice::Disabled => false,
         }
     }
 }
@@ -250,7 +267,7 @@ fn advise_mapped_read_region(
     options: ReadToMemoryOptions,
 ) -> io::Result<()> {
     madvise_best_effort(ptr, len, libc::MADV_RANDOM)?;
-    if options.hugepages {
+    if options.use_hugepages_for_len(len) {
         madvise_best_effort(ptr, len, libc::MADV_HUGEPAGE)?;
     }
     Ok(())
@@ -920,7 +937,7 @@ fn load_file_to_shared_buffer(
     options: ReadToMemoryOptions,
 ) -> std::io::Result<LoadedFile> {
     let mut data = AlignedBuffer::new_uninit(file_len)?;
-    if options.hugepages {
+    if options.use_hugepages_for_len(file_len) {
         madvise_best_effort(
             data.as_mut_slice().as_mut_ptr().cast(),
             file_len.max(1),
@@ -1877,10 +1894,17 @@ mod tests {
     }
 
     #[test]
-    fn read_to_memory_defaults_enable_hugepages() {
+    fn read_to_memory_defaults_use_auto_hugepages_policy() {
         let options = ReadToMemoryOptions::default();
-        assert!(options.hugepages);
+        assert_eq!(options.hugepages, HugepageAdvice::Auto);
         assert!(!options.measure_unmap_time);
+    }
+
+    #[test]
+    fn auto_hugepages_disable_small_files() {
+        let options = ReadToMemoryOptions::default();
+        assert!(!options.use_hugepages_for_len(HUGEPAGE_MIN_FILE_LEN - 1));
+        assert!(options.use_hugepages_for_len(HUGEPAGE_MIN_FILE_LEN));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::process;
 use std::process::Command;
 use std::thread;
@@ -20,6 +21,11 @@ struct TestCase {
     files_to_prep: Vec<String>,
 }
 
+const RECURSIVE_TREE_TARGET_FILES: usize = 100_000;
+const RECURSIVE_TREE_MIN_FILE_SIZE: u64 = 4 * 1024;
+const RECURSIVE_TREE_FILES_PER_DIR: usize = 100;
+const RECURSIVE_TREE_POWER_ALPHA: f64 = 1.15;
+
 fn parse_first_gbps(text: &str) -> Option<f64> {
     for line in text.lines() {
         if let Some(idx) = line.find(" GB/s") {
@@ -33,6 +39,18 @@ fn parse_first_gbps(text: &str) -> Option<f64> {
 }
 
 fn evict_cache(path: &str) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    if let Some(child) = entry.path().to_str() {
+                        evict_cache(child);
+                    }
+                }
+            }
+            return;
+        }
+    }
     if let Ok(file) = std::fs::File::open(path) {
         use std::os::unix::io::AsRawFd;
         unsafe {
@@ -42,6 +60,18 @@ fn evict_cache(path: &str) {
 }
 
 fn pre_cache(path: &str) {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    if let Some(child) = entry.path().to_str() {
+                        pre_cache(child);
+                    }
+                }
+            }
+            return;
+        }
+    }
     if let Ok(mut file) = std::fs::File::open(path) {
         use std::os::unix::io::AsRawFd;
         unsafe {
@@ -136,6 +166,136 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn recursive_tree_file_count(total_bytes: u64) -> usize {
+    if total_bytes == 0 {
+        return 0;
+    }
+    if total_bytes < RECURSIVE_TREE_MIN_FILE_SIZE {
+        return 1;
+    }
+    RECURSIVE_TREE_TARGET_FILES.min((total_bytes / RECURSIVE_TREE_MIN_FILE_SIZE) as usize)
+}
+
+fn recursive_tree_file_sizes(total_bytes: u64) -> Vec<u64> {
+    let file_count = recursive_tree_file_count(total_bytes);
+    if file_count == 0 {
+        return Vec::new();
+    }
+    if file_count == 1 {
+        return vec![total_bytes];
+    }
+
+    let base_total = RECURSIVE_TREE_MIN_FILE_SIZE * file_count as u64;
+    let mut sizes = vec![RECURSIVE_TREE_MIN_FILE_SIZE; file_count];
+    if total_bytes <= base_total {
+        let even = total_bytes / file_count as u64;
+        let mut remainder = total_bytes % file_count as u64;
+        for size in &mut sizes {
+            *size = even;
+            if remainder > 0 {
+                *size += 1;
+                remainder -= 1;
+            }
+        }
+        return sizes;
+    }
+
+    let remaining = total_bytes - base_total;
+    let weights = (0..file_count)
+        .map(|index| 1.0_f64 / ((index + 1) as f64).powf(RECURSIVE_TREE_POWER_ALPHA))
+        .collect::<Vec<_>>();
+    let weight_sum = weights.iter().sum::<f64>();
+    let mut assigned = 0_u64;
+    for (size, weight) in sizes.iter_mut().zip(weights.iter()) {
+        let extra = ((remaining as f64) * (*weight / weight_sum)).floor() as u64;
+        *size += extra;
+        assigned += extra;
+    }
+    sizes[0] += remaining - assigned;
+    sizes
+}
+
+fn write_fixture_file(path: &std::path::Path, size: u64, pattern: &[u8]) {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("Could not create fixture file {} {}", path.display(), e));
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    let mut remaining = size;
+    while remaining > 0 {
+        let chunk_len = remaining.min(pattern.len() as u64) as usize;
+        writer
+            .write_all(&pattern[..chunk_len])
+            .unwrap_or_else(|e| panic!("Could not write fixture file {} {}", path.display(), e));
+        remaining -= chunk_len as u64;
+    }
+    writer
+        .flush()
+        .unwrap_or_else(|e| panic!("Could not flush fixture file {} {}", path.display(), e));
+}
+
+fn create_recursive_tree_fixture(root: &std::path::Path, total_bytes: u64) {
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).unwrap_or_else(|e| {
+        panic!(
+            "Could not create recursive benchmark tree {} {}",
+            root.display(),
+            e
+        )
+    });
+
+    let sizes = recursive_tree_file_sizes(total_bytes);
+    let pattern = (0..(1024 * 1024))
+        .map(|i| (i & 0xff) as u8)
+        .collect::<Vec<_>>();
+    let mut current_dir = None::<std::path::PathBuf>;
+    for (index, size) in sizes.into_iter().enumerate() {
+        let shard = index / RECURSIVE_TREE_FILES_PER_DIR;
+        let dir = root
+            .join(format!("{:03}", shard / 100))
+            .join(format!("{:03}", shard % 100));
+        if current_dir.as_ref() != Some(&dir) {
+            fs::create_dir_all(&dir).unwrap_or_else(|e| {
+                panic!("Could not create tree directory {} {}", dir.display(), e)
+            });
+            current_dir = Some(dir.clone());
+        }
+        let path = dir.join(format!("file_{index:06}.bin"));
+        write_fixture_file(&path, size, &pattern);
+    }
+}
+
+fn matches_any_pattern<S: AsRef<str>>(name: &str, patterns: &[S]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| name.starts_with(pattern.as_ref()))
+}
+
+fn recursive_tree_fixture_stats(root: &std::path::Path) -> Option<(u64, usize)> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut total_bytes = 0_u64;
+    let mut file_count = 0_usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                total_bytes = total_bytes.saturating_add(metadata.len());
+                file_count += 1;
+            }
+        }
+    }
+    Some((total_bytes, file_count))
 }
 
 fn align_down(bytes: u64, align: u64) -> u64 {
@@ -300,6 +460,8 @@ fn main() {
     let source_file = run_dir.join("fro_bench_tmp_source").display().to_string();
     let target_file_dir = run_dir.join("fro_bench_tmp_direct").display().to_string();
     let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
+    let recursive_tree = test_path.join("fro_bench_recursive_tree");
+    let recursive_tree_str = recursive_tree.display().to_string();
 
     let tests = vec![
         TestCase {
@@ -489,6 +651,19 @@ fn main() {
             target: 8.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+        },
+        TestCase {
+            name: "recursive-read-bench (hot)",
+            args: vec![
+                "recursive-read-bench".into(),
+                "--no-direct".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_str.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
         },
         TestCase {
             name: "copy (direct)",
@@ -875,21 +1050,21 @@ fn main() {
         println!("{}", combined);
     }
 
+    let recursive_selected_explicitly =
+        matches_any_pattern("recursive-read-bench (hot)", &patterns);
+    let recursive_fixture_stats = recursive_tree_fixture_stats(&recursive_tree);
+    let recursive_fixture_exists = recursive_fixture_stats.is_some();
     let mut selected_tests = Vec::new();
     for t in tests {
         if patterns.is_empty() {
+            if t.name.starts_with("recursive-read-bench") && !recursive_fixture_exists {
+                continue;
+            }
             selected_tests.push(t);
             continue;
         }
 
-        let mut ok = false;
-        for p in patterns.iter() {
-            if t.name.starts_with(p.as_str()) {
-                ok = true;
-                break;
-            }
-        }
-        if ok {
+        if matches_any_pattern(t.name, &patterns) {
             selected_tests.push(t);
         }
     }
@@ -915,6 +1090,7 @@ fn main() {
     let mut need_source = false;
     let mut need_target_dir = false;
     let mut need_target_cache = false;
+    let mut need_recursive_tree = false;
     let mut need_target_dir_matching = false;
     let mut need_target_cache_matching = false;
 
@@ -931,6 +1107,9 @@ fn main() {
         }
         if t.args.iter().any(|s| s == &target_file_cache) {
             need_target_cache = true;
+        }
+        if t.args.iter().any(|s| s == &recursive_tree_str) {
+            need_recursive_tree = true;
         }
 
         if (op == "diff" || op == "dual-read-bench") && t.args.iter().any(|s| s == &target_file_dir)
@@ -959,14 +1138,26 @@ fn main() {
         }
     }
 
-    let file_count = (need_source as u64) + (need_target_dir as u64) + (need_target_cache as u64);
+    let recursive_tree_equiv_files = if need_recursive_tree && !recursive_fixture_exists {
+        1
+    } else {
+        0
+    };
+    let file_count = (need_source as u64)
+        + (need_target_dir as u64)
+        + (need_target_cache as u64)
+        + recursive_tree_equiv_files;
     let setup_writes = (need_source as u64)
         + (need_target_dir_matching as u64)
-        + (need_target_cache_matching as u64);
+        + (need_target_cache_matching as u64)
+        + ((need_recursive_tree && recursive_selected_explicitly && !recursive_fixture_exists)
+            as u64);
     num_full_writes = num_full_writes.saturating_add(setup_writes);
 
     // Create temp files (only if needed by the selected tests).
-    let size = if file_count == 0 {
+    let size = if file_count == 0 && need_recursive_tree && recursive_fixture_exists {
+        recursive_fixture_stats.map(|(bytes, _)| bytes).unwrap_or(0)
+    } else if file_count == 0 {
         0
     } else if let Some(s) = test_size {
         align_down(s, 4096).max(4096)
@@ -988,6 +1179,14 @@ fn main() {
         .saturating_mul(num_full_writes)
         .saturating_add(fixed_write_bytes);
     let alloc = size.saturating_mul(file_count);
+    let recursive_tree_fixture_files = if let Some((_, file_count)) = recursive_fixture_stats {
+        file_count
+    } else if need_recursive_tree && recursive_selected_explicitly {
+        recursive_tree_file_count(size)
+    } else {
+        0
+    };
+    let recursive_tree_fixture_bytes = recursive_fixture_stats.map(|(bytes, _)| bytes).unwrap_or(0);
 
     if file_count > 0 && test_size.is_none() {
         eprintln!(
@@ -1006,9 +1205,20 @@ fn main() {
         println!("  test_dir: {}", test_dir);
         println!("  test_size: {}", format_bytes(size));
         println!(
-            "  file_count: {} (source={} direct_target={} cache_target={})",
-            file_count, need_source, need_target_dir, need_target_cache
+            "  file_count: {} (source={} direct_target={} cache_target={} recursive_tree={} recursive_tree_files={})",
+            file_count,
+            need_source,
+            need_target_dir,
+            need_target_cache,
+            need_recursive_tree,
+            recursive_tree_fixture_files
         );
+        if need_recursive_tree {
+            println!(
+                "  recursive_tree_bytes: {}",
+                format_bytes(recursive_tree_fixture_bytes.max(size * recursive_tree_equiv_files))
+            );
+        }
         println!("  alloc_total: {}", format_bytes(alloc));
         println!("  est_full_writes: {}", num_full_writes);
         println!(
@@ -1071,6 +1281,10 @@ fn main() {
         }
     }
 
+    if need_recursive_tree && recursive_selected_explicitly && !recursive_fixture_exists {
+        create_recursive_tree_fixture(&recursive_tree, size);
+    }
+
     let mut regressions = false;
 
     println!(
@@ -1123,7 +1337,7 @@ fn main() {
             0.0
         };
 
-        let status = if best_speed == 0.0 {
+        let status = if best_speed == 0.0 && t.target > 0.0 {
             regressions = true;
             "FAILED"
         } else if best_speed < t.target * 0.90 {

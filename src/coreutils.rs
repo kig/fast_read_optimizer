@@ -10,11 +10,12 @@ use iou::sqe::SpliceFlags;
 use iou::IoUring;
 use memchr::{memchr_iter, memmem::Finder};
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -28,6 +29,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "cmp"
             | "fgrep"
             | "find"
+            | "du"
             | "tac"
             | "wc"
             | "cksum"
@@ -100,6 +102,10 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         "fgrep" => run_fgrep(args)?,
         "find" => {
             run_find(args)?;
+            0
+        }
+        "du" => {
+            run_du(args)?;
             0
         }
         "tac" => {
@@ -405,7 +411,9 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
                 Ok(_) => {}
                 Err(err) => match err.raw_os_error() {
                     Some(libc::EINTR) => continue,
-                    Some(libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                    Some(
+                        libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV,
+                    ) => {
                         break;
                     }
                     _ => return Err(err),
@@ -444,7 +452,9 @@ fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
         return Ok(false);
     }
     match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => copy_regular_file_to_stdout_sendfile(path),
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            copy_regular_file_to_stdout_sendfile(path)
+        }
         StreamInput::Stdin { .. } => copy_stdin_to_stdout_splice(),
         StreamInput::File(path) => {
             let file_type = fs::metadata(path)?.file_type();
@@ -478,10 +488,10 @@ fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
                                 Some(libc::EINTR) => continue,
                                 Some(
                                     libc::EBADF
-                                        | libc::EINVAL
-                                        | libc::ENOSYS
-                                        | libc::EOPNOTSUPP
-                                        | libc::EXDEV,
+                                    | libc::EINVAL
+                                    | libc::ENOSYS
+                                    | libc::EOPNOTSUPP
+                                    | libc::EXDEV,
                                 ) => break,
                                 _ => return Err(err),
                             },
@@ -557,12 +567,8 @@ fn count_wc_block(block: &[u8], options: WcCountOptions) -> WcBlockCounts {
         lines,
         words,
         bytes,
-        starts_in_word: block
-            .first()
-            .is_some_and(|byte| !is_wc_whitespace(*byte)),
-        ends_in_word: block
-            .last()
-            .is_some_and(|byte| !is_wc_whitespace(*byte)),
+        starts_in_word: block.first().is_some_and(|byte| !is_wc_whitespace(*byte)),
+        ends_in_word: block.last().is_some_and(|byte| !is_wc_whitespace(*byte)),
     }
 }
 
@@ -923,10 +929,7 @@ fn run_find(args: &[String]) -> io::Result<()> {
     } else {
         vec![".".to_string()]
     };
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .max(1);
+    let worker_count = parallel_find_worker_count();
     let config = load_config(None);
     let write_params = config.get_params("write", false);
     let output = Arc::new(BufWriter::stdout(
@@ -934,7 +937,7 @@ fn run_find(args: &[String]) -> io::Result<()> {
         write_params.block_size,
         worker_count.saturating_mul(2),
     )?);
-    let queue = Arc::new(FindWorkQueue::default());
+    let queue = Arc::new(WorkQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
 
     for root in roots {
@@ -946,64 +949,43 @@ fn run_find(args: &[String]) -> io::Result<()> {
         }
     }
 
-    let mut threads = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        let queue = queue.clone();
+    run_parallel_work_queue(queue, stop, worker_count, {
         let output = output.clone();
-        let stop = stop.clone();
-        threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(start_dir) = queue.claim(&stop) {
-                let result = walk_find_subtree(&start_dir, &queue, &output, &stop);
-                queue.complete_claim();
-                if let Err(err) = result {
-                    stop.store(true, Ordering::SeqCst);
-                    queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut first_error = None;
-    for thread in threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("find worker thread panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
-
+        move |start_dir, queue, stop| walk_find_subtree(start_dir, queue, &output, stop)
+    })?;
     let output = Arc::into_inner(output)
         .ok_or_else(|| io::Error::other("find output writer still has active references"))?;
-    let finish_result = output.into_inner();
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    finish_result
+    output.into_inner()
 }
 
-#[derive(Default)]
-struct FindWorkQueue {
-    state: Mutex<FindWorkState>,
+struct WorkQueue<T> {
+    state: Mutex<WorkState<T>>,
     ready: Condvar,
 }
 
-#[derive(Default)]
-struct FindWorkState {
-    queue: VecDeque<PathBuf>,
+struct WorkState<T> {
+    queue: VecDeque<T>,
     active_workers: usize,
 }
 
-impl FindWorkQueue {
-    fn enqueue(&self, dirs: impl IntoIterator<Item = PathBuf>) {
+impl<T> Default for WorkQueue<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(WorkState {
+                queue: VecDeque::new(),
+                active_workers: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+impl<T> WorkQueue<T> {
+    fn enqueue(&self, items: impl IntoIterator<Item = T>) {
         let mut state = self.state.lock().unwrap();
         let mut added = false;
-        for dir in dirs {
-            state.queue.push_back(dir);
+        for item in items {
+            state.queue.push_back(item);
             added = true;
         }
         if added {
@@ -1011,21 +993,21 @@ impl FindWorkQueue {
         }
     }
 
-    fn enqueue_one(&self, dir: PathBuf) {
+    fn enqueue_one(&self, item: T) {
         let mut state = self.state.lock().unwrap();
-        state.queue.push_back(dir);
+        state.queue.push_back(item);
         self.ready.notify_one();
     }
 
-    fn claim(&self, stop: &AtomicBool) -> Option<PathBuf> {
+    fn claim(&self, stop: &AtomicBool) -> Option<T> {
         let mut state = self.state.lock().unwrap();
         loop {
             if stop.load(Ordering::SeqCst) {
                 return None;
             }
-            if let Some(dir) = state.queue.pop_front() {
+            if let Some(item) = state.queue.pop_front() {
                 state.active_workers += 1;
-                return Some(dir);
+                return Some(item);
             }
             if state.active_workers == 0 {
                 return None;
@@ -1046,12 +1028,12 @@ impl FindWorkQueue {
 }
 
 fn walk_find_subtree(
-    start_dir: &Path,
-    queue: &FindWorkQueue,
+    start_dir: PathBuf,
+    queue: &WorkQueue<PathBuf>,
     output: &BufWriter,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    let mut stack = vec![start_dir.to_path_buf()];
+    let mut stack = vec![start_dir];
     let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
     while let Some(dir) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
@@ -1077,6 +1059,60 @@ fn walk_find_subtree(
     output.write_all(&chunk)
 }
 
+fn parallel_find_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn run_parallel_work_queue<T, F>(
+    queue: Arc<WorkQueue<T>>,
+    stop: Arc<AtomicBool>,
+    worker_count: usize,
+    run_task: F,
+) -> io::Result<()>
+where
+    T: Send + 'static,
+    F: Fn(T, &WorkQueue<T>, &AtomicBool) -> io::Result<()> + Send + Sync + 'static,
+{
+    let run_task = Arc::new(run_task);
+    let mut threads = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = queue.clone();
+        let stop = stop.clone();
+        let run_task = run_task.clone();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(item) = queue.claim(&stop) {
+                let result = run_task(item, &queue, &stop);
+                queue.complete_claim();
+                if let Err(err) = result {
+                    stop.store(true, Ordering::SeqCst);
+                    queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("directory walk worker thread panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn write_find_path(output: &BufWriter, path: &Path) -> io::Result<()> {
     let mut chunk = Vec::with_capacity(path.as_os_str().as_bytes().len() + 1);
     append_find_path(&mut chunk, path);
@@ -1086,6 +1122,377 @@ fn write_find_path(output: &BufWriter, path: &Path) -> io::Result<()> {
 fn append_find_path(chunk: &mut Vec<u8>, path: &Path) {
     chunk.extend_from_slice(path.as_os_str().as_bytes());
     chunk.push(b'\n');
+}
+
+fn disk_usage_kib(blocks: u64) -> u64 {
+    blocks.div_ceil(2)
+}
+
+fn append_du_line(chunk: &mut Vec<u8>, kib: u64, path: &Path) {
+    chunk.extend_from_slice(kib.to_string().as_bytes());
+    chunk.push(b'\t');
+    chunk.extend_from_slice(path.as_os_str().as_bytes());
+    chunk.push(b'\n');
+}
+
+#[derive(Clone)]
+struct DuLine {
+    path: PathBuf,
+    kib: u64,
+}
+
+struct DuNode {
+    path: PathBuf,
+    total_kib: u64,
+    parent: Option<usize>,
+    pending_children: usize,
+    pending_file_stats: usize,
+    scanned: bool,
+    own_stat_done: bool,
+    completed: bool,
+    emit: bool,
+}
+
+struct DuSharedState {
+    nodes: Mutex<Vec<DuNode>>,
+    lines: Mutex<Vec<DuLine>>,
+}
+
+fn cstring_from_os_str(value: &std::ffi::OsStr) -> io::Result<CString> {
+    CString::new(value.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
+}
+
+fn lstat_no_follow(path: &Path) -> io::Result<libc::stat> {
+    let path = cstring_from_os_str(path.as_os_str())?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::lstat(path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn fstatat_no_follow(dirfd: RawFd, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
+    let name = cstring_from_os_str(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            dirfd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn stat_is_dir(stat: &libc::stat) -> bool {
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR
+}
+
+struct DirHandle(*mut libc::DIR);
+
+struct DirEntryName {
+    name: std::ffi::OsString,
+}
+
+impl DirHandle {
+    fn open(path: &Path) -> io::Result<Self> {
+        let path = cstring_from_os_str(path.as_os_str())?;
+        let dir = unsafe { libc::opendir(path.as_ptr()) };
+        if dir.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(dir))
+    }
+
+    fn fd(&self) -> RawFd {
+        unsafe { libc::dirfd(self.0) }
+    }
+
+    fn next_entry(&mut self) -> io::Result<Option<DirEntryName>> {
+        loop {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(0) => Ok(None),
+                    _ => Err(err),
+                };
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            return Ok(Some(DirEntryName {
+                name: std::ffi::OsString::from_vec(bytes.to_vec()),
+            }));
+        }
+    }
+}
+
+impl Drop for DirHandle {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = libc::closedir(self.0);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DuTraversalTask {
+    path: PathBuf,
+    node_id: usize,
+}
+
+fn finish_du_node(node_id: usize, state: &DuSharedState) {
+    let mut current = Some(node_id);
+    let mut completed_lines = Vec::new();
+    while let Some(id) = current {
+        let mut next = None;
+        {
+            let mut nodes = state.nodes.lock().unwrap();
+            if !nodes[id].scanned
+                || !nodes[id].own_stat_done
+                || nodes[id].pending_children != 0
+                || nodes[id].pending_file_stats != 0
+                || nodes[id].completed
+            {
+                break;
+            }
+            let total_kib = nodes[id].total_kib;
+            if nodes[id].emit {
+                completed_lines.push(DuLine {
+                    path: nodes[id].path.clone(),
+                    kib: total_kib,
+                });
+            }
+            nodes[id].completed = true;
+            if let Some(parent_id) = nodes[id].parent {
+                nodes[parent_id].total_kib += total_kib;
+                nodes[parent_id].pending_children =
+                    nodes[parent_id].pending_children.saturating_sub(1);
+                if nodes[parent_id].scanned
+                    && nodes[parent_id].own_stat_done
+                    && nodes[parent_id].pending_children == 0
+                    && nodes[parent_id].pending_file_stats == 0
+                    && !nodes[parent_id].completed
+                {
+                    next = Some(parent_id);
+                }
+            }
+        }
+        current = next;
+    }
+    if !completed_lines.is_empty() {
+        state.lines.lock().unwrap().extend(completed_lines);
+    }
+}
+
+fn walk_du_subtree(
+    start: DuTraversalTask,
+    dir_queue: &WorkQueue<DuTraversalTask>,
+    state: &DuSharedState,
+    stop: &AtomicBool,
+    summarize: bool,
+    all: bool,
+) -> io::Result<()> {
+    let mut stack = vec![start];
+    while let Some(task) = stack.pop() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut dir = DirHandle::open(&task.path)?;
+        let dirfd = dir.fd();
+        let mut child_dirs = Vec::new();
+        let mut file_lines = Vec::new();
+        let mut file_total_kib = 0u64;
+        while let Some(entry) = dir.next_entry()? {
+            let child_path = task.path.join(&entry.name);
+            let stat = fstatat_no_follow(dirfd, &entry.name)?;
+            let kib = disk_usage_kib(stat.st_blocks as u64);
+            if stat_is_dir(&stat) {
+                let child_id = {
+                    let mut nodes = state.nodes.lock().unwrap();
+                    let child_id = nodes.len();
+                    nodes.push(DuNode {
+                        path: child_path.clone(),
+                        total_kib: kib,
+                        parent: Some(task.node_id),
+                        pending_children: 0,
+                        pending_file_stats: 0,
+                        scanned: false,
+                        own_stat_done: true,
+                        completed: false,
+                        emit: !summarize,
+                    });
+                    child_id
+                };
+                child_dirs.push(DuTraversalTask {
+                    path: child_path,
+                    node_id: child_id,
+                });
+            } else {
+                file_total_kib += kib;
+                if all {
+                    file_lines.push(DuLine {
+                        path: child_path,
+                        kib,
+                    });
+                }
+            }
+        }
+        {
+            let mut nodes = state.nodes.lock().unwrap();
+            nodes[task.node_id].pending_children += child_dirs.len();
+            nodes[task.node_id].total_kib += file_total_kib;
+            nodes[task.node_id].scanned = true;
+        }
+        if !file_lines.is_empty() {
+            state.lines.lock().unwrap().extend(file_lines);
+        }
+        if let Some(local_dir) = child_dirs.pop() {
+            dir_queue.enqueue(child_dirs);
+            stack.push(local_dir);
+        }
+        finish_du_node(task.node_id, state);
+    }
+    Ok(())
+}
+
+fn parallel_du_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .max(1)
+}
+
+fn append_du_output(path: &Path, summarize: bool, all: bool, output: &mut Vec<u8>) -> io::Result<()> {
+    let stat = lstat_no_follow(path)?;
+    let root_kib = disk_usage_kib(stat.st_blocks as u64);
+    if !stat_is_dir(&stat) {
+        append_du_line(output, root_kib, path);
+        return Ok(());
+    }
+
+    let dir_queue = Arc::new(WorkQueue::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(DuSharedState {
+        nodes: Mutex::new(vec![DuNode {
+            path: path.to_path_buf(),
+            total_kib: root_kib,
+            parent: None,
+            pending_children: 0,
+            pending_file_stats: 0,
+            scanned: false,
+            own_stat_done: true,
+            completed: false,
+            emit: true,
+        }]),
+        lines: Mutex::new(Vec::new()),
+    });
+    dir_queue.enqueue_one(DuTraversalTask {
+        path: path.to_path_buf(),
+        node_id: 0,
+    });
+    run_parallel_work_queue(
+        dir_queue,
+        stop.clone(),
+        parallel_du_worker_count(),
+        {
+            let state = state.clone();
+            move |task, dir_queue, stop| {
+                walk_du_subtree(task, dir_queue, &state, stop, summarize, all)
+            }
+        },
+    )?;
+
+    let state = Arc::into_inner(state)
+        .ok_or_else(|| io::Error::other("du shared state still has active references"))?;
+    let lines = state.lines.into_inner().unwrap();
+    for line in lines {
+        append_du_line(output, line.kib, &line.path);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod du_tests {
+    use super::*;
+
+    #[test]
+    fn disk_usage_kib_rounds_512_byte_blocks_to_kib() {
+        assert_eq!(disk_usage_kib(0), 0);
+        assert_eq!(disk_usage_kib(1), 1);
+        assert_eq!(disk_usage_kib(2), 1);
+        assert_eq!(disk_usage_kib(3), 2);
+    }
+
+    #[test]
+    fn stat_is_dir_detects_directory_mode() {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        stat.st_mode = libc::S_IFDIR;
+        assert!(stat_is_dir(&stat));
+        stat.st_mode = libc::S_IFREG;
+        assert!(!stat_is_dir(&stat));
+    }
+
+    #[test]
+    fn cstring_from_os_str_rejects_nul() {
+        let value = std::ffi::OsString::from_vec(b"bad\0name".to_vec());
+        let err = cstring_from_os_str(&value).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+fn run_du(args: &[String]) -> io::Result<()> {
+    let mut summarize = false;
+    let mut all = false;
+    let mut paths = Vec::new();
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "-s" | "--summarize" => summarize = true,
+            "-a" | "--all" => all = true,
+            other if other.starts_with('-') && other != "-" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported du flag: {other}"),
+                ));
+            }
+            other => paths.push(other.to_string()),
+        }
+    }
+
+    if paths.is_empty() {
+        paths.push(".".to_string());
+    }
+    if summarize && all {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "du does not support combining -a/--all with -s/--summarize",
+        ));
+    }
+
+    let out = stdout_buf_writer()?;
+    for path in paths {
+        let mut chunk = Vec::new();
+        append_du_output(Path::new(&path), summarize, all, &mut chunk)?;
+        out.write_all(&chunk)?;
+    }
+    out.into_inner()
 }
 
 fn run_tac(args: &[String]) -> io::Result<()> {
@@ -1198,15 +1605,16 @@ fn run_wc(args: &[String]) -> io::Result<()> {
                     "read",
                     &file,
                     internal_io_mode(io_mode),
-                    move |block| {
-                        Ok::<_, io::Error>(count_wc_block(block.data, options))
-                    },
+                    move |block| Ok::<_, io::Error>(count_wc_block(block.data, options)),
                 )?;
                 (reduce_wc_counts(&blocks.blocks), Some(file))
             }
             StreamInput::File(file) => {
                 let mut reader = BufReader::new(std::fs::File::open(&file)?);
-                (wc_totals_from_reader_parallel(&mut reader, options)?, Some(file))
+                (
+                    wc_totals_from_reader_parallel(&mut reader, options)?,
+                    Some(file),
+                )
             }
             StreamInput::Stdin { label } => {
                 let mut reader = stdin_buf_reader()?;

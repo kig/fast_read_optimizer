@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -156,6 +157,71 @@ fn assert_same_wc(fro: Output, system: Output, label: &str) {
         .collect::<Vec<_>>();
     assert_eq!(fro_tokens, sys_tokens, "{label}: wc token mismatch");
     assert_eq!(fro.stderr, system.stderr, "{label}: wc stderr mismatch");
+}
+
+fn assert_same_sorted_lines(fro: Output, system: Output, label: &str) {
+    assert_eq!(
+        fro.status.code(),
+        system.status.code(),
+        "{label}: status mismatch"
+    );
+    let mut fro_lines = String::from_utf8_lossy(&fro.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut sys_lines = String::from_utf8_lossy(&system.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fro_lines.sort();
+    sys_lines.sort();
+    assert_eq!(fro_lines, sys_lines, "{label}: sorted stdout mismatch");
+    assert_eq!(fro.stderr, system.stderr, "{label}: stderr mismatch");
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(String, u8, Vec<u8>)> {
+    fn walk(root: &Path, rel: &Path, out: &mut Vec<(String, u8, Vec<u8>)>) {
+        let dir = if rel.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
+        let mut entries = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let rel_path = if rel.as_os_str().is_empty() {
+                PathBuf::from(&name)
+            } else {
+                rel.join(&name)
+            };
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            let rel_string = rel_path.to_string_lossy().into_owned();
+            if metadata.file_type().is_dir() {
+                out.push((rel_string.clone(), 0, Vec::new()));
+                walk(root, &rel_path, out);
+            } else if metadata.file_type().is_symlink() {
+                out.push((
+                    rel_string,
+                    2,
+                    fs::read_link(entry.path())
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec(),
+                ));
+            } else {
+                out.push((rel_string, 1, fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, Path::new(""), &mut out);
+    out
 }
 
 fn io_flag_sets() -> Vec<Vec<&'static str>> {
@@ -412,11 +478,15 @@ fn fifo_text_inputs_match_system_output() {
     let text_fifo = tmp.join("text-default.fifo");
 
     let fro = with_fifo_input(&text_fifo, &text, |fifo_path| run_fro("cat", &[fifo_path]));
-    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| run_system("cat", &[fifo_path]));
+    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| {
+        run_system("cat", &[fifo_path])
+    });
     assert_same_result(fro, sys, "cat fifo");
 
     let fro = with_fifo_input(&text_fifo, &text, |fifo_path| run_fro("tac", &[fifo_path]));
-    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| run_system("tac", &[fifo_path]));
+    let sys = with_fifo_input(&text_fifo, &text, |fifo_path| {
+        run_system("tac", &[fifo_path])
+    });
     assert_same_result(fro, sys, "tac fifo");
 
     for wc_flags in wc_flag_sets() {
@@ -463,12 +533,17 @@ fn fifo_hash_inputs_match_system_output() {
         .collect::<Vec<_>>();
     let binary_fifo = tmp.join("binary-default.fifo");
 
-    let fro = with_fifo_input(&binary_fifo, &binary, |fifo_path| run_fro("cksum", &[fifo_path]));
-    let sys = with_fifo_input(&binary_fifo, &binary, |fifo_path| run_system("cksum", &[fifo_path]));
+    let fro = with_fifo_input(&binary_fifo, &binary, |fifo_path| {
+        run_fro("cksum", &[fifo_path])
+    });
+    let sys = with_fifo_input(&binary_fifo, &binary, |fifo_path| {
+        run_system("cksum", &[fifo_path])
+    });
     assert_same_result(fro, sys, "cksum fifo");
 
-    let fro =
-        with_fifo_input(&binary_fifo, &binary, |fifo_path| run_fro("sha256sum", &[fifo_path]));
+    let fro = with_fifo_input(&binary_fifo, &binary, |fifo_path| {
+        run_fro("sha256sum", &[fifo_path])
+    });
     let sys = with_fifo_input(&binary_fifo, &binary, |fifo_path| {
         run_system("sha256sum", &[fifo_path])
     });
@@ -664,5 +739,77 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
             &format!("shred remove {:?}", fro_remove_args),
         );
         assert_eq!(fro_remove.exists(), sys_remove.exists());
+    }
+}
+
+#[test]
+fn cartesian_cp_recursive_matches_system_side_effects() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-recursive-matrix");
+
+    for flags in io_flag_sets() {
+        let source_root = tmp.join(format!("cp-tree-src-{}", flags.join("_")));
+        let fro_dest_parent = tmp.join(format!("cp-tree-fro-{}", flags.join("_")));
+        let sys_dest_parent = tmp.join(format!("cp-tree-sys-{}", flags.join("_")));
+        let nested = source_root.join("nested/deeper");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(source_root.join("small.txt"), b"alpha\nbeta\n").unwrap();
+        fs::write(
+            nested.join("large.bin"),
+            (0..(2 * 1024 * 1024 + 333))
+                .map(|i| ((i * 13) % 251) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        symlink("../small.txt", source_root.join("nested/link-small")).unwrap();
+        fs::create_dir_all(&fro_dest_parent).unwrap();
+        fs::create_dir_all(&sys_dest_parent).unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.push("-r");
+        fro_args.push(source_root.to_str().unwrap());
+        fro_args.push(fro_dest_parent.to_str().unwrap());
+        let sys_args = [
+            "-r",
+            source_root.to_str().unwrap(),
+            sys_dest_parent.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp recursive {:?}", fro_args),
+        );
+
+        let copied_name = source_root.file_name().unwrap();
+        let fro_tree = snapshot_tree(&fro_dest_parent.join(copied_name));
+        let sys_tree = snapshot_tree(&sys_dest_parent.join(copied_name));
+        assert_eq!(
+            fro_tree, sys_tree,
+            "recursive tree mismatch for {:?}",
+            fro_args
+        );
+    }
+}
+
+#[test]
+fn cartesian_du_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-matrix");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested/deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), b"root\n").unwrap();
+    fs::write(tree.join("nested/child.txt"), vec![0x55; 8192]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 16384]).unwrap();
+
+    for du_args in [
+        vec![tree.to_str().unwrap()],
+        vec!["-s", tree.to_str().unwrap()],
+        vec!["-a", tree.to_str().unwrap()],
+        vec![tree.join("root.txt").to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du {:?}", du_args),
+        );
     }
 }
