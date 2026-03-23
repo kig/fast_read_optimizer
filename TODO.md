@@ -289,9 +289,9 @@
     - [ ] `-b`, `--byte-offset`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-n`, `--line-number`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-n`, `--line-number`
+      - [x] equality test
+      - [x] implementation
     - [ ] `--line-buffered`
       - [ ] equality test
       - [ ] implementation

@@ -7,6 +7,10 @@ pub(super) fn fgrep_short_flag_effect(flag: u8) -> Option<bool> {
     }
 }
 
+pub(super) fn fgrep_line_number_prefix(print_line_numbers: bool, line_no: u64) -> Option<u64> {
+    print_line_numbers.then_some(line_no)
+}
+
 fn write_matching_stream_lines<R: BufRead, W: Write>(
     out: &mut W,
     label: Option<&str>,
@@ -31,8 +35,8 @@ fn write_matching_stream_lines<R: BufRead, W: Write>(
                     write!(out, "{label}:")?;
                 }
             }
-            if print_line_numbers {
-                write!(out, "{line_no}:")?;
+            if let Some(number) = fgrep_line_number_prefix(print_line_numbers, line_no) {
+                write!(out, "{number}:")?;
             }
             out.write_all(&line)?;
         }
@@ -70,8 +74,8 @@ fn write_matching_lines<W: Write>(
             if multi_file {
                 write!(out, "{}:", file)?;
             }
-            if print_line_numbers {
-                write!(out, "{}:", line_no)?;
+            if let Some(number) = fgrep_line_number_prefix(print_line_numbers, line_no) {
+                write!(out, "{number}:")?;
             }
             out.write_all(&bytes[line_start..line_end])?;
         }
@@ -89,6 +93,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     for arg in &args[1..] {
         match arg.as_str() {
             "-n" => print_line_numbers = true,
+            "--line-number" => print_line_numbers = true,
             "--fixed-strings" => {}
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
@@ -172,7 +177,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::fgrep_short_flag_effect;
+    use super::{fgrep_line_number_prefix, fgrep_short_flag_effect};
 
     #[kani::proof]
     fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
@@ -183,15 +188,31 @@ mod kani_proofs {
         };
         assert_eq!(fgrep_short_flag_effect(flag), expected);
     }
+
+    #[kani::proof]
+    fn fgrep_line_number_prefix_matches_boolean_gate() {
+        let print_line_numbers: bool = kani::any();
+        let line_no: u64 = kani::any();
+        assert_eq!(
+            fgrep_line_number_prefix(print_line_numbers, line_no),
+            if print_line_numbers { Some(line_no) } else { None }
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fgrep_short_flag_effect;
+    use super::{fgrep_line_number_prefix, fgrep_short_flag_effect};
 
     #[test]
     fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
         assert_eq!(fgrep_short_flag_effect(b'F'), Some(true));
         assert_eq!(fgrep_short_flag_effect(b'n'), None);
+    }
+
+    #[test]
+    fn fgrep_line_number_prefix_matches_boolean_gate() {
+        assert_eq!(fgrep_line_number_prefix(false, 7), None);
+        assert_eq!(fgrep_line_number_prefix(true, 7), Some(7));
     }
 }
