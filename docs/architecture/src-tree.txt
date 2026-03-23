@@ -2,12 +2,23 @@ src/
   bin/
     fro-benchmark.rs
     fro-optimize.rs
+  coreutils/
+    cat.rs
+    cmp.rs
+    du.rs
+    fgrep.rs
+    find.rs
+    hash.rs
+    mod.rs
+    shred.rs
+    tac.rs
+    wc.rs
   api.rs
   blake3_hash.rs
   block_hash.rs
   common.rs
   config.rs
-  coreutils.rs
+  dd_tool.rs
   differ.rs
   file_hash.rs
   io_util.rs
