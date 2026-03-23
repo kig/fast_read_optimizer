@@ -1,21 +1,43 @@
 use super::*;
 
-fn count_newlines_up_to(
+fn count_newlines_in_range(
     path: &str,
     io_mode: IOMode,
     mode: &str,
+    start_offset: u64,
     end_offset: u64,
 ) -> io::Result<u64> {
     let data = load_file_bytes(path, io_mode, mode)?;
     let bytes = data.data.as_slice();
+    let start = usize::try_from(start_offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?
+        .min(bytes.len());
     let end = usize::try_from(end_offset)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?
         .min(bytes.len());
-    Ok(memchr_iter(b'\n', &bytes[..end]).count() as u64)
+    Ok(memchr_iter(b'\n', &bytes[start..end]).count() as u64)
 }
 
 pub(super) fn cmp_effective_compare_len(first_len: u64, second_len: u64, limit: Option<u64>) -> u64 {
     first_len.min(second_len).min(limit.unwrap_or(u64::MAX))
+}
+
+pub(super) fn cmp_remaining_len_after_skip(len: u64, skip: u64) -> u64 {
+    len.saturating_sub(skip)
+}
+
+pub(super) fn cmp_effective_compare_len_with_skips(
+    first_len: u64,
+    second_len: u64,
+    first_skip: u64,
+    second_skip: u64,
+    limit: Option<u64>,
+) -> u64 {
+    cmp_effective_compare_len(
+        cmp_remaining_len_after_skip(first_len, first_skip),
+        cmp_remaining_len_after_skip(second_len, second_skip),
+        limit,
+    )
 }
 
 fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'static str) {
@@ -35,11 +57,39 @@ fn parse_cmp_limit(value: &str) -> io::Result<u64> {
     })
 }
 
+fn parse_cmp_skip_spec(value: &str) -> io::Result<(u64, u64)> {
+    if let Some((left, right)) = value.split_once(':') {
+        let first_skip = left.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --ignore-initial value '{value}'"),
+            )
+        })?;
+        let second_skip = right.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --ignore-initial value '{value}'"),
+            )
+        })?;
+        Ok((first_skip, second_skip))
+    } else {
+        let skip = value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --ignore-initial value '{value}'"),
+            )
+        })?;
+        Ok((skip, skip))
+    }
+}
+
 pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut io_mode = IOMode::Auto;
     let mut quiet = false;
     let mut limit = None::<u64>;
+    let mut first_skip = 0u64;
+    let mut second_skip = 0u64;
     let mut files = Vec::new();
     let mut i = 1usize;
     while i < args.len() {
@@ -55,12 +105,26 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
                 })?;
                 limit = Some(parse_cmp_limit(value)?);
             }
+            "-i" | "--ignore-initial" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing --ignore-initial value")
+                })?;
+                (first_skip, second_skip) = parse_cmp_skip_spec(value)?;
+            }
             other if other.starts_with("-n") && other.len() > 2 => {
                 limit = Some(parse_cmp_limit(&other[2..])?);
             }
             other if other.starts_with("--bytes=") => {
                 let value = &other["--bytes=".len()..];
                 limit = Some(parse_cmp_limit(value)?);
+            }
+            other if other.starts_with("-i") && other.len() > 2 => {
+                (first_skip, second_skip) = parse_cmp_skip_spec(&other[2..])?;
+            }
+            other if other.starts_with("--ignore-initial=") => {
+                let value = &other["--ignore-initial=".len()..];
+                (first_skip, second_skip) = parse_cmp_skip_spec(value)?;
             }
             other => files.push(other.to_string()),
         }
@@ -69,7 +133,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -80,18 +144,39 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
 
     let first_len = fs::metadata(&files[0])?.len();
     let second_len = fs::metadata(&files[1])?.len();
-    let shared_len = first_len.min(second_len);
-    let compare_len = cmp_effective_compare_len(first_len, second_len, limit);
+    let first_remaining = cmp_remaining_len_after_skip(first_len, first_skip);
+    let second_remaining = cmp_remaining_len_after_skip(second_len, second_skip);
+    let shared_remaining = first_remaining.min(second_remaining);
+    let compare_len = cmp_effective_compare_len_with_skips(
+        first_len,
+        second_len,
+        first_skip,
+        second_skip,
+        limit,
+    );
     if compare_len == 0 {
-        return Ok(0);
+        if limit == Some(0) || first_remaining == second_remaining {
+            return Ok(0);
+        }
+        if !quiet {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            eprintln!("cmp: EOF on {} which is empty", eof_file);
+        }
+        return Ok(1);
     }
 
     let config = load_config(None);
     let diff_page_cache = config.get_params_for_path("diff", false, &files[0]);
     let diff_direct = config.get_params_for_path("diff", true, &files[0]);
-    let mismatch = diff_files_up_to(
+    let mismatch = diff_files_window(
         &files[0],
         &files[1],
+        first_skip,
+        second_skip,
         diff_page_cache.num_threads,
         diff_page_cache.block_size,
         diff_page_cache.qd,
@@ -106,7 +191,14 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     if mismatch != 0 {
         if !quiet {
             let index = mismatch as usize - 1;
-            let line = 1 + count_newlines_up_to(&files[0], io_mode, "read", mismatch - 1)?;
+            let line = 1
+                + count_newlines_in_range(
+                    &files[0],
+                    io_mode,
+                    "read",
+                    first_skip,
+                    first_skip + mismatch - 1,
+                )?;
             println!(
                 "{} {} differ: byte {}, line {}",
                 files[0],
@@ -118,23 +210,35 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         return Ok(1);
     }
 
-    if first_len != second_len && limit.map_or(true, |limit| limit > shared_len) {
+    if first_remaining != second_remaining && limit.map_or(true, |limit| limit > shared_remaining) {
         if !quiet {
-            let eof_file = if first_len < second_len {
+            let eof_file = if first_remaining < second_remaining {
                 &files[0]
             } else {
                 &files[1]
             };
+            let eof_skip = if first_remaining < second_remaining {
+                first_skip
+            } else {
+                second_skip
+            };
+            let eof_len = if first_remaining < second_remaining {
+                first_remaining
+            } else {
+                second_remaining
+            };
             let data = load_file_bytes(eof_file, io_mode, "read")?;
             let bytes = data.data.as_slice();
-            let shared_len_usize = usize::try_from(shared_len).unwrap_or(bytes.len()).min(bytes.len());
-            let newlines_before_eof =
-                memchr_iter(b'\n', &bytes[..shared_len_usize]).count() as u64;
-            let ends_with_newline = shared_len_usize != 0 && bytes[shared_len_usize - 1] == b'\n';
+            let slice_start = usize::try_from(eof_skip).unwrap_or(bytes.len()).min(bytes.len());
+            let slice_end = usize::try_from(eof_skip + eof_len)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            let newlines_before_eof = memchr_iter(b'\n', &bytes[slice_start..slice_end]).count() as u64;
+            let ends_with_newline = slice_end > slice_start && bytes[slice_end - 1] == b'\n';
             let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
             eprintln!(
                 "cmp: EOF on {} after byte {}, {} {}",
-                eof_file, shared_len, phrase, line
+                eof_file, shared_remaining, phrase, line
             );
         }
         return Ok(1);
@@ -145,7 +249,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::cmp_effective_compare_len;
+    use super::{cmp_effective_compare_len, cmp_effective_compare_len_with_skips, cmp_remaining_len_after_skip};
 
     #[kani::proof]
     fn cmp_effective_compare_len_matches_min_formula() {
@@ -159,11 +263,45 @@ mod kani_proofs {
             first_len.min(second_len).min(limit.unwrap_or(u64::MAX))
         );
     }
+
+    #[kani::proof]
+    fn cmp_effective_compare_len_with_skips_matches_remaining_formula() {
+        let first_len: u64 = kani::any();
+        let second_len: u64 = kani::any();
+        let first_skip: u64 = kani::any();
+        let second_skip: u64 = kani::any();
+        let limit_present: bool = kani::any();
+        let limit_value: u64 = kani::any();
+        let limit = if limit_present { Some(limit_value) } else { None };
+        assert_eq!(
+            cmp_effective_compare_len_with_skips(
+                first_len,
+                second_len,
+                first_skip,
+                second_skip,
+                limit
+            ),
+            first_len
+                .saturating_sub(first_skip)
+                .min(second_len.saturating_sub(second_skip))
+                .min(limit.unwrap_or(u64::MAX))
+        );
+    }
+
+    #[kani::proof]
+    fn cmp_remaining_len_after_skip_matches_saturating_sub() {
+        let len: u64 = kani::any();
+        let skip: u64 = kani::any();
+        assert_eq!(cmp_remaining_len_after_skip(len, skip), len.saturating_sub(skip));
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cmp_effective_compare_len, cmp_eof_line, parse_cmp_limit};
+    use super::{
+        cmp_effective_compare_len, cmp_effective_compare_len_with_skips, cmp_eof_line,
+        cmp_remaining_len_after_skip, parse_cmp_limit, parse_cmp_skip_spec,
+    };
 
     #[test]
     fn cmp_effective_compare_len_respects_shorter_file_and_limit() {
@@ -174,10 +312,33 @@ mod tests {
     }
 
     #[test]
+    fn cmp_remaining_len_after_skip_saturates_at_zero() {
+        assert_eq!(cmp_remaining_len_after_skip(10, 0), 10);
+        assert_eq!(cmp_remaining_len_after_skip(10, 4), 6);
+        assert_eq!(cmp_remaining_len_after_skip(3, 9), 0);
+    }
+
+    #[test]
+    fn cmp_effective_compare_len_with_skips_respects_remaining_prefixes() {
+        assert_eq!(cmp_effective_compare_len_with_skips(10, 12, 3, 4, None), 7);
+        assert_eq!(cmp_effective_compare_len_with_skips(10, 12, 3, 4, Some(2)), 2);
+        assert_eq!(cmp_effective_compare_len_with_skips(3, 9, 6, 6, None), 0);
+        assert_eq!(cmp_effective_compare_len_with_skips(3, 9, 4, 6, Some(9)), 0);
+    }
+
+    #[test]
     fn parse_cmp_limit_accepts_decimal_counts() {
         assert_eq!(parse_cmp_limit("0").unwrap(), 0);
         assert_eq!(parse_cmp_limit("17").unwrap(), 17);
         assert!(parse_cmp_limit("x").is_err());
+    }
+
+    #[test]
+    fn parse_cmp_skip_spec_accepts_shared_and_split_skips() {
+        assert_eq!(parse_cmp_skip_spec("4").unwrap(), (4, 4));
+        assert_eq!(parse_cmp_skip_spec("3:9").unwrap(), (3, 9));
+        assert!(parse_cmp_skip_spec("x").is_err());
+        assert!(parse_cmp_skip_spec("1:x").is_err());
     }
 
     #[test]

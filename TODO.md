@@ -120,12 +120,12 @@
     - [ ] `-b`, `--print-bytes`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-i`, `--ignore-initial=SKIP`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-i`, `--ignore-initial=SKIP1:SKIP2`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-i`, `--ignore-initial=SKIP`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-initial=SKIP1:SKIP2`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-l`, `--verbose`
       - [ ] equality test
       - [ ] implementation
