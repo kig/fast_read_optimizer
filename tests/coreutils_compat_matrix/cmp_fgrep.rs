@@ -74,3 +74,50 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cmp_bytes_flag_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-bytes");
+    let equal_a = tmp.join("equal-a.txt");
+    let equal_b = tmp.join("equal-b.txt");
+    let diff_a = tmp.join("diff-a.txt");
+    let diff_b = tmp.join("diff-b.txt");
+    let short = tmp.join("short.txt");
+    let long = tmp.join("long.txt");
+
+    fs::write(&equal_a, b"same-bytes\n").unwrap();
+    fs::write(&equal_b, b"same-bytes\n").unwrap();
+    fs::write(&diff_a, b"abcde\n").unwrap();
+    fs::write(&diff_b, b"abXde\n").unwrap();
+    fs::write(&short, b"abc").unwrap();
+    fs::write(&long, b"abcXYZ").unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-n", "0"],
+            vec!["-n", "2"],
+            vec!["-n", "3"],
+            vec!["-n3"],
+            vec!["--bytes", "3"],
+            vec!["--bytes=3"],
+            vec!["--bytes", "99"],
+        ] {
+            for files in [
+                vec![equal_a.to_str().unwrap(), equal_b.to_str().unwrap()],
+                vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
+                vec![short.to_str().unwrap(), long.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, compat_flags),
+                );
+            }
+        }
+    }
+}

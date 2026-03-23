@@ -1,5 +1,5 @@
 use crate::config::load_config;
-use crate::differ::diff_files;
+use crate::differ::diff_files_up_to;
 use crate::reader::{
     grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode, BufReader,
     LoadedFile,

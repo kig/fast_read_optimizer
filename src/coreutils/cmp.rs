@@ -14,24 +14,62 @@ fn count_newlines_up_to(
     Ok(memchr_iter(b'\n', &bytes[..end]).count() as u64)
 }
 
+pub(super) fn cmp_effective_compare_len(first_len: u64, second_len: u64, limit: Option<u64>) -> u64 {
+    first_len.min(second_len).min(limit.unwrap_or(u64::MAX))
+}
+
+fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'static str) {
+    if ends_with_newline {
+        (newlines_before_eof, "line")
+    } else {
+        (newlines_before_eof + 1, "in line")
+    }
+}
+
+fn parse_cmp_limit(value: &str) -> io::Result<u64> {
+    value.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --bytes value '{value}'"),
+        )
+    })
+}
+
 pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut io_mode = IOMode::Auto;
     let mut quiet = false;
+    let mut limit = None::<u64>;
     let mut files = Vec::new();
-    for arg in &args[1..] {
-        match arg.as_str() {
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "-s" | "--quiet" | "--silent" => quiet = true,
+            "-n" | "--bytes" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing --bytes value")
+                })?;
+                limit = Some(parse_cmp_limit(value)?);
+            }
+            other if other.starts_with("-n") && other.len() > 2 => {
+                limit = Some(parse_cmp_limit(&other[2..])?);
+            }
+            other if other.starts_with("--bytes=") => {
+                let value = &other["--bytes=".len()..];
+                limit = Some(parse_cmp_limit(value)?);
+            }
             other => files.push(other.to_string()),
         }
+        i += 1;
     }
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -40,10 +78,18 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         ));
     }
 
+    let first_len = fs::metadata(&files[0])?.len();
+    let second_len = fs::metadata(&files[1])?.len();
+    let shared_len = first_len.min(second_len);
+    let compare_len = cmp_effective_compare_len(first_len, second_len, limit);
+    if compare_len == 0 {
+        return Ok(0);
+    }
+
     let config = load_config(None);
     let diff_page_cache = config.get_params_for_path("diff", false, &files[0]);
     let diff_direct = config.get_params_for_path("diff", true, &files[0]);
-    let mismatch = diff_files(
+    let mismatch = diff_files_up_to(
         &files[0],
         &files[1],
         diff_page_cache.num_threads,
@@ -55,6 +101,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         internal_io_mode(io_mode),
         false,
         false,
+        Some(compare_len),
     )?;
     if mismatch != 0 {
         if !quiet {
@@ -71,24 +118,72 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         return Ok(1);
     }
 
-    let first_len = fs::metadata(&files[0])?.len();
-    let second_len = fs::metadata(&files[1])?.len();
-    let shared_len = first_len.min(second_len);
-    if first_len != second_len {
+    if first_len != second_len && limit.map_or(true, |limit| limit > shared_len) {
         if !quiet {
             let eof_file = if first_len < second_len {
                 &files[0]
             } else {
                 &files[1]
             };
-            let line = count_newlines_up_to(eof_file, io_mode, "read", shared_len)?;
+            let data = load_file_bytes(eof_file, io_mode, "read")?;
+            let bytes = data.data.as_slice();
+            let shared_len_usize = usize::try_from(shared_len).unwrap_or(bytes.len()).min(bytes.len());
+            let newlines_before_eof =
+                memchr_iter(b'\n', &bytes[..shared_len_usize]).count() as u64;
+            let ends_with_newline = shared_len_usize != 0 && bytes[shared_len_usize - 1] == b'\n';
+            let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
             eprintln!(
-                "cmp: EOF on {} after byte {}, line {}",
-                eof_file, shared_len, line
+                "cmp: EOF on {} after byte {}, {} {}",
+                eof_file, shared_len, phrase, line
             );
         }
         return Ok(1);
     }
 
     Ok(0)
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::cmp_effective_compare_len;
+
+    #[kani::proof]
+    fn cmp_effective_compare_len_matches_min_formula() {
+        let first_len: u64 = kani::any();
+        let second_len: u64 = kani::any();
+        let limit_present: bool = kani::any();
+        let limit_value: u64 = kani::any();
+        let limit = if limit_present { Some(limit_value) } else { None };
+        assert_eq!(
+            cmp_effective_compare_len(first_len, second_len, limit),
+            first_len.min(second_len).min(limit.unwrap_or(u64::MAX))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cmp_effective_compare_len, cmp_eof_line, parse_cmp_limit};
+
+    #[test]
+    fn cmp_effective_compare_len_respects_shorter_file_and_limit() {
+        assert_eq!(cmp_effective_compare_len(10, 12, None), 10);
+        assert_eq!(cmp_effective_compare_len(10, 12, Some(4)), 4);
+        assert_eq!(cmp_effective_compare_len(3, 9, Some(99)), 3);
+        assert_eq!(cmp_effective_compare_len(3, 9, Some(0)), 0);
+    }
+
+    #[test]
+    fn parse_cmp_limit_accepts_decimal_counts() {
+        assert_eq!(parse_cmp_limit("0").unwrap(), 0);
+        assert_eq!(parse_cmp_limit("17").unwrap(), 17);
+        assert!(parse_cmp_limit("x").is_err());
+    }
+
+    #[test]
+    fn cmp_eof_line_matches_gnu_newline_convention() {
+        assert_eq!(cmp_eof_line(0, false), (1, "in line"));
+        assert_eq!(cmp_eof_line(1, true), (1, "line"));
+        assert_eq!(cmp_eof_line(1, false), (2, "in line"));
+    }
 }

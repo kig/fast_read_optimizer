@@ -129,9 +129,9 @@
     - [ ] `-l`, `--verbose`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-n`, `--bytes=LIMIT`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-n`, `--bytes=LIMIT`
+      - [x] equality test
+      - [x] implementation
     - [x] `-s`, `--quiet`, `--silent`
       - [x] equality test
       - [x] implementation

@@ -229,6 +229,36 @@ pub fn diff_files(
     bench_only: bool,
     report_mismatch: bool,
 ) -> io::Result<u64> {
+    diff_files_up_to(
+        file1,
+        file2,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+        bench_only,
+        report_mismatch,
+        None,
+    )
+}
+
+pub fn diff_files_up_to(
+    file1: &str,
+    file2: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    bench_only: bool,
+    report_mismatch: bool,
+    compare_len_limit: Option<u64>,
+) -> io::Result<u64> {
     let mismatch = Arc::new(AtomicU64::new(0));
     let mut threads = vec![];
 
@@ -250,7 +280,7 @@ pub fn diff_files(
 
     let s1 = std::fs::metadata(file1)?.len();
     let s2 = std::fs::metadata(file2)?.len();
-    let file_size = std::cmp::min(s1, s2);
+    let file_size = std::cmp::min(s1, s2).min(compare_len_limit.unwrap_or(u64::MAX));
     for thread_id in 0..num_threads {
         let mismatch = mismatch.clone();
         let f1_name = file1.to_string();
