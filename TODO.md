@@ -107,9 +107,9 @@
     - [ ] `-t`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-T`, `--show-tabs`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-T`, `--show-tabs`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-u`
       - [ ] equality test
       - [ ] implementation

@@ -44,12 +44,17 @@ pub(super) fn cat_show_ends_rendered_len(original_len: usize, ends_with_newline:
     }
 }
 
+pub(super) fn cat_show_tabs_rendered_len(original_len: usize, tab_count: usize) -> Option<usize> {
+    original_len.checked_add(tab_count)
+}
+
 fn cat_write_transformed_line<W: Write>(
     out: &mut W,
     line: &[u8],
     number: bool,
     number_nonblank: bool,
     show_ends: bool,
+    show_tabs: bool,
     squeeze_blank: bool,
     next_line_number: &mut u64,
     previous_blank_line: &mut bool,
@@ -75,13 +80,38 @@ fn cat_write_transformed_line<W: Write>(
             write!(out, "{line_number:>6}\t")?;
         }
     }
-    let rendered_len =
+    let mut rendered_len =
         cat_show_ends_rendered_len(line.len(), line.ends_with(b"\n")).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cat show-ends rendering overflow",
             )
         })?;
+    if show_tabs {
+        rendered_len = cat_show_tabs_rendered_len(
+            rendered_len,
+            line.iter().copied().filter(|&byte| byte == b'\t').count(),
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cat show-tabs rendering overflow"))?;
+    }
+    if show_tabs {
+        let body = if show_ends && line.ends_with(b"\n") {
+            &line[..line.len().saturating_sub(1)]
+        } else {
+            line
+        };
+        for &byte in body {
+            if byte == b'\t' {
+                out.write_all(b"^I")?;
+            } else {
+                out.write_all(&[byte])?;
+            }
+        }
+        if show_ends && cat_show_ends_rendered_len(line.len(), line.ends_with(b"\n")).unwrap() != line.len() {
+            out.write_all(b"$\n")?;
+        }
+        return Ok(());
+    }
     if show_ends && rendered_len != line.len() {
         let split = line.len().saturating_sub(1);
         out.write_all(&line[..split])?;
@@ -96,6 +126,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let mut number = false;
     let mut number_nonblank = false;
     let mut show_ends = false;
+    let mut show_tabs = false;
     let mut squeeze_blank = false;
     let mut files = Vec::new();
     for arg in &args[1..] {
@@ -106,13 +137,14 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
             "-n" | "--number" => number = true,
             "-b" | "--number-nonblank" => number_nonblank = true,
             "-E" | "--show-ends" => show_ends = true,
+            "-T" | "--show-tabs" => show_tabs = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
             other => files.push(other.to_string()),
         }
     }
     let inputs = parse_stream_inputs(files);
     let mut out = stdout_buf_writer()?;
-    if number || number_nonblank || show_ends || squeeze_blank {
+    if number || number_nonblank || show_ends || show_tabs || squeeze_blank {
         let mut next_line_number = 1u64;
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
@@ -127,6 +159,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                         number,
                         number_nonblank,
                         show_ends,
+                        show_tabs,
                         squeeze_blank,
                         &mut next_line_number,
                         &mut previous_blank_line,
@@ -147,6 +180,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 number,
                 number_nonblank,
                 show_ends,
+                show_tabs,
                 squeeze_blank,
                 &mut next_line_number,
                 &mut previous_blank_line,
@@ -167,7 +201,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 mod kani_proofs {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_squeeze_blank_step,
+        cat_show_tabs_rendered_len, cat_squeeze_blank_step,
     };
 
     #[kani::proof]
@@ -236,13 +270,25 @@ mod kani_proofs {
             })
         );
     }
+
+    #[kani::proof]
+    fn cat_show_tabs_rendered_len_matches_tab_formula() {
+        let original_len: usize = kani::any();
+        let tab_count: usize = kani::any();
+        let rendered_len = cat_show_tabs_rendered_len(original_len, tab_count);
+        if original_len > usize::MAX - tab_count {
+            assert!(rendered_len.is_none());
+            return;
+        }
+        assert_eq!(rendered_len, Some(original_len + tab_count));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_squeeze_blank_step,
+        cat_show_tabs_rendered_len, cat_squeeze_blank_step,
     };
 
     #[test]
@@ -286,5 +332,14 @@ mod tests {
         assert_eq!(cat_show_ends_rendered_len(4, false), Some(4));
         assert_eq!(cat_show_ends_rendered_len(4, true), Some(5));
         assert_eq!(cat_show_ends_rendered_len(usize::MAX, true), None);
+    }
+
+    #[test]
+    fn cat_show_tabs_rendered_len_adds_one_byte_per_tab() {
+        assert_eq!(cat_show_tabs_rendered_len(0, 0), Some(0));
+        assert_eq!(cat_show_tabs_rendered_len(4, 0), Some(4));
+        assert_eq!(cat_show_tabs_rendered_len(4, 1), Some(5));
+        assert_eq!(cat_show_tabs_rendered_len(4, 3), Some(7));
+        assert_eq!(cat_show_tabs_rendered_len(usize::MAX, 1), None);
     }
 }
