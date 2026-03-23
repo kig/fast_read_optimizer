@@ -220,3 +220,51 @@ fn cmp_verbose_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cmp_print_bytes_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-print-bytes");
+    let diff_a = tmp.join("diff-a.txt");
+    let diff_b = tmp.join("diff-b.txt");
+    let short = tmp.join("short.txt");
+    let long = tmp.join("long.txt");
+    let binary_a = tmp.join("binary-a.bin");
+    let binary_b = tmp.join("binary-b.bin");
+
+    fs::write(&diff_a, b"abc\nxyz\n").unwrap();
+    fs::write(&diff_b, b"abQ\nxyZ\n").unwrap();
+    fs::write(&short, b"abc").unwrap();
+    fs::write(&long, b"abQXYZ").unwrap();
+    fs::write(&binary_a, [0, b'\n', b' ', b'A', 126, 127, 255]).unwrap();
+    fs::write(&binary_b, [1, b'\n', b'\t', b'B', 126, 127, 254]).unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-b"],
+            vec!["--print-bytes"],
+            vec!["-b", "-n", "4"],
+            vec!["-b", "-i", "3"],
+            vec!["-b", "-i", "3:4"],
+            vec!["-b", "-l"],
+            vec!["--print-bytes", "--verbose"],
+            vec!["-b", "-s"],
+        ] {
+            for files in [
+                vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
+                vec![short.to_str().unwrap(), long.to_str().unwrap()],
+                vec![binary_a.to_str().unwrap(), binary_b.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, compat_flags),
+                );
+            }
+        }
+    }
+}

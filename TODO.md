@@ -117,9 +117,9 @@
       - [ ] equality test
       - [ ] implementation
   - [ ] `cmp`
-    - [ ] `-b`, `--print-bytes`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-b`, `--print-bytes`
+      - [x] equality test
+      - [x] implementation
     - [x] `-i`, `--ignore-initial=SKIP`
       - [x] equality test
       - [x] implementation

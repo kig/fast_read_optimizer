@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::FileExt;
 
 fn count_newlines_in_range(
     path: &str,
@@ -46,6 +47,39 @@ pub(super) fn cmp_flags_are_compatible(quiet: bool, verbose: bool) -> bool {
 
 fn cmp_decimal_width(value: u64) -> usize {
     value.max(1).to_string().len()
+}
+
+fn cmp_byte_display_parts(byte: u8) -> (bool, u8) {
+    if byte >= 128 {
+        (true, byte - 128)
+    } else {
+        (false, byte)
+    }
+}
+
+fn cmp_render_core_byte(core: u8) -> String {
+    match core {
+        0..=31 => format!("^{}", char::from(core + 64)),
+        127 => "^?".to_string(),
+        _ => char::from(core).to_string(),
+    }
+}
+
+fn cmp_render_byte_char(byte: u8) -> String {
+    let (meta, core) = cmp_byte_display_parts(byte);
+    let rendered = cmp_render_core_byte(core);
+    if meta {
+        format!("M-{rendered}")
+    } else {
+        rendered
+    }
+}
+
+fn cmp_read_byte_at(path: &str, offset: u64) -> io::Result<u8> {
+    let file = fs::File::open(path)?;
+    let mut byte = [0u8; 1];
+    file.read_exact_at(&mut byte, offset)?;
+    Ok(byte[0])
 }
 
 fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'static str) {
@@ -96,6 +130,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut quiet = false;
     let mut verbose = false;
+    let mut print_bytes = false;
     let mut limit = None::<u64>;
     let mut first_skip = 0u64;
     let mut second_skip = 0u64;
@@ -108,6 +143,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             "--no-direct" => io_mode = IOMode::PageCache,
             "-s" | "--quiet" | "--silent" => quiet = true,
             "-l" | "--verbose" => verbose = true,
+            "-b" | "--print-bytes" => print_bytes = true,
             "-n" | "--bytes" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -143,7 +179,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [-l|--verbose] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [-l|--verbose] [-b|--print-bytes] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -202,7 +238,19 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         for (idx, (&left, &right)) in first_slice.iter().zip(second_slice.iter()).enumerate() {
             if left != right {
                 had_mismatch = true;
-                println!("{:>width$} {:>3o} {:>3o}", idx + 1, left, right, width = byte_width);
+                if print_bytes {
+                    println!(
+                        "{:>width$} {:>3o} {:<4} {:>3o} {}",
+                        idx + 1,
+                        left,
+                        cmp_render_byte_char(left),
+                        right,
+                        cmp_render_byte_char(right),
+                        width = byte_width
+                    );
+                } else {
+                    println!("{:>width$} {:>3o} {:>3o}", idx + 1, left, right, width = byte_width);
+                }
             }
         }
         if first_remaining != second_remaining && limit.map_or(true, |limit| limit > shared_remaining) {
@@ -247,13 +295,26 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
                     first_skip,
                     first_skip + mismatch - 1,
                 )?;
-            println!(
-                "{} {} differ: byte {}, line {}",
-                files[0],
-                files[1],
-                index + 1,
-                line
-            );
+            if print_bytes {
+                let left = cmp_read_byte_at(&files[0], first_skip + mismatch - 1)?;
+                let right = cmp_read_byte_at(&files[1], second_skip + mismatch - 1)?;
+                println!(
+                    "{} {} differ: byte {}, line {} is {:>3o} {} {:>3o} {}",
+                    files[0],
+                    files[1],
+                    index + 1,
+                    line,
+                    left,
+                    cmp_render_byte_char(left),
+                    right,
+                    cmp_render_byte_char(right)
+                );
+            } else {
+                println!(
+                    "{} {} differ: byte {}, line {}",
+                    files[0], files[1], index + 1, line
+                );
+            }
         }
         return Ok(1);
     }
@@ -298,7 +359,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        cmp_effective_compare_len, cmp_effective_compare_len_with_skips,
+        cmp_byte_display_parts, cmp_effective_compare_len, cmp_effective_compare_len_with_skips,
         cmp_flags_are_compatible, cmp_remaining_len_after_skip,
     };
 
@@ -352,14 +413,23 @@ mod kani_proofs {
         let verbose: bool = kani::any();
         assert_eq!(cmp_flags_are_compatible(quiet, verbose), !(quiet && verbose));
     }
+
+    #[kani::proof]
+    fn cmp_byte_display_parts_split_meta_bit() {
+        let byte: u8 = kani::any();
+        let (meta, core) = cmp_byte_display_parts(byte);
+        assert_eq!(meta, byte >= 128);
+        assert!(core <= 127);
+        assert_eq!(byte, core + if meta { 128 } else { 0 });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cmp_effective_compare_len, cmp_effective_compare_len_with_skips, cmp_eof_line,
-        cmp_flags_are_compatible, cmp_remaining_len_after_skip, cmp_decimal_width, parse_cmp_limit,
-        parse_cmp_skip_spec,
+        cmp_byte_display_parts, cmp_decimal_width, cmp_effective_compare_len,
+        cmp_effective_compare_len_with_skips, cmp_eof_line, cmp_flags_are_compatible,
+        cmp_remaining_len_after_skip, cmp_render_byte_char, parse_cmp_limit, parse_cmp_skip_spec,
     };
 
     #[test]
@@ -421,5 +491,23 @@ mod tests {
         assert_eq!(cmp_decimal_width(9), 1);
         assert_eq!(cmp_decimal_width(10), 2);
         assert_eq!(cmp_decimal_width(999), 3);
+    }
+
+    #[test]
+    fn cmp_byte_display_parts_split_high_bit_from_render_core() {
+        assert_eq!(cmp_byte_display_parts(0), (false, 0));
+        assert_eq!(cmp_byte_display_parts(127), (false, 127));
+        assert_eq!(cmp_byte_display_parts(128), (true, 0));
+        assert_eq!(cmp_byte_display_parts(255), (true, 127));
+    }
+
+    #[test]
+    fn cmp_render_byte_char_matches_gnu_style_examples() {
+        assert_eq!(cmp_render_byte_char(b'Q'), "Q");
+        assert_eq!(cmp_render_byte_char(b' '), " ");
+        assert_eq!(cmp_render_byte_char(b'\t'), "^I");
+        assert_eq!(cmp_render_byte_char(0), "^@");
+        assert_eq!(cmp_render_byte_char(127), "^?");
+        assert_eq!(cmp_render_byte_char(255), "M-^?");
     }
 }
