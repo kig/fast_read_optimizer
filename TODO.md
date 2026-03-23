@@ -104,9 +104,9 @@
     - [x] `-s`, `--squeeze-blank`
       - [x] equality test
       - [x] implementation
-    - [ ] `-t`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-t`
+      - [x] equality test
+      - [x] implementation
     - [x] `-T`, `--show-tabs`
       - [x] equality test
       - [x] implementation
