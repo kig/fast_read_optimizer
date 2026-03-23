@@ -98,9 +98,9 @@
     - [ ] `-E`, `--show-ends`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-n`, `--number`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-n`, `--number`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-s`, `--squeeze-blank`
       - [ ] equality test
       - [ ] implementation
