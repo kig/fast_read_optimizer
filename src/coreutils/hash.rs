@@ -23,6 +23,7 @@ struct HashSumOptions {
     quiet: bool,
     status_only: bool,
     warn: bool,
+    strict: bool,
     inputs: Vec<StreamInput>,
 }
 
@@ -49,7 +50,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                 }
                 format = HashSumFormat::Default;
             }
-            "--quiet" | "--status" | "-w" | "--warn" => {}
+            "--quiet" | "--status" | "-w" | "--warn" | "--strict" => {}
             "-" => files.push(arg.clone()),
             other if other.starts_with('-') => {
                 return Err(io::Error::new(
@@ -72,6 +73,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
         warn: args[1..]
             .iter()
             .any(|arg| matches!(arg.as_str(), "-w" | "--warn")),
+        strict: args[1..].iter().any(|arg| arg == "--strict"),
         inputs: parse_stream_inputs(files),
     })
 }
@@ -129,6 +131,14 @@ pub(super) fn hash_check_should_print_result(
 
 pub(super) fn hash_check_should_report_malformed_line(warn: bool, status_only: bool) -> bool {
     warn && !status_only
+}
+
+pub(super) fn hash_check_exit_code(had_failure: bool, malformed_lines: usize, strict: bool) -> i32 {
+    if had_failure || (strict && malformed_lines != 0) {
+        1
+    } else {
+        0
+    }
 }
 
 fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
@@ -273,7 +283,11 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
             hash_sum_program_name(algorithm)
         );
     }
-    Ok(if had_failure { 1 } else { 0 })
+    Ok(hash_check_exit_code(
+        had_failure,
+        malformed_lines,
+        options.strict,
+    ))
 }
 
 pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<i32> {
@@ -410,7 +424,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::hash_check_should_report_malformed_line;
+    use super::{hash_check_exit_code, hash_check_should_report_malformed_line};
 
     #[kani::proof]
     fn hash_check_malformed_line_policy_matches_flag_formula() {
@@ -419,6 +433,21 @@ mod kani_proofs {
         assert_eq!(
             hash_check_should_report_malformed_line(warn, status_only),
             warn && !status_only
+        );
+    }
+
+    #[kani::proof]
+    fn hash_check_exit_code_matches_failure_formula() {
+        let had_failure: bool = kani::any();
+        let malformed_lines: usize = kani::any();
+        let strict: bool = kani::any();
+        assert_eq!(
+            hash_check_exit_code(had_failure, malformed_lines, strict),
+            if had_failure || (strict && malformed_lines != 0) {
+                1
+            } else {
+                0
+            }
         );
     }
 }
@@ -459,5 +488,14 @@ mod tests {
         assert!(hash_check_should_report_malformed_line(true, false));
         assert!(!hash_check_should_report_malformed_line(false, false));
         assert!(!hash_check_should_report_malformed_line(true, true));
+    }
+
+    #[test]
+    fn hash_check_exit_code_matches_failure_and_strict_rules() {
+        assert_eq!(hash_check_exit_code(false, 0, false), 0);
+        assert_eq!(hash_check_exit_code(false, 1, false), 0);
+        assert_eq!(hash_check_exit_code(false, 1, true), 1);
+        assert_eq!(hash_check_exit_code(true, 0, false), 1);
+        assert_eq!(hash_check_exit_code(true, 1, true), 1);
     }
 }

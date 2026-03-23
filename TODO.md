@@ -407,9 +407,9 @@
     - [x] `--status`
       - [x] equality test
       - [x] implementation
-    - [ ] `--strict`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `--strict`
+      - [x] equality test
+      - [x] implementation
     - [x] `-w`, `--warn`
       - [x] equality test
       - [x] implementation

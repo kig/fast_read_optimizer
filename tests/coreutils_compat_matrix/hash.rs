@@ -236,3 +236,56 @@ fn digest_family_check_warn_matches_system_output() {
         }
     }
 }
+
+#[test]
+fn digest_family_check_strict_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-strict");
+    let path_ok = tmp.join("ok.bin");
+    let path_bad = tmp.join("bad.bin");
+    fs::write(
+        &path_ok,
+        (0..4097)
+            .map(|i| ((i * 41 + 13) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &path_bad,
+        (0..4097)
+            .map(|i| ((i * 43 + 17) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest_malformed = tmp.join(format!("{name}-strict-malformed.txt"));
+        let manifest_bad = tmp.join(format!("{name}-strict-bad.txt"));
+        let ok_manifest = run_system(system_name, &[path_ok.to_str().unwrap()]);
+        assert!(ok_manifest.status.success());
+        let ok_line = String::from_utf8(ok_manifest.stdout.clone()).unwrap();
+        fs::write(&manifest_malformed, format!("bogus-line\n{ok_line}")).unwrap();
+
+        let mut bad_manifest = ok_line.clone();
+        bad_manifest = bad_manifest.replace(path_ok.to_str().unwrap(), path_bad.to_str().unwrap());
+        fs::write(&manifest_bad, bad_manifest).unwrap();
+
+        for extra_flags in [vec!["--strict", "-c"], vec!["--strict", "--status", "-c"]] {
+            for manifest in [manifest_malformed.as_path(), manifest_bad.as_path()] {
+                let mut args = extra_flags.clone();
+                args.push(manifest.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &args),
+                    run_system(system_name, &args),
+                    &format!("{name} {:?} {:?}", extra_flags, manifest),
+                );
+            }
+        }
+    }
+}
