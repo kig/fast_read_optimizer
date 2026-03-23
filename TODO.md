@@ -92,9 +92,9 @@
     - [x] `-b`, `--number-nonblank`
       - [x] equality test
       - [x] implementation
-    - [ ] `-e`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-e`
+      - [x] equality test
+      - [x] implementation
     - [x] `-E`, `--show-ends`
       - [x] equality test
       - [x] implementation

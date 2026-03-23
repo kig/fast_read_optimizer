@@ -83,6 +83,18 @@ pub(super) fn cat_uses_transform_path(
     number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
 }
 
+pub(super) fn cat_short_visual_flag_effect(flag: u8) -> Option<(bool, bool, bool)> {
+    match flag {
+        b'E' => Some((true, false, false)),
+        b'T' => Some((false, true, false)),
+        b'v' => Some((false, false, true)),
+        b'e' => Some((true, false, true)),
+        b't' => Some((false, true, true)),
+        b'A' => Some((true, true, true)),
+        _ => None,
+    }
+}
+
 fn cat_write_visible_byte<W: Write>(
     out: &mut W,
     byte: u8,
@@ -218,10 +230,21 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 show_nonprinting = true;
             }
             "-u" => {}
-            "-v" => show_nonprinting = true,
             "--show-nonprinting" => show_nonprinting = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
-            other => files.push(other.to_string()),
+            other => {
+                if let [b'-', flag] = other.as_bytes() {
+                    if let Some((flag_show_ends, flag_show_tabs, flag_show_nonprinting)) =
+                        cat_short_visual_flag_effect(*flag)
+                    {
+                        show_ends |= flag_show_ends;
+                        show_tabs |= flag_show_tabs;
+                        show_nonprinting |= flag_show_nonprinting;
+                        continue;
+                    }
+                }
+                files.push(other.to_string());
+            }
         }
     }
     let inputs = parse_stream_inputs(files);
@@ -292,7 +315,8 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 mod kani_proofs {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_uses_transform_path,
+        cat_short_visual_flag_effect, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
+        cat_uses_transform_path,
         cat_visible_byte_rendered_len,
     };
 
@@ -431,13 +455,30 @@ mod kani_proofs {
             number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
         );
     }
+
+    #[kani::proof]
+    fn cat_short_visual_flag_effect_matches_gnu_composites() {
+        let flag: u8 = kani::any();
+        let effect = cat_short_visual_flag_effect(flag);
+        let expected = match flag {
+            b'E' => Some((true, false, false)),
+            b'T' => Some((false, true, false)),
+            b'v' => Some((false, false, true)),
+            b'e' => Some((true, false, true)),
+            b't' => Some((false, true, true)),
+            b'A' => Some((true, true, true)),
+            _ => None,
+        };
+        assert_eq!(effect, expected);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_uses_transform_path,
+        cat_short_visual_flag_effect, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
+        cat_uses_transform_path,
         cat_visible_byte_rendered_len,
     };
 
@@ -516,5 +557,16 @@ mod tests {
     fn cat_uses_transform_path_is_false_for_plain_unbuffered_mode() {
         assert!(!cat_uses_transform_path(false, false, false, false, false, false));
         assert!(cat_uses_transform_path(true, false, false, false, false, false));
+    }
+
+    #[test]
+    fn cat_short_visual_flag_effect_matches_expected_composites() {
+        assert_eq!(cat_short_visual_flag_effect(b'E'), Some((true, false, false)));
+        assert_eq!(cat_short_visual_flag_effect(b'T'), Some((false, true, false)));
+        assert_eq!(cat_short_visual_flag_effect(b'v'), Some((false, false, true)));
+        assert_eq!(cat_short_visual_flag_effect(b'e'), Some((true, false, true)));
+        assert_eq!(cat_short_visual_flag_effect(b't'), Some((false, true, true)));
+        assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
+        assert_eq!(cat_short_visual_flag_effect(b'x'), None);
     }
 }
