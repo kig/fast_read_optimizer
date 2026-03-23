@@ -24,7 +24,7 @@ The current product direction is NVMe- and page-cache-optimized replacements for
 | Tree walk (`find`, `du`) | Fast metadata-heavy traversal on large trees | Implemented and actively optimized. `du` now shares the same concurrent directory-walk machinery as `find`. |
 | Literal search (`fgrep`, `fro grep`) | Hot-cache and NVMe-friendly fixed-string search | Implemented for single-file scans. This is a good candidate for adapting `rg`-style UX to `fro` I/O over time. |
 | Copy / move (`cp`, `fro copy`, future `mv`) | High-throughput large-file copy and practical tree copy | Single-file copy and recursive `cp -r` exist; `mv` is still a target area rather than a delivered multicall tool. |
-| Stream processing (`cat`, `wc`, future `dd`, other pipe-heavy tools) | Page-cache and pipe-throughput-optimized stream utilities | `cat` and `wc` exist and have improved materially, but they are still below the long-term hot-cache pipeline target. `dd` and other streaming utils remain roadmap work. |
+| Stream processing (`cat`, `wc`, `dd`, other pipe-heavy tools) | Page-cache and pipe-throughput-optimized stream utilities | `cat`, `wc`, and `dd` now exist on the main CLI / multicall surface. The hot-cache pipeline work is still ongoing, and other streaming utils remain roadmap work. |
 | Read file to memory (`read --to-memory`) | Lift a file into RAM quickly with tunable backends | Implemented, benchmarked, and separately tunable via `read_to_memory` config entries. |
 | Populate page cache for shared mmap consumers | Warm shared model/data files for multi-process `mmap` reuse | Still exploratory. Plain `mmap` and `--mmap-read-pages` exist; the dedicated `--mmap-willneed` branch was removed because it did not earn its keep. |
 
@@ -150,7 +150,7 @@ For verification status and the current proof outline, see [`VERIFICATION.md`](V
 
 ## Examples
 
-See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`.
+See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`. The same `dd` implementation is also available as `fro dd` / multicall `dd`.
 
 ## Rust crate API
 

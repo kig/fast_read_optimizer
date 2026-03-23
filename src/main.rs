@@ -29,18 +29,17 @@ use reader::{
     read_file, resolve_to_memory_mode, ReadToMemoryMode, ReadToMemoryOptions,
 };
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{
-    copy_file_with_strategy, copy_file_with_strategy_and_truncate, overwrite_changed_chunks_direct,
-    write_buffer, write_file,
+    copy_file_range_syscall, copy_file_with_strategy, copy_file_with_strategy_and_truncate,
+    overwrite_changed_chunks_direct, write_buffer, write_file,
 };
 
 fn parse_size(s: &str) -> Option<u64> {
@@ -70,7 +69,7 @@ const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
 const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
 const COPY_RANGE_PARAM_INDICES: [usize; 3] = [6, 7, 8];
 const RECURSIVE_COPY_LARGE_FILE_THRESHOLD: u64 = 8 << 20;
-const RECURSIVE_COPY_PREALLOC_WORKERS: usize = 2;
+const RECURSIVE_COPY_MAX_LARGE_WORKERS: usize = 2;
 
 #[derive(Clone)]
 struct RecursiveCopyContext {
@@ -96,10 +95,8 @@ struct RecursiveDirectoryTask {
 struct RecursiveFileTask {
     source_path: PathBuf,
     target_path: PathBuf,
-    source_len: u64,
     source_mode: u32,
     resolved_copy: ResolvedCopyExecution,
-    preallocated: bool,
 }
 
 #[derive(Default)]
@@ -1115,20 +1112,6 @@ fn copy_symlink_entry(
     Ok(())
 }
 
-fn prepare_regular_copy_target(target_path: &Path, source_len: u64) -> io::Result<()> {
-    ensure_parent_directory(target_path)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(target_path)?;
-    file.set_len(source_len)?;
-    unsafe {
-        libc::posix_fallocate(file.as_raw_fd(), 0, source_len as i64);
-    }
-    Ok(())
-}
-
 fn execute_recursive_file_copy(
     task: &RecursiveFileTask,
     ctx: &RecursiveCopyContext,
@@ -1167,7 +1150,7 @@ fn execute_recursive_file_copy(
             task.resolved_copy.io_mode_read,
             task.resolved_copy.io_mode_write,
             task.resolved_copy.copy_strategy,
-            !(ctx.keep_target_size || task.preallocated),
+            !ctx.keep_target_size,
         )?
     };
     guard.ensure_source_unchanged()?;
@@ -1180,11 +1163,94 @@ fn execute_recursive_file_copy(
     Ok(())
 }
 
+fn recursive_copy_dir_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .max(1)
+}
+
+fn recursive_copy_large_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(RECURSIVE_COPY_MAX_LARGE_WORKERS)
+        .max(1)
+}
+
+fn recursive_copy_uses_small_file_range(ctx: &RecursiveCopyContext, source_len: u64) -> bool {
+    source_len < RECURSIVE_COPY_LARGE_FILE_THRESHOLD
+        && ctx.rewrite_mode == CopyRewriteMode::Auto
+        && !ctx.keep_target_size
+        && !matches!(
+            ctx.requested_strategy,
+            CopyStrategy::Threaded | CopyStrategy::Reflink
+        )
+        && ctx.io_mode_read != common::IOMode::Direct
+        && ctx.io_mode_write != common::IOMode::Direct
+}
+
+fn resolve_recursive_large_copy_execution(
+    ctx: &RecursiveCopyContext,
+    source_path: &Path,
+    target_path: &Path,
+) -> io::Result<ResolvedCopyExecution> {
+    let source_str = source_path.to_string_lossy();
+    let target_str = target_path.to_string_lossy();
+    let resolved = resolve_copy_execution(
+        &ctx.config,
+        &source_str,
+        &target_str,
+        ctx.requested_strategy,
+        ctx.rewrite_mode,
+        ctx.io_mode_read,
+        ctx.io_mode_write,
+    )?;
+    if ctx.requested_strategy == CopyStrategy::Auto {
+        return Ok(ResolvedCopyExecution {
+            copy_strategy: CopyStrategy::Threaded,
+            io_mode_read: resolved.io_mode_read,
+            io_mode_write: resolved.io_mode_write,
+            diff_overwrite: false,
+            full_rewrite: false,
+            path_label: "recursive large threaded",
+        });
+    }
+    Ok(resolved)
+}
+
+fn execute_recursive_small_file_copy(
+    source_path: &Path,
+    target_path: &Path,
+    source_len: u64,
+    source_mode: u32,
+    use_lock: bool,
+    stats: &RecursiveCopyStats,
+) -> io::Result<()> {
+    let source_str = source_path.to_string_lossy();
+    let target_str = target_path.to_string_lossy();
+    let guard = CopyOperationGuard::new(&source_str, &target_str, use_lock)?;
+    let copied = copy_file_range_syscall(
+        &source_str,
+        &target_str,
+        0,
+        0,
+        source_len,
+        true,
+        common::IOMode::PageCache,
+        common::IOMode::PageCache,
+    )?;
+    guard.ensure_source_unchanged()?;
+    fs::set_permissions(target_path, fs::Permissions::from_mode(source_mode))?;
+    stats.files_copied.fetch_add(1, Ordering::Relaxed);
+    stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+    Ok(())
+}
+
 fn walk_recursive_copy_subtree(
     start: RecursiveDirectoryTask,
     dir_queue: &RecursiveDirectoryQueue,
-    small_queue: &RecursiveTaskQueue<RecursiveFileTask>,
-    prealloc_queue: &RecursiveTaskQueue<RecursiveFileTask>,
     large_queue: &RecursiveTaskQueue<RecursiveFileTask>,
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
@@ -1224,34 +1290,26 @@ fn walk_recursive_copy_subtree(
                     ),
                 ));
             }
-
-            let source_str = source_path.to_string_lossy();
-            let target_str = target_path.to_string_lossy();
-            let resolved_copy = resolve_copy_execution(
-                &ctx.config,
-                &source_str,
-                &target_str,
-                ctx.requested_strategy,
-                ctx.rewrite_mode,
-                ctx.io_mode_read,
-                ctx.io_mode_write,
-            )?;
-            let file_task = RecursiveFileTask {
-                source_path,
-                target_path,
-                source_len: metadata.len(),
-                source_mode: metadata.permissions().mode(),
-                resolved_copy,
-                preallocated: false,
-            };
-            if file_task.source_len >= RECURSIVE_COPY_LARGE_FILE_THRESHOLD {
-                if !ctx.keep_target_size && !file_task.resolved_copy.diff_overwrite {
-                    prealloc_queue.enqueue(file_task)?;
-                } else {
-                    large_queue.enqueue(file_task)?;
-                }
+            let source_len = metadata.len();
+            let source_mode = metadata.permissions().mode();
+            if recursive_copy_uses_small_file_range(ctx, source_len) {
+                execute_recursive_small_file_copy(
+                    &source_path,
+                    &target_path,
+                    source_len,
+                    source_mode,
+                    ctx.use_lock,
+                    stats,
+                )?;
             } else {
-                small_queue.enqueue(file_task)?;
+                let resolved_copy =
+                    resolve_recursive_large_copy_execution(ctx, &source_path, &target_path)?;
+                large_queue.enqueue(RecursiveFileTask {
+                    source_path,
+                    target_path,
+                    source_mode,
+                    resolved_copy,
+                })?;
             }
         }
         if let Some(local_dir) = child_dirs.pop() {
@@ -1274,8 +1332,6 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     let stats = Arc::new(RecursiveCopyStats::default());
     create_directory_like(source_meta.permissions().mode(), &ctx.target_root, &stats)?;
     let dir_queue = Arc::new(RecursiveDirectoryQueue::default());
-    let small_queue = Arc::new(RecursiveTaskQueue::default());
-    let prealloc_queue = Arc::new(RecursiveTaskQueue::default());
     let large_queue = Arc::new(RecursiveTaskQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -1284,18 +1340,12 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
         target_dir: ctx.target_root.clone(),
     });
 
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .max(1);
-    let small_worker_count = worker_count.clamp(1, 8);
-    let large_worker_count = worker_count.clamp(1, 4);
+    let worker_count = recursive_copy_dir_worker_count();
+    let large_worker_count = recursive_copy_large_worker_count();
 
     let mut walk_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let dir_queue = dir_queue.clone();
-        let small_queue = small_queue.clone();
-        let prealloc_queue = prealloc_queue.clone();
         let large_queue = large_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
@@ -1305,8 +1355,6 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
                 let result = walk_recursive_copy_subtree(
                     task,
                     &dir_queue,
-                    &small_queue,
-                    &prealloc_queue,
                     &large_queue,
                     &ctx,
                     &stats,
@@ -1316,32 +1364,6 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
                 if let Err(err) = result {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
-                    small_queue.wake_all();
-                    prealloc_queue.wake_all();
-                    large_queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut small_threads = Vec::with_capacity(small_worker_count);
-    for _ in 0..small_worker_count {
-        let queue = small_queue.clone();
-        let dir_queue = dir_queue.clone();
-        let prealloc_queue = prealloc_queue.clone();
-        let large_queue = large_queue.clone();
-        let ctx = ctx.clone();
-        let stats = stats.clone();
-        let stop = stop.clone();
-        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(task) = queue.claim(&stop) {
-                if let Err(err) = execute_recursive_file_copy(&task, &ctx, &stats) {
-                    stop.store(true, Ordering::SeqCst);
-                    dir_queue.wake_all();
-                    queue.wake_all();
-                    prealloc_queue.wake_all();
                     large_queue.wake_all();
                     return Err(err);
                 }
@@ -1354,8 +1376,6 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     for _ in 0..large_worker_count {
         let queue = large_queue.clone();
         let dir_queue = dir_queue.clone();
-        let small_queue = small_queue.clone();
-        let prealloc_queue = prealloc_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
         let stop = stop.clone();
@@ -1364,40 +1384,7 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
                 if let Err(err) = execute_recursive_file_copy(&task, &ctx, &stats) {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
-                    small_queue.wake_all();
-                    prealloc_queue.wake_all();
                     queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut prealloc_threads = Vec::with_capacity(RECURSIVE_COPY_PREALLOC_WORKERS);
-    for _ in 0..RECURSIVE_COPY_PREALLOC_WORKERS {
-        let input = prealloc_queue.clone();
-        let output = large_queue.clone();
-        let dir_queue = dir_queue.clone();
-        let small_queue = small_queue.clone();
-        let stop = stop.clone();
-        prealloc_threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(mut task) = input.claim(&stop) {
-                if let Err(err) = prepare_regular_copy_target(&task.target_path, task.source_len) {
-                    stop.store(true, Ordering::SeqCst);
-                    dir_queue.wake_all();
-                    small_queue.wake_all();
-                    input.wake_all();
-                    output.wake_all();
-                    return Err(err);
-                }
-                task.preallocated = true;
-                if let Err(err) = output.enqueue(task) {
-                    stop.store(true, Ordering::SeqCst);
-                    dir_queue.wake_all();
-                    small_queue.wake_all();
-                    input.wake_all();
-                    output.wake_all();
                     return Err(err);
                 }
             }
@@ -1416,22 +1403,9 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
             Err(_) => {}
         }
     }
-    prealloc_queue.close();
-    small_queue.close();
-
-    for thread in prealloc_threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("recursive copy prealloc worker panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
     large_queue.close();
 
-    for thread in small_threads.into_iter().chain(large_threads) {
+    for thread in large_threads {
         match thread
             .join()
             .map_err(|_| io::Error::other("recursive copy file worker panicked"))?
@@ -1697,6 +1671,16 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Count lines, words, and bytes using fro block visitors.",
             notes: &["Without -l/-w/-c, prints all three counts."],
             examples: &[("Count lines and words", "wc -l -w notes.txt")],
+        }),
+        "dd" => Some(CommandHelp {
+            name: "dd",
+            usage: "dd if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct] [oflag=direct] [conv=notrunc,fsync] [status=none|progress]",
+            summary: "Copy byte ranges with dd-style operands on top of fro I/O primitives.",
+            notes: &[
+                "Whole-file copies without offset/count flags use the tuned copy path directly.",
+                "Compatibility currently focuses on the covered operands from tests/dd_example_compat.rs.",
+            ],
+            examples: &[("Copy five 4 KiB blocks with no summary", "dd if=src.bin of=dst.bin bs=4K count=5 status=none")],
         }),
         "cksum" => Some(CommandHelp {
             name: "cksum",
@@ -2022,6 +2006,7 @@ fn print_general_help(program: &str) {
     for (name, summary) in [
         ("cat", "print files using the fro read path"),
         ("cmp", "compare two files using the fro diff engine"),
+        ("dd", "copy byte ranges with dd-style operands"),
         ("fgrep", "literal line-oriented grep compatibility wrapper"),
         ("find", "walk directory trees and print every path"),
         ("du", "report disk usage from filesystem block counts"),
@@ -2081,7 +2066,7 @@ fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp fgrep find du cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp dd fgrep find du cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

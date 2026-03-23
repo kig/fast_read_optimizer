@@ -47,6 +47,15 @@ fn run_example(args: &[String]) -> Output {
         .expect("failed to run dd example")
 }
 
+fn run_fro_dd(args: &[String]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_fro"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("dd")
+        .args(args)
+        .output()
+        .expect("failed to run fro dd")
+}
+
 fn run_system_dd(args: &[String]) -> Output {
     Command::new("dd")
         .args(args)
@@ -71,34 +80,39 @@ fn build_args(input: &Path, output: &Path, flags: &[&str]) -> Vec<String> {
 
 fn compare_outputs(
     case_name: &str,
-    example: &Output,
+    label: &str,
+    actual: &Output,
     system: &Output,
-    example_output: &Path,
+    actual_output: &Path,
     system_output: &Path,
 ) {
     assert_eq!(
-        example.status.success(),
+        actual.status.success(),
         system.status.success(),
-        "case {}: example stderr=\n{}\nsystem stderr=\n{}",
+        "case {} ({}): actual stderr=\n{}\nsystem stderr=\n{}",
         case_name,
-        String::from_utf8_lossy(&example.stderr),
+        label,
+        String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&system.stderr)
     );
     assert_eq!(
-        example.stdout, system.stdout,
-        "case {}: stdout mismatch",
-        case_name
+        actual.stdout, system.stdout,
+        "case {} ({}): stdout mismatch",
+        case_name,
+        label
     );
     assert_eq!(
-        example.stderr, system.stderr,
-        "case {}: stderr mismatch",
-        case_name
+        actual.stderr, system.stderr,
+        "case {} ({}): stderr mismatch",
+        case_name,
+        label
     );
     assert_eq!(
-        fs::read(example_output).unwrap(),
+        fs::read(actual_output).unwrap(),
         fs::read(system_output).unwrap(),
-        "case {}: output mismatch",
-        case_name
+        "case {} ({}): output mismatch",
+        case_name,
+        label
     );
 }
 
@@ -166,23 +180,36 @@ fn dd_example_matches_system_dd_for_supported_flag_combinations() {
         let tmp = unique_temp_dir(case.name);
         let input = tmp.join("input.bin");
         let example_output = tmp.join("example.bin");
+        let fro_output = tmp.join("fro.bin");
         let system_output = tmp.join("system.bin");
         fs::write(&input, &input_bytes).unwrap();
         if let Some(initial) = case.initial_output {
             fs::write(&example_output, initial).unwrap();
+            fs::write(&fro_output, initial).unwrap();
             fs::write(&system_output, initial).unwrap();
         }
 
         let example_args = build_args(&input, &example_output, case.flags);
+        let fro_args = build_args(&input, &fro_output, case.flags);
         let system_args = build_args(&input, &system_output, case.flags);
         let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
         let system = run_system_dd(&system_args);
 
         compare_outputs(
             case.name,
+            "example",
             &example,
             &system,
             &example_output,
+            &system_output,
+        );
+        compare_outputs(
+            case.name,
+            "fro dd",
+            &fro,
+            &system,
+            &fro_output,
             &system_output,
         );
     }
@@ -254,6 +281,7 @@ fn dd_example_direct_flags_preserve_output_semantics() {
 
         compare_outputs(
             case.name,
+            "baseline example",
             &baseline,
             &system,
             &baseline_output,
@@ -303,6 +331,7 @@ fn dd_example_matches_system_dd_when_writing_to_dev_null() {
         "status=none".to_string(),
     ];
     let example = run_example(&args);
+    let fro = run_fro_dd(&args);
     let system = run_system_dd(&args);
 
     assert_eq!(
@@ -314,6 +343,15 @@ fn dd_example_matches_system_dd_when_writing_to_dev_null() {
     );
     assert_eq!(example.stdout, system.stdout);
     assert_eq!(example.stderr, system.stderr);
+    assert_eq!(
+        fro.status.success(),
+        system.status.success(),
+        "fro stderr=\n{}\nsystem stderr=\n{}",
+        String::from_utf8_lossy(&fro.stderr),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(fro.stdout, system.stdout);
+    assert_eq!(fro.stderr, system.stderr);
 }
 
 #[test]
@@ -340,4 +378,18 @@ fn dd_example_prints_dd_style_record_counts() {
     assert!(stderr.contains("9+1 records in"), "stderr=\n{stderr}");
     assert!(stderr.contains("9+1 records out"), "stderr=\n{stderr}");
     assert!(stderr.contains("97 bytes copied in"), "stderr=\n{stderr}");
+
+    let fro_output = run_fro_dd(&args);
+    assert!(
+        fro_output.status.success(),
+        "stderr=\n{}",
+        String::from_utf8_lossy(&fro_output.stderr)
+    );
+    let fro_stderr = String::from_utf8_lossy(&fro_output.stderr);
+    assert!(fro_stderr.contains("9+1 records in"), "stderr=\n{fro_stderr}");
+    assert!(fro_stderr.contains("9+1 records out"), "stderr=\n{fro_stderr}");
+    assert!(
+        fro_stderr.contains("97 bytes copied in"),
+        "stderr=\n{fro_stderr}"
+    );
 }

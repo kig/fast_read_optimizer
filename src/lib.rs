@@ -1,6 +1,7 @@
 mod api;
 mod blake3_hash;
 mod common;
+pub mod dd_tool;
 mod file_hash;
 mod io_util;
 mod mincore;

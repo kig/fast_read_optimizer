@@ -154,6 +154,28 @@ fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
 }
 
 #[test]
+fn multicall_dd_copies_requested_range() {
+    let tmp = unique_temp_dir("fro-coreutils-dd");
+    let input = tmp.join("input.bin");
+    let output = tmp.join("output.bin");
+    let bytes = (0..97).map(|i| ((i * 13) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, &bytes).unwrap();
+
+    let out = assert_success(run_fro(
+        "dd",
+        &[
+            &format!("if={}", input.display()),
+            &format!("of={}", output.display()),
+            "bs=7",
+            "count=5",
+            "status=none",
+        ],
+    ));
+    assert!(out.stderr.is_empty(), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read(&output).unwrap(), bytes[..35].to_vec());
+}
+
+#[test]
 fn multicall_cat_and_wc_accept_stdin_and_dash() {
     let bytes = b"one two\nthree\n";
 

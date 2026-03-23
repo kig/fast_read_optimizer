@@ -462,6 +462,7 @@ fn main() {
     let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
     let recursive_tree = test_path.join("fro_bench_recursive_tree");
     let recursive_tree_str = recursive_tree.display().to_string();
+    let recursive_copy_target = run_dir.join("fro_bench_recursive_copy_out").display().to_string();
 
     let tests = vec![
         TestCase {
@@ -660,6 +661,21 @@ fn main() {
                 "-n".into(),
                 "1".into(),
                 recursive_tree_str.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+        },
+        TestCase {
+            name: "copy (recursive, hot)",
+            args: vec![
+                "copy".into(),
+                "--recursive".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
             ],
             target: 0.0,
             cache_state: CacheState::Hot,
@@ -1050,14 +1066,16 @@ fn main() {
         println!("{}", combined);
     }
 
-    let recursive_selected_explicitly =
-        matches_any_pattern("recursive-read-bench (hot)", &patterns);
+    let recursive_selected_explicitly = matches_any_pattern("recursive-read-bench (hot)", &patterns)
+        || matches_any_pattern("copy (recursive, hot)", &patterns);
     let recursive_fixture_stats = recursive_tree_fixture_stats(&recursive_tree);
     let recursive_fixture_exists = recursive_fixture_stats.is_some();
     let mut selected_tests = Vec::new();
     for t in tests {
         if patterns.is_empty() {
-            if t.name.starts_with("recursive-read-bench") && !recursive_fixture_exists {
+            let needs_recursive_fixture = t.name.starts_with("recursive-read-bench")
+                || t.name.starts_with("copy (recursive");
+            if needs_recursive_fixture && !recursive_fixture_exists {
                 continue;
             }
             selected_tests.push(t);
@@ -1302,6 +1320,15 @@ fn main() {
         let mut outputs = Vec::with_capacity(repeat_count);
 
         for _ in 0..repeat_count {
+            if t.args.first().map(String::as_str) == Some("copy")
+                && t.args.iter().any(|arg| arg == "--recursive")
+            {
+                if let Some(target) = t.args.last() {
+                    let target_path = std::path::Path::new(target);
+                    let _ = std::fs::remove_dir_all(target_path);
+                    let _ = std::fs::remove_file(target_path);
+                }
+            }
             match t.cache_state {
                 CacheState::Cold => {
                     for f in &t.files_to_prep {

@@ -132,9 +132,9 @@
     - [ ] `-n`, `--bytes=LIMIT`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-s`, `--quiet`, `--silent`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-s`, `--quiet`, `--silent`
+      - [x] equality test
+      - [x] implementation
   - [ ] `cp` / `fro copy`
     - [ ] `-a`, `--archive`
       - [ ] equality test
@@ -383,21 +383,21 @@
       - [ ] equality test
       - [ ] implementation
   - [ ] digest family shared compatibility (`md5sum`, `sha224sum`, `sha256sum`, `sha384sum`, `sha512sum`)
-    - [ ] `-b`, `--binary`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-c`, `--check`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `--tag`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-t`, `--text`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-z`, `--zero`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-b`, `--binary`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-c`, `--check`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--tag`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-t`, `--text`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-z`, `--zero`
+      - [x] equality test
+      - [x] implementation
     - [ ] `--ignore-missing`
       - [ ] equality test
       - [ ] implementation

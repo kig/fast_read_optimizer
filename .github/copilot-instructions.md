@@ -54,6 +54,11 @@ This repo’s main automated verification is the benchmark runner binary:
 
 ## Key repo-specific conventions
 
+- When generating test data or scratch files for validation, prefer the repo's own utilities over ad hoc shell/Python generators when practical:
+  - use `./target/release/fro write --create <size> <path>` for sized files
+  - use `./target/release/fro dd if=<src> of=<dst> ...` for offset/partial copy semantics
+  - use `./target/release/fro copy`, `fro cat`, and related multicalls to exercise the actual optimized paths under test
+  - reserve external generators for cases the repo tools cannot express directly
 - `fro.json` is the source of truth for tuned params (per tool × {direct,page_cache}): see `src/config.rs`.
   - `AppConfig::load("fro.json")` auto-creates a default `fro.json` if missing.
   - Prefer regenerating via `fro-optimize` (or `fro ... -s`) rather than hand-editing.

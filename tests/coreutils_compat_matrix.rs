@@ -627,6 +627,98 @@ fn cartesian_hash_tools_match_system_output() {
 }
 
 #[test]
+fn digest_family_format_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-flags");
+    let path = tmp.join("hash file.txt");
+    fs::write(
+        &path,
+        (0..65599)
+            .map(|i| ((i * 11 + 3) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        for compat_flags in [
+            vec!["-b"],
+            vec!["-t"],
+            vec!["--tag"],
+            vec!["-z"],
+            vec!["-b", "-z"],
+        ] {
+            for io_flags in io_flag_sets() {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.push(path.to_str().unwrap());
+                let mut sys_args = compat_flags.clone();
+                sys_args.push(path.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &fro_args),
+                    run_system(system_name, &sys_args),
+                    &format!("{name} {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn digest_family_check_flag_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check");
+    let path_ok = tmp.join("ok.bin");
+    let path_bad = tmp.join("bad.bin");
+    fs::write(
+        &path_ok,
+        (0..8193).map(|i| ((i * 19 + 7) % 251) as u8).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &path_bad,
+        (0..8193).map(|i| ((i * 23 + 5) % 251) as u8).collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest_ok = tmp.join(format!("{name}-ok.txt"));
+        let manifest_bad = tmp.join(format!("{name}-bad.txt"));
+        let ok_manifest = run_system(system_name, &[path_ok.to_str().unwrap()]);
+        assert!(
+            ok_manifest.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok_manifest.stderr)
+        );
+        fs::write(&manifest_ok, &ok_manifest.stdout).unwrap();
+
+        let mut bad_manifest = String::from_utf8(ok_manifest.stdout.clone()).unwrap();
+        bad_manifest = bad_manifest.replace(path_ok.to_str().unwrap(), path_bad.to_str().unwrap());
+        fs::write(&manifest_bad, bad_manifest).unwrap();
+
+        for manifest in [manifest_ok.as_path(), manifest_bad.as_path()] {
+            let args = ["-c", manifest.to_str().unwrap()];
+            assert_same_result(
+                run_fro(name, &args),
+                run_system(system_name, &args),
+                &format!("{name} check {:?}", manifest),
+            );
+        }
+    }
+}
+
+#[test]
 fn cartesian_cmp_and_fgrep_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-cmp-grep-matrix");
     let equal_a = tmp.join("equal-a.txt");
@@ -660,6 +752,25 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
                 run_system("cmp", &files),
                 &format!("cmp {:?}", args),
             );
+        }
+
+        for quiet_flags in [vec!["-s"], vec!["--quiet"], vec!["--silent"]] {
+            for files in [
+                vec![equal_a.to_str().unwrap(), equal_b.to_str().unwrap()],
+                vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
+                vec![eof_a.to_str().unwrap(), eof_b.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(quiet_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = quiet_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, quiet_flags),
+                );
+            }
         }
 
         for grep_args in [

@@ -27,6 +27,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
         name,
         "cat"
             | "cmp"
+            | "dd"
             | "fgrep"
             | "find"
             | "du"
@@ -99,6 +100,10 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             0
         }
         "cmp" => run_cmp(args)?,
+        "dd" => {
+            fro::dd_tool::run_dd(args)?;
+            0
+        }
         "fgrep" => run_fgrep(args)?,
         "find" => run_find(args)?,
         "du" => run_du(args)?,
@@ -114,34 +119,13 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             run_cksum(args)?;
             0
         }
-        "b3sum" => {
-            run_hash_sum(args, HashAlgorithm::Blake3)?;
-            0
-        }
-        "b2sum" => {
-            run_hash_sum(args, HashAlgorithm::Blake2b512)?;
-            0
-        }
-        "md5sum" => {
-            run_hash_sum(args, HashAlgorithm::Md5)?;
-            0
-        }
-        "sha224sum" => {
-            run_hash_sum(args, HashAlgorithm::Sha224)?;
-            0
-        }
-        "sha256sum" => {
-            run_hash_sum(args, HashAlgorithm::Sha256)?;
-            0
-        }
-        "sha384sum" => {
-            run_hash_sum(args, HashAlgorithm::Sha384)?;
-            0
-        }
-        "sha512sum" => {
-            run_hash_sum(args, HashAlgorithm::Sha512)?;
-            0
-        }
+        "b3sum" => run_hash_sum(args, HashAlgorithm::Blake3)?,
+        "b2sum" => run_hash_sum(args, HashAlgorithm::Blake2b512)?,
+        "md5sum" => run_hash_sum(args, HashAlgorithm::Md5)?,
+        "sha224sum" => run_hash_sum(args, HashAlgorithm::Sha224)?,
+        "sha256sum" => run_hash_sum(args, HashAlgorithm::Sha256)?,
+        "sha384sum" => run_hash_sum(args, HashAlgorithm::Sha384)?,
+        "sha512sum" => run_hash_sum(args, HashAlgorithm::Sha512)?,
         "shred" => {
             run_shred(args)?;
             0
@@ -791,11 +775,22 @@ fn run_cat(args: &[String]) -> io::Result<()> {
 
 fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
-    let (io_mode, files) = parse_io_mode(&args[1..])?;
+    let mut io_mode = IOMode::Auto;
+    let mut quiet = false;
+    let mut files = Vec::new();
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--auto" => io_mode = IOMode::Auto,
+            "--direct" => io_mode = IOMode::Direct,
+            "--no-direct" => io_mode = IOMode::PageCache,
+            "-s" | "--quiet" | "--silent" => quiet = true,
+            other => files.push(other.to_string()),
+        }
+    }
     let files = ensure_files(
         program,
         files,
-        "[--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [--auto|--no-direct|--direct] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -821,15 +816,17 @@ fn run_cmp(args: &[String]) -> io::Result<i32> {
         false,
     )?;
     if mismatch != 0 {
-        let index = mismatch as usize - 1;
-        let line = 1 + count_newlines_up_to(&files[0], io_mode, "read", mismatch - 1)?;
-        println!(
-            "{} {} differ: byte {}, line {}",
-            files[0],
-            files[1],
-            index + 1,
-            line
-        );
+        if !quiet {
+            let index = mismatch as usize - 1;
+            let line = 1 + count_newlines_up_to(&files[0], io_mode, "read", mismatch - 1)?;
+            println!(
+                "{} {} differ: byte {}, line {}",
+                files[0],
+                files[1],
+                index + 1,
+                line
+            );
+        }
         return Ok(1);
     }
 
@@ -837,16 +834,18 @@ fn run_cmp(args: &[String]) -> io::Result<i32> {
     let second_len = fs::metadata(&files[1])?.len();
     let shared_len = first_len.min(second_len);
     if first_len != second_len {
-        let eof_file = if first_len < second_len {
-            &files[0]
-        } else {
-            &files[1]
-        };
-        let line = count_newlines_up_to(eof_file, io_mode, "read", shared_len)?;
-        eprintln!(
-            "cmp: EOF on {} after byte {}, line {}",
-            eof_file, shared_len, line
-        );
+        if !quiet {
+            let eof_file = if first_len < second_len {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            let line = count_newlines_up_to(eof_file, io_mode, "read", shared_len)?;
+            eprintln!(
+                "cmp: EOF on {} after byte {}, line {}",
+                eof_file, shared_len, line
+            );
+        }
         return Ok(1);
     }
 
@@ -1581,7 +1580,10 @@ mod du_tests {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{du_node_ready, permission_denied_components};
+    use super::{
+        du_node_ready, hash_check_line_kind, hash_check_untagged_kind,
+        permission_denied_components, HashCheckLineKind,
+    };
     use std::io;
 
     #[kani::proof]
@@ -1637,6 +1639,22 @@ mod kani_proofs {
                 && pending_file_stats == 0
                 && !completed
         );
+    }
+
+    #[kani::proof]
+    fn hash_check_untagged_kind_matches_separator_contract() {
+        let separator: u8 = kani::any();
+        let has_filename: bool = kani::any();
+        let expected = if !has_filename {
+            HashCheckLineKind::Invalid
+        } else {
+            match separator {
+                b' ' => HashCheckLineKind::UntaggedText,
+                b'*' => HashCheckLineKind::UntaggedBinary,
+                _ => HashCheckLineKind::Invalid,
+            }
+        };
+        assert_eq!(hash_check_untagged_kind(separator, has_filename), expected);
     }
 }
 
@@ -1831,21 +1849,234 @@ fn run_wc(args: &[String]) -> io::Result<()> {
     out.into_inner()
 }
 
-fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<()> {
-    let (io_mode, files) = parse_io_mode(&args[1..])?;
-    let inputs = parse_stream_inputs(files);
-    for input in inputs {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashSumFormat {
+    Default,
+    Binary,
+    Tag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashCheckLineKind {
+    Tagged,
+    UntaggedText,
+    UntaggedBinary,
+    Invalid,
+}
+
+struct HashSumOptions {
+    io_mode: IOMode,
+    format: HashSumFormat,
+    zero_terminated: bool,
+    check: bool,
+    inputs: Vec<StreamInput>,
+}
+
+fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
+    let mut io_mode = IOMode::Auto;
+    let mut format = HashSumFormat::Default;
+    let mut zero_terminated = false;
+    let mut files = Vec::new();
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--auto" => io_mode = IOMode::Auto,
+            "--direct" => io_mode = IOMode::Direct,
+            "--no-direct" => io_mode = IOMode::PageCache,
+            "-b" | "--binary" => format = HashSumFormat::Binary,
+            "-t" | "--text" => format = HashSumFormat::Default,
+            "--tag" => format = HashSumFormat::Tag,
+            "-z" | "--zero" => zero_terminated = true,
+            "-c" | "--check" => {
+                if format == HashSumFormat::Tag {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--check does not support --tag input",
+                    ));
+                }
+                format = HashSumFormat::Default;
+            }
+            "-" => files.push(arg.clone()),
+            other if other.starts_with('-') => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported hash flag: {other}"),
+                ));
+            }
+            _ => files.push(arg.clone()),
+        }
+    }
+    Ok(HashSumOptions {
+        io_mode,
+        format,
+        zero_terminated,
+        check: args[1..]
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-c" | "--check")),
+        inputs: parse_stream_inputs(files),
+    })
+}
+
+fn hash_sum_tag_name(algorithm: HashAlgorithm) -> Option<&'static str> {
+    match algorithm {
+        HashAlgorithm::Md5 => Some("MD5"),
+        HashAlgorithm::Blake2b512 => Some("BLAKE2b"),
+        HashAlgorithm::Sha224 => Some("SHA224"),
+        HashAlgorithm::Sha256 => Some("SHA256"),
+        HashAlgorithm::Sha384 => Some("SHA384"),
+        HashAlgorithm::Sha512 => Some("SHA512"),
+        HashAlgorithm::Blake3 | HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => {
+            None
+        }
+    }
+}
+
+fn hash_sum_program_name(algorithm: HashAlgorithm) -> &'static str {
+    match algorithm {
+        HashAlgorithm::Md5 => "md5sum",
+        HashAlgorithm::Blake2b512 => "b2sum",
+        HashAlgorithm::Sha224 => "sha224sum",
+        HashAlgorithm::Sha256 => "sha256sum",
+        HashAlgorithm::Sha384 => "sha384sum",
+        HashAlgorithm::Sha512 => "sha512sum",
+        HashAlgorithm::Blake3 => "b3sum",
+        HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => "hash",
+    }
+}
+
+fn hash_check_untagged_kind(separator: u8, has_filename: bool) -> HashCheckLineKind {
+    if !has_filename {
+        return HashCheckLineKind::Invalid;
+    }
+    match separator {
+        b' ' => HashCheckLineKind::UntaggedText,
+        b'*' => HashCheckLineKind::UntaggedBinary,
+        _ => HashCheckLineKind::Invalid,
+    }
+}
+
+fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
+    if line.is_empty() {
+        return HashCheckLineKind::Invalid;
+    }
+    if let Some((left, _)) = line.split_once(" = ") {
+        if left.ends_with(')') && left.contains(" (") {
+            return HashCheckLineKind::Tagged;
+        }
+    }
+    let bytes = line.as_bytes();
+    if let Some(space_pos) = bytes.iter().position(|&byte| byte == b' ') {
+        let has_filename = space_pos + 2 < bytes.len();
+        let separator = bytes.get(space_pos + 1).copied().unwrap_or_default();
+        return hash_check_untagged_kind(separator, has_filename);
+    }
+    HashCheckLineKind::Invalid
+}
+
+fn write_hash_sum_line(
+    out: &mut dyn Write,
+    algorithm: HashAlgorithm,
+    format: HashSumFormat,
+    zero_terminated: bool,
+    digest: &[u8],
+    label: &str,
+) -> io::Result<()> {
+    let line = match format {
+        HashSumFormat::Default => format!("{}  {}", hex_digest(digest), label),
+        HashSumFormat::Binary => format!("{} *{}", hex_digest(digest), label),
+        HashSumFormat::Tag => format!(
+            "{} ({}) = {}",
+            hash_sum_tag_name(algorithm).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unsupported tagged digest")
+            })?,
+            label,
+            hex_digest(digest)
+        ),
+    };
+    out.write_all(line.as_bytes())?;
+    out.write_all(if zero_terminated { b"\0" } else { b"\n" })
+}
+
+fn parse_hash_check_line(line: &str) -> Option<(&str, &str)> {
+    match hash_check_line_kind(line) {
+        HashCheckLineKind::UntaggedText | HashCheckLineKind::UntaggedBinary => {
+            let space_pos = line.as_bytes().iter().position(|&byte| byte == b' ')?;
+            let digest = &line[..space_pos];
+            let file = &line[(space_pos + 2)..];
+            Some((digest, file))
+        }
+        _ => None,
+    }
+}
+
+fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io::Result<i32> {
+    if options.inputs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing checksum file operand",
+        ));
+    }
+    let out = stdout_buf_writer()?;
+    let mut had_failure = false;
+    let mut had_valid_line = false;
+    let algorithm_name = hash_sum_tag_name(algorithm).unwrap_or("digest");
+    for input in &options.inputs {
+        let data = match input {
+            StreamInput::File(ref file) => fs::read_to_string(file)?,
+            StreamInput::Stdin { .. } => {
+                let mut reader = stdin_buf_reader()?;
+                let mut text = String::new();
+                reader.read_to_string(&mut text)?;
+                text
+            }
+        };
+        for line in data.lines() {
+            let Some((expected_hex, path)) = parse_hash_check_line(line) else {
+                continue;
+            };
+            had_valid_line = true;
+            let actual = hash_file(path, algorithm, options.io_mode)?;
+            if hex_digest(&actual) == expected_hex {
+                out.write_all(format!("{path}: OK\n").as_bytes())?;
+            } else {
+                had_failure = true;
+                out.write_all(format!("{path}: FAILED\n").as_bytes())?;
+            }
+        }
+        if !had_valid_line {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no properly formatted {algorithm_name} checksum lines found"),
+            ));
+        }
+    }
+    out.into_inner()?;
+    if had_failure {
+        eprintln!(
+            "{}: WARNING: 1 computed checksum did NOT match",
+            hash_sum_program_name(algorithm)
+        );
+    }
+    Ok(if had_failure { 1 } else { 0 })
+}
+
+fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<i32> {
+    let options = parse_hash_sum_options(args)?;
+    if options.check {
+        return run_hash_sum_check(&options, algorithm);
+    }
+    let mut out = stdout_buf_writer()?;
+    for input in options.inputs {
         let label = match &input {
             StreamInput::File(file) => Some(file.as_str()),
             StreamInput::Stdin { label } => Some(label.as_deref().unwrap_or("-")),
         };
         let digest = match &input {
             StreamInput::File(file) if is_regular_input_path(file)? => {
-                hash_file(file, algorithm, io_mode)?
+                hash_file(file, algorithm, options.io_mode)?
             }
             _ => {
                 let mut data = Vec::new();
-                visit_ordered_input(&input, io_mode, |block| {
+                visit_ordered_input(&input, options.io_mode, |block| {
                     data.extend_from_slice(block);
                     Ok(())
                 })?;
@@ -1880,12 +2111,21 @@ fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<()> {
             }
         };
         if let Some(label) = label {
-            println!("{}  {}", hex_digest(&digest), label);
+            write_hash_sum_line(
+                &mut out,
+                algorithm,
+                options.format,
+                options.zero_terminated,
+                &digest,
+                label,
+            )?;
         } else {
-            println!("{}", hex_digest(&digest));
+            out.write_all(hex_digest(&digest).as_bytes())?;
+            out.write_all(if options.zero_terminated { b"\0" } else { b"\n" })?;
         }
     }
-    Ok(())
+    out.into_inner()?;
+    Ok(0)
 }
 
 fn crc32_cksum_update(mut crc: u32, data: &[u8]) -> u32 {
@@ -2027,7 +2267,10 @@ fn overwrite_with_pattern(path: &str, size: u64, io_mode: IOMode, random: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_wc_whitespace, reduce_wc_counts, WcBlockCounts, WcTotals};
+    use super::{
+        hash_check_line_kind, is_wc_whitespace, reduce_wc_counts, HashCheckLineKind,
+        WcBlockCounts, WcTotals,
+    };
 
     #[test]
     fn reduce_wc_counts_merges_cross_block_words() {
@@ -2069,5 +2312,23 @@ mod tests {
                 "byte {byte:#x} should not split words"
             );
         }
+    }
+
+    #[test]
+    fn hash_check_line_kind_classifies_supported_layouts() {
+        assert_eq!(
+            hash_check_line_kind("abc123  file.txt"),
+            HashCheckLineKind::UntaggedText
+        );
+        assert_eq!(
+            hash_check_line_kind("abc123 *file.txt"),
+            HashCheckLineKind::UntaggedBinary
+        );
+        assert_eq!(
+            hash_check_line_kind("SHA256 (file.txt) = abc123"),
+            HashCheckLineKind::Tagged
+        );
+        assert_eq!(hash_check_line_kind(""), HashCheckLineKind::Invalid);
+        assert_eq!(hash_check_line_kind("nonsense"), HashCheckLineKind::Invalid);
     }
 }
