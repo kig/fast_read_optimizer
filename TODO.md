@@ -110,9 +110,9 @@
     - [x] `-T`, `--show-tabs`
       - [x] equality test
       - [x] implementation
-    - [ ] `-u`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-u`
+      - [x] equality test
+      - [x] implementation
     - [x] `-v`, `--show-nonprinting`
       - [x] equality test
       - [x] implementation

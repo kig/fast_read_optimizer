@@ -72,6 +72,17 @@ pub(super) fn cat_visible_byte_rendered_len(byte: u8, show_tabs: bool, show_nonp
     }
 }
 
+pub(super) fn cat_uses_transform_path(
+    number: bool,
+    number_nonblank: bool,
+    show_ends: bool,
+    show_tabs: bool,
+    show_nonprinting: bool,
+    squeeze_blank: bool,
+) -> bool {
+    number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
+}
+
 fn cat_write_visible_byte<W: Write>(
     out: &mut W,
     byte: u8,
@@ -206,6 +217,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 show_tabs = true;
                 show_nonprinting = true;
             }
+            "-u" => {}
             "-v" => show_nonprinting = true,
             "--show-nonprinting" => show_nonprinting = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
@@ -214,7 +226,14 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     }
     let inputs = parse_stream_inputs(files);
     let mut out = stdout_buf_writer()?;
-    if number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank {
+    if cat_uses_transform_path(
+        number,
+        number_nonblank,
+        show_ends,
+        show_tabs,
+        show_nonprinting,
+        squeeze_blank,
+    ) {
         let mut next_line_number = 1u64;
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
@@ -273,7 +292,8 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 mod kani_proofs {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_visible_byte_rendered_len,
+        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_uses_transform_path,
+        cat_visible_byte_rendered_len,
     };
 
     #[kani::proof]
@@ -390,13 +410,35 @@ mod kani_proofs {
         let byte = if keep_newline { b'\n' } else { b'\t' };
         assert_eq!(cat_visible_byte_rendered_len(byte, false, true), 1);
     }
+
+    #[kani::proof]
+    fn cat_uses_transform_path_matches_disjunction() {
+        let number: bool = kani::any();
+        let number_nonblank: bool = kani::any();
+        let show_ends: bool = kani::any();
+        let show_tabs: bool = kani::any();
+        let show_nonprinting: bool = kani::any();
+        let squeeze_blank: bool = kani::any();
+        assert_eq!(
+            cat_uses_transform_path(
+                number,
+                number_nonblank,
+                show_ends,
+                show_tabs,
+                show_nonprinting,
+                squeeze_blank,
+            ),
+            number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_visible_byte_rendered_len,
+        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_uses_transform_path,
+        cat_visible_byte_rendered_len,
     };
 
     #[test]
@@ -468,5 +510,11 @@ mod tests {
     fn cat_visible_byte_rendered_len_keeps_tab_and_newline_single_width_without_show_tabs() {
         assert_eq!(cat_visible_byte_rendered_len(b'\t', false, true), 1);
         assert_eq!(cat_visible_byte_rendered_len(b'\n', false, true), 1);
+    }
+
+    #[test]
+    fn cat_uses_transform_path_is_false_for_plain_unbuffered_mode() {
+        assert!(!cat_uses_transform_path(false, false, false, false, false, false));
+        assert!(cat_uses_transform_path(true, false, false, false, false, false));
     }
 }

@@ -353,3 +353,50 @@ fn cat_show_nonprinting_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cat_unbuffered_flag_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cat-unbuffered");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    let blank = tmp.join("blank.txt");
+
+    fs::write(&a, b"alpha\n\n beta\n").unwrap();
+    fs::write(&b, b"uno\ndos\n").unwrap();
+    fs::write(&blank, b"\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-u"],
+            vec!["-u", "-n"],
+            vec!["-u", "-b"],
+            vec!["-u", "-E"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![blank.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cat", &fro_args),
+                    run_system("cat", &sys_args),
+                    &format!("cat {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+
+        let mut fro_args = io_flags.clone();
+        fro_args.push("-u");
+        fro_args.push("-");
+        assert_same_result(
+            run_fro_with_stdin("cat", &fro_args, b"x\ny\n"),
+            run_system_with_stdin("cat", &["-u", "-"], b"x\ny\n"),
+            &format!("cat stdin {:?} {:?}", io_flags, fro_args),
+        );
+    }
+}
