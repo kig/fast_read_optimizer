@@ -95,9 +95,9 @@
     - [ ] `-e`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-E`, `--show-ends`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-E`, `--show-ends`
+      - [x] equality test
+      - [x] implementation
     - [x] `-n`, `--number`
       - [x] equality test
       - [x] implementation

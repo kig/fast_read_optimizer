@@ -36,11 +36,20 @@ pub(super) fn cat_should_number_line(number: bool, number_nonblank: bool, line: 
     }
 }
 
+pub(super) fn cat_show_ends_rendered_len(original_len: usize, ends_with_newline: bool) -> Option<usize> {
+    if ends_with_newline {
+        original_len.checked_add(1)
+    } else {
+        Some(original_len)
+    }
+}
+
 fn cat_write_transformed_line<W: Write>(
     out: &mut W,
     line: &[u8],
     number: bool,
     number_nonblank: bool,
+    show_ends: bool,
     squeeze_blank: bool,
     next_line_number: &mut u64,
     previous_blank_line: &mut bool,
@@ -66,13 +75,27 @@ fn cat_write_transformed_line<W: Write>(
             write!(out, "{line_number:>6}\t")?;
         }
     }
-    out.write_all(line)
+    let rendered_len =
+        cat_show_ends_rendered_len(line.len(), line.ends_with(b"\n")).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cat show-ends rendering overflow",
+            )
+        })?;
+    if show_ends && rendered_len != line.len() {
+        let split = line.len().saturating_sub(1);
+        out.write_all(&line[..split])?;
+        out.write_all(b"$\n")
+    } else {
+        out.write_all(line)
+    }
 }
 
 pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let mut io_mode = IOMode::Auto;
     let mut number = false;
     let mut number_nonblank = false;
+    let mut show_ends = false;
     let mut squeeze_blank = false;
     let mut files = Vec::new();
     for arg in &args[1..] {
@@ -82,13 +105,14 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
             "--no-direct" => io_mode = IOMode::PageCache,
             "-n" | "--number" => number = true,
             "-b" | "--number-nonblank" => number_nonblank = true,
+            "-E" | "--show-ends" => show_ends = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
             other => files.push(other.to_string()),
         }
     }
     let inputs = parse_stream_inputs(files);
     let mut out = stdout_buf_writer()?;
-    if number || number_nonblank || squeeze_blank {
+    if number || number_nonblank || show_ends || squeeze_blank {
         let mut next_line_number = 1u64;
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
@@ -102,6 +126,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                         &pending_line,
                         number,
                         number_nonblank,
+                        show_ends,
                         squeeze_blank,
                         &mut next_line_number,
                         &mut previous_blank_line,
@@ -121,6 +146,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 &pending_line,
                 number,
                 number_nonblank,
+                show_ends,
                 squeeze_blank,
                 &mut next_line_number,
                 &mut previous_blank_line,
@@ -139,7 +165,10 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{cat_numbering_step, cat_should_number_line, cat_squeeze_blank_step};
+    use super::{
+        cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
+        cat_squeeze_blank_step,
+    };
 
     #[kani::proof]
     fn cat_numbering_step_matches_start_of_line_formula() {
@@ -188,11 +217,33 @@ mod kani_proofs {
             if number_nonblank { !blank } else { number }
         );
     }
+
+    #[kani::proof]
+    fn cat_show_ends_rendered_len_matches_newline_formula() {
+        let original_len: usize = kani::any();
+        let ends_with_newline: bool = kani::any();
+        let rendered_len = cat_show_ends_rendered_len(original_len, ends_with_newline);
+        if ends_with_newline && original_len == usize::MAX {
+            assert!(rendered_len.is_none());
+            return;
+        }
+        assert_eq!(
+            rendered_len,
+            Some(if ends_with_newline {
+                original_len + 1
+            } else {
+                original_len
+            })
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cat_numbering_step, cat_should_number_line, cat_squeeze_blank_step};
+    use super::{
+        cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
+        cat_squeeze_blank_step,
+    };
 
     #[test]
     fn cat_numbering_step_numbers_only_at_line_starts() {
@@ -226,5 +277,14 @@ mod tests {
         assert!(!cat_should_number_line(false, false, b"x\n"));
         assert!(!cat_should_number_line(true, true, b"\n"));
         assert!(cat_should_number_line(false, true, b"x\n"));
+    }
+
+    #[test]
+    fn cat_show_ends_rendered_len_adds_one_byte_only_for_newline_terminated_lines() {
+        assert_eq!(cat_show_ends_rendered_len(0, false), Some(0));
+        assert_eq!(cat_show_ends_rendered_len(0, true), Some(1));
+        assert_eq!(cat_show_ends_rendered_len(4, false), Some(4));
+        assert_eq!(cat_show_ends_rendered_len(4, true), Some(5));
+        assert_eq!(cat_show_ends_rendered_len(usize::MAX, true), None);
     }
 }
