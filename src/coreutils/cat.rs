@@ -231,6 +231,13 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
             }
             "-u" => {}
             "--show-nonprinting" => show_nonprinting = true,
+            "--show-all" => {
+                let (flag_show_ends, flag_show_tabs, flag_show_nonprinting) =
+                    cat_short_visual_flag_effect(b'A').unwrap();
+                show_ends |= flag_show_ends;
+                show_tabs |= flag_show_tabs;
+                show_nonprinting |= flag_show_nonprinting;
+            }
             "-s" | "--squeeze-blank" => squeeze_blank = true,
             other => {
                 if let [b'-', flag] = other.as_bytes() {
@@ -471,6 +478,11 @@ mod kani_proofs {
         };
         assert_eq!(effect, expected);
     }
+
+    #[kani::proof]
+    fn cat_short_visual_flag_effect_maps_show_all_to_all_visual_bits() {
+        assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
+    }
 }
 
 #[cfg(test)]
@@ -568,5 +580,10 @@ mod tests {
         assert_eq!(cat_short_visual_flag_effect(b't'), Some((false, true, true)));
         assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
         assert_eq!(cat_short_visual_flag_effect(b'x'), None);
+    }
+
+    #[test]
+    fn cat_short_visual_flag_effect_maps_show_all_to_all_visual_bits() {
+        assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
     }
 }

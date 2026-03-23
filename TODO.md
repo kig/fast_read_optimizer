@@ -85,10 +85,10 @@
 - [ ] Coreutils flag compatibility
   - [ ] For each implemented utility, run GNU `--help`, snapshot the current flag surface, and keep the checklist below in sync as new commands land.
   - [ ] If this section gets unwieldy, split compatibility work by utility family into separate source files/tests while keeping this TODO as the index.
-  - [ ] `cat`
-    - [ ] `-A`, `--show-all`
-      - [ ] equality test
-      - [ ] implementation
+  - [x] `cat`
+    - [x] `-A`, `--show-all`
+      - [x] equality test
+      - [x] implementation
     - [x] `-b`, `--number-nonblank`
       - [x] equality test
       - [x] implementation
