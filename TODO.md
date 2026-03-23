@@ -247,9 +247,9 @@
     - [ ] `-E`, `--extended-regexp`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-F`, `--fixed-strings`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-F`, `--fixed-strings`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-G`, `--basic-regexp`
       - [ ] equality test
       - [ ] implementation

@@ -112,3 +112,5 @@ fn io_flag_sets() -> Vec<Vec<&'static str>> {
 
 #[path = "coreutils/cat.rs"]
 mod cat;
+#[path = "coreutils/fgrep.rs"]
+mod fgrep;

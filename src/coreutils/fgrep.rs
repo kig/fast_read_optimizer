@@ -1,5 +1,12 @@
 use super::*;
 
+pub(super) fn fgrep_short_flag_effect(flag: u8) -> Option<bool> {
+    match flag {
+        b'F' => Some(true),
+        _ => None,
+    }
+}
+
 fn write_matching_stream_lines<R: BufRead, W: Write>(
     out: &mut W,
     label: Option<&str>,
@@ -82,11 +89,22 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     for arg in &args[1..] {
         match arg.as_str() {
             "-n" => print_line_numbers = true,
+            "--fixed-strings" => {}
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
-            other if pattern.is_none() => pattern = Some(other.to_string()),
-            other => files.push(other.to_string()),
+            other => {
+                if let [b'-', flag] = other.as_bytes() {
+                    if fgrep_short_flag_effect(*flag).is_some() {
+                        continue;
+                    }
+                }
+                if pattern.is_none() {
+                    pattern = Some(other.to_string());
+                } else {
+                    files.push(other.to_string());
+                }
+            }
         }
     }
     let pattern = pattern.ok_or_else(|| {
@@ -150,4 +168,30 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     }
     out.into_inner()?;
     Ok(if matched_any { 0 } else { 1 })
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::fgrep_short_flag_effect;
+
+    #[kani::proof]
+    fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
+        let flag: u8 = kani::any();
+        let expected = match flag {
+            b'F' => Some(true),
+            _ => None,
+        };
+        assert_eq!(fgrep_short_flag_effect(flag), expected);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fgrep_short_flag_effect;
+
+    #[test]
+    fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
+        assert_eq!(fgrep_short_flag_effect(b'F'), Some(true));
+        assert_eq!(fgrep_short_flag_effect(b'n'), None);
+    }
 }
