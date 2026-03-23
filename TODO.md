@@ -89,9 +89,9 @@
     - [ ] `-A`, `--show-all`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-b`, `--number-nonblank`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-b`, `--number-nonblank`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-e`
       - [ ] equality test
       - [ ] implementation

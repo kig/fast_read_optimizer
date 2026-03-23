@@ -28,10 +28,19 @@ pub(super) fn cat_squeeze_blank_step(
     (emit_line, next_previous_blank_line)
 }
 
+pub(super) fn cat_should_number_line(number: bool, number_nonblank: bool, line: &[u8]) -> bool {
+    if number_nonblank {
+        line != b"\n"
+    } else {
+        number
+    }
+}
+
 fn cat_write_transformed_line<W: Write>(
     out: &mut W,
     line: &[u8],
     number: bool,
+    number_nonblank: bool,
     squeeze_blank: bool,
     next_line_number: &mut u64,
     previous_blank_line: &mut bool,
@@ -47,7 +56,7 @@ fn cat_write_transformed_line<W: Write>(
     } else {
         *previous_blank_line = current_blank_line;
     }
-    if number {
+    if cat_should_number_line(number, number_nonblank, line) {
         let (updated_next_line_number, _, emitted_line_number) =
             cat_numbering_step(*next_line_number, true, line[0]).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cat line number overflow")
@@ -63,6 +72,7 @@ fn cat_write_transformed_line<W: Write>(
 pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let mut io_mode = IOMode::Auto;
     let mut number = false;
+    let mut number_nonblank = false;
     let mut squeeze_blank = false;
     let mut files = Vec::new();
     for arg in &args[1..] {
@@ -71,13 +81,14 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "-n" | "--number" => number = true,
+            "-b" | "--number-nonblank" => number_nonblank = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
             other => files.push(other.to_string()),
         }
     }
     let inputs = parse_stream_inputs(files);
     let mut out = stdout_buf_writer()?;
-    if number || squeeze_blank {
+    if number || number_nonblank || squeeze_blank {
         let mut next_line_number = 1u64;
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
@@ -90,6 +101,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                         &mut out,
                         &pending_line,
                         number,
+                        number_nonblank,
                         squeeze_blank,
                         &mut next_line_number,
                         &mut previous_blank_line,
@@ -108,6 +120,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 &mut out,
                 &pending_line,
                 number,
+                number_nonblank,
                 squeeze_blank,
                 &mut next_line_number,
                 &mut previous_blank_line,
@@ -126,7 +139,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{cat_numbering_step, cat_squeeze_blank_step};
+    use super::{cat_numbering_step, cat_should_number_line, cat_squeeze_blank_step};
 
     #[kani::proof]
     fn cat_numbering_step_matches_start_of_line_formula() {
@@ -163,11 +176,23 @@ mod kani_proofs {
             if emit_line { current_blank_line } else { true }
         );
     }
+
+    #[kani::proof]
+    fn cat_should_number_line_matches_nonblank_precedence() {
+        let number: bool = kani::any();
+        let number_nonblank: bool = kani::any();
+        let blank: bool = kani::any();
+        let line = if blank { b"\n".as_slice() } else { b"x\n".as_slice() };
+        assert_eq!(
+            cat_should_number_line(number, number_nonblank, line),
+            if number_nonblank { !blank } else { number }
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cat_numbering_step, cat_squeeze_blank_step};
+    use super::{cat_numbering_step, cat_should_number_line, cat_squeeze_blank_step};
 
     #[test]
     fn cat_numbering_step_numbers_only_at_line_starts() {
@@ -192,5 +217,14 @@ mod tests {
         assert_eq!(cat_squeeze_blank_step(false, true), (true, true));
         assert_eq!(cat_squeeze_blank_step(true, false), (true, false));
         assert_eq!(cat_squeeze_blank_step(true, true), (false, true));
+    }
+
+    #[test]
+    fn cat_should_number_line_gives_nonblank_mode_precedence() {
+        assert!(cat_should_number_line(true, false, b"\n"));
+        assert!(cat_should_number_line(true, false, b"x\n"));
+        assert!(!cat_should_number_line(false, false, b"x\n"));
+        assert!(!cat_should_number_line(true, true, b"\n"));
+        assert!(cat_should_number_line(false, true, b"x\n"));
     }
 }
