@@ -410,9 +410,9 @@
     - [ ] `--strict`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-w`, `--warn`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-w`, `--warn`
+      - [x] equality test
+      - [x] implementation
   - [ ] `b2sum`
     - [ ] all digest-family shared flags above
       - [ ] equality test

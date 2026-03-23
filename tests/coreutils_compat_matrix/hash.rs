@@ -191,3 +191,48 @@ fn digest_family_check_quiet_and_status_match_system_output() {
         }
     }
 }
+
+#[test]
+fn digest_family_check_warn_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-warn");
+    let path_ok = tmp.join("ok.bin");
+    fs::write(
+        &path_ok,
+        (0..4097)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest_ok = tmp.join(format!("{name}-ok.txt"));
+        let manifest_mixed = tmp.join(format!("{name}-warn-mixed.txt"));
+        let manifest_only_bad = tmp.join(format!("{name}-warn-only-bad.txt"));
+        let ok_manifest = run_system(system_name, &[path_ok.to_str().unwrap()]);
+        assert!(ok_manifest.status.success());
+        fs::write(&manifest_ok, &ok_manifest.stdout).unwrap();
+
+        let ok_line = String::from_utf8(ok_manifest.stdout.clone()).unwrap();
+        fs::write(&manifest_mixed, format!("bogus-line\n{ok_line}")).unwrap();
+        fs::write(&manifest_only_bad, "bogus-line\n").unwrap();
+
+        for extra_flags in [vec!["--warn", "-c"], vec!["--warn", "--status", "-c"]] {
+            for manifest in [manifest_mixed.as_path(), manifest_only_bad.as_path()] {
+                let mut args = extra_flags.clone();
+                args.push(manifest.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &args),
+                    run_system(system_name, &args),
+                    &format!("{name} {:?} {:?}", extra_flags, manifest),
+                );
+            }
+        }
+    }
+}

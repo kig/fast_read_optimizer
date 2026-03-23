@@ -22,6 +22,7 @@ struct HashSumOptions {
     check: bool,
     quiet: bool,
     status_only: bool,
+    warn: bool,
     inputs: Vec<StreamInput>,
 }
 
@@ -48,7 +49,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                 }
                 format = HashSumFormat::Default;
             }
-            "--quiet" | "--status" => {}
+            "--quiet" | "--status" | "-w" | "--warn" => {}
             "-" => files.push(arg.clone()),
             other if other.starts_with('-') => {
                 return Err(io::Error::new(
@@ -68,6 +69,9 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
             .any(|arg| matches!(arg.as_str(), "-c" | "--check")),
         quiet: args[1..].iter().any(|arg| arg == "--quiet"),
         status_only: args[1..].iter().any(|arg| arg == "--status"),
+        warn: args[1..]
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-w" | "--warn")),
         inputs: parse_stream_inputs(files),
     })
 }
@@ -97,6 +101,13 @@ fn hash_sum_program_name(algorithm: HashAlgorithm) -> &'static str {
     }
 }
 
+fn hash_check_algorithm_name(algorithm: HashAlgorithm) -> &'static str {
+    match algorithm {
+        HashAlgorithm::Blake2b512 => "BLAKE2",
+        _ => hash_sum_tag_name(algorithm).unwrap_or("digest"),
+    }
+}
+
 pub(super) fn hash_check_untagged_kind(separator: u8, has_filename: bool) -> HashCheckLineKind {
     if !has_filename {
         return HashCheckLineKind::Invalid;
@@ -114,6 +125,10 @@ pub(super) fn hash_check_should_print_result(
     status_only: bool,
 ) -> bool {
     !status_only && (!success || !quiet)
+}
+
+pub(super) fn hash_check_should_report_malformed_line(warn: bool, status_only: bool) -> bool {
+    warn && !status_only
 }
 
 fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
@@ -180,8 +195,15 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
     let out = stdout_buf_writer()?;
     let mut had_failure = false;
     let mut had_valid_line = false;
-    let algorithm_name = hash_sum_tag_name(algorithm).unwrap_or("digest");
+    let mut malformed_lines = 0usize;
+    let mut no_valid_input = None::<String>;
+    let algorithm_name = hash_check_algorithm_name(algorithm);
     for input in &options.inputs {
+        let input_label = match input {
+            StreamInput::File(file) => file.as_str(),
+            StreamInput::Stdin { label } => label.as_deref().unwrap_or("-"),
+        };
+        let mut input_had_valid_line = false;
         let data = match input {
             StreamInput::File(ref file) => fs::read_to_string(file)?,
             StreamInput::Stdin { .. } => {
@@ -191,11 +213,22 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
                 text
             }
         };
-        for line in data.lines() {
+        for (line_no, line) in data.lines().enumerate() {
             let Some((expected_hex, path)) = parse_hash_check_line(line) else {
+                malformed_lines += 1;
+                if hash_check_should_report_malformed_line(options.warn, options.status_only) {
+                    eprintln!(
+                        "{}: {}: {}: improperly formatted {} checksum line",
+                        hash_sum_program_name(algorithm),
+                        input_label,
+                        line_no + 1,
+                        algorithm_name
+                    );
+                }
                 continue;
             };
             had_valid_line = true;
+            input_had_valid_line = true;
             let actual = hash_file(path, algorithm, options.io_mode)?;
             let success = hex_digest(&actual) == expected_hex;
             if !success {
@@ -206,14 +239,34 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
                 out.write_all(format!("{path}: {status}\n").as_bytes())?;
             }
         }
-        if !had_valid_line {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("no properly formatted {algorithm_name} checksum lines found"),
-            ));
+        if !input_had_valid_line {
+            no_valid_input = Some(input_label.to_string());
+            break;
         }
     }
     out.into_inner()?;
+    if let Some(input_label) = no_valid_input {
+        eprintln!(
+            "{}: {}: no properly formatted {} checksum lines found",
+            hash_sum_program_name(algorithm),
+            input_label,
+            algorithm_name
+        );
+        return Ok(1);
+    }
+    if malformed_lines != 0 && had_valid_line && !options.status_only {
+        let phrase = if malformed_lines == 1 {
+            "line is"
+        } else {
+            "lines are"
+        };
+        eprintln!(
+            "{}: WARNING: {} {} improperly formatted",
+            hash_sum_program_name(algorithm),
+            malformed_lines,
+            phrase
+        );
+    }
     if had_failure && !options.status_only {
         eprintln!(
             "{}: WARNING: 1 computed checksum did NOT match",
@@ -355,6 +408,21 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::hash_check_should_report_malformed_line;
+
+    #[kani::proof]
+    fn hash_check_malformed_line_policy_matches_flag_formula() {
+        let warn: bool = kani::any();
+        let status_only: bool = kani::any();
+        assert_eq!(
+            hash_check_should_report_malformed_line(warn, status_only),
+            warn && !status_only
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +452,12 @@ mod tests {
         assert!(hash_check_should_print_result(false, true, false));
         assert!(!hash_check_should_print_result(true, false, true));
         assert!(!hash_check_should_print_result(false, false, true));
+    }
+
+    #[test]
+    fn hash_check_malformed_line_policy_matches_warn_and_status_rules() {
+        assert!(hash_check_should_report_malformed_line(true, false));
+        assert!(!hash_check_should_report_malformed_line(false, false));
+        assert!(!hash_check_should_report_malformed_line(true, true));
     }
 }
