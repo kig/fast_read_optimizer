@@ -301,3 +301,55 @@ fn cat_show_tab_nonprinting_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cat_show_nonprinting_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cat-show-nonprinting");
+    let a = tmp.join("a.bin");
+    let b = tmp.join("b.bin");
+    let blank = tmp.join("blank.bin");
+
+    fs::write(&a, [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80]).unwrap();
+    fs::write(&b, [b'\n', 0x1f, b'\n', 0xff, b'\n']).unwrap();
+    fs::write(&blank, [b'\n']).unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-v"],
+            vec!["--show-nonprinting"],
+            vec!["-v", "-n"],
+            vec!["-v", "-b"],
+            vec!["-v", "-E"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![blank.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cat", &fro_args),
+                    run_system("cat", &sys_args),
+                    &format!("cat {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+
+        for compat_flags in [vec!["-v"], vec!["--show-nonprinting"]] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push("-");
+            let mut sys_args = compat_flags.clone();
+            sys_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("cat", &fro_args, b"x\t\n\x01\n\xff"),
+                run_system_with_stdin("cat", &sys_args, b"x\t\n\x01\n\xff"),
+                &format!("cat stdin {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+}

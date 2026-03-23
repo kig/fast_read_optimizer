@@ -206,6 +206,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 show_tabs = true;
                 show_nonprinting = true;
             }
+            "-v" => show_nonprinting = true,
             "--show-nonprinting" => show_nonprinting = true,
             "-s" | "--squeeze-blank" => squeeze_blank = true,
             other => files.push(other.to_string()),
@@ -382,6 +383,13 @@ mod kani_proofs {
         };
         assert_eq!(rendered_len, expected);
     }
+
+    #[kani::proof]
+    fn cat_visible_byte_rendered_len_keeps_layout_bytes_single_width_for_v_mode() {
+        let keep_newline: bool = kani::any();
+        let byte = if keep_newline { b'\n' } else { b'\t' };
+        assert_eq!(cat_visible_byte_rendered_len(byte, false, true), 1);
+    }
 }
 
 #[cfg(test)]
@@ -454,5 +462,11 @@ mod tests {
         assert_eq!(cat_visible_byte_rendered_len(0xa0, false, true), 3);
         assert_eq!(cat_visible_byte_rendered_len(0xff, false, true), 4);
         assert_eq!(cat_visible_byte_rendered_len(b'A', false, true), 1);
+    }
+
+    #[test]
+    fn cat_visible_byte_rendered_len_keeps_tab_and_newline_single_width_without_show_tabs() {
+        assert_eq!(cat_visible_byte_rendered_len(b'\t', false, true), 1);
+        assert_eq!(cat_visible_byte_rendered_len(b'\n', false, true), 1);
     }
 }

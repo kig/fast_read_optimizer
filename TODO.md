@@ -113,9 +113,9 @@
     - [ ] `-u`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-v`, `--show-nonprinting`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-v`, `--show-nonprinting`
+      - [x] equality test
+      - [x] implementation
   - [ ] `cmp`
     - [x] `-b`, `--print-bytes`
       - [x] equality test
