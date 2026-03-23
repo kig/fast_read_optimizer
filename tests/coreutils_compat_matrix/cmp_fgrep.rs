@@ -172,3 +172,51 @@ fn cmp_ignore_initial_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cmp_verbose_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-verbose");
+    let diff_a = tmp.join("diff-a.txt");
+    let diff_b = tmp.join("diff-b.txt");
+    let short = tmp.join("short.txt");
+    let long = tmp.join("long.txt");
+    let wide_a = tmp.join("wide-a.txt");
+    let wide_b = tmp.join("wide-b.txt");
+
+    fs::write(&diff_a, b"abc\nxyz\n").unwrap();
+    fs::write(&diff_b, b"abQ\nxyZ\n").unwrap();
+    fs::write(&short, b"abc").unwrap();
+    fs::write(&long, b"abQXYZ").unwrap();
+    fs::write(&wide_a, b"0123456789\n").unwrap();
+    fs::write(&wide_b, b"012x45y789\n").unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-l"],
+            vec!["--verbose"],
+            vec!["-l", "-n", "4"],
+            vec!["-l", "-i", "3"],
+            vec!["-l", "-i", "3:4"],
+            vec!["-l", "-i", "3:4", "-n", "7"],
+            vec!["-l", "-s"],
+            vec!["--verbose", "--quiet"],
+        ] {
+            for files in [
+                vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
+                vec![short.to_str().unwrap(), long.to_str().unwrap()],
+                vec![wide_a.to_str().unwrap(), wide_b.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, compat_flags),
+                );
+            }
+        }
+    }
+}

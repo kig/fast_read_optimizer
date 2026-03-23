@@ -40,6 +40,14 @@ pub(super) fn cmp_effective_compare_len_with_skips(
     )
 }
 
+pub(super) fn cmp_flags_are_compatible(quiet: bool, verbose: bool) -> bool {
+    !(quiet && verbose)
+}
+
+fn cmp_decimal_width(value: u64) -> usize {
+    value.max(1).to_string().len()
+}
+
 fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'static str) {
     if ends_with_newline {
         (newlines_before_eof, "line")
@@ -87,6 +95,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut io_mode = IOMode::Auto;
     let mut quiet = false;
+    let mut verbose = false;
     let mut limit = None::<u64>;
     let mut first_skip = 0u64;
     let mut second_skip = 0u64;
@@ -98,6 +107,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "-s" | "--quiet" | "--silent" => quiet = true,
+            "-l" | "--verbose" => verbose = true,
             "-n" | "--bytes" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -133,13 +143,18 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [-l|--verbose] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "cmp requires exactly two file operands",
         ));
+    }
+    if !cmp_flags_are_compatible(quiet, verbose) {
+        eprintln!("cmp: options -l and -s are incompatible");
+        eprintln!("cmp: Try 'cmp --help' for more information.");
+        return Ok(2);
     }
 
     let first_len = fs::metadata(&files[0])?.len();
@@ -167,6 +182,39 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             eprintln!("cmp: EOF on {} which is empty", eof_file);
         }
         return Ok(1);
+    }
+
+    if verbose {
+        let first = load_file_bytes(&files[0], io_mode, "read")?;
+        let second = load_file_bytes(&files[1], io_mode, "read")?;
+        let first_start = usize::try_from(first_skip)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?
+            .min(first.data.len());
+        let second_start = usize::try_from(second_skip)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?
+            .min(second.data.len());
+        let compare_len_usize = usize::try_from(compare_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?;
+        let first_slice = &first.data.as_slice()[first_start..first_start + compare_len_usize];
+        let second_slice = &second.data.as_slice()[second_start..second_start + compare_len_usize];
+        let byte_width = cmp_decimal_width(compare_len);
+        let mut had_mismatch = false;
+        for (idx, (&left, &right)) in first_slice.iter().zip(second_slice.iter()).enumerate() {
+            if left != right {
+                had_mismatch = true;
+                println!("{:>width$} {:>3o} {:>3o}", idx + 1, left, right, width = byte_width);
+            }
+        }
+        if first_remaining != second_remaining && limit.map_or(true, |limit| limit > shared_remaining) {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
+            return Ok(1);
+        }
+        return Ok(if had_mismatch { 1 } else { 0 });
     }
 
     let config = load_config(None);
@@ -249,7 +297,10 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{cmp_effective_compare_len, cmp_effective_compare_len_with_skips, cmp_remaining_len_after_skip};
+    use super::{
+        cmp_effective_compare_len, cmp_effective_compare_len_with_skips,
+        cmp_flags_are_compatible, cmp_remaining_len_after_skip,
+    };
 
     #[kani::proof]
     fn cmp_effective_compare_len_matches_min_formula() {
@@ -294,13 +345,21 @@ mod kani_proofs {
         let skip: u64 = kani::any();
         assert_eq!(cmp_remaining_len_after_skip(len, skip), len.saturating_sub(skip));
     }
+
+    #[kani::proof]
+    fn cmp_flag_compatibility_matches_quiet_verbose_formula() {
+        let quiet: bool = kani::any();
+        let verbose: bool = kani::any();
+        assert_eq!(cmp_flags_are_compatible(quiet, verbose), !(quiet && verbose));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         cmp_effective_compare_len, cmp_effective_compare_len_with_skips, cmp_eof_line,
-        cmp_remaining_len_after_skip, parse_cmp_limit, parse_cmp_skip_spec,
+        cmp_flags_are_compatible, cmp_remaining_len_after_skip, cmp_decimal_width, parse_cmp_limit,
+        parse_cmp_skip_spec,
     };
 
     #[test]
@@ -346,5 +405,21 @@ mod tests {
         assert_eq!(cmp_eof_line(0, false), (1, "in line"));
         assert_eq!(cmp_eof_line(1, true), (1, "line"));
         assert_eq!(cmp_eof_line(1, false), (2, "in line"));
+    }
+
+    #[test]
+    fn cmp_flag_compatibility_rejects_quiet_plus_verbose() {
+        assert!(cmp_flags_are_compatible(false, false));
+        assert!(cmp_flags_are_compatible(true, false));
+        assert!(cmp_flags_are_compatible(false, true));
+        assert!(!cmp_flags_are_compatible(true, true));
+    }
+
+    #[test]
+    fn cmp_decimal_width_matches_decimal_digit_count() {
+        assert_eq!(cmp_decimal_width(1), 1);
+        assert_eq!(cmp_decimal_width(9), 1);
+        assert_eq!(cmp_decimal_width(10), 2);
+        assert_eq!(cmp_decimal_width(999), 3);
     }
 }

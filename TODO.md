@@ -126,9 +126,9 @@
     - [x] `-i`, `--ignore-initial=SKIP1:SKIP2`
       - [x] equality test
       - [x] implementation
-    - [ ] `-l`, `--verbose`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-l`, `--verbose`
+      - [x] equality test
+      - [x] implementation
     - [x] `-n`, `--bytes=LIMIT`
       - [x] equality test
       - [x] implementation
