@@ -101,9 +101,9 @@
     - [x] `-n`, `--number`
       - [x] equality test
       - [x] implementation
-    - [ ] `-s`, `--squeeze-blank`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-s`, `--squeeze-blank`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-t`
       - [ ] equality test
       - [ ] implementation
