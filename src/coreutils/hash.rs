@@ -24,6 +24,7 @@ struct HashSumOptions {
     status_only: bool,
     warn: bool,
     strict: bool,
+    ignore_missing: bool,
     inputs: Vec<StreamInput>,
 }
 
@@ -50,7 +51,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                 }
                 format = HashSumFormat::Default;
             }
-            "--quiet" | "--status" | "-w" | "--warn" | "--strict" => {}
+            "--quiet" | "--status" | "-w" | "--warn" | "--strict" | "--ignore-missing" => {}
             "-" => files.push(arg.clone()),
             other if other.starts_with('-') => {
                 return Err(io::Error::new(
@@ -74,6 +75,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
             .iter()
             .any(|arg| matches!(arg.as_str(), "-w" | "--warn")),
         strict: args[1..].iter().any(|arg| arg == "--strict"),
+        ignore_missing: args[1..].iter().any(|arg| arg == "--ignore-missing"),
         inputs: parse_stream_inputs(files),
     })
 }
@@ -133,12 +135,21 @@ pub(super) fn hash_check_should_report_malformed_line(warn: bool, status_only: b
     warn && !status_only
 }
 
-pub(super) fn hash_check_exit_code(had_failure: bool, malformed_lines: usize, strict: bool) -> i32 {
-    if had_failure || (strict && malformed_lines != 0) {
+pub(super) fn hash_check_exit_code(
+    had_failure: bool,
+    malformed_lines: usize,
+    strict: bool,
+    no_verified_files: bool,
+) -> i32 {
+    if had_failure || (strict && malformed_lines != 0) || no_verified_files {
         1
     } else {
         0
     }
+}
+
+fn is_not_found_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT)
 }
 
 fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
@@ -204,7 +215,10 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
     }
     let out = stdout_buf_writer()?;
     let mut had_failure = false;
+    let mut had_checksum_failure = false;
     let mut had_valid_line = false;
+    let mut verified_files = 0usize;
+    let mut unread_files = 0usize;
     let mut malformed_lines = 0usize;
     let mut no_valid_input = None::<String>;
     let algorithm_name = hash_check_algorithm_name(algorithm);
@@ -239,10 +253,36 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
             };
             had_valid_line = true;
             input_had_valid_line = true;
-            let actual = hash_file(path, algorithm, options.io_mode)?;
+            let actual = match hash_file(path, algorithm, options.io_mode) {
+                Ok(actual) => actual,
+                Err(err) if options.ignore_missing && is_not_found_error(&err) => continue,
+                Err(err) if is_not_found_error(&err) => {
+                    unread_files += 1;
+                    had_failure = true;
+                    if hash_check_should_print_result(false, options.quiet, options.status_only) {
+                        out.write_all(format!("{path}: FAILED open or read\n").as_bytes())?;
+                    }
+                    let message = if is_not_found_error(&err) {
+                        "No such file or directory".to_string()
+                    } else {
+                        err.to_string()
+                    };
+                    eprintln!(
+                        "{}: {}: {}",
+                        hash_sum_program_name(algorithm),
+                        path,
+                        message
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let success = hex_digest(&actual) == expected_hex;
             if !success {
                 had_failure = true;
+                had_checksum_failure = true;
+            } else {
+                verified_files += 1;
             }
             if hash_check_should_print_result(success, options.quiet, options.status_only) {
                 let status = if success { "OK" } else { "FAILED" };
@@ -264,6 +304,7 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
         );
         return Ok(1);
     }
+    let no_verified_files = options.ignore_missing && had_valid_line && verified_files == 0;
     if malformed_lines != 0 && had_valid_line && !options.status_only {
         let phrase = if malformed_lines == 1 {
             "line is"
@@ -277,16 +318,42 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
             phrase
         );
     }
-    if had_failure && !options.status_only {
+    if unread_files != 0 && !options.status_only {
+        let phrase = if unread_files == 1 {
+            "listed file could not be read"
+        } else {
+            "listed files could not be read"
+        };
+        eprintln!(
+            "{}: WARNING: {} {}",
+            hash_sum_program_name(algorithm),
+            unread_files,
+            phrase
+        );
+    }
+    if had_checksum_failure && !options.status_only {
         eprintln!(
             "{}: WARNING: 1 computed checksum did NOT match",
             hash_sum_program_name(algorithm)
+        );
+    }
+    if no_verified_files && !options.status_only {
+        let input_label = match options.inputs.first() {
+            Some(StreamInput::File(file)) => file.as_str(),
+            Some(StreamInput::Stdin { label }) => label.as_deref().unwrap_or("-"),
+            None => "-",
+        };
+        eprintln!(
+            "{}: {}: no file was verified",
+            hash_sum_program_name(algorithm),
+            input_label
         );
     }
     Ok(hash_check_exit_code(
         had_failure,
         malformed_lines,
         options.strict,
+        no_verified_files,
     ))
 }
 
@@ -441,9 +508,10 @@ mod kani_proofs {
         let had_failure: bool = kani::any();
         let malformed_lines: usize = kani::any();
         let strict: bool = kani::any();
+        let no_verified_files: bool = kani::any();
         assert_eq!(
-            hash_check_exit_code(had_failure, malformed_lines, strict),
-            if had_failure || (strict && malformed_lines != 0) {
+            hash_check_exit_code(had_failure, malformed_lines, strict, no_verified_files),
+            if had_failure || (strict && malformed_lines != 0) || no_verified_files {
                 1
             } else {
                 0
@@ -492,10 +560,11 @@ mod tests {
 
     #[test]
     fn hash_check_exit_code_matches_failure_and_strict_rules() {
-        assert_eq!(hash_check_exit_code(false, 0, false), 0);
-        assert_eq!(hash_check_exit_code(false, 1, false), 0);
-        assert_eq!(hash_check_exit_code(false, 1, true), 1);
-        assert_eq!(hash_check_exit_code(true, 0, false), 1);
-        assert_eq!(hash_check_exit_code(true, 1, true), 1);
+        assert_eq!(hash_check_exit_code(false, 0, false, false), 0);
+        assert_eq!(hash_check_exit_code(false, 1, false, false), 0);
+        assert_eq!(hash_check_exit_code(false, 1, true, false), 1);
+        assert_eq!(hash_check_exit_code(true, 0, false, false), 1);
+        assert_eq!(hash_check_exit_code(true, 1, true, false), 1);
+        assert_eq!(hash_check_exit_code(false, 0, false, true), 1);
     }
 }

@@ -77,7 +77,7 @@
 - [ ] Idea: sort files by block inode to get a more sequential access pattern. 
 - [ ] Idea: keep nearby-on-media files in the same thread, pin threads to cores (each core manages an area of memory -> higher cache hit rate).
 - [ ] Idea: small files bundled into processing bundles for efficient batching, large files dealt with separately (while large file data is streaming, small file inodes are streaming).
-- [ ] Process subtrees with io_uring by doing multi-tree parallel DFS (threads start traversing at nearest-to-root non-claimed subtree, claim it, add found dirs to "to-process" stack.)
+- [x] Process subtrees with io_uring by doing multi-tree parallel DFS (threads start traversing at nearest-to-root non-claimed subtree, claim it, add found dirs to "to-process" stack.)
 
 ### More utils
 
@@ -398,9 +398,9 @@
     - [x] `-z`, `--zero`
       - [x] equality test
       - [x] implementation
-    - [ ] `--ignore-missing`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `--ignore-missing`
+      - [x] equality test
+      - [x] implementation
     - [x] `--quiet`
       - [x] equality test
       - [x] implementation
@@ -532,8 +532,8 @@
 
 ### Streaming I/O for pipes & spinning disks
 
-- [ ] Read sequentially
-- [ ] Write sequentially
+- [x] Read sequentially
+- [x] Write sequentially
 - [ ] Sequential I/O preference if the accessed device is a HDD / array of HDDs.
 - [ ] Overlap processing and I/O
 

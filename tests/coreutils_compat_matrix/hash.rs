@@ -289,3 +289,80 @@ fn digest_family_check_strict_matches_system_output() {
         }
     }
 }
+
+#[test]
+fn digest_family_check_missing_file_modes_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-missing");
+    let path_ok = tmp.join("ok.bin");
+    let path_bad = tmp.join("bad.bin");
+    let path_missing = tmp.join("missing.bin");
+    fs::write(
+        &path_ok,
+        (0..4097)
+            .map(|i| ((i * 47 + 19) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &path_bad,
+        (0..4097)
+            .map(|i| ((i * 53 + 23) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest_mixed = tmp.join(format!("{name}-missing-mixed.txt"));
+        let manifest_only_missing = tmp.join(format!("{name}-missing-only.txt"));
+        let manifest_mixed_bad = tmp.join(format!("{name}-missing-bad.txt"));
+        let ok_manifest = run_system(system_name, &[path_ok.to_str().unwrap()]);
+        assert!(ok_manifest.status.success());
+        let ok_line = String::from_utf8(ok_manifest.stdout.clone()).unwrap();
+        let missing_line = ok_line.replace(path_ok.to_str().unwrap(), path_missing.to_str().unwrap());
+        let bad_line = ok_line.replace(path_ok.to_str().unwrap(), path_bad.to_str().unwrap());
+        fs::write(&manifest_mixed, format!("{missing_line}{ok_line}")).unwrap();
+        fs::write(&manifest_only_missing, &missing_line).unwrap();
+        fs::write(&manifest_mixed_bad, format!("{missing_line}{bad_line}")).unwrap();
+
+        for (extra_flags, manifests) in [
+            (vec!["-c"], vec![manifest_mixed.as_path(), manifest_only_missing.as_path()]),
+            (
+                vec!["--status", "-c"],
+                vec![manifest_mixed.as_path(), manifest_only_missing.as_path()],
+            ),
+            (
+                vec!["--ignore-missing", "-c"],
+                vec![
+                    manifest_mixed.as_path(),
+                    manifest_only_missing.as_path(),
+                    manifest_mixed_bad.as_path(),
+                ],
+            ),
+            (
+                vec!["--ignore-missing", "--status", "-c"],
+                vec![
+                    manifest_mixed.as_path(),
+                    manifest_only_missing.as_path(),
+                    manifest_mixed_bad.as_path(),
+                ],
+            ),
+        ] {
+            for manifest in manifests {
+                let mut args = extra_flags.clone();
+                args.push(manifest.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &args),
+                    run_system(system_name, &args),
+                    &format!("{name} {:?} {:?}", extra_flags, manifest),
+                );
+            }
+        }
+    }
+}
