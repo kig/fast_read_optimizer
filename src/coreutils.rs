@@ -1581,7 +1581,7 @@ mod du_tests {
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        du_node_ready, hash_check_line_kind, hash_check_untagged_kind,
+        du_node_ready, hash_check_should_print_result, hash_check_untagged_kind,
         permission_denied_components, HashCheckLineKind,
     };
     use std::io;
@@ -1655,6 +1655,17 @@ mod kani_proofs {
             }
         };
         assert_eq!(hash_check_untagged_kind(separator, has_filename), expected);
+    }
+
+    #[kani::proof]
+    fn hash_check_print_policy_matches_flag_formula() {
+        let success: bool = kani::any();
+        let quiet: bool = kani::any();
+        let status_only: bool = kani::any();
+        assert_eq!(
+            hash_check_should_print_result(success, quiet, status_only),
+            !status_only && (!success || !quiet)
+        );
     }
 }
 
@@ -1869,6 +1880,8 @@ struct HashSumOptions {
     format: HashSumFormat,
     zero_terminated: bool,
     check: bool,
+    quiet: bool,
+    status_only: bool,
     inputs: Vec<StreamInput>,
 }
 
@@ -1895,6 +1908,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                 }
                 format = HashSumFormat::Default;
             }
+            "--quiet" | "--status" => {}
             "-" => files.push(arg.clone()),
             other if other.starts_with('-') => {
                 return Err(io::Error::new(
@@ -1912,6 +1926,8 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
         check: args[1..]
             .iter()
             .any(|arg| matches!(arg.as_str(), "-c" | "--check")),
+        quiet: args[1..].iter().any(|arg| arg == "--quiet"),
+        status_only: args[1..].iter().any(|arg| arg == "--status"),
         inputs: parse_stream_inputs(files),
     })
 }
@@ -1952,6 +1968,10 @@ fn hash_check_untagged_kind(separator: u8, has_filename: bool) -> HashCheckLineK
         b'*' => HashCheckLineKind::UntaggedBinary,
         _ => HashCheckLineKind::Invalid,
     }
+}
+
+fn hash_check_should_print_result(success: bool, quiet: bool, status_only: bool) -> bool {
+    !status_only && (!success || !quiet)
 }
 
 fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
@@ -2035,11 +2055,13 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
             };
             had_valid_line = true;
             let actual = hash_file(path, algorithm, options.io_mode)?;
-            if hex_digest(&actual) == expected_hex {
-                out.write_all(format!("{path}: OK\n").as_bytes())?;
-            } else {
+            let success = hex_digest(&actual) == expected_hex;
+            if !success {
                 had_failure = true;
-                out.write_all(format!("{path}: FAILED\n").as_bytes())?;
+            }
+            if hash_check_should_print_result(success, options.quiet, options.status_only) {
+                let status = if success { "OK" } else { "FAILED" };
+                out.write_all(format!("{path}: {status}\n").as_bytes())?;
             }
         }
         if !had_valid_line {
@@ -2050,7 +2072,7 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
         }
     }
     out.into_inner()?;
-    if had_failure {
+    if had_failure && !options.status_only {
         eprintln!(
             "{}: WARNING: 1 computed checksum did NOT match",
             hash_sum_program_name(algorithm)
@@ -2268,8 +2290,8 @@ fn overwrite_with_pattern(path: &str, size: u64, io_mode: IOMode, random: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_check_line_kind, is_wc_whitespace, reduce_wc_counts, HashCheckLineKind,
-        WcBlockCounts, WcTotals,
+        hash_check_line_kind, hash_check_should_print_result, is_wc_whitespace,
+        reduce_wc_counts, HashCheckLineKind, WcBlockCounts, WcTotals,
     };
 
     #[test]
@@ -2330,5 +2352,14 @@ mod tests {
         );
         assert_eq!(hash_check_line_kind(""), HashCheckLineKind::Invalid);
         assert_eq!(hash_check_line_kind("nonsense"), HashCheckLineKind::Invalid);
+    }
+
+    #[test]
+    fn hash_check_print_policy_matches_gnu_quiet_and_status_rules() {
+        assert!(hash_check_should_print_result(true, false, false));
+        assert!(!hash_check_should_print_result(true, true, false));
+        assert!(hash_check_should_print_result(false, true, false));
+        assert!(!hash_check_should_print_result(true, false, true));
+        assert!(!hash_check_should_print_result(false, false, true));
     }
 }

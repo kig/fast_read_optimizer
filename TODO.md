@@ -401,12 +401,12 @@
     - [ ] `--ignore-missing`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `--quiet`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `--status`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `--quiet`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--status`
+      - [x] equality test
+      - [x] implementation
     - [ ] `--strict`
       - [ ] equality test
       - [ ] implementation
