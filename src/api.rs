@@ -1,16 +1,14 @@
 use crate::common::CopyStrategy;
 use crate::config::load_config;
 use crate::io_util::CopyOperationGuard;
-use crate::reader::load_file_to_memory_for_mode;
+use crate::reader::{evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache};
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
     self, copy_file_range_with_strategy as copy_range_internal, resolve_writer_params_for_mode,
     SequentialWriter,
 };
 use crate::IOMode;
-use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -39,34 +37,6 @@ fn page_cache_lift_checkpoint_nanos(foreground_nanos: u64, background_nanos: u64
 fn duration_to_u64_nanos(duration: Duration) -> io::Result<u64> {
     u64::try_from(duration.as_nanos())
         .map_err(|_| io::Error::other("benchmark duration overflowed u64 nanoseconds"))
-}
-
-fn evict_file_cache(path: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let file = File::open(path)?;
-    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(result))
-    }
-}
-
-fn warm_file_page_cache(path: &Path) -> io::Result<u64> {
-    let file = File::open(path)?;
-    let mut reader = io::BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    let mut total = 0_u64;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(total);
-        }
-        total = total
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("page-cache warm byte count overflowed"))?;
-    }
 }
 
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<ParallelFile> {
@@ -204,11 +174,12 @@ pub fn benchmark_page_cache_lift<P: AsRef<Path>>(
     path: P,
 ) -> io::Result<PageCacheLiftBenchmarkReport> {
     let path = path.as_ref();
-    evict_file_cache(path)?;
+    let path_string = path_str(path)?.to_owned();
+    evict_file_cache(&path_string)?;
 
     let start_barrier = Arc::new(Barrier::new(2));
     let background_barrier = Arc::clone(&start_barrier);
-    let background_path = path.to_path_buf();
+    let background_path = path_string.clone();
     let start = Instant::now();
     let background = thread::spawn(move || -> io::Result<(u64, u64)> {
         background_barrier.wait();
@@ -217,9 +188,9 @@ pub fn benchmark_page_cache_lift<P: AsRef<Path>>(
     });
 
     let config = load_config(None);
-    let path_string = path_str(path)?.to_owned();
     start_barrier.wait();
-    let loaded = load_file_to_memory_for_mode(&config, "read_to_memory", &path_string, IOMode::Direct)?;
+    let loaded =
+        load_file_to_memory_for_mode(&config, "read_to_memory", &path_string, IOMode::Direct)?;
     let checkpoint_1_nanos = duration_to_u64_nanos(start.elapsed())?;
     let (background_warmed, background_nanos) = background
         .join()

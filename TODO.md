@@ -16,6 +16,7 @@
   - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, and read-to-memory flows are all wired into the main tool surface
   - `io_uring` `GETDENTS` remains blocked in this environment because the shipped kernel headers and current Rust crate surfaces do not expose `IORING_OP_GETDENTS`
 - The public API now exposes a first application-level benchmark hook for the "cold direct read to program memory while warming the page cache in the background" workflow via `benchmark_page_cache_lift()`, with ordered checkpoint reporting and a bounded Kani proof for the checkpoint helper.
+- `read` and `grep` now also have a user-facing `--auto-lift` mode that starts cold files on the direct path, warms the page cache in a background thread for later iterations in the same process, and measurably improves cold-start repeated scans on `checkpoints.tar.gz`.
 
 ## Current active items
 

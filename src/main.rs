@@ -25,8 +25,9 @@ use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
 use reader::visit_file_blocks;
 use reader::{
-    HugepageAdvice, load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory,
-    read_file, resolve_to_memory_mode, ReadToMemoryMode, ReadToMemoryOptions,
+    load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory, read_file,
+    read_file_auto_lift, resolve_to_memory_mode, HugepageAdvice, ReadToMemoryMode,
+    ReadToMemoryOptions,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -1579,11 +1580,12 @@ fn command_help(name: &str) -> Option<CommandHelp> {
     match name {
         "read" => Some(CommandHelp {
             name: "read",
-            usage: "read [--to-memory] [--paged-shared-buffer|--mmap|--mmap-read-pages|--multiple-target-buffers] [--threads N] [--qd N] [--blocksize SIZE] [--disable-hugepages] [--measure-unmap-time] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
+            usage: "read [--auto-lift] [--to-memory] [--paged-shared-buffer|--mmap|--mmap-read-pages|--multiple-target-buffers] [--threads N] [--qd N] [--blocksize SIZE] [--disable-hugepages] [--measure-unmap-time] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <filename>",
             summary: "Striped multi-threaded file read for measuring raw throughput on one file.",
             notes: &[
                 "Use -n 1 for one measured run with the current tuned parameters.",
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
+                "--auto-lift starts cold files on the direct path while a background thread warms the page cache for later iterations in the same process.",
                 "--to-memory defaults to an auto backend: mmap when the first page looks cached, otherwise the direct/shared-buffer loader.",
                 "--paged-shared-buffer forces the old shared destination-buffer loader for read --to-memory.",
                 "--mmap maps the file instead of reading into a destination buffer; --mmap-read-pages also walks the mapped bytes in userspace.",
@@ -1602,6 +1604,10 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                     "read --to-memory -n 1 /mnt/fast/bigfile.dat",
                 ),
                 (
+                    "Start cold reads on direct IO, then flip later iterations onto page cache",
+                    "read --auto-lift -n 100 /mnt/fast/bigfile.dat",
+                ),
+                (
                     "Map a hot file and read all mapped bytes",
                     "read --to-memory --mmap-read-pages --no-direct -n 1 /mnt/fast/bigfile.dat",
                 ),
@@ -1609,16 +1615,23 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "grep" => Some(CommandHelp {
             name: "grep",
-            usage: "grep [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <pattern> <filename>",
+            usage: "grep [--auto-lift] [--auto|--no-direct|--direct] [-v] [-n iterations] [-s] [-c config.json] <pattern> <filename>",
             summary: "Read plus literal byte-substring search over one file.",
             notes: &[
                 "This is a literal substring search, not a regex engine.",
                 "Matches are printed as offset:pattern.",
+                "--auto-lift starts cold files on the direct path while a background thread warms the page cache for later iterations in the same process.",
             ],
-            examples: &[(
-                "Scan a file in page cache for a literal marker string",
-                "grep --no-direct -n 1 needle /mnt/fast/bigfile.dat",
-            )],
+            examples: &[
+                (
+                    "Scan a file in page cache for a literal marker string",
+                    "grep --no-direct -n 1 needle /mnt/fast/bigfile.dat",
+                ),
+                (
+                    "Start cold and improve over repeated scans of the same file",
+                    "grep --auto-lift -n 100 needle /mnt/fast/bigfile.dat",
+                ),
+            ],
         }),
         "cat" => Some(CommandHelp {
             name: "cat",
@@ -2113,6 +2126,7 @@ fn try_main() -> io::Result<i32> {
     let mut io_mode = common::IOMode::Auto;
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
+    let mut auto_lift = false;
     let mut to_memory_mode = ReadToMemoryMode::Auto;
     let mut to_memory_options = ReadToMemoryOptions::default();
     let mut manual_read_overrides = ManualReadOverrides::default();
@@ -2262,6 +2276,8 @@ fn try_main() -> io::Result<i32> {
                 io_mode_write = common::IOMode::Auto;
             } else if args[i] == "--to-memory" {
                 to_memory = true;
+            } else if args[i] == "--auto-lift" {
+                auto_lift = true;
             } else if args[i] == "--paged-shared-buffer" {
                 to_memory_mode = ReadToMemoryMode::PagedSharedBuffer;
             } else if args[i] == "--mmap" {
@@ -2392,6 +2408,18 @@ fn try_main() -> io::Result<i32> {
     }
     if to_memory && mode != "read" {
         println!("--to-memory is only supported for read");
+        return Ok(1);
+    }
+    if auto_lift && mode != "read" && mode != "grep" {
+        println!("--auto-lift is only supported for read and grep");
+        return Ok(1);
+    }
+    if auto_lift && to_memory {
+        println!("--auto-lift is not supported with read --to-memory");
+        return Ok(1);
+    }
+    if auto_lift && io_mode != common::IOMode::Auto {
+        println!("--auto-lift chooses between direct and page-cache itself; do not combine it with --auto, --no-direct, or --direct");
         return Ok(1);
     }
     if to_memory_mode != ReadToMemoryMode::Auto && !to_memory {
@@ -2678,17 +2706,30 @@ fn try_main() -> io::Result<i32> {
                 to_memory_options,
             )
         } else if mode == "read" || mode == "grep" {
-            read_file(
-                pattern,
-                filename,
-                p[0],
-                p[1],
-                p[2] as usize,
-                p[3],
-                p[4],
-                p[5] as usize,
-                io_mode,
-            )
+            if auto_lift {
+                read_file_auto_lift(
+                    pattern,
+                    filename,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                )
+            } else {
+                read_file(
+                    pattern,
+                    filename,
+                    p[0],
+                    p[1],
+                    p[2] as usize,
+                    p[3],
+                    p[4],
+                    p[5] as usize,
+                    io_mode,
+                )
+            }
         } else if mode == "recursive-read-bench" {
             bench_recursive_read(
                 filename,

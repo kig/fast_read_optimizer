@@ -6,13 +6,14 @@ use crate::io_util::{
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
+use std::collections::HashMap;
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct BufReader<R> {
     inner: std::io::BufReader<R>,
@@ -37,6 +38,102 @@ impl<R: Read> BufReader<R> {
     #[allow(dead_code)]
     pub fn into_inner(self) -> R {
         self.inner.into_inner()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoLiftWarmState {
+    InProgress,
+    Complete,
+    Failed(String),
+}
+
+fn auto_lift_mode_for_residency(first_page_resident: bool) -> IOMode {
+    if first_page_resident {
+        IOMode::PageCache
+    } else {
+        IOMode::Direct
+    }
+}
+
+fn auto_lift_warmers() -> &'static Mutex<HashMap<String, AutoLiftWarmState>> {
+    static AUTO_LIFT_WARMERS: OnceLock<Mutex<HashMap<String, AutoLiftWarmState>>> = OnceLock::new();
+    AUTO_LIFT_WARMERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[allow(dead_code)]
+pub(crate) fn evict_file_cache(filename: &str) -> io::Result<()> {
+    let file = File::open(filename)?;
+    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+pub(crate) fn warm_file_page_cache(filename: &str) -> io::Result<u64> {
+    let file = File::open(filename)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("page-cache warm byte count overflowed"))?;
+    }
+}
+
+fn resolve_auto_lift_io_mode(filename: &str) -> io::Result<IOMode> {
+    {
+        let warmers = auto_lift_warmers().lock().unwrap();
+        match warmers.get(filename) {
+            Some(AutoLiftWarmState::Complete) => return Ok(IOMode::PageCache),
+            Some(AutoLiftWarmState::InProgress) => return Ok(IOMode::Direct),
+            Some(AutoLiftWarmState::Failed(message)) => {
+                return Err(io::Error::other(format!(
+                    "background page-cache warm failed for {}: {}",
+                    filename, message
+                )));
+            }
+            None => {}
+        }
+    }
+
+    if auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false))
+        == IOMode::PageCache
+    {
+        return Ok(IOMode::PageCache);
+    }
+
+    let mut warmers = auto_lift_warmers().lock().unwrap();
+    match warmers.get(filename) {
+        Some(AutoLiftWarmState::Complete) => Ok(IOMode::PageCache),
+        Some(AutoLiftWarmState::InProgress) => Ok(IOMode::Direct),
+        Some(AutoLiftWarmState::Failed(message)) => Err(io::Error::other(format!(
+            "background page-cache warm failed for {}: {}",
+            filename, message
+        ))),
+        None => {
+            warmers.insert(filename.to_string(), AutoLiftWarmState::InProgress);
+            let filename_owned = filename.to_string();
+            std::thread::spawn(move || {
+                let result = warm_file_page_cache(&filename_owned);
+                let next_state = match result {
+                    Ok(_) => AutoLiftWarmState::Complete,
+                    Err(err) => AutoLiftWarmState::Failed(err.to_string()),
+                };
+                auto_lift_warmers()
+                    .lock()
+                    .unwrap()
+                    .insert(filename_owned, next_state);
+            });
+            Ok(IOMode::Direct)
+        }
     }
 }
 
@@ -1778,6 +1875,30 @@ pub fn read_file(
     Ok(bytes_read)
 }
 
+pub fn read_file_auto_lift(
+    pattern: &str,
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+) -> std::io::Result<u64> {
+    let io_mode = resolve_auto_lift_io_mode(filename)?;
+    read_file(
+        pattern,
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +2052,37 @@ mod tests {
             resolve_to_memory_mode(path.to_str().unwrap(), IOMode::Auto, ReadToMemoryMode::Auto),
             ReadToMemoryMode::Mmap
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_lift_mode_prefers_page_cache_for_resident_file() {
+        assert!(auto_lift_mode_for_residency(false) == IOMode::Direct);
+        assert!(auto_lift_mode_for_residency(true) == IOMode::PageCache);
+    }
+
+    #[test]
+    fn auto_lift_background_warm_promotes_future_reads() {
+        let path = unique_temp_file("fro-auto-lift");
+        fs::write(&path, vec![7_u8; 2 * 1024 * 1024]).unwrap();
+        let filename = path.to_str().unwrap();
+
+        evict_file_cache(filename).unwrap();
+        let first_mode = resolve_auto_lift_io_mode(filename).unwrap();
+        assert!(first_mode == IOMode::Direct);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match resolve_auto_lift_io_mode(filename).unwrap() {
+                IOMode::PageCache => break,
+                IOMode::Direct => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                IOMode::Auto => panic!("auto-lift should resolve to a concrete mode"),
+            }
+        }
+
         let _ = fs::remove_file(path);
     }
 
@@ -2153,4 +2305,21 @@ fn read_all_bytes(data: &[u8], num_threads: u64) -> std::io::Result<()> {
     }
     black_box(checksum.load(Ordering::Relaxed));
     Ok(())
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::auto_lift_mode_for_residency;
+    use crate::common::IOMode;
+
+    #[kani::proof]
+    fn auto_lift_mode_matches_first_page_residency() {
+        let first_page_resident: bool = kani::any();
+        let mode = auto_lift_mode_for_residency(first_page_resident);
+        if first_page_resident {
+            assert_eq!(mode, IOMode::PageCache);
+        } else {
+            assert_eq!(mode, IOMode::Direct);
+        }
+    }
 }
