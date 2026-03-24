@@ -10,6 +10,38 @@ const BASE64_ENCODE_INPUT_ALIGN: u64 = 3 * 4096;
 const BASE64_BENCH_INPUT_SIZE: usize = 12 * 1024;
 const BASE64_BENCH_OUTPUT_SIZE: usize = 16 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Base64EncodeKernel {
+    Auto,
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx2Spmd,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx2Shuffle,
+}
+
+impl Base64EncodeKernel {
+    fn bench_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Scalar => "scalar",
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2Spmd => "avx2-spmd",
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2Shuffle => "avx2-shuffle",
+        }
+    }
+}
+
+#[cfg(target_arch = "x86")]
+type M128i = std::arch::x86::__m128i;
+#[cfg(target_arch = "x86")]
+type M256i = std::arch::x86::__m256i;
+#[cfg(target_arch = "x86_64")]
+type M128i = std::arch::x86_64::__m128i;
+#[cfg(target_arch = "x86_64")]
+type M256i = std::arch::x86_64::__m256i;
+
 #[derive(Clone)]
 struct Base64Options {
     decode: bool,
@@ -120,6 +152,48 @@ fn encoded_base64_len(input_len: usize) -> usize {
     input_len.div_ceil(3) * 4
 }
 
+pub(crate) fn parse_base64_encode_kernel(value: &str) -> io::Result<Base64EncodeKernel> {
+    match value {
+        "auto" => Ok(Base64EncodeKernel::Auto),
+        "scalar" => Ok(Base64EncodeKernel::Scalar),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "spmd" | "avx2-spmd" => Ok(Base64EncodeKernel::Avx2Spmd),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "shuffle" | "avx2-shuffle" => Ok(Base64EncodeKernel::Avx2Shuffle),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown base64 kernel variant '{value}'"),
+        )),
+    }
+}
+
+fn encode_base64_kernel_for_block(
+    bytes_len: usize,
+    requested: Base64EncodeKernel,
+) -> Base64EncodeKernel {
+    if bytes_len < 24 {
+        return Base64EncodeKernel::Scalar;
+    }
+    match requested {
+        Base64EncodeKernel::Auto => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Base64EncodeKernel::Avx2Shuffle;
+            }
+            Base64EncodeKernel::Scalar
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64EncodeKernel::Avx2Spmd | Base64EncodeKernel::Avx2Shuffle => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return requested;
+            }
+            Base64EncodeKernel::Scalar
+        }
+        Base64EncodeKernel::Scalar => Base64EncodeKernel::Scalar,
+    }
+}
+
 #[cfg(any(test, kani))]
 fn base64_encode_ascii_scalar_glsl(sextet: u8) -> u8 {
     let mut off = 65_i16;
@@ -146,14 +220,31 @@ fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn encode_base64_block_into(bytes: &[u8], out: &mut [u8]) -> usize {
+    encode_base64_block_into_with_kernel(bytes, out, Base64EncodeKernel::Auto)
+}
+
+fn encode_base64_block_into_with_kernel(
+    bytes: &[u8],
+    out: &mut [u8],
+    requested: Base64EncodeKernel,
+) -> usize {
     let expected = encoded_base64_len(bytes.len());
     assert!(out.len() >= expected);
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if std::arch::is_x86_feature_detected!("avx2") && bytes.len() >= 24 {
-        // SAFETY: guarded by runtime AVX2 detection.
-        return unsafe { encode_base64_block_into_avx2(bytes, out) };
+    match encode_base64_kernel_for_block(bytes.len(), requested) {
+        Base64EncodeKernel::Scalar | Base64EncodeKernel::Auto => {
+            encode_base64_block_into_scalar(bytes, out)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64EncodeKernel::Avx2Spmd => {
+            // SAFETY: guarded by runtime AVX2 detection.
+            unsafe { encode_base64_block_into_avx2_spmd(bytes, out) }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64EncodeKernel::Avx2Shuffle => {
+            // SAFETY: guarded by runtime AVX2 detection.
+            unsafe { encode_base64_block_into_avx2_shuffle(bytes, out) }
+        }
     }
-    encode_base64_block_into_scalar(bytes, out)
 }
 
 #[cfg(any(test, kani))]
@@ -202,19 +293,15 @@ fn encode_base64_block_into_scalar(bytes: &[u8], out: &mut [u8]) -> usize {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn encode_base64_ascii_avx2(sextets: &[u8; 32]) -> [u8; 32] {
+unsafe fn encode_base64_ascii_avx2(values: M256i) -> M256i {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
-        _mm256_loadu_si256, _mm256_set1_epi8, _mm256_storeu_si256,
+        _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_set1_epi8,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
-        _mm256_loadu_si256, _mm256_set1_epi8, _mm256_storeu_si256,
+        _mm256_add_epi8, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_set1_epi8,
     };
-
-    let values = _mm256_loadu_si256(sextets.as_ptr() as *const _);
     let mut encoded = _mm256_add_epi8(values, _mm256_set1_epi8(65));
 
     let gt25 = _mm256_cmpgt_epi8(values, _mm256_set1_epi8(25));
@@ -228,15 +315,17 @@ unsafe fn encode_base64_ascii_avx2(sextets: &[u8; 32]) -> [u8; 32] {
 
     let eq63 = _mm256_cmpeq_epi8(values, _mm256_set1_epi8(63));
     encoded = _mm256_add_epi8(encoded, _mm256_and_si256(eq63, _mm256_set1_epi8(-12)));
-
-    let mut out = [0_u8; 32];
-    _mm256_storeu_si256(out.as_mut_ptr() as *mut _, encoded);
-    out
+    encoded
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn encode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> usize {
+unsafe fn encode_base64_block_into_avx2_spmd(bytes: &[u8], out: &mut [u8]) -> usize {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{_mm256_loadu_si256, _mm256_storeu_si256};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+
     let mut index = 0usize;
     let mut out_index = 0usize;
     while index + 24 <= bytes.len() {
@@ -253,8 +342,59 @@ unsafe fn encode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> usize {
             sextets[out_base + 2] = ((b & 0x0f) << 2) | (c >> 6);
             sextets[out_base + 3] = c & 0x3f;
         }
-        let encoded = encode_base64_ascii_avx2(&sextets);
-        out[out_index..(out_index + 32)].copy_from_slice(&encoded);
+        let sextets = _mm256_loadu_si256(sextets.as_ptr() as *const _);
+        let encoded = encode_base64_ascii_avx2(sextets);
+        _mm256_storeu_si256(out[out_index..].as_mut_ptr() as *mut _, encoded);
+        index += 24;
+        out_index += 32;
+    }
+
+    if index < bytes.len() {
+        out_index += encode_base64_block_into_scalar(&bytes[index..], &mut out[out_index..]);
+    }
+    out_index
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_base64_block_into_avx2_shuffle(bytes: &[u8], out: &mut [u8]) -> usize {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_and_si256, _mm256_loadu_si256, _mm256_mulhi_epu16, _mm256_mullo_epi16,
+        _mm256_or_si256, _mm256_set1_epi32, _mm256_set_m128i, _mm256_shuffle_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_and_si256, _mm256_loadu_si256, _mm256_mulhi_epu16, _mm256_mullo_epi16,
+        _mm256_or_si256, _mm256_set1_epi32, _mm256_set_m128i, _mm256_shuffle_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
+    };
+
+    const RESHUFFLE: [i8; 32] = [
+        1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10, 5, 4, 6, 5, 8, 7, 9, 8, 11, 10, 12, 11,
+        14, 13, 15, 14,
+    ];
+
+    let reshuffle = _mm256_loadu_si256(RESHUFFLE.as_ptr() as *const _);
+    let hi_mask = _mm256_set1_epi32(0x0fc0fc00_u32 as i32);
+    let lo_mask = _mm256_set1_epi32(0x003f03f0_u32 as i32);
+    let hi_mul = _mm256_set1_epi32(0x04000040_u32 as i32);
+    let lo_mul = _mm256_set1_epi32(0x01000010_u32 as i32);
+
+    let mut index = 0usize;
+    let mut out_index = 0usize;
+    while index + 24 <= bytes.len() {
+        let chunk = bytes.as_ptr().add(index);
+        let lo = _mm_loadu_si128(chunk as *const M128i);
+        let hi = _mm_loadu_si128(chunk.add(8) as *const M128i);
+        let packed = _mm256_set_m128i(hi, lo);
+        let unpacked = _mm256_shuffle_epi8(packed, reshuffle);
+        let hi_bits = _mm256_mulhi_epu16(_mm256_and_si256(unpacked, hi_mask), hi_mul);
+        let lo_bits = _mm256_mullo_epi16(_mm256_and_si256(unpacked, lo_mask), lo_mul);
+        let sextets = _mm256_or_si256(hi_bits, lo_bits);
+        let encoded = encode_base64_ascii_avx2(sextets);
+        _mm256_storeu_si256(out[out_index..].as_mut_ptr() as *mut _, encoded);
         index += 24;
         out_index += 32;
     }
@@ -562,7 +702,10 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
     Ok(0)
 }
 
-pub(crate) fn bench_base64_encode(iterations: u64) -> io::Result<()> {
+pub(crate) fn bench_base64_encode(
+    iterations: u64,
+    requested_kernel: Base64EncodeKernel,
+) -> io::Result<()> {
     if iterations == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -576,15 +719,17 @@ pub(crate) fn bench_base64_encode(iterations: u64) -> io::Result<()> {
     let mut output = vec![0_u8; BASE64_BENCH_OUTPUT_SIZE];
     debug_assert_eq!(encoded_base64_len(input.len()), BASE64_BENCH_OUTPUT_SIZE);
 
+    let selected_kernel = encode_base64_kernel_for_block(input.len(), requested_kernel);
+
     for _ in 0..1024 {
-        let written = encode_base64_block_into(&input, &mut output);
+        let written = encode_base64_block_into_with_kernel(&input, &mut output, selected_kernel);
         black_box(written);
     }
 
     let start = Instant::now();
     let mut sink = 0_u64;
     for _ in 0..iterations {
-        let written = encode_base64_block_into(&input, &mut output);
+        let written = encode_base64_block_into_with_kernel(&input, &mut output, selected_kernel);
         sink ^= u64::from(output[0]);
         sink ^= u64::from(output[written - 1]);
     }
@@ -593,7 +738,8 @@ pub(crate) fn bench_base64_encode(iterations: u64) -> io::Result<()> {
     let gb_per_second = (iterations as f64 * BASE64_BENCH_INPUT_SIZE as f64) / elapsed / 1e9;
 
     println!(
-        "Base64 encode kernel {} iterations of {} -> {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
+        "Base64 encode kernel [{}] {} iterations of {} -> {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
+        selected_kernel.bench_name(),
         iterations,
         BASE64_BENCH_INPUT_SIZE,
         BASE64_BENCH_OUTPUT_SIZE,
@@ -713,7 +859,12 @@ mod tests {
                 .collect::<Vec<_>>();
             let scalar = encode_base64_block_scalar(&bytes);
             let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
-            let written = unsafe { encode_base64_block_into_avx2(&bytes, &mut out) };
+            let written = unsafe { encode_base64_block_into_avx2_spmd(&bytes, &mut out) };
+            out.truncate(written);
+            assert_eq!(out, scalar);
+
+            let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
+            let written = unsafe { encode_base64_block_into_avx2_shuffle(&bytes, &mut out) };
             out.truncate(written);
             assert_eq!(out, scalar);
         }

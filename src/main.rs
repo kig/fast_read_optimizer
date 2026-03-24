@@ -1975,11 +1975,12 @@ fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "bench-base64-encode" => Some(CommandHelp {
             name: "bench-base64-encode",
-            usage: "bench-base64-encode [-n iterations]",
+            usage: "bench-base64-encode [-n iterations] [--variant auto|scalar|spmd|shuffle]",
             summary: "Hot-loop the in-memory 12 KiB -> 16 KiB base64 encode kernel on one core.",
             notes: &[
                 "Uses a fixed 12 KiB source buffer and fixed 16 KiB destination buffer.",
                 "Reports iterations per second and effective input GB/s per core.",
+                "Use --variant to compare scalar, AVX2 SPMD, and AVX2 shuffle-unpack kernels.",
             ],
             examples: &[(
                 "Run one million kernel iterations",
@@ -2196,6 +2197,7 @@ fn try_main() -> io::Result<i32> {
     let mut config_path: Option<&str> = None;
     let mut bench_size: Option<u64> = None;
     let mut bench_threads: Option<usize> = None;
+    let mut base64_kernel = coreutils::Base64EncodeKernel::Auto;
 
     let mut i = 2;
     let mut end_flags = false;
@@ -2231,6 +2233,16 @@ fn try_main() -> io::Result<i32> {
                         None
                     });
                     if bench_size.is_none() {
+                        return Ok(1);
+                    }
+                }
+            } else if args[i] == "--variant" {
+                i += 1;
+                if i < args.len() {
+                    if mode == "bench-base64-encode" {
+                        base64_kernel = coreutils::parse_base64_encode_kernel(args[i].as_str())?;
+                    } else {
+                        eprintln!("--variant is only supported for bench-base64-encode");
                         return Ok(1);
                     }
                 }
@@ -2421,7 +2433,7 @@ fn try_main() -> io::Result<i32> {
         return Ok(0);
     }
     if mode == "bench-base64-encode" {
-        coreutils::bench_base64_encode(iterations as u64)?;
+        coreutils::bench_base64_encode(iterations as u64, base64_kernel)?;
         return Ok(0);
     }
     if mode == "bench-mmap-write" {

@@ -31,6 +31,8 @@ mod shred;
 mod tac;
 mod wc;
 
+pub(crate) use base64::{parse_base64_encode_kernel, Base64EncodeKernel};
+
 pub fn is_coreutils_command(name: &str) -> bool {
     matches!(
         name,
@@ -103,8 +105,8 @@ pub fn try_run_subcommand(
     run_named_command(command, &args)
 }
 
-pub(crate) fn bench_base64_encode(iterations: u64) -> io::Result<()> {
-    base64::bench_base64_encode(iterations)
+pub(crate) fn bench_base64_encode(iterations: u64, kernel: Base64EncodeKernel) -> io::Result<()> {
+    base64::bench_base64_encode(iterations, kernel)
 }
 
 fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
