@@ -4,11 +4,48 @@ fn disk_usage_kib(blocks: u64) -> u64 {
     blocks.div_ceil(2)
 }
 
-fn append_du_line(chunk: &mut Vec<u8>, kib: u64, path: &Path) {
-    chunk.extend_from_slice(kib.to_string().as_bytes());
+fn du_format_kib(kib: u64, human_readable: bool) -> String {
+    if !human_readable {
+        return kib.to_string();
+    }
+    const UNITS: [&str; 8] = ["K", "M", "G", "T", "P", "E", "Z", "Y"];
+    let mut value = kib as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 10.0 {
+        format!("{}{}", value.ceil() as u64, UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+fn append_du_line(chunk: &mut Vec<u8>, kib: u64, path: &Path, human_readable: bool) {
+    chunk.extend_from_slice(du_format_kib(kib, human_readable).as_bytes());
     chunk.push(b'\t');
     chunk.extend_from_slice(path.as_os_str().as_bytes());
     chunk.push(b'\n');
+}
+
+fn du_apply_short_flag(
+    summarize: bool,
+    all: bool,
+    human_readable: bool,
+    total: bool,
+    flag: u8,
+) -> io::Result<(bool, bool, bool, bool)> {
+    match flag {
+        b's' => Ok((true, all, human_readable, total)),
+        b'a' => Ok((summarize, true, human_readable, total)),
+        b'h' => Ok((summarize, all, true, total)),
+        b'c' => Ok((summarize, all, human_readable, true)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported du flag: -{}", other as char),
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -304,14 +341,15 @@ fn append_du_output(
     path: &Path,
     summarize: bool,
     all: bool,
+    human_readable: bool,
     output: &mut Vec<u8>,
     had_warnings: Arc<AtomicBool>,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let stat = lstat_no_follow(path)?;
     let root_kib = disk_usage_kib(stat.st_blocks as u64);
     if !stat_is_dir(&stat) {
-        append_du_line(output, root_kib, path);
-        return Ok(());
+        append_du_line(output, root_kib, path, human_readable);
+        return Ok(root_kib);
     }
 
     let dir_queue = Arc::new(WorkQueue::default());
@@ -346,9 +384,10 @@ fn append_du_output(
         .ok_or_else(|| io::Error::other("du shared state still has active references"))?;
     let lines = state.lines.into_inner().unwrap();
     for line in lines {
-        append_du_line(output, line.kib, &line.path);
+        append_du_line(output, line.kib, &line.path, human_readable);
     }
-    Ok(())
+    let total_kib = state.nodes.into_inner().unwrap()[0].total_kib;
+    Ok(total_kib)
 }
 
 #[cfg(test)]
@@ -377,6 +416,22 @@ mod du_tests {
         let value = std::ffi::OsString::from_vec(b"bad\0name".to_vec());
         let err = cstring_from_os_str(&value).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn du_format_kib_uses_expected_unit_suffixes() {
+        assert_eq!(du_format_kib(7, false), "7");
+        assert_eq!(du_format_kib(7, true), "7.0K");
+        assert_eq!(du_format_kib(1024, true), "1.0M");
+        assert_eq!(du_format_kib(1536, true), "1.5M");
+    }
+
+    #[test]
+    fn du_apply_short_flag_accepts_combined_supported_flags() {
+        let h = du_apply_short_flag(false, false, false, false, b'h').unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, b'c').unwrap();
+        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, b's').unwrap();
+        assert_eq!(hcs, (true, false, true, true));
     }
 
     #[test]
@@ -415,7 +470,7 @@ mod kani_proofs {
     use super::super::hash::{
         hash_check_should_print_result, hash_check_untagged_kind, HashCheckLineKind,
     };
-    use super::{du_node_ready, permission_denied_components};
+    use super::{du_apply_short_flag, du_node_ready, permission_denied_components};
     use std::io;
 
     #[kani::proof]
@@ -482,6 +537,17 @@ mod kani_proofs {
     }
 
     #[kani::proof]
+    fn du_short_flag_hcs_sets_expected_state() {
+        let h = du_apply_short_flag(false, false, false, false, b'h').unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, b'c').unwrap();
+        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, b's').unwrap();
+        assert!(hcs.0);
+        assert!(!hcs.1);
+        assert!(hcs.2);
+        assert!(hcs.3);
+    }
+
+    #[kani::proof]
     fn hash_check_untagged_kind_matches_separator_contract() {
         let separator: u8 = kani::any();
         let has_filename: bool = kani::any();
@@ -512,11 +578,21 @@ mod kani_proofs {
 pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
     let mut summarize = false;
     let mut all = false;
+    let mut human_readable = false;
+    let mut total = false;
     let mut paths = Vec::new();
     for arg in &args[1..] {
         match arg.as_str() {
             "-s" | "--summarize" => summarize = true,
             "-a" | "--all" => all = true,
+            "-h" | "--human-readable" => human_readable = true,
+            "-c" | "--total" => total = true,
+            other if other.starts_with('-') && other != "-" && !other.starts_with("--") => {
+                for flag in other.as_bytes().iter().copied().skip(1) {
+                    (summarize, all, human_readable, total) =
+                        du_apply_short_flag(summarize, all, human_readable, total, flag)?;
+                }
+            }
             other if other.starts_with('-') && other != "-" => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -539,23 +615,32 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
 
     let out = stdout_buf_writer()?;
     let had_warnings = Arc::new(AtomicBool::new(false));
+    let mut grand_total_kib = 0_u64;
     for path in paths {
         let mut chunk = Vec::new();
-        match append_du_output(
+        let root_total_kib = match append_du_output(
             Path::new(&path),
             summarize,
             all,
+            human_readable,
             &mut chunk,
             had_warnings.clone(),
         ) {
-            Ok(()) => {}
+            Ok(root_total_kib) => root_total_kib,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("du", Path::new(&path), &err, "cannot access");
                 had_warnings.store(true, Ordering::SeqCst);
                 continue;
             }
             Err(err) => return Err(err),
-        }
+        };
+        grand_total_kib = grand_total_kib.saturating_add(root_total_kib);
+        out.write_all(&chunk)?;
+    }
+    if total {
+        let total_path = Path::new("total");
+        let mut chunk = Vec::new();
+        append_du_line(&mut chunk, grand_total_kib, total_path, human_readable);
         out.write_all(&chunk)?;
     }
     out.into_inner()?;

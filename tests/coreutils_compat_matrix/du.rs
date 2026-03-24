@@ -25,6 +25,23 @@ fn cartesian_du_matches_system_output() {
 }
 
 #[test]
+fn du_hcs_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-hcs");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested/deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(tree.join("nested/child.txt"), vec![0x22; 8192]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 16384]).unwrap();
+
+    assert_same_result(
+        run_fro("du", &["-hcs", tree.to_str().unwrap()]),
+        run_system("du", &["-hcs", tree.to_str().unwrap()]),
+        "du -hcs",
+    );
+}
+
+#[test]
 fn du_matches_system_for_symlinks_broken_symlinks_and_fifos() {
     let tmp = unique_temp_dir("fro-coreutils-du-special");
     let tree = tmp.join("tree");
