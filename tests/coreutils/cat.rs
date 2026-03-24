@@ -257,7 +257,11 @@ fn cat_show_tab_nonprinting_flags_match_system_output() {
     let b = tmp.join("b.bin");
     let blank = tmp.join("blank.bin");
 
-    fs::write(&a, [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80]).unwrap();
+    fs::write(
+        &a,
+        [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80],
+    )
+    .unwrap();
     fs::write(&b, [b'\t', b'\n', 0x1f, b'\n', 0xff, b'\n']).unwrap();
     fs::write(&blank, [b'\t', b'\n']).unwrap();
 
@@ -309,7 +313,11 @@ fn cat_show_nonprinting_flags_match_system_output() {
     let b = tmp.join("b.bin");
     let blank = tmp.join("blank.bin");
 
-    fs::write(&a, [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80]).unwrap();
+    fs::write(
+        &a,
+        [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80],
+    )
+    .unwrap();
     fs::write(&b, [b'\n', 0x1f, b'\n', 0xff, b'\n']).unwrap();
     fs::write(&blank, [b'\n']).unwrap();
 
@@ -408,16 +416,16 @@ fn cat_show_ends_nonprinting_flag_matches_system_output() {
     let b = tmp.join("b.bin");
     let blank = tmp.join("blank.bin");
 
-    fs::write(&a, [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80]).unwrap();
+    fs::write(
+        &a,
+        [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80],
+    )
+    .unwrap();
     fs::write(&b, [b'\n', 0x1f, b'\n', 0xff, b'\n']).unwrap();
     fs::write(&blank, [b'\n']).unwrap();
 
     for io_flags in io_flag_sets() {
-        for compat_flags in [
-            vec!["-e"],
-            vec!["-e", "-n"],
-            vec!["-e", "-b"],
-        ] {
+        for compat_flags in [vec!["-e"], vec!["-e", "-n"], vec!["-e", "-b"]] {
             for files in [
                 vec![a.to_str().unwrap()],
                 vec![blank.to_str().unwrap()],
@@ -454,7 +462,11 @@ fn cat_show_all_flags_match_system_output() {
     let b = tmp.join("b.bin");
     let blank = tmp.join("blank.bin");
 
-    fs::write(&a, [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80]).unwrap();
+    fs::write(
+        &a,
+        [b'a', b'\t', b'b', b'\n', 0x01, b'\n', 0x7f, b'\n', 0x80],
+    )
+    .unwrap();
     fs::write(&b, [b'\t', b'\n', 0x1f, b'\n', 0xff, b'\n']).unwrap();
     fs::write(&blank, [b'\n']).unwrap();
 

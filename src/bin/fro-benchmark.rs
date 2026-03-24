@@ -462,7 +462,10 @@ fn main() {
     let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
     let recursive_tree = test_path.join("fro_bench_recursive_tree");
     let recursive_tree_str = recursive_tree.display().to_string();
-    let recursive_copy_target = run_dir.join("fro_bench_recursive_copy_out").display().to_string();
+    let recursive_copy_target = run_dir
+        .join("fro_bench_recursive_copy_out")
+        .display()
+        .to_string();
 
     let tests = vec![
         TestCase {
@@ -1066,15 +1069,16 @@ fn main() {
         println!("{}", combined);
     }
 
-    let recursive_selected_explicitly = matches_any_pattern("recursive-read-bench (hot)", &patterns)
-        || matches_any_pattern("copy (recursive, hot)", &patterns);
+    let recursive_selected_explicitly =
+        matches_any_pattern("recursive-read-bench (hot)", &patterns)
+            || matches_any_pattern("copy (recursive, hot)", &patterns);
     let recursive_fixture_stats = recursive_tree_fixture_stats(&recursive_tree);
     let recursive_fixture_exists = recursive_fixture_stats.is_some();
     let mut selected_tests = Vec::new();
     for t in tests {
         if patterns.is_empty() {
-            let needs_recursive_fixture = t.name.starts_with("recursive-read-bench")
-                || t.name.starts_with("copy (recursive");
+            let needs_recursive_fixture =
+                t.name.starts_with("recursive-read-bench") || t.name.starts_with("copy (recursive");
             if needs_recursive_fixture && !recursive_fixture_exists {
                 continue;
             }

@@ -171,7 +171,11 @@ fn multicall_dd_copies_requested_range() {
             "status=none",
         ],
     ));
-    assert!(out.stderr.is_empty(), "stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(fs::read(&output).unwrap(), bytes[..35].to_vec());
 }
 

@@ -98,14 +98,12 @@ fn compare_outputs(
     assert_eq!(
         actual.stdout, system.stdout,
         "case {} ({}): stdout mismatch",
-        case_name,
-        label
+        case_name, label
     );
     assert_eq!(
         actual.stderr, system.stderr,
         "case {} ({}): stderr mismatch",
-        case_name,
-        label
+        case_name, label
     );
     assert_eq!(
         fs::read(actual_output).unwrap(),
@@ -386,8 +384,14 @@ fn dd_example_prints_dd_style_record_counts() {
         String::from_utf8_lossy(&fro_output.stderr)
     );
     let fro_stderr = String::from_utf8_lossy(&fro_output.stderr);
-    assert!(fro_stderr.contains("9+1 records in"), "stderr=\n{fro_stderr}");
-    assert!(fro_stderr.contains("9+1 records out"), "stderr=\n{fro_stderr}");
+    assert!(
+        fro_stderr.contains("9+1 records in"),
+        "stderr=\n{fro_stderr}"
+    );
+    assert!(
+        fro_stderr.contains("9+1 records out"),
+        "stderr=\n{fro_stderr}"
+    );
     assert!(
         fro_stderr.contains("97 bytes copied in"),
         "stderr=\n{fro_stderr}"

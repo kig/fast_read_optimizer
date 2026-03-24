@@ -36,7 +36,10 @@ pub(super) fn cat_should_number_line(number: bool, number_nonblank: bool, line: 
     }
 }
 
-pub(super) fn cat_show_ends_rendered_len(original_len: usize, ends_with_newline: bool) -> Option<usize> {
+pub(super) fn cat_show_ends_rendered_len(
+    original_len: usize,
+    ends_with_newline: bool,
+) -> Option<usize> {
     if ends_with_newline {
         original_len.checked_add(1)
     } else {
@@ -49,7 +52,11 @@ pub(super) fn cat_show_tabs_rendered_len(original_len: usize, tab_count: usize) 
     original_len.checked_add(tab_count)
 }
 
-pub(super) fn cat_visible_byte_rendered_len(byte: u8, show_tabs: bool, show_nonprinting: bool) -> usize {
+pub(super) fn cat_visible_byte_rendered_len(
+    byte: u8,
+    show_tabs: bool,
+    show_nonprinting: bool,
+) -> usize {
     if show_tabs && byte == b'\t' {
         return 2;
     }
@@ -173,14 +180,21 @@ fn cat_write_transformed_line<W: Write>(
         let mut rendered_len = 0usize;
         for &byte in body {
             rendered_len = rendered_len
-                .checked_add(cat_visible_byte_rendered_len(byte, show_tabs, show_nonprinting))
+                .checked_add(cat_visible_byte_rendered_len(
+                    byte,
+                    show_tabs,
+                    show_nonprinting,
+                ))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "cat byte rendering overflow")
                 })?;
         }
         if show_ends && ends_with_newline {
             rendered_len = rendered_len.checked_add(2).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "cat show-ends rendering overflow")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cat show-ends rendering overflow",
+                )
             })?;
         }
         let _ = rendered_len;
@@ -192,12 +206,13 @@ fn cat_write_transformed_line<W: Write>(
         }
         return Ok(());
     }
-    let rendered_len = cat_show_ends_rendered_len(line.len(), ends_with_newline).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cat show-ends rendering overflow",
-        )
-    })?;
+    let rendered_len =
+        cat_show_ends_rendered_len(line.len(), ends_with_newline).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cat show-ends rendering overflow",
+            )
+        })?;
     if show_ends && rendered_len != line.len() {
         let split = line.len().saturating_sub(1);
         out.write_all(&line[..split])?;
@@ -321,10 +336,9 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_short_visual_flag_effect, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
-        cat_uses_transform_path,
-        cat_visible_byte_rendered_len,
+        cat_numbering_step, cat_short_visual_flag_effect, cat_should_number_line,
+        cat_show_ends_rendered_len, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
+        cat_uses_transform_path, cat_visible_byte_rendered_len,
     };
 
     #[kani::proof]
@@ -368,7 +382,11 @@ mod kani_proofs {
         let number: bool = kani::any();
         let number_nonblank: bool = kani::any();
         let blank: bool = kani::any();
-        let line = if blank { b"\n".as_slice() } else { b"x\n".as_slice() };
+        let line = if blank {
+            b"\n".as_slice()
+        } else {
+            b"x\n".as_slice()
+        };
         assert_eq!(
             cat_should_number_line(number, number_nonblank, line),
             if number_nonblank { !blank } else { number }
@@ -459,7 +477,12 @@ mod kani_proofs {
                 show_nonprinting,
                 squeeze_blank,
             ),
-            number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
+            number
+                || number_nonblank
+                || show_ends
+                || show_tabs
+                || show_nonprinting
+                || squeeze_blank
         );
     }
 
@@ -488,18 +511,29 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::{
-        cat_numbering_step, cat_should_number_line, cat_show_ends_rendered_len,
-        cat_short_visual_flag_effect, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
-        cat_uses_transform_path,
-        cat_visible_byte_rendered_len,
+        cat_numbering_step, cat_short_visual_flag_effect, cat_should_number_line,
+        cat_show_ends_rendered_len, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
+        cat_uses_transform_path, cat_visible_byte_rendered_len,
     };
 
     #[test]
     fn cat_numbering_step_numbers_only_at_line_starts() {
-        assert_eq!(cat_numbering_step(1, true, b'a').unwrap(), (2, false, Some(1)));
-        assert_eq!(cat_numbering_step(2, false, b'b').unwrap(), (2, false, None));
-        assert_eq!(cat_numbering_step(2, false, b'\n').unwrap(), (2, true, None));
-        assert_eq!(cat_numbering_step(2, true, b'\n').unwrap(), (3, true, Some(2)));
+        assert_eq!(
+            cat_numbering_step(1, true, b'a').unwrap(),
+            (2, false, Some(1))
+        );
+        assert_eq!(
+            cat_numbering_step(2, false, b'b').unwrap(),
+            (2, false, None)
+        );
+        assert_eq!(
+            cat_numbering_step(2, false, b'\n').unwrap(),
+            (2, true, None)
+        );
+        assert_eq!(
+            cat_numbering_step(2, true, b'\n').unwrap(),
+            (3, true, Some(2))
+        );
     }
 
     #[test]
@@ -567,17 +601,36 @@ mod tests {
 
     #[test]
     fn cat_uses_transform_path_is_false_for_plain_unbuffered_mode() {
-        assert!(!cat_uses_transform_path(false, false, false, false, false, false));
-        assert!(cat_uses_transform_path(true, false, false, false, false, false));
+        assert!(!cat_uses_transform_path(
+            false, false, false, false, false, false
+        ));
+        assert!(cat_uses_transform_path(
+            true, false, false, false, false, false
+        ));
     }
 
     #[test]
     fn cat_short_visual_flag_effect_matches_expected_composites() {
-        assert_eq!(cat_short_visual_flag_effect(b'E'), Some((true, false, false)));
-        assert_eq!(cat_short_visual_flag_effect(b'T'), Some((false, true, false)));
-        assert_eq!(cat_short_visual_flag_effect(b'v'), Some((false, false, true)));
-        assert_eq!(cat_short_visual_flag_effect(b'e'), Some((true, false, true)));
-        assert_eq!(cat_short_visual_flag_effect(b't'), Some((false, true, true)));
+        assert_eq!(
+            cat_short_visual_flag_effect(b'E'),
+            Some((true, false, false))
+        );
+        assert_eq!(
+            cat_short_visual_flag_effect(b'T'),
+            Some((false, true, false))
+        );
+        assert_eq!(
+            cat_short_visual_flag_effect(b'v'),
+            Some((false, false, true))
+        );
+        assert_eq!(
+            cat_short_visual_flag_effect(b'e'),
+            Some((true, false, true))
+        );
+        assert_eq!(
+            cat_short_visual_flag_effect(b't'),
+            Some((false, true, true))
+        );
         assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
         assert_eq!(cat_short_visual_flag_effect(b'x'), None);
     }

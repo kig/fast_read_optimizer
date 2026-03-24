@@ -72,14 +72,7 @@ fn write_matching_stream_lines<W: Write>(
                 let line = &block[line_start..line_end];
                 if pending_line_has_match {
                     matched_any = true;
-                    write_matching_line(
-                        out,
-                        label,
-                        line,
-                        line_no,
-                        multi_file,
-                        print_line_numbers,
-                    )?;
+                    write_matching_line(out, label, line, line_no, multi_file, print_line_numbers)?;
                 }
             } else {
                 pending_line.extend_from_slice(&block[line_start..line_end]);
@@ -281,7 +274,11 @@ mod kani_proofs {
         let line_no: u64 = kani::any();
         assert_eq!(
             fgrep_line_number_prefix(print_line_numbers, line_no),
-            if print_line_numbers { Some(line_no) } else { None }
+            if print_line_numbers {
+                Some(line_no)
+            } else {
+                None
+            }
         );
     }
 }

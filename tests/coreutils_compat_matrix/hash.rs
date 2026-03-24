@@ -325,14 +325,18 @@ fn digest_family_check_missing_file_modes_match_system_output() {
         let ok_manifest = run_system(system_name, &[path_ok.to_str().unwrap()]);
         assert!(ok_manifest.status.success());
         let ok_line = String::from_utf8(ok_manifest.stdout.clone()).unwrap();
-        let missing_line = ok_line.replace(path_ok.to_str().unwrap(), path_missing.to_str().unwrap());
+        let missing_line =
+            ok_line.replace(path_ok.to_str().unwrap(), path_missing.to_str().unwrap());
         let bad_line = ok_line.replace(path_ok.to_str().unwrap(), path_bad.to_str().unwrap());
         fs::write(&manifest_mixed, format!("{missing_line}{ok_line}")).unwrap();
         fs::write(&manifest_only_missing, &missing_line).unwrap();
         fs::write(&manifest_mixed_bad, format!("{missing_line}{bad_line}")).unwrap();
 
         for (extra_flags, manifests) in [
-            (vec!["-c"], vec![manifest_mixed.as_path(), manifest_only_missing.as_path()]),
+            (
+                vec!["-c"],
+                vec![manifest_mixed.as_path(), manifest_only_missing.as_path()],
+            ),
             (
                 vec!["--status", "-c"],
                 vec![manifest_mixed.as_path(), manifest_only_missing.as_path()],

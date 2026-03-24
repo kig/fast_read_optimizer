@@ -86,7 +86,12 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
         }
         let block = &buffer[..read];
         let counts = count_wc_block(block, options);
-        merge_wc_counts(&mut totals, &mut previous_ended_in_word, counts, options.words);
+        merge_wc_counts(
+            &mut totals,
+            &mut previous_ended_in_word,
+            counts,
+            options.words,
+        );
     }
 }
 
@@ -97,7 +102,10 @@ fn wc_totals_from_reader_parallel<R: Read>(
     wc_totals_from_reader(reader, options)
 }
 
-fn wc_metadata_totals(input: &StreamInput, options: WcCountOptions) -> io::Result<Option<WcTotals>> {
+fn wc_metadata_totals(
+    input: &StreamInput,
+    options: WcCountOptions,
+) -> io::Result<Option<WcTotals>> {
     if !options.bytes || options.lines || options.words {
         return Ok(None);
     }
@@ -224,7 +232,10 @@ unsafe fn count_wc_block_avx2(block: &[u8], options: WcCountOptions) -> WcBlockC
         let chunk = _mm256_loadu_si256(ptr);
         let whitespace = _mm256_or_si256(
             _mm256_or_si256(
-                _mm256_or_si256(_mm256_cmpeq_epi8(chunk, space), _mm256_cmpeq_epi8(chunk, tab)),
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi8(chunk, space),
+                    _mm256_cmpeq_epi8(chunk, tab),
+                ),
                 _mm256_or_si256(
                     _mm256_cmpeq_epi8(chunk, newline),
                     _mm256_cmpeq_epi8(chunk, vtab),
@@ -273,13 +284,18 @@ fn reduce_wc_counts(blocks: &[WcBlockCounts]) -> WcTotals {
     };
     let mut previous_ended_in_word = false;
     for block in blocks {
-        merge_wc_counts(&mut totals, &mut previous_ended_in_word, WcBlockCounts {
-            lines: block.lines,
-            words: block.words,
-            bytes: block.bytes,
-            starts_in_word: block.starts_in_word,
-            ends_in_word: block.ends_in_word,
-        }, true);
+        merge_wc_counts(
+            &mut totals,
+            &mut previous_ended_in_word,
+            WcBlockCounts {
+                lines: block.lines,
+                words: block.words,
+                bytes: block.bytes,
+                starts_in_word: block.starts_in_word,
+                ends_in_word: block.ends_in_word,
+            },
+            true,
+        );
     }
     totals
 }
@@ -427,8 +443,8 @@ mod tests {
             words: true,
             bytes: true,
         };
-        let sequential = wc_totals_from_reader(&mut std::io::Cursor::new(bytes.as_slice()), options)
-            .unwrap();
+        let sequential =
+            wc_totals_from_reader(&mut std::io::Cursor::new(bytes.as_slice()), options).unwrap();
         let parallel =
             wc_totals_from_reader_parallel(&mut std::io::Cursor::new(bytes.as_slice()), options)
                 .unwrap();
