@@ -3,6 +3,7 @@ src/
     fro-benchmark.rs
     fro-optimize.rs
   coreutils/
+    base64.rs
     cat.rs
     cmp.rs
     du.rs

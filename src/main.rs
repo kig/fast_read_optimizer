@@ -1640,6 +1640,20 @@ fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &["Useful as a compatibility wrapper over the same IO-mode flags as fro reads."],
             examples: &[("Print two files", "cat a.txt b.txt")],
         }),
+        "base64" => Some(CommandHelp {
+            name: "base64",
+            usage: "base64 [-d|--decode] [-i|--ignore-garbage] [-w cols|--wrap=cols] [--auto|--no-direct|--direct] [file]",
+            summary: "Encode or decode one file or stdin using RFC 4648 base64.",
+            notes: &[
+                "Without a file operand, or when the file is -, base64 reads standard input.",
+                "Encoding wraps at 76 columns by default; use -w 0 to disable wrapping.",
+                "--ignore-garbage only affects decode mode.",
+            ],
+            examples: &[
+                ("Encode stdin without wrapping", "base64 -w 0 < input.bin"),
+                ("Decode one file", "base64 -d payload.b64"),
+            ],
+        }),
         "cmp" => Some(CommandHelp {
             name: "cmp",
             usage: "cmp [--auto|--no-direct|--direct] <file1> <file2>",
@@ -1959,6 +1973,19 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "bench-memcpy --size 4GiB --threads 32",
             )],
         }),
+        "bench-base64-encode" => Some(CommandHelp {
+            name: "bench-base64-encode",
+            usage: "bench-base64-encode [-n iterations]",
+            summary: "Hot-loop the in-memory 12 KiB -> 16 KiB base64 encode kernel on one core.",
+            notes: &[
+                "Uses a fixed 12 KiB source buffer and fixed 16 KiB destination buffer.",
+                "Reports iterations per second and effective input GB/s per core.",
+            ],
+            examples: &[(
+                "Run one million kernel iterations",
+                "bench-base64-encode -n 1000000",
+            )],
+        }),
         "bench-mmap-write" => Some(CommandHelp {
             name: "bench-mmap-write",
             usage: "bench-mmap-write <filename>",
@@ -2018,6 +2045,7 @@ fn print_general_help(program: &str) {
     println!("Utilities:");
     for (name, summary) in [
         ("cat", "print files using the fro read path"),
+        ("base64", "encode or decode base64 data"),
         ("cmp", "compare two files using the fro diff engine"),
         ("dd", "copy byte ranges with dd-style operands"),
         ("fgrep", "literal line-oriented grep compatibility wrapper"),
@@ -2066,6 +2094,7 @@ fn print_general_help(program: &str) {
     println!("  fro-benchmark      run the regression benchmark suite");
     println!("  bench-diff         in-memory diff microbenchmark");
     println!("  bench-memcpy       in-memory memcpy microbenchmark");
+    println!("  bench-base64-encode base64 encode kernel microbenchmark");
     println!("  bench-mmap-write   mmap write microbenchmark");
     println!("  bench-write        plain write microbenchmark");
     println!();
@@ -2079,7 +2108,7 @@ fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp dd fgrep find du cat tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp dd fgrep find du cat base64 tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();
@@ -2156,7 +2185,13 @@ fn try_main() -> io::Result<i32> {
     let mut recover_fast_requested = false;
     let mut recover_in_place_all_requested = false;
     let mut create_size: Option<u64> = None;
-    let mut iterations = if mode == "read" { 1000 } else { 1 };
+    let mut iterations = if mode == "read" {
+        1000
+    } else if mode == "bench-base64-encode" {
+        1_000_000
+    } else {
+        1
+    };
     let mut save_config = false;
     let mut config_path: Option<&str> = None;
     let mut bench_size: Option<u64> = None;
@@ -2383,6 +2418,10 @@ fn try_main() -> io::Result<i32> {
             )
         })?;
         bench_memcpy_memory(num_threads, total_size);
+        return Ok(0);
+    }
+    if mode == "bench-base64-encode" {
+        coreutils::bench_base64_encode(iterations as u64)?;
         return Ok(0);
     }
     if mode == "bench-mmap-write" {

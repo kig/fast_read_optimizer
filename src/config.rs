@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub grep: ModeConfig,
     pub diff: ModeConfig,
     pub dual_read_bench: ModeConfig,
+    #[serde(default = "default_compute_mode_config")]
+    pub compute: ModeConfig,
     #[serde(default = "default_hash_mode_config")]
     pub hash: ModeConfig,
     #[serde(default = "default_verify_mode_config")]
@@ -72,6 +74,7 @@ pub struct AppConfigPatch {
     pub grep: Option<ModeConfigPatch>,
     pub diff: Option<ModeConfigPatch>,
     pub dual_read_bench: Option<ModeConfigPatch>,
+    pub compute: Option<ModeConfigPatch>,
     pub hash: Option<ModeConfigPatch>,
     pub verify: Option<ModeConfigPatch>,
 }
@@ -305,6 +308,7 @@ impl AppConfigPatch {
             "grep" => self.grep.as_ref(),
             "diff" => self.diff.as_ref(),
             "dual-read-bench" | "dual_read_bench" => self.dual_read_bench.as_ref(),
+            "compute" => self.compute.as_ref(),
             "hash" => self.hash.as_ref(),
             "verify" => self.verify.as_ref(),
             _ => None,
@@ -320,6 +324,7 @@ impl AppConfigPatch {
             "grep" => &mut self.grep,
             "diff" => &mut self.diff,
             "dual-read-bench" | "dual_read_bench" => &mut self.dual_read_bench,
+            "compute" => &mut self.compute,
             "hash" => &mut self.hash,
             "verify" => &mut self.verify,
             _ => return,
@@ -541,6 +546,18 @@ impl Default for AppConfig {
             direct: default_hash_direct.clone(),
             page_cache: default_hash.clone(),
         };
+        let default_compute_mode = ModeConfig {
+            direct: IOParams {
+                num_threads: 32,
+                block_size: crate::block_hash::BLOCK_HASH_SIZE,
+                qd: default_direct.qd,
+            },
+            page_cache: IOParams {
+                num_threads: 32,
+                block_size: crate::block_hash::BLOCK_HASH_SIZE,
+                qd: default_cache.qd,
+            },
+        };
 
         let default_write_mode = ModeConfig {
             direct: default_write_direct.clone(),
@@ -567,6 +584,7 @@ impl Default for AppConfig {
                 direct: default_direct.clone(),
                 page_cache: diff_cache.clone(),
             },
+            compute: default_compute_mode,
             hash: default_hash_mode.clone(),
             verify: default_hash_mode,
         }
@@ -589,6 +607,7 @@ impl AppConfig {
             "grep" => &self.grep,
             "diff" => &self.diff,
             "dual-read-bench" => &self.dual_read_bench,
+            "compute" => &self.compute,
             "hash" => &self.hash,
             "verify" => &self.verify,
             "copy_range" => {
@@ -619,6 +638,7 @@ impl AppConfig {
             "grep" => &mut self.grep,
             "diff" => &mut self.diff,
             "dual-read-bench" => &mut self.dual_read_bench,
+            "compute" => &mut self.compute,
             "hash" => &mut self.hash,
             "verify" => &mut self.verify,
             "copy_range" => {
@@ -638,6 +658,10 @@ impl AppConfig {
 
 fn default_hash_mode_config() -> ModeConfig {
     AppConfig::default().hash
+}
+
+fn default_compute_mode_config() -> ModeConfig {
+    AppConfig::default().compute
 }
 
 fn default_read_to_memory_mode_config() -> ModeConfig {
@@ -874,10 +898,13 @@ mod tests {
         let loaded = load_config(Some(cfg_path.to_str().unwrap()));
         let hash = loaded.get_params("hash", false);
         let verify = loaded.get_params("verify", false);
+        let compute = loaded.get_params("compute", false);
         let copy_range = loaded.get_copy_range_params();
         assert_eq!(hash.block_size, crate::block_hash::BLOCK_HASH_SIZE);
         assert_eq!(verify.block_size, crate::block_hash::BLOCK_HASH_SIZE);
+        assert_eq!(compute.block_size, crate::block_hash::BLOCK_HASH_SIZE);
         assert_eq!(hash.num_threads, 31);
+        assert_eq!(compute.num_threads, 32);
         assert_eq!(verify.qd, 1);
         assert_eq!(copy_range.block_size, 512 * 1024);
         assert_eq!(loaded.get_copy_auto_mode(), CopyAutoMode::Heuristic);

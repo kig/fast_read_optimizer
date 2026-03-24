@@ -238,6 +238,8 @@ fn wc_flag_sets() -> Vec<Vec<&'static str>> {
     ]
 }
 
+#[path = "coreutils_compat_matrix/base64.rs"]
+mod base64;
 #[path = "coreutils_compat_matrix/cat_tac.rs"]
 mod cat_tac;
 #[path = "coreutils_compat_matrix/cmp_fgrep.rs"]

@@ -1,8 +1,8 @@
 use crate::config::load_config;
 use crate::differ::diff_files_window;
 use crate::reader::{
-    grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode, BufReader,
-    LoadedFile,
+    grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode,
+    visit_file_blocks, BufReader, LoadedFile,
 };
 use crate::writer::{write_generated_file, BufWriter, GeneratedWritePattern};
 use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};
@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
+mod base64;
 mod cat;
 mod cmp;
 mod du;
@@ -34,6 +35,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
     matches!(
         name,
         "cat"
+            | "base64"
             | "cmp"
             | "dd"
             | "fgrep"
@@ -101,12 +103,17 @@ pub fn try_run_subcommand(
     run_named_command(command, &args)
 }
 
+pub(crate) fn bench_base64_encode(iterations: u64) -> io::Result<()> {
+    base64::bench_base64_encode(iterations)
+}
+
 fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
     let code = match invoked {
         "cat" => {
             cat::run_cat(args)?;
             0
         }
+        "base64" => base64::run_base64(args)?,
         "cmp" => cmp::run_cmp(args)?,
         "dd" => {
             fro::dd_tool::run_dd(args)?;

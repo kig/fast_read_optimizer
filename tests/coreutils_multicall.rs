@@ -149,6 +149,12 @@ fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
         format!("2 3 14 {}", path.to_str().unwrap())
     );
 
+    let base64_out = assert_success(run_fro("base64", &["-w", "0", path.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&base64_out.stdout).trim(),
+        "b25lIHR3bwp0aHJlZQo="
+    );
+
     let du_out = assert_success(run_fro("du", &[path.to_str().unwrap()]));
     assert!(String::from_utf8_lossy(&du_out.stdout).contains(path.to_str().unwrap()));
 }

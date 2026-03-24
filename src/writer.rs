@@ -319,8 +319,15 @@ impl BufWriter {
         if buf.is_empty() {
             return Ok(());
         }
+        self.write_vec(buf.to_vec())
+    }
+
+    pub fn write_vec(&self, buf: Vec<u8>) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.tx
-            .send(BufWriteRequest::Data(buf.to_vec()))
+            .send(BufWriteRequest::Data(buf))
             .map_err(|err| io::Error::other(err.to_string()))
     }
 
@@ -358,9 +365,7 @@ impl Write for BufWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.tx
-            .send(BufWriteRequest::Data(buf.to_vec()))
-            .map_err(|err| io::Error::other(err.to_string()))?;
+        self.write_vec(buf.to_vec())?;
         Ok(buf.len())
     }
 

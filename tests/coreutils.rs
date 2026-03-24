@@ -110,6 +110,8 @@ fn io_flag_sets() -> Vec<Vec<&'static str>> {
     vec![vec![], vec!["--no-direct"], vec!["--direct"]]
 }
 
+#[path = "coreutils/base64.rs"]
+mod base64;
 #[path = "coreutils/cat.rs"]
 mod cat;
 #[path = "coreutils/fgrep.rs"]
