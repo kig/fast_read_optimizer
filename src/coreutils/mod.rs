@@ -32,6 +32,7 @@ mod tac;
 mod wc;
 
 pub(crate) use base64::{parse_base64_encode_kernel, Base64EncodeKernel};
+const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn is_coreutils_command(name: &str) -> bool {
     matches!(
@@ -110,6 +111,13 @@ pub(crate) fn bench_base64_encode(iterations: u64, kernel: Base64EncodeKernel) -
 }
 
 fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
+    if !is_coreutils_command(invoked) {
+        return Ok(None);
+    }
+    if args.get(1).map(String::as_str) == Some("--version") {
+        print_coreutils_version(invoked);
+        return Ok(Some(0));
+    }
     let code = match invoked {
         "cat" => {
             cat::run_cat(args)?;
@@ -150,6 +158,10 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         _ => return Ok(None),
     };
     Ok(Some(code))
+}
+
+fn print_coreutils_version(invoked: &str) {
+    println!("{invoked} (fro coreutils) {FRO_VERSION}");
 }
 fn permission_denied_components(kind: io::ErrorKind, raw_os_error: Option<i32>) -> bool {
     matches!(kind, io::ErrorKind::PermissionDenied)

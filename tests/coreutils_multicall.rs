@@ -281,6 +281,28 @@ fn multicall_hash_sums_print_expected_digests() {
 }
 
 #[test]
+fn multicall_and_subcommand_version_flags_print_version() {
+    let pkg_version = env!("CARGO_PKG_VERSION");
+
+    let subcommand = assert_success(run_fro("cat", &["--version"]));
+    let subcommand_stdout = String::from_utf8_lossy(&subcommand.stdout);
+    assert!(subcommand_stdout.contains(pkg_version));
+    assert!(subcommand_stdout.contains("cat"));
+
+    let alias_dir = unique_temp_dir("fro-coreutils-version");
+    let alias_path = alias_dir.join("cat");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fro"), &alias_path).unwrap();
+    let alias = Command::new(&alias_path)
+        .arg("--version")
+        .output()
+        .expect("failed to run multicall alias --version");
+    let alias = assert_success(alias);
+    let alias_stdout = String::from_utf8_lossy(&alias.stdout);
+    assert!(alias_stdout.contains(pkg_version));
+    assert!(alias_stdout.contains("cat"));
+}
+
+#[test]
 fn multicall_shred_can_zero_and_remove_file() {
     let tmp = unique_temp_dir("fro-coreutils-shred");
     let keep = tmp.join("keep.bin");

@@ -43,6 +43,8 @@ use writer::{
     overwrite_changed_chunks_direct, write_buffer, write_file,
 };
 
+const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -1576,6 +1578,14 @@ fn is_help_flag(arg: &str) -> bool {
     arg == "--help" || arg == "-h"
 }
 
+fn is_version_flag(arg: &str) -> bool {
+    arg == "--version"
+}
+
+fn print_version(program: &str) {
+    println!("{program} {FRO_VERSION}");
+}
+
 fn command_help(name: &str) -> Option<CommandHelp> {
     match name {
         "read" => Some(CommandHelp {
@@ -2126,6 +2136,10 @@ fn try_main() -> io::Result<i32> {
     let raw_args: Vec<String> = env::args().collect();
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
         return Ok(code);
+    }
+    if raw_args.get(1).is_some_and(|arg| is_version_flag(arg.as_str())) {
+        print_version(raw_args[0].as_str());
+        return Ok(0);
     }
     let args = coreutils::rewrite_subcommand_alias(coreutils::rewrite_alias_args(raw_args));
     if args.len() < 2 || is_help_flag(args[1].as_str()) {

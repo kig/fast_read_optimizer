@@ -110,3 +110,23 @@ fn smoke_base64_encode_bench_runs() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Base64 encode kernel"));
 }
+
+#[test]
+fn smoke_fro_version_runs() {
+    let fro = env!("CARGO_BIN_EXE_fro");
+
+    let out = Command::new(fro)
+        .arg("--version")
+        .output()
+        .expect("failed to run fro --version");
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}\n",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+}
