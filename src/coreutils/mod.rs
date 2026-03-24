@@ -12,7 +12,7 @@ use memchr::{memchr_iter, memmem::Finder};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -332,6 +332,16 @@ fn fd_is_fifo(fd: libc::c_int) -> io::Result<bool> {
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFIFO)
 }
 
+fn fd_is_regular(fd: libc::c_int) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
 fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
     if !fd_is_fifo(fd)? {
         return Ok(());
@@ -446,6 +456,43 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
     }
 }
 
+fn copy_stdin_to_stdout_sendfile() -> io::Result<bool> {
+    if !fd_is_regular(libc::STDIN_FILENO)? {
+        return Ok(false);
+    }
+    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+    let max_chunk = 0x7fff_f000usize;
+    loop {
+        let copied = unsafe {
+            libc::sendfile(
+                libc::STDOUT_FILENO,
+                libc::STDIN_FILENO,
+                std::ptr::null_mut(),
+                max_chunk,
+            )
+        };
+        if copied > 0 {
+            continue;
+        }
+        if copied == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(false),
+            _ => return Err(err),
+        }
+    }
+}
+
+fn copy_stdin_to_stdout_fast() -> io::Result<bool> {
+    if copy_stdin_to_stdout_sendfile()? {
+        return Ok(true);
+    }
+    copy_stdin_to_stdout_splice()
+}
+
 fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
     if io_mode == IOMode::Direct {
         return Ok(false);
@@ -454,7 +501,7 @@ fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
         StreamInput::File(path) if is_regular_input_path(path)? => {
             copy_regular_file_to_stdout_sendfile(path)
         }
-        StreamInput::Stdin { .. } => copy_stdin_to_stdout_splice(),
+        StreamInput::Stdin { .. } => copy_stdin_to_stdout_fast(),
         StreamInput::File(path) => {
             let file_type = fs::metadata(path)?.file_type();
             if file_type.is_fifo() {

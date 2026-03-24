@@ -11,37 +11,123 @@ pub(super) fn fgrep_line_number_prefix(print_line_numbers: bool, line_no: u64) -
     print_line_numbers.then_some(line_no)
 }
 
-fn write_matching_stream_lines<R: BufRead, W: Write>(
+fn write_matching_line<W: Write>(
     out: &mut W,
     label: Option<&str>,
-    reader: &mut R,
+    line: &[u8],
+    line_no: u64,
+    multi_file: bool,
+    print_line_numbers: bool,
+) -> io::Result<()> {
+    if multi_file {
+        if let Some(label) = label {
+            write!(out, "{label}:")?;
+        }
+    }
+    if let Some(number) = fgrep_line_number_prefix(print_line_numbers, line_no) {
+        write!(out, "{number}:")?;
+    }
+    out.write_all(line)
+}
+
+fn write_matching_stream_lines<W: Write>(
+    out: &mut W,
+    label: Option<&str>,
+    input: &StreamInput,
+    io_mode: IOMode,
     pattern: &[u8],
     multi_file: bool,
     print_line_numbers: bool,
 ) -> io::Result<bool> {
     let finder = Finder::new(pattern);
     let mut matched_any = false;
-    let mut line = Vec::new();
+    let mut pending_line = Vec::new();
+    let mut pending_line_has_match = pattern.is_empty();
+    let mut boundary_tail = Vec::new();
     let mut line_no = 1_u64;
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(matched_any);
+    visit_ordered_input(input, io_mode, |block| {
+        let block_matches = finder.find_iter(block).collect::<Vec<_>>();
+        let mut next_match = 0usize;
+        if !pattern.is_empty() && !boundary_tail.is_empty() {
+            let prefix_len = block.len().min(pattern.len().saturating_sub(1));
+            if prefix_len > 0 {
+                let mut boundary = Vec::with_capacity(boundary_tail.len() + prefix_len);
+                boundary.extend_from_slice(&boundary_tail);
+                boundary.extend_from_slice(&block[..prefix_len]);
+                pending_line_has_match |= finder.find_iter(&boundary).any(|offset| {
+                    offset < boundary_tail.len() && offset + pattern.len() > boundary_tail.len()
+                });
+            }
         }
-        if finder.find(&line).is_some() {
-            matched_any = true;
-            if multi_file {
-                if let Some(label) = label {
-                    write!(out, "{label}:")?;
+        let mut line_start = 0usize;
+        for rel_end in memchr_iter(b'\n', block) {
+            let line_end = rel_end + 1;
+            while next_match < block_matches.len() && block_matches[next_match] < line_end {
+                if block_matches[next_match] >= line_start {
+                    pending_line_has_match = true;
                 }
+                next_match += 1;
             }
-            if let Some(number) = fgrep_line_number_prefix(print_line_numbers, line_no) {
-                write!(out, "{number}:")?;
+            if pending_line.is_empty() {
+                let line = &block[line_start..line_end];
+                if pending_line_has_match {
+                    matched_any = true;
+                    write_matching_line(
+                        out,
+                        label,
+                        line,
+                        line_no,
+                        multi_file,
+                        print_line_numbers,
+                    )?;
+                }
+            } else {
+                pending_line.extend_from_slice(&block[line_start..line_end]);
+                if pending_line_has_match {
+                    matched_any = true;
+                    write_matching_line(
+                        out,
+                        label,
+                        &pending_line,
+                        line_no,
+                        multi_file,
+                        print_line_numbers,
+                    )?;
+                }
+                pending_line.clear();
             }
-            out.write_all(&line)?;
+            pending_line_has_match = pattern.is_empty();
+            line_no += 1;
+            line_start = line_end;
         }
-        line_no += 1;
+        if line_start < block.len() {
+            pending_line.extend_from_slice(&block[line_start..]);
+            while next_match < block_matches.len() {
+                pending_line_has_match = true;
+                next_match += 1;
+            }
+        }
+        if pattern.is_empty() {
+            boundary_tail.clear();
+        } else {
+            let tail_len = pattern.len().saturating_sub(1).min(block.len());
+            boundary_tail.clear();
+            boundary_tail.extend_from_slice(&block[block.len() - tail_len..]);
+        }
+        Ok::<_, io::Error>(())
+    })?;
+    if !pending_line.is_empty() && pending_line_has_match {
+        matched_any = true;
+        write_matching_line(
+            out,
+            label,
+            &pending_line,
+            line_no,
+            multi_file,
+            print_line_numbers,
+        )?;
     }
+    Ok(matched_any)
 }
 
 fn write_matching_lines<W: Write>(
@@ -124,12 +210,12 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let multi_file = inputs.len() > 1;
     let config = load_config(None);
     for input in inputs {
-        match input {
-            StreamInput::File(file) if is_regular_input_path(&file)? => {
+        match &input {
+            StreamInput::File(file) if is_regular_input_path(file)? => {
                 let (matches, _) = grep_match_offsets_for_mode(
                     &config,
                     "grep",
-                    &file,
+                    file,
                     internal_io_mode(io_mode),
                     pattern.as_bytes(),
                 )?;
@@ -137,10 +223,10 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                     continue;
                 }
                 matched_any = true;
-                let data = load_file_bytes(&file, io_mode, "read_to_memory")?;
+                let data = load_file_bytes(file, io_mode, "read_to_memory")?;
                 write_matching_lines(
                     &mut out,
-                    &file,
+                    file,
                     data.data.as_slice(),
                     &matches,
                     multi_file,
@@ -148,22 +234,22 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 )?;
             }
             StreamInput::File(file) => {
-                let mut reader = BufReader::new(std::fs::File::open(&file)?);
                 matched_any |= write_matching_stream_lines(
                     &mut out,
-                    Some(&file),
-                    &mut reader,
+                    Some(file),
+                    &input,
+                    io_mode,
                     pattern.as_bytes(),
                     multi_file,
                     print_line_numbers,
                 )?;
             }
             StreamInput::Stdin { label } => {
-                let mut reader = stdin_buf_reader()?;
                 matched_any |= write_matching_stream_lines(
                     &mut out,
                     label.as_deref(),
-                    &mut reader,
+                    &input,
+                    io_mode,
                     pattern.as_bytes(),
                     multi_file,
                     print_line_numbers,

@@ -81,3 +81,22 @@ fn wc_matches_system_on_binary_whitespace_boundaries() {
         );
     }
 }
+
+#[test]
+fn wc_byte_count_matches_system_on_sparse_regular_file() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-sparse");
+    let path = tmp.join("sparse.bin");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len((32_u64 << 20) + 17).unwrap();
+
+    for flags in io_flag_sets() {
+        let mut args = flags.clone();
+        args.push("-c");
+        args.push(path.to_str().unwrap());
+        assert_same_wc(
+            run_fro("wc", &args),
+            run_system("wc", &["-c", path.to_str().unwrap()]),
+            &format!("wc sparse {:?}", args),
+        );
+    }
+}

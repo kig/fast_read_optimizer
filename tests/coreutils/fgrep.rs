@@ -99,3 +99,22 @@ fn fgrep_line_number_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn fgrep_stdin_matches_pattern_crossing_block_boundary() {
+    let prefix = vec![b'a'; (1 << 20) - 3];
+    let mut input = prefix;
+    input.extend_from_slice(b"foo");
+    input.extend_from_slice(b"bar\n");
+
+    assert_same_result(
+        run_fro_with_stdin("fgrep", &["foobar"], &input),
+        run_system_with_stdin("fgrep", &["foobar"], &input),
+        "fgrep stdin boundary match",
+    );
+    assert_same_result(
+        run_fro_with_stdin("fgrep", &["-n", "foobar"], &input),
+        run_system_with_stdin("fgrep", &["-n", "foobar"], &input),
+        "fgrep stdin boundary match -n",
+    );
+}
