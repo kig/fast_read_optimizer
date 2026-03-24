@@ -15,6 +15,7 @@
   - `du` now uses split scheduling: coarse `find`-style traversal plus a wider metadata-stat worker pool, measuring about `0.09-0.10 s` on the same tree
   - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, and read-to-memory flows are all wired into the main tool surface
   - `io_uring` `GETDENTS` remains blocked in this environment because the shipped kernel headers and current Rust crate surfaces do not expose `IORING_OP_GETDENTS`
+- The public API now exposes a first application-level benchmark hook for the "cold direct read to program memory while warming the page cache in the background" workflow via `benchmark_page_cache_lift()`, with ordered checkpoint reporting and a bounded Kani proof for the checkpoint helper.
 
 ## Current active items
 

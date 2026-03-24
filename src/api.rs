@@ -8,8 +8,13 @@ use crate::writer::{
     SequentialWriter,
 };
 use crate::IOMode;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn path_str(path: &Path) -> io::Result<&str> {
     path.to_str().ok_or_else(|| {
@@ -20,8 +25,77 @@ fn path_str(path: &Path) -> io::Result<&str> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCacheLiftBenchmarkReport {
+    pub bytes_read: u64,
+    pub checkpoint_1: Duration,
+    pub checkpoint_2: Duration,
+}
+
+fn page_cache_lift_checkpoint_nanos(foreground_nanos: u64, background_nanos: u64) -> u64 {
+    foreground_nanos.max(background_nanos)
+}
+
+fn duration_to_u64_nanos(duration: Duration) -> io::Result<u64> {
+    u64::try_from(duration.as_nanos())
+        .map_err(|_| io::Error::other("benchmark duration overflowed u64 nanoseconds"))
+}
+
+fn evict_file_cache(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = File::open(path)?;
+    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+fn warm_file_page_cache(path: &Path) -> io::Result<u64> {
+    let file = File::open(path)?;
+    let mut reader = io::BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("page-cache warm byte count overflowed"))?;
+    }
+}
+
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<ParallelFile> {
     open_with_mode(path, IOMode::Auto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_cache_lift_checkpoint_nanos;
+
+    #[test]
+    fn page_cache_lift_checkpoint_never_precedes_foreground_completion() {
+        assert_eq!(page_cache_lift_checkpoint_nanos(9, 3), 9);
+        assert_eq!(page_cache_lift_checkpoint_nanos(9, 14), 14);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::page_cache_lift_checkpoint_nanos;
+
+    #[kani::proof]
+    fn checkpoint_2_is_monotonic_over_foreground_completion() {
+        let foreground_nanos: u64 = kani::any();
+        let background_nanos: u64 = kani::any();
+        let checkpoint_2 = page_cache_lift_checkpoint_nanos(foreground_nanos, background_nanos);
+        assert!(checkpoint_2 >= foreground_nanos);
+        assert!(checkpoint_2 >= background_nanos || checkpoint_2 == foreground_nanos);
+    }
 }
 
 pub fn open_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<ParallelFile> {
@@ -115,6 +189,55 @@ pub fn read_file_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Resu
             .as_slice()
             .to_vec(),
     )
+}
+
+/// Benchmark a cold-start direct-to-memory load while warming the page cache in
+/// parallel for the same file.
+///
+/// The call makes a best-effort cache eviction first, then starts:
+/// - a foreground `read_to_memory` load forced to `IOMode::Direct`
+/// - a background page-cache warm pass through the same file
+///
+/// `checkpoint_1` is when the application-owned direct load completes.
+/// `checkpoint_2` is when the background page-cache warm is also complete.
+pub fn benchmark_page_cache_lift<P: AsRef<Path>>(
+    path: P,
+) -> io::Result<PageCacheLiftBenchmarkReport> {
+    let path = path.as_ref();
+    evict_file_cache(path)?;
+
+    let start_barrier = Arc::new(Barrier::new(2));
+    let background_barrier = Arc::clone(&start_barrier);
+    let background_path = path.to_path_buf();
+    let start = Instant::now();
+    let background = thread::spawn(move || -> io::Result<(u64, u64)> {
+        background_barrier.wait();
+        let warmed = warm_file_page_cache(&background_path)?;
+        Ok((warmed, duration_to_u64_nanos(start.elapsed())?))
+    });
+
+    let config = load_config(None);
+    let path_string = path_str(path)?.to_owned();
+    start_barrier.wait();
+    let loaded = load_file_to_memory_for_mode(&config, "read_to_memory", &path_string, IOMode::Direct)?;
+    let checkpoint_1_nanos = duration_to_u64_nanos(start.elapsed())?;
+    let (background_warmed, background_nanos) = background
+        .join()
+        .map_err(|_| io::Error::other("background page-cache warm thread panicked"))??;
+
+    if background_warmed != loaded.bytes_read {
+        return Err(io::Error::other(format!(
+            "background page-cache warm read {} bytes but foreground loaded {}",
+            background_warmed, loaded.bytes_read
+        )));
+    }
+
+    let checkpoint_2_nanos = page_cache_lift_checkpoint_nanos(checkpoint_1_nanos, background_nanos);
+    Ok(PageCacheLiftBenchmarkReport {
+        bytes_read: loaded.bytes_read,
+        checkpoint_1: Duration::from_nanos(checkpoint_1_nanos),
+        checkpoint_2: Duration::from_nanos(checkpoint_2_nanos),
+    })
 }
 
 pub fn visit_blocks<P, F>(path: P, visit: F) -> io::Result<ParallelReadReport>

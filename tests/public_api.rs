@@ -139,3 +139,18 @@ fn direct_mode_keeps_high_level_block_iteration_stable() {
         *direct_chunks.lock().unwrap()
     );
 }
+
+#[test]
+fn page_cache_lift_benchmark_reports_ordered_checkpoints() {
+    let tmp = unique_temp_dir("fro-public-api-page-cache-lift");
+    fs::create_dir_all(&tmp).unwrap();
+    let path = tmp.join("source.bin");
+    let bytes = (0..(4 * 1024 * 1024 + 137))
+        .map(|i| ((i * 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &bytes).unwrap();
+
+    let report = fro::benchmark_page_cache_lift(&path).unwrap();
+    assert_eq!(report.bytes_read, bytes.len() as u64);
+    assert!(report.checkpoint_2 >= report.checkpoint_1);
+}
