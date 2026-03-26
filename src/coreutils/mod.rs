@@ -1,8 +1,8 @@
 use crate::config::load_config;
 use crate::differ::diff_files_window;
 use crate::reader::{
-    grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode,
-    visit_file_blocks, BufReader, LoadedFile,
+    grep_match_offsets_for_mode, load_file_to_memory_for_mode, map_file_blocks_for_mode, BufReader,
+    LoadedFile,
 };
 use crate::writer::{write_generated_file, BufWriter, GeneratedWritePattern};
 use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};

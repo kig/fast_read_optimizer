@@ -2137,7 +2137,10 @@ fn try_main() -> io::Result<i32> {
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
         return Ok(code);
     }
-    if raw_args.get(1).is_some_and(|arg| is_version_flag(arg.as_str())) {
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| is_version_flag(arg.as_str()))
+    {
         print_version(raw_args[0].as_str());
         return Ok(0);
     }

@@ -310,10 +310,12 @@ impl MappedReadBuffer {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
+    #[allow(unused)]
     pub fn mapped_len(&self) -> usize {
         self.map_len
     }
 
+    #[allow(unused)]
     pub fn unmap_prefix(&mut self, bytes: usize) -> std::io::Result<usize> {
         if bytes == 0 || self.map_len == 0 {
             return Ok(0);

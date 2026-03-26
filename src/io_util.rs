@@ -269,6 +269,24 @@ impl PendingReadSlots {
                 io::Error::other(format!("read slot {slot} completed with no pending block"))
             })
     }
+
+    /// Peek at the pending block id for slot without removing it. Useful when the
+    /// read completion needs to be observed but the slot should remain reserved
+    /// until a later write completion frees it.
+    pub fn peek(&self, slot: usize) -> io::Result<u64> {
+        let entry = self.pending_block_ids.get(slot).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read slot {slot} is out of range"),
+            )
+        })?;
+        match entry {
+            Some(v) => Ok(*v),
+            None => Err(io::Error::other(format!(
+                "read slot {slot} has no pending block"
+            ))),
+        }
+    }
 }
 
 fn interpret_read_result(
