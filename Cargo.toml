@@ -24,3 +24,8 @@ proptest = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[profile.release-debug]
+inherits = "release"
+debug = true # Necessary for good symbols in perf
+lto = false  # Avoid LTO for more readable profiles
