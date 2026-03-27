@@ -264,9 +264,16 @@ impl PendingReadSlots {
                     format!("read slot {slot} is out of range"),
                 )
             })?
-            .take()
+.take()
             .ok_or_else(|| {
                 io::Error::other(format!("read slot {slot} completed with no pending block"))
+            })
+            .map(|v| {
+                // Note: decrement inflight counter for a completed write path. This
+                // provides a single central place to track when a pending read slot
+                // is freed (i.e., the associated write completed).
+                crate::instrumentation::note_inflight_dec();
+                v
             })
     }
 

@@ -5,6 +5,7 @@ mod common;
 mod config;
 mod coreutils;
 mod differ;
+mod instrumentation;
 mod io_util;
 mod mincore;
 mod optimizer;

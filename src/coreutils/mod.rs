@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
+use crate::instrumentation as instr;
+
 mod base64;
 mod cat;
 mod cmp;
@@ -423,6 +425,7 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
                 .prepare_sqe()
                 .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             unsafe {
+                instr::inc_splice();
                 sqe.prep_splice(
                     libc::STDIN_FILENO,
                     -1,
@@ -452,6 +455,7 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
         }
     }
     loop {
+        instr::inc_splice();
         let copied = unsafe {
             libc::splice(
                 libc::STDIN_FILENO,

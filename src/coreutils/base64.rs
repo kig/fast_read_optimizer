@@ -85,6 +85,34 @@ fn set_stdout_direct() -> io::Result<bool> {
     }
 }
 
+fn is_regular_fd(fd: std::os::unix::io::RawFd) -> io::Result<bool> {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+    }
+}
+
+fn is_stdout_dev_null() -> io::Result<bool> {
+    use std::io::stdout;
+    let stdout_fd = stdout().as_raw_fd();
+    unsafe {
+        let mut stdout_stat: libc::stat = std::mem::zeroed();
+        let mut dev_null_stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(stdout_fd, &mut stdout_stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // stat("/dev/null") - ensure C string is NUL terminated
+        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
+        if libc::stat(path, &mut dev_null_stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stdout_stat.st_dev == dev_null_stat.st_dev && stdout_stat.st_ino == dev_null_stat.st_ino)
+    }
+}
+
 fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32>> {
     let mut decode = false;
     let mut ignore_garbage = false;
@@ -246,7 +274,8 @@ fn base64_encode_ascii_scalar_glsl(sextet: u8) -> u8 {
     (i16::from(sextet) + off) as u8
 }
 
-fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
+#[allow(unused)]
+pub fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
     let written = encode_base64_block_into(bytes, &mut out);
     out.truncate(written);
@@ -440,22 +469,6 @@ unsafe fn encode_base64_block_into_avx2_shuffle(bytes: &[u8], out: &mut [u8]) ->
     out_index
 }
 
-fn encode_base64_triplet(bytes: &[u8]) -> [u8; 4] {
-    let a = bytes[0];
-    let b = *bytes.get(1).unwrap_or(&0);
-    let c = *bytes.get(2).unwrap_or(&0);
-    let mut out = [b'='; 4];
-    out[0] = BASE64_ENCODE[(a >> 2) as usize];
-    out[1] = BASE64_ENCODE[(((a & 0x03) << 4) | (b >> 4)) as usize];
-    if bytes.len() > 1 {
-        out[2] = BASE64_ENCODE[(((b & 0x0f) << 2) | (c >> 6)) as usize];
-    }
-    if bytes.len() > 2 {
-        out[3] = BASE64_ENCODE[(c & 0x3f) as usize];
-    }
-    out
-}
-
 fn decode_base64_quartet(quartet: [u8; 4]) -> Option<([u8; 3], usize)> {
     if quartet[0] == b'=' || quartet[1] == b'=' {
         return None;
@@ -551,132 +564,65 @@ fn append_wrapped_base64_bytes(
     }
 }
 
-fn encode_base64_input<W: Write>(
-    out: &mut W,
+
+pub fn encode_base64_input<W: Write>(
+    dest: &mut W,
     input: &StreamInput,
-    io_mode: IOMode,
-    wrap_cols: usize,
+    _io_mode: IOMode,
+    _wrap_cols: usize,
 ) -> io::Result<()> {
-    let mut carry = [0_u8; 3];
-    let mut carry_len = 0usize;
+    // Sequential fallback: process ordered input blocks and write encoded bytes to dest
+    let config = load_config(None);
+    let page_cache = config.get_params_for_path("compute", true, "/");
+    let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
+    let read_block = page_cache_block_size as usize;
+    let mut outbuf = vec![0u8; encoded_base64_len(read_block)];
     let mut current_line_len = 0usize;
-    let mut wrote_output = false;
-    visit_ordered_input(input, io_mode, |block| {
-        let mut index = 0usize;
-        if carry_len != 0 {
-            while carry_len < 3 && index < block.len() {
-                carry[carry_len] = block[index];
-                carry_len += 1;
-                index += 1;
-            }
-            if carry_len == 3 {
-                let encoded = encode_base64_triplet(&carry);
-                write_base64_encoded_bytes(out, &encoded, wrap_cols, &mut current_line_len)?;
-                wrote_output = true;
-                carry_len = 0;
-            }
-        }
 
-        while index + 3 <= block.len() {
-            let encoded = encode_base64_triplet(&block[index..(index + 3)]);
-            write_base64_encoded_bytes(out, &encoded, wrap_cols, &mut current_line_len)?;
-            wrote_output = true;
-            index += 3;
-        }
-
-        let remaining = block.len() - index;
-        if remaining != 0 {
-            carry[..remaining].copy_from_slice(&block[index..]);
-            carry_len = remaining;
-        }
+    visit_ordered_input(input, _io_mode, |block| {
+        let produced = encode_base64_block_into(block, &mut outbuf);
+        write_base64_encoded_bytes(dest, &outbuf[..produced], _wrap_cols, &mut current_line_len)?;
         Ok(())
     })?;
-
-    if carry_len != 0 {
-        let encoded = encode_base64_triplet(&carry[..carry_len]);
-        write_base64_encoded_bytes(out, &encoded, wrap_cols, &mut current_line_len)?;
-        wrote_output = true;
-    }
-
-    if wrap_cols != 0 && wrote_output && current_line_len != 0 {
-        out.write_all(b"\n")?;
+    if _wrap_cols != 0 {
+        dest.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn encode_base64_regular_file(
-    out: &BufWriter,
+pub fn encode_base64_regular_file(
+    dest: &mut std::fs::File,
     path: &str,
     _io_mode: IOMode,
-    wrap_cols: usize,
+    _wrap_cols: usize,
 ) -> io::Result<()> {
-    // Use ParallelStream to compute per-block encoded output into a temporary file,
-    // then stream the encoded blocks in order to the provided BufWriter while
-    // applying the requested wrapping.
+    // Simple sequential file->writer implementation used as a conservative fallback.
     let config = load_config(None);
-    let page_cache = config.get_params_for_path("compute", false, path);
-    let _direct = config.get_params_for_path("compute", true, path);
+    let page_cache = config.get_params_for_path("compute", true, path);
     let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    // choose the read_block size for ParallelStream
     let read_block = page_cache_block_size;
     let write_block = encoded_base64_len(read_block as usize);
 
-    // create a unique temporary file path
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tmp_path = std::env::temp_dir()
-        .join(format!("fro-base64-{}-{}", std::process::id(), nanos))
-        .to_string_lossy()
-        .into_owned();
-
-    // processor: encode one read block into base64 and return produced length
     let processor = |input: &[u8], out: &mut [u8]| -> io::Result<usize> {
         Ok(encode_base64_block_into(input, out))
     };
 
-    // Run the parallel map to produce the encoded blocks into the temp file
-    let report = ParallelStream::map_file_fixed_size(
+    let _report = ParallelStream::map_file_fixed_size_to_fd(
         &config,
         path,
-        &tmp_path,
+        dest,
         read_block,
         write_block,
         processor,
     )?;
 
-    // Stream the encoded blocks from the produced file using the reported block_ranges to avoid scanning
-    use std::fs::File;
-    use std::os::unix::fs::FileExt;
-
-    let f = File::open(&tmp_path)?;
-    let mut current_line_len = 0usize;
-    let mut wrote_output = false;
-
-    for br in report.block_ranges.iter() {
-        if br.len == 0 {
-            continue;
-        }
-        let mut buf = vec![0_u8; br.len as usize];
-        f.read_at(&mut buf, br.offset)?;
-        wrote_output = true;
-        write_base64_encoded_vec(out, buf, wrap_cols, &mut current_line_len)?;
-    }
-
-    // clean up produced file
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if wrap_cols != 0 && wrote_output && current_line_len != 0 {
-        out.write_all(b"\n")?;
-    }
     Ok(())
 }
 
 /// Variant that writes raw encoded blocks directly into an open destination File.
 /// Caller must ensure the destination file is prepared (opened with desired flags).
 pub fn encode_base64_regular_file_to_file(
-    dest: &std::fs::File,
+    dest: &mut std::fs::File,
     path: &str,
     _io_mode: IOMode,
     _wrap_cols: usize,
@@ -701,6 +647,10 @@ pub fn encode_base64_regular_file_to_file(
         write_block,
         processor,
     )?;
+    if _wrap_cols != 0 {
+        use std::io::Write as _;
+        dest.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -752,8 +702,8 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
     };
     //eprintln!("What is going on:");
 
-    let mut out = stdout_buf_writer()?;
     let invalid = if options.decode {
+        let mut out = stdout_buf_writer()?;
         //eprintln!("Decoding file");
         decode_base64_input(
             &mut out,
@@ -761,33 +711,55 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
             options.io_mode,
             options.ignore_garbage,
         )?
-    } else if let StreamInput::File(path) = &options.input {
-        if is_regular_input_path(path)? {
-            if set_stdout_direct()? {
-                //eprintln!("Using file_to_file mapping");
-                let mut stdout = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
-                encode_base64_regular_file_to_file(
-                    &mut stdout,
-                    path,
-                    options.io_mode,
-                    options.wrap_cols,
-                )?;
-            } else {
-                //eprintln!("Using file to pipe mapping");
-                encode_base64_regular_file(&mut out, path, options.io_mode, options.wrap_cols)?;
-            }
-            false
-        } else {
-            //eprintln!("Input isn't a regular file: Using pipe to pipe mapping");
-            encode_base64_input(&mut out, &options.input, options.io_mode, options.wrap_cols)?;
-            false
-        }
     } else {
-        //eprintln!("Using pipe to pipe mapping");
-        encode_base64_input(&mut out, &options.input, options.io_mode, options.wrap_cols)?;
+        let mut stdout = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
+
+        // Handle File, Stdin (maybe a regular file), and other inputs uniformly.
+        if let StreamInput::File(path) = &options.input {
+            if is_regular_input_path(path)? {
+                // If stdout is /dev/null prefer the file write path; otherwise if stdout is a regular
+                // file and O_DIRECT can be set use the direct path, else fall back to the temp-file path.
+                if is_stdout_dev_null()? || (set_stdout_direct()? && options.wrap_cols == 0) {
+                    encode_base64_regular_file_to_file(
+                        &mut stdout,
+                        path,
+                        options.io_mode,
+                        options.wrap_cols,
+                    )?;
+                } else {
+                    encode_base64_regular_file(&mut stdout, path, options.io_mode, options.wrap_cols)?;
+                }
+            } else {
+                encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+            }
+        } else if let StreamInput::Stdin { .. } = &options.input {
+            // Detect if stdin is actually a regular file (e.g., redirected from a file)
+            let stdin_fd = io::stdin().as_raw_fd();
+            if is_regular_fd(stdin_fd)? {
+                let read_path_buf = fs::read_link(format!("/proc/self/fd/{}", stdin_fd))
+                    .expect("Could not resolve symlink");
+
+                let read_path = read_path_buf.to_str()
+                    .expect("Path contains invalid UTF-8");
+                if is_stdout_dev_null()? || (set_stdout_direct()? && options.wrap_cols == 0) {
+                    let mut stdout = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
+                    encode_base64_regular_file_to_file(
+                        &mut stdout,
+                        read_path,
+                        options.io_mode,
+                        options.wrap_cols,
+                    )?;
+                } else {
+                    encode_base64_regular_file(&mut stdout, read_path, options.io_mode, options.wrap_cols)?;
+                }
+            } else {
+                encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+            }
+        } else {
+            encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+        }
         false
     };
-    out.into_inner()?;
     if invalid {
         eprintln!("base64: invalid input");
         return Ok(1);

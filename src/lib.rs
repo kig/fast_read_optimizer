@@ -6,6 +6,7 @@ mod file_hash;
 mod io_util;
 mod mincore;
 mod verified_copy;
+mod instrumentation;
 
 pub mod block_hash;
 pub mod config;
