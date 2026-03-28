@@ -58,6 +58,13 @@ impl AlignedBuffer {
         })
     }
 
+    pub fn truncate(&mut self, new_len: usize) -> usize {
+        if new_len < self.len {
+            self.len = new_len
+        }
+        return self.len
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
