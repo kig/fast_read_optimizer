@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use bytemuck::{Pod, Zeroable};
 
-#[repr(align(4096))]
-#[derive(Clone, Copy)]
+#[repr(C, align(4096))]
+#[derive(Copy, Clone, Pod, Zeroable)]
 #[allow(dead_code)]
 pub struct PageAligned(pub [u8; 4096]);
 

@@ -346,9 +346,10 @@ impl ParallelWriter {
         io_mode: IOMode,
         block_count: usize,
     ) -> std::io::Result<Self> {
+        // For file-based writer params we don't have a path string; use "/" as a placeholder
         Self::spawn_file(
             file,
-            resolve_writer_params_for_mode(config, mode, path, io_mode),
+            resolve_writer_params_for_mode(config, mode, "/", io_mode),
             io_mode,
             WriterMode::ByIndex { block_count },
         )
@@ -411,15 +412,17 @@ impl ParallelWriter {
     fn spawn_file(
         file: &std::fs::File,
         write_params: ResolvedWriteParams,
-        io_mode: IOMode,
+        _io_mode: IOMode,
         mode: WriterMode,
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<WriteRequest>();
+        // Clone the provided File so the spawned thread owns its own File instance
+        let file_owned = file.try_clone()?;
         let join_handle = std::thread::spawn(move || -> std::io::Result<ParallelWriteReport> {
             match mode {
                 WriterMode::ByIndex { block_count } => {
                     let mut out = SequentialWriter::from_file(
-                        *file,
+                        file_owned,
                         write_params.qd,
                         write_params.block_size,
                     )?;
@@ -475,8 +478,8 @@ impl ParallelWriter {
                     })
                 }
                 WriterMode::ByOffset {
-                    total_size,
-                    truncate,
+                    total_size: _,
+                    truncate: _,
                 } => {
                     todo!()
                 }
@@ -615,7 +618,18 @@ impl ParallelWriter {
     /// using vmsplice into a local pipe and splice to the dest fd. This keeps the
     /// ordered-block semantics of the indexed writer but uses pipe zero-copy for
     /// low-overhead file->pipe output.
-    pub fn indexed_pipe(dest_fd: std::os::unix::io::RawFd, block_count: usize) -> std::io::Result<Self> {
+    pub fn indexed_pipe(dest_fd: std::os::unix::io::RawFd, block_count: usize, write_block_size: u64) -> std::io::Result<Self> {
+        Self::indexed_pipe_with_pool(dest_fd, block_count, None, write_block_size)
+    }
+
+    /// Indexed pipe writer variant that can return used Vec<u8> buffers back to
+    /// a provided pool sender so producer threads can reuse allocations.
+    pub fn indexed_pipe_with_pool(
+        dest_fd: std::os::unix::io::RawFd,
+        block_count: usize,
+        pool_sender: Option<mpsc::Sender<Vec<u8>>>,
+        write_block_size: u64,
+    ) -> std::io::Result<Self> {
         use std::os::unix::io::RawFd;
         let (tx, rx) = mpsc::channel::<WriteRequest>();
         let join_handle = std::thread::spawn(move || -> std::io::Result<ParallelWriteReport> {
@@ -643,34 +657,6 @@ impl ParallelWriter {
                 Ok(written_total)
             }
 
-            unsafe fn splice_all(pipe_read: RawFd, dest_fd: RawFd, mut to_copy: usize) -> std::io::Result<usize> {
-                let mut copied_total = 0usize;
-                while to_copy > 0 {
-                    let rc = libc::splice(pipe_read, std::ptr::null_mut(), dest_fd, std::ptr::null_mut(), to_copy, 0);
-                    if rc < 0 {
-                        let err = std::io::Error::last_os_error();
-                        match err.raw_os_error() {
-                            Some(libc::EINTR) => continue,
-                            Some(libc::EAGAIN) => continue,
-                            _ => return Err(err),
-                        }
-                    }
-                    let n = rc as usize;
-                    if n == 0 { break; }
-                    copied_total = copied_total.checked_add(n).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "splice overflow"))?;
-                    to_copy = to_copy.saturating_sub(n);
-                }
-                Ok(copied_total)
-            }
-
-            // create a pipe for vmsplice->splice
-            let mut fds = [0; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let pipe_read = fds[0];
-            let pipe_write = fds[1];
-
             let mut pending = BTreeMap::<usize, Vec<u8>>::new();
             let mut seen = vec![false; block_count];
             let mut next_index = 0usize;
@@ -692,34 +678,29 @@ impl ParallelWriter {
                 pending.insert(index, data);
                 while let Some(data) = pending.remove(&next_index) {
                     // vmsplice into pipe_write and splice to dest_fd
-                    let mut remaining = data.len();
+                    let data_len = data.len();
+                    let mut remaining = data_len;
                     let mut offset = 0usize;
                     while remaining > 0 {
                         let chunk = &data[offset..offset + remaining.min(1 << 20)];
-                        crate::instrumentation::inc_vmsplice();
-                        let pushed = unsafe { vmsplice_all(pipe_write, chunk)? };
-                        // now splice from pipe_read to dest_fd
-                        crate::instrumentation::inc_splice();
-                        let spliced = unsafe { splice_all(pipe_read, dest_fd, pushed)? };
-                        if spliced != pushed {
-                            // short splice is unexpected but handle
-                        }
+                        let pushed = unsafe { vmsplice_all(dest_fd, chunk)? };
                         offset += pushed;
                         remaining -= pushed;
                         bytes_written = bytes_written.checked_add(pushed as u64).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "bytes_written overflow"))?;
                     }
                     block_ranges[next_index] = BlockRange {
-                        offset: bytes_written - data.len() as u64,
-                        len: data.len() as u64,
+                        offset: bytes_written - data_len as u64,
+                        len: data_len as u64,
                     };
+                    // return buffer to producer pool if available
+                    if let Some(ref sender) = pool_sender {
+                        let _ = sender.send(data);
+                    }
                     next_index += 1;
                 }
             }
 
-            // close pipe fds
-            unsafe { libc::close(pipe_read); libc::close(pipe_write); }
-
-            Ok(ParallelWriteReport { bytes_written, block_ranges, write_params: ResolvedWriteParams { use_direct: false, qd: 1, block_size: 4096 } })
+            Ok(ParallelWriteReport { bytes_written, block_ranges, write_params: ResolvedWriteParams { use_direct: false, qd: 1, block_size: write_block_size } })
         });
 
         Ok(Self { tx, finish_handle: Arc::new(Mutex::new(Some(join_handle))) })
@@ -731,14 +712,6 @@ impl ParallelWriter {
 pub struct ParallelStream {}
 
 impl ParallelStream {
-    /// Lightweight instrumentation placeholder kept for compatibility with callers.
-    /// The heavy-weight counters were removed to keep the implementation small and
-    /// avoid causing build noise during iterative development. Callers may
-    /// continue to call this function; it will print a short note when invoked.
-    pub fn print_instrumentation() {
-        crate::instrumentation::print();
-    }
-
     /// Simple fallback: read from a pipe/file and write processed blocks to a pipe (dest).
     /// This is a conservative single-threaded implementation used when the fast
     /// ParallelStream io_uring pipeline is not applicable (e.g., when dest is a pipe).
@@ -786,7 +759,7 @@ impl ParallelStream {
         processor: F,
     ) -> std::io::Result<ParallelWriteReport>
     where
-        F: for<'a> Fn(&'a [u8], &mut [u8]) -> std::io::Result<usize> + Send + Sync + 'static,
+        F: for<'a> Fn(&'a [u8]) -> std::io::Result<Vec<u8>> + Send + Sync + 'static,
     {
         let input_file = ParallelFile::open(config, "compute", read_path, IOMode::PageCache)?;
         let block_size = read_block_size;
@@ -794,18 +767,24 @@ impl ParallelStream {
             return Err(std::io::Error::other("block size must be greater than zero").into());
         }
         let block_count = input_file.block_count(block_size)?;
-        let output_stream =
-            ParallelWriter::indexed_file(config, "write", &dest, IOMode::Auto, block_count)?;
 
-        let compression_level = opts.compression_level;
-        let start = Instant::now();
-        let output_stream_for_blocks = output_stream.clone();
-        let read_report =
-            input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
-                let mut buf = Vec<u8>::new(write_block_size);
-                let len = processor(raw_bytes, &buf.as_mut_slice());
-                output_stream_for_blocks.write_at_index(chunk_index, buf[..len])
-            })?;
+        // Create a small pool of preallocated output buffers that producers can reuse.
+        // Pool is a Vec protected by a Mutex and populated with `pool_size` buffers.
+        let _page_cache = config.get_params_for_path("compute", false, read_path);
+
+        // Create the indexed pipe writer and hand it a Sender so it can return buffers
+        let output_stream = ParallelWriter::indexed_pipe(dest.as_raw_fd(), block_count, write_block_size as u64)?;
+        let output_stream_arc = Arc::new(output_stream);
+        let output_stream_for_blocks = output_stream_arc.clone();
+
+        let _read_report = input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
+            let produced = processor(raw_bytes)?;
+            output_stream_for_blocks.write_at_index(chunk_index, produced)?;
+            Ok(())
+        })?;
+
+        // Unwrap the Arc back into ownership and finish
+        let output_stream = Arc::try_unwrap(output_stream_arc).map_err(|_| std::io::Error::other("failed to unwrap writer Arc"))?;
         output_stream.finish()
     }
 
@@ -1084,9 +1063,6 @@ impl ParallelStream {
                                     );
                                     sqe.set_user_data((slot as u64) | (2u64 << 40));
                                 }
-                                // instrumentation: note an uring write submission and inflight
-                                crate::instrumentation::inc_uring_write();
-                                crate::instrumentation::note_inflight_inc();
                                 if std::env::var("FRO_PARALLEL_LOG").is_ok() {
                                     eprintln!(
                                         "[thread {}] submit write block_index={} len={}",
@@ -1094,7 +1070,6 @@ impl ParallelStream {
                                         block_index,
                                         produced_len,
                                     );
-                                    crate::instrumentation::print();
                                 }
                                 // record pending write length; buffer itself is already in buffers[slot]
                                 pending_writes[slot] = Some(PendingWrite { len: produced_len });
@@ -1555,9 +1530,6 @@ impl ParallelStream {
                                     );
                                     sqe.set_user_data((slot as u64) | (2u64 << 40));
                                 }
-                                // instrumentation: note an uring write submission and inflight
-                                crate::instrumentation::inc_uring_write();
-                                crate::instrumentation::note_inflight_inc();
                                 if std::env::var("FRO_PARALLEL_LOG").is_ok() {
                                     eprintln!(
                                         "[thread {}] submit write block_index={} len={}",
@@ -1565,7 +1537,6 @@ impl ParallelStream {
                                         block_index,
                                         produced_len,
                                     );
-                                    crate::instrumentation::print();
                                 }
                                 // record pending write length; buffer itself is already in buffers[slot]
                                 pending_writes[slot] = Some(PendingWrite { len: produced_len });

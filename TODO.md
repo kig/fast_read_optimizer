@@ -531,6 +531,10 @@
   - [ ] copy with directory target
   - [ ] after dirwalk work, copy -r
 - [ ] mv (across mounts using the optimized copy -r)
+- [ ] tar
+  - [ ] uncompressed dirtree to file optimized as `fallocate(file, tar_size(du_result))` + parallel
+        `file.write(offset, tar_header(file_stat)); file.copy_file_range_into(offset+header_len, file_stat);`
+  - [ ] compressing version that builds ~8MB compressed chunks in parallel in RAM, then writes them out in order
 
 ### Streaming I/O for pipes & spinning disks
 

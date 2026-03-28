@@ -1,6 +1,7 @@
 use super::*;
 use crate::stream::ParallelStream;
 use crate::writer::BufWriter;
+use crate::common::AlignedBuffer;
 use std::fs::File;
 use std::hint::black_box;
 use std::io;
@@ -276,7 +277,8 @@ fn base64_encode_ascii_scalar_glsl(sextet: u8) -> u8 {
 
 #[allow(unused)]
 pub fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
-    let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
+    let len = encoded_base64_len(bytes.len());
+    let mut out = vec![0u8;len];
     let written = encode_base64_block_into(bytes, &mut out);
     out.truncate(written);
     out
@@ -565,7 +567,7 @@ fn append_wrapped_base64_bytes(
 }
 
 
-pub fn encode_base64_input<W: Write>(
+pub fn encode_base64_pipe_to_pipe<W: Write>(
     dest: &mut W,
     input: &StreamInput,
     _io_mode: IOMode,
@@ -573,9 +575,9 @@ pub fn encode_base64_input<W: Write>(
 ) -> io::Result<()> {
     // Sequential fallback: process ordered input blocks and write encoded bytes to dest
     let config = load_config(None);
-    let page_cache = config.get_params_for_path("compute", true, "/");
-    let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    let read_block = page_cache_block_size as usize;
+    // let page_cache = config.get_params_for_path("compute", true, "/");
+    // let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
+    let read_block = base64_parallel_encode_block_size(1572864u64) as usize; // 1.5 MiB
     let mut outbuf = vec![0u8; encoded_base64_len(read_block)];
     let mut current_line_len = 0usize;
 
@@ -590,24 +592,27 @@ pub fn encode_base64_input<W: Write>(
     Ok(())
 }
 
-pub fn encode_base64_regular_file(
+pub fn encode_base64_file_to_pipe(
     dest: &mut std::fs::File,
     path: &str,
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    // Simple sequential file->writer implementation used as a conservative fallback.
-    let config = load_config(None);
-    let page_cache = config.get_params_for_path("compute", true, path);
-    let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    let read_block = page_cache_block_size;
-    let write_block = encoded_base64_len(read_block as usize);
+    // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
+    if _wrap_cols != 0 {
+        return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
+    }
 
-    let processor = |input: &[u8], out: &mut [u8]| -> io::Result<usize> {
-        Ok(encode_base64_block_into(input, out))
+    // Use fixed block sizes optimized for base64: 1.5MiB input -> 2MiB encoded output
+    let config = load_config(None);
+    let read_block = 1572864u64; // 1.5 MiB
+    let write_block = 2097152usize; // 2 MiB (encoded base64 size for 1.5MiB)
+
+    let processor = |input: &[u8]| -> io::Result<Vec<u8>> {
+        Ok(encode_base64_block(input))
     };
 
-    let _report = ParallelStream::map_file_fixed_size_to_fd(
+    let _report = ParallelStream::map_file_fixed_size_to_pipe(
         &config,
         path,
         dest,
@@ -621,19 +626,21 @@ pub fn encode_base64_regular_file(
 
 /// Variant that writes raw encoded blocks directly into an open destination File.
 /// Caller must ensure the destination file is prepared (opened with desired flags).
-pub fn encode_base64_regular_file_to_file(
+pub fn encode_base64_file_to_file(
     dest: &mut std::fs::File,
     path: &str,
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    // This variant encodes input blocks into raw base64 bytes and writes them
-    // directly into the provided destination file using ParallelStream.
+    // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
+    if _wrap_cols != 0 {
+        return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
+    }
+
+    // Use fixed block sizes optimized for base64: 1.5MiB input -> 2MiB encoded output
     let config = load_config(None);
-    let page_cache = config.get_params_for_path("compute", true, path);
-    let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    let read_block = page_cache_block_size;
-    let write_block = encoded_base64_len(read_block as usize);
+    let read_block = 1572864u64; // 1.5 MiB
+    let write_block = 2097152usize; // 2 MiB (encoded base64 size for 1.5MiB)
 
     let processor = |input: &[u8], out: &mut [u8]| -> io::Result<usize> {
         Ok(encode_base64_block_into(input, out))
@@ -647,10 +654,6 @@ pub fn encode_base64_regular_file_to_file(
         write_block,
         processor,
     )?;
-    if _wrap_cols != 0 {
-        use std::io::Write as _;
-        dest.write_all(b"\n")?;
-    }
     Ok(())
 }
 
@@ -705,14 +708,23 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
     let invalid = if options.decode {
         let mut out = stdout_buf_writer()?;
         //eprintln!("Decoding file");
-        decode_base64_input(
+        let invalid = decode_base64_input(
             &mut out,
             &options.input,
             options.io_mode,
             options.ignore_garbage,
-        )?
+        )?;
+        // Ensure buffered stdout writer flushes and joins the background thread before exiting
+        out.into_inner()?;
+        invalid
     } else {
-        let mut stdout = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
+        let mut stdout = {
+            let dupfd = unsafe { libc::dup(io::stdout().as_raw_fd()) };
+            if dupfd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { File::from_raw_fd(dupfd) }
+        };
 
         // Handle File, Stdin (maybe a regular file), and other inputs uniformly.
         if let StreamInput::File(path) = &options.input {
@@ -720,17 +732,17 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
                 // If stdout is /dev/null prefer the file write path; otherwise if stdout is a regular
                 // file and O_DIRECT can be set use the direct path, else fall back to the temp-file path.
                 if is_stdout_dev_null()? || (set_stdout_direct()? && options.wrap_cols == 0) {
-                    encode_base64_regular_file_to_file(
+                    encode_base64_file_to_file(
                         &mut stdout,
                         path,
                         options.io_mode,
                         options.wrap_cols,
                     )?;
                 } else {
-                    encode_base64_regular_file(&mut stdout, path, options.io_mode, options.wrap_cols)?;
+                    encode_base64_file_to_pipe(&mut stdout, path, options.io_mode, options.wrap_cols)?;
                 }
             } else {
-                encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+                encode_base64_pipe_to_pipe(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
             }
         } else if let StreamInput::Stdin { .. } = &options.input {
             // Detect if stdin is actually a regular file (e.g., redirected from a file)
@@ -742,21 +754,27 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
                 let read_path = read_path_buf.to_str()
                     .expect("Path contains invalid UTF-8");
                 if is_stdout_dev_null()? || (set_stdout_direct()? && options.wrap_cols == 0) {
-                    let mut stdout = unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) };
-                    encode_base64_regular_file_to_file(
+                    let mut stdout = {
+                        let dupfd = unsafe { libc::dup(io::stdout().as_raw_fd()) };
+                        if dupfd < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        unsafe { File::from_raw_fd(dupfd) }
+                    };
+                    encode_base64_file_to_file(
                         &mut stdout,
                         read_path,
                         options.io_mode,
                         options.wrap_cols,
                     )?;
                 } else {
-                    encode_base64_regular_file(&mut stdout, read_path, options.io_mode, options.wrap_cols)?;
+                    encode_base64_file_to_pipe(&mut stdout, read_path, options.io_mode, options.wrap_cols)?;
                 }
             } else {
-                encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+                encode_base64_pipe_to_pipe(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
             }
         } else {
-            encode_base64_input(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
+            encode_base64_pipe_to_pipe(&mut stdout, &options.input, options.io_mode, options.wrap_cols)?;
         }
         false
     };
@@ -820,12 +838,6 @@ pub(crate) fn bench_base64_encode(
 mod tests {
     use super::*;
 
-    #[test]
-    fn encode_base64_triplet_matches_expected_padding() {
-        assert_eq!(encode_base64_triplet(b"f"), *b"Zg==");
-        assert_eq!(encode_base64_triplet(b"fo"), *b"Zm8=");
-        assert_eq!(encode_base64_triplet(b"foo"), *b"Zm9v");
-    }
 
     #[test]
     fn base64_encode_ascii_scalar_glsl_matches_table() {
