@@ -289,6 +289,74 @@ pub fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+use std::alloc::{alloc, handle_alloc_error, Layout};
+
+pub fn encode_base64_block_aligned_small(bytes: &[u8]) -> Vec<u8> {
+    let len = encoded_base64_len(bytes.len());
+    let alignment = 4096;
+
+    // 1. Create a layout with your specific alignment
+    let layout =
+        Layout::from_size_align(len, alignment).expect("Invalid layout: size or alignment issue");
+
+    // 2. Allocate directly from the global allocator
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+
+    // 3. Convert the raw pointer into a Vec<u8>
+    // SAFETY: Vec requires the pointer to have been allocated
+    // with the same layout (size and alignment).
+    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, len, len) };
+
+    // 4. Encode directly into the aligned Vec
+    let written = encode_base64_block_into(bytes, &mut out_vec);
+
+    // Optional: truncate if needed, though usually len is exact for base64
+    out_vec.truncate(written);
+    out_vec
+}
+
+use libc::{madvise, MADV_HUGEPAGE};
+
+pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
+    let len = encoded_base64_len(bytes.len());
+
+    // Huge pages are usually 2MB. Alignment must match this for THP to kick in.
+    let huge_page_size = 2 * 1024 * 1024;
+
+    // Round up the capacity to a full page multiple to satisfy vmsplice alignment
+    let capacity = (len + huge_page_size - 1) & !(huge_page_size - 1);
+
+    let layout =
+        Layout::from_size_align(capacity, huge_page_size).expect("Invalid layout for huge pages");
+
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+
+    // 1. Give the kernel the hint to use Transparent Huge Pages
+    unsafe {
+        let _ret = madvise(ptr as *mut libc::c_void, capacity, MADV_HUGEPAGE);
+    }
+
+    // 2. Wrap in a Vec.
+    // IMPORTANT: Vec capacity must match the Layout exactly for safe deallocation.
+    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
+
+    // 3. Perform encoding
+    let written = encode_base64_block_into(bytes, &mut out_vec);
+
+    // Set the length to the actual written bytes for the caller
+    unsafe {
+        out_vec.set_len(written);
+    }
+
+    out_vec
+}
+
 fn encode_base64_block_into(bytes: &[u8], out: &mut [u8]) -> usize {
     encode_base64_block_into_with_kernel(bytes, out, Base64EncodeKernel::Auto)
 }
@@ -642,6 +710,14 @@ pub fn encode_base64_pipe_to_file(
     Ok(())
 }
 
+use libc::{fcntl, F_SETPIPE_SZ};
+
+fn increase_pipe_capacity(pipe_fd: i32, new_size: usize) {
+    unsafe {
+        let _res = fcntl(pipe_fd, F_SETPIPE_SZ, new_size);
+    }
+}
+
 pub fn encode_base64_file_to_pipe(
     dest: &mut std::fs::File,
     path: &str,
@@ -664,7 +740,10 @@ pub fn encode_base64_file_to_pipe(
     let read_block = 1572864u64; // 1.5 MiB
     let write_block = 2097152usize; // 2 MiB (encoded base64 size for 1.5MiB)
 
-    let processor = |input: &[u8]| -> io::Result<Vec<u8>> { Ok(encode_base64_block(input)) };
+    increase_pipe_capacity(dest.as_raw_fd(), write_block);
+
+    let processor =
+        |input: &[u8]| -> io::Result<Vec<u8>> { Ok(encode_base64_block_aligned(input)) };
 
     let _report = ParallelStream::map_file_fixed_size_to_pipe(
         &config,

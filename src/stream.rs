@@ -15,22 +15,10 @@ use libc::{fcntl, F_GETFL, F_SETFL};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
-use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
-
-fn dup(file: &std::fs::File) -> std::io::Result<File> {
-    let fd = file.as_raw_fd();
-    unsafe {
-        let newfd = libc::dup(fd);
-        if newfd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        return Ok(File::from_raw_fd(newfd));
-    }
-}
 
 fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
@@ -642,13 +630,17 @@ impl ParallelWriter {
         use std::os::unix::io::RawFd;
         let (tx, rx) = mpsc::channel::<WriteRequest>();
         let join_handle = std::thread::spawn(move || -> std::io::Result<ParallelWriteReport> {
-            // helper: vmsplice all bytes from a slice into pipe_write
+            //let mut vmsplices = 0;
+            //let mut writes = 0;
+
+            //let mut vmsplice_all = unsafe { |pipe_write: RawFd, buf: &[u8]| -> std::io::Result<usize> {
             unsafe fn vmsplice_all(pipe_write: RawFd, buf: &[u8]) -> std::io::Result<usize> {
                 let mut written_total = 0usize;
                 let mut ptr = buf.as_ptr();
                 let mut remaining = buf.len();
                 while remaining > 0 {
                     let rc = if remaining % 4096 == 0 && ptr.align_offset(4096) == 0 {
+                        //vmsplices += 1;
                         let iov = libc::iovec {
                             iov_base: ptr as *mut libc::c_void,
                             iov_len: remaining,
@@ -660,6 +652,7 @@ impl ParallelWriter {
                             libc::SPLICE_F_GIFT,
                         )
                     } else {
+                        //writes += 1;
                         libc::write(pipe_write, ptr as *mut libc::c_void, remaining)
                     };
                     if rc < 0 {
@@ -741,6 +734,8 @@ impl ParallelWriter {
                     next_index += 1;
                 }
             }
+
+            // eprintln!("vmsplices {} writes {}", vmsplices, writes);
 
             Ok(ParallelWriteReport {
                 bytes_written,
@@ -829,8 +824,6 @@ impl ParallelStream {
         }
         let block_count = input_file.block_count(block_size)?;
 
-        // Create a small pool of preallocated output buffers that producers can reuse.
-        // Pool is a Vec protected by a Mutex and populated with `pool_size` buffers.
         let _page_cache = config.get_params_for_path("compute", false, read_path);
 
         // Create the indexed pipe writer and hand it a Sender so it can return buffers
@@ -1127,12 +1120,14 @@ impl ParallelStream {
                                     );
                                     sqe.set_user_data((slot as u64) | (2u64 << 40));
                                 }
+                                /*
                                 if std::env::var("FRO_PARALLEL_LOG").is_ok() {
                                     eprintln!(
                                         "[thread {}] submit write block_index={} len={}",
                                         thread_id, block_index, produced_len,
                                     );
                                 }
+                                */
                                 // record pending write length; buffer itself is already in buffers[slot]
                                 pending_writes[slot] = Some(PendingWrite { len: produced_len });
                                 // a write was submitted; increment inflight to account for it
@@ -1440,13 +1435,15 @@ impl ParallelStream {
                     .write(true)
                     .custom_flags(libc::O_DIRECT) // Set O_DIRECT during open
                     .open(&proc_path)
-                    .unwrap_or_else(|_| { dest_file.try_clone().expect("Failed to clone dest_file") });
+                    .unwrap_or_else(|_| dest_file.try_clone().expect("Failed to clone dest_file"));
 
                 // Create another independent one for Page Cache (standard open)
                 let dest_pagecache = OpenOptions::new()
                     .write(true)
                     .open(&proc_path)
-                    .unwrap_or_else(|_| { dest_file.try_clone().expect("Failed to clone dest_file 2") });
+                    .unwrap_or_else(|_| {
+                        dest_file.try_clone().expect("Failed to clone dest_file 2")
+                    });
 
                 let file_size = file.seek(SeekFrom::End(0)).expect("Failed to seek file");
                 let thread_base = thread_id * read_block_size;
