@@ -587,7 +587,7 @@ pub fn encode_base64_pipe_to_pipe<W: Write>(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    eprintln!("pipe_to_pipe");
+    // eprintln!("pipe_to_pipe");
     // Sequential fallback: process ordered input blocks and write encoded bytes to dest
     let config = load_config(None);
     // let page_cache = config.get_params_for_path("compute", true, "/");
@@ -613,7 +613,7 @@ pub fn encode_base64_pipe_to_file(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    eprintln!("pipe_to_pipe");
+    // eprintln!("pipe_to_pipe");
     // Sequential fallback: process ordered input blocks and write encoded bytes to dest
     let config = load_config(None);
     // let page_cache = config.get_params_for_path("compute", true, "/");
@@ -639,7 +639,7 @@ pub fn encode_base64_file_to_pipe(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    eprintln!("file_to_pipe");
+    // eprintln!("file_to_pipe");
     // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
     if _wrap_cols != 0 {
         return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
@@ -674,7 +674,7 @@ pub fn encode_base64_file_to_file(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
-    eprintln!("file_to_file");
+    // eprintln!("file_to_file");
     // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
     if _wrap_cols != 0 {
         return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
@@ -906,7 +906,7 @@ mod tests {
     fn write_base64_encoded_bytes_wraps_at_requested_columns() {
         let mut out = Vec::new();
         let mut current_line_len = 0usize;
-        write_base64encoded_bytes(&mut out, b"YWJjZGVm", 5, &mut current_line_len).unwrap();
+        write_base64_encoded_bytes(&mut out, b"YWJjZGVm", 5, &mut current_line_len).unwrap();
         assert_eq!(out, b"YWJjZ\nGVm");
         assert_eq!(current_line_len, 3);
     }
