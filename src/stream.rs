@@ -1440,13 +1440,13 @@ impl ParallelStream {
                     .write(true)
                     .custom_flags(libc::O_DIRECT) // Set O_DIRECT during open
                     .open(&proc_path)
-                    .expect("Failed to open independent direct FD");
+                    .unwrap_or_else(|_| { dest_file.try_clone().expect("Failed to clone dest_file") });
 
                 // Create another independent one for Page Cache (standard open)
                 let dest_pagecache = OpenOptions::new()
                     .write(true)
                     .open(&proc_path)
-                    .expect("Failed to open independent pagecache FD");
+                    .unwrap_or_else(|_| { dest_file.try_clone().expect("Failed to clone dest_file 2") });
 
                 let file_size = file.seek(SeekFrom::End(0)).expect("Failed to seek file");
                 let thread_base = thread_id * read_block_size;
