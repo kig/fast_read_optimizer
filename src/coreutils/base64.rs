@@ -524,6 +524,20 @@ fn write_base64_encoded_bytes<W: Write>(
     out.write_all(&wrapped)
 }
 
+fn write_base64_encoded_bytes_file(
+    out: &mut std::fs::File,
+    bytes: &[u8],
+    wrap_cols: usize,
+    current_line_len: &mut usize,
+) -> io::Result<()> {
+    if wrap_cols == 0 {
+        return out.write_all(bytes);
+    }
+    let mut wrapped = Vec::with_capacity(bytes.len() + (bytes.len() / wrap_cols.max(1)) + 2);
+    append_wrapped_base64_bytes(&mut wrapped, bytes, wrap_cols, current_line_len);
+    out.write_all(&wrapped)
+}
+
 fn write_base64_encoded_vec(
     out: &BufWriter,
     bytes: Vec<u8>,
@@ -573,6 +587,7 @@ pub fn encode_base64_pipe_to_pipe<W: Write>(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
+    eprintln!("pipe_to_pipe");
     // Sequential fallback: process ordered input blocks and write encoded bytes to dest
     let config = load_config(None);
     // let page_cache = config.get_params_for_path("compute", true, "/");
@@ -592,12 +607,39 @@ pub fn encode_base64_pipe_to_pipe<W: Write>(
     Ok(())
 }
 
+pub fn encode_base64_pipe_to_file(
+    dest: &mut std::fs::File,
+    input: &StreamInput,
+    _io_mode: IOMode,
+    _wrap_cols: usize,
+) -> io::Result<()> {
+    eprintln!("pipe_to_pipe");
+    // Sequential fallback: process ordered input blocks and write encoded bytes to dest
+    let config = load_config(None);
+    // let page_cache = config.get_params_for_path("compute", true, "/");
+    // let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
+    let read_block = base64_parallel_encode_block_size(1572864u64) as usize; // 1.5 MiB
+    let mut outbuf = vec![0u8; encoded_base64_len(read_block)];
+    let mut current_line_len = 0usize;
+
+    visit_ordered_input(input, _io_mode, |block| {
+        let produced = encode_base64_block_into(block, &mut outbuf);
+        write_base64_encoded_bytes_file(dest, &outbuf[..produced], _wrap_cols, &mut current_line_len)?;
+        Ok(())
+    })?;
+    if _wrap_cols != 0 {
+        dest.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 pub fn encode_base64_file_to_pipe(
     dest: &mut std::fs::File,
     path: &str,
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
+    eprintln!("file_to_pipe");
     // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
     if _wrap_cols != 0 {
         return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
@@ -632,6 +674,7 @@ pub fn encode_base64_file_to_file(
     _io_mode: IOMode,
     _wrap_cols: usize,
 ) -> io::Result<()> {
+    eprintln!("file_to_file");
     // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
     if _wrap_cols != 0 {
         return encode_base64_pipe_to_pipe(dest, &StreamInput::File(path.to_string()), _io_mode, _wrap_cols);
@@ -863,7 +906,7 @@ mod tests {
     fn write_base64_encoded_bytes_wraps_at_requested_columns() {
         let mut out = Vec::new();
         let mut current_line_len = 0usize;
-        write_base64_encoded_bytes(&mut out, b"YWJjZGVm", 5, &mut current_line_len).unwrap();
+        write_base64encoded_bytes(&mut out, b"YWJjZGVm", 5, &mut current_line_len).unwrap();
         assert_eq!(out, b"YWJjZ\nGVm");
         assert_eq!(current_line_len, 3);
     }

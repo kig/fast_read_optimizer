@@ -22,11 +22,7 @@ use std::sync::{mpsc, Arc, Mutex};
 fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
-        // Get current flags
         let flags = fcntl(fd, F_GETFL);
-        if flags == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
         return Ok(flags);
     }
 }
@@ -35,9 +31,6 @@ fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
         let flags = fcntl(fd, F_SETFL, flags);
-        if flags == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
         return Ok(flags);
     }
 }
@@ -1280,7 +1273,7 @@ impl ParallelStream {
         }
 
         // Open reader to query block count and to ensure the file exists.
-        let reader = ParallelFile::open(config, "read", read_path, IOMode::Auto)?;
+        let reader = ParallelFile::open(config, "read", read_path, IOMode::Auto).expect("Failed to ParallelFile::open the input file");
         let block_count = reader.block_count(read_block_size)?;
 
         // Prepare writer params for the provided destination file.
@@ -1297,11 +1290,11 @@ impl ParallelStream {
 
         // If destination file length differs from expected, try to resize it.
         if total_size > 0 {
-            let metadata = dest_file.metadata()?;
+            let metadata = dest_file.metadata().expect("Failed to get destination file metadata");
             if metadata.file_type().is_file() {
                 let current_len = metadata.len();
                 if current_len != total_size {
-                    dest_file.set_len(total_size)?;
+                    dest_file.set_len(total_size).expect("Failed to set destination file len");
                     unsafe {
                         libc::posix_fallocate(dest_file.as_raw_fd(), 0, total_size as i64);
                     }
@@ -1343,8 +1336,8 @@ impl ParallelStream {
 
             threads.push(std::thread::spawn(move || -> std::io::Result<u64> {
                 // Open per-thread reader files and a reader io_uring
-                let (mut file, file_direct) = open_reader_files(&read_path, params.use_direct)?;
-                let write_flags = get_file_flags(&dest_file)?;
+                let (mut file, file_direct) = open_reader_files(&read_path, params.use_direct).expect("Failed to open reader files");
+                let write_flags = get_file_flags(&dest_file).expect("Failed to get file flags");
                 let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
                 let mut buffers = Vec::new();
                 let mut write_buffers = Vec::new();
@@ -1357,9 +1350,9 @@ impl ParallelStream {
                 let mut write_mode = O_DIRECT;
                 let direct_flags = write_flags | O_DIRECT;
                 let pagecache_flags = write_flags ^ O_DIRECT;
-                set_file_flags(&dest_file, direct_flags)?;
+                set_file_flags(&dest_file, direct_flags).expect("Failed to set file flags");
 
-                let file_size = file.seek(SeekFrom::End(0))?;
+                let file_size = file.seek(SeekFrom::End(0)).expect("Failed to seek file");
                 let thread_base = thread_id * read_block_size;
                 let mut block_num: u64 = 0;
                 // inflight counts outstanding io (reads + writes). Start by submitting reads.
@@ -1507,13 +1500,13 @@ impl ParallelStream {
                                     (dst_offset % 4096 == 0) && (produced_len % 4096 == 0);
                                 let fd = if write_params.use_direct && is_aligned_write {
                                     if write_mode != O_DIRECT {
-                                        set_file_flags(&dest_file, direct_flags)?;
+                                        set_file_flags(&dest_file, direct_flags).expect("Failed to unset O_DIRECT");
                                         write_mode = O_DIRECT;
                                     }
                                     dest_file.as_raw_fd()
                                 } else {
                                     if write_mode == O_DIRECT {
-                                        set_file_flags(&dest_file, pagecache_flags)?;
+                                        set_file_flags(&dest_file, pagecache_flags).expect("Failed to set O_DIRECT");
                                         write_mode = 0;
                                     }
                                     dest_file.as_raw_fd()
@@ -1550,7 +1543,7 @@ impl ParallelStream {
                             }
 
                             // submit any sqes prepared above
-                            io_uring.submit_sqes().map_err(std::io::Error::other)?;
+                            io_uring.submit_sqes().map_err(std::io::Error::other).expect("io_uring write failed");
                         } else if state == 2 {
                             // Write finished for slot
                             let written = result as usize;
@@ -1710,13 +1703,12 @@ impl ParallelStream {
         }
 
         // truncate the destination file to the actual written size to remove unused padding
-        if total_written != 0 {
-            dest_file.set_len(total_written)?;
-        } else if total_size == 0 {
-            // nothing to do for empty files
-        } else {
-            // if no bytes were written but total_size was non-zero, truncate to zero
-            dest_file.set_len(0)?;
+        let metadata = dest_file.metadata().expect("Failed to get destination file metadata");
+        if metadata.file_type().is_file() {
+            let current_len = metadata.len();
+            if current_len != total_written {
+                dest_file.set_len(total_written).expect("Failed to truncate destination file");
+            }
         }
 
         Ok(ParallelWriteReport {
