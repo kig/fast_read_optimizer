@@ -1,7 +1,7 @@
+use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use bytemuck::{Pod, Zeroable};
 
 #[repr(C, align(4096))]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -62,7 +62,7 @@ impl AlignedBuffer {
         if new_len < self.len {
             self.len = new_len
         }
-        return self.len
+        return self.len;
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {

@@ -264,13 +264,11 @@ impl PendingReadSlots {
                     format!("read slot {slot} is out of range"),
                 )
             })?
-.take()
+            .take()
             .ok_or_else(|| {
                 io::Error::other(format!("read slot {slot} completed with no pending block"))
             })
-            .map(|v| {
-                v
-            })
+            .map(|v| v)
     }
 
     /// Peek at the pending block id for slot without removing it. Useful when the

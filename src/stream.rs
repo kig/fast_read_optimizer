@@ -11,13 +11,26 @@ use crate::writer::{
     resolve_writer_params_for_mode, OffsetWriter, ResolvedWriteParams, SequentialWriter,
 };
 use iou::IoUring;
-use libc::{fcntl, F_GETFL, F_SETFL, O_DIRECT};
+use libc::{fcntl, F_GETFL, F_SETFL};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
+
+fn dup(file: &std::fs::File) -> std::io::Result<File> {
+    let fd = file.as_raw_fd();
+    unsafe {
+        let newfd = libc::dup(fd);
+        if newfd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(File::from_raw_fd(newfd));
+    }
+}
 
 fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
@@ -485,7 +498,6 @@ impl ParallelWriter {
         })
     }
 
-
     fn spawn(
         path: &str,
         write_params: ResolvedWriteParams,
@@ -611,7 +623,11 @@ impl ParallelWriter {
     /// using vmsplice into a local pipe and splice to the dest fd. This keeps the
     /// ordered-block semantics of the indexed writer but uses pipe zero-copy for
     /// low-overhead file->pipe output.
-    pub fn indexed_pipe(dest_fd: std::os::unix::io::RawFd, block_count: usize, write_block_size: u64) -> std::io::Result<Self> {
+    pub fn indexed_pipe(
+        dest_fd: std::os::unix::io::RawFd,
+        block_count: usize,
+        write_block_size: u64,
+    ) -> std::io::Result<Self> {
         Self::indexed_pipe_with_pool(dest_fd, block_count, None, write_block_size)
     }
 
@@ -632,8 +648,20 @@ impl ParallelWriter {
                 let mut ptr = buf.as_ptr();
                 let mut remaining = buf.len();
                 while remaining > 0 {
-                    let iov = libc::iovec { iov_base: ptr as *mut libc::c_void, iov_len: remaining };
-                    let rc = libc::vmsplice(pipe_write, &iov as *const libc::iovec, 1, 0);
+                    let rc = if remaining % 4096 == 0 && ptr.align_offset(4096) == 0 {
+                        let iov = libc::iovec {
+                            iov_base: ptr as *mut libc::c_void,
+                            iov_len: remaining,
+                        };
+                        libc::vmsplice(
+                            pipe_write,
+                            &iov as *const libc::iovec,
+                            1,
+                            libc::SPLICE_F_GIFT,
+                        )
+                    } else {
+                        libc::write(pipe_write, ptr as *mut libc::c_void, remaining)
+                    };
                     if rc < 0 {
                         let err = std::io::Error::last_os_error();
                         match err.raw_os_error() {
@@ -643,7 +671,12 @@ impl ParallelWriter {
                         }
                     }
                     let n = rc as usize;
-                    written_total = written_total.checked_add(n).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "vmsplice overflow"))?;
+                    written_total = written_total
+                        .checked_add(n)
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "vmsplice overflow")
+                        })
+                        .expect("boom");
                     ptr = unsafe { ptr.add(n) };
                     remaining -= n;
                 }
@@ -659,13 +692,23 @@ impl ParallelWriter {
             for request in rx {
                 let (index, data) = match request {
                     WriteRequest::ByIndex { index, data } => (index, data),
-                    _ => return Err(std::io::Error::other("parallel writer is configured for indexed writes")),
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "parallel writer is configured for indexed writes",
+                        ))
+                    }
                 };
                 if index >= block_count {
-                    return Err(std::io::Error::other(format!("block index {} is out of range for {} blocks", index, block_count)));
+                    return Err(std::io::Error::other(format!(
+                        "block index {} is out of range for {} blocks",
+                        index, block_count
+                    )));
                 }
                 if seen[index] || pending.contains_key(&index) {
-                    return Err(std::io::Error::other(format!("duplicate write for block index {}", index)));
+                    return Err(std::io::Error::other(format!(
+                        "duplicate write for block index {}",
+                        index
+                    )));
                 }
                 seen[index] = true;
                 pending.insert(index, data);
@@ -676,10 +719,16 @@ impl ParallelWriter {
                     let mut offset = 0usize;
                     while remaining > 0 {
                         let chunk = &data[offset..offset + remaining.min(1 << 20)];
-                        let pushed = unsafe { vmsplice_all(dest_fd, chunk)? };
+                        let pushed = unsafe { vmsplice_all(dest_fd, chunk).expect("Boom") };
                         offset += pushed;
                         remaining -= pushed;
-                        bytes_written = bytes_written.checked_add(pushed as u64).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "bytes_written overflow"))?;
+                        bytes_written =
+                            bytes_written.checked_add(pushed as u64).ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "bytes_written overflow",
+                                )
+                            })?;
                     }
                     block_ranges[next_index] = BlockRange {
                         offset: bytes_written - data_len as u64,
@@ -693,12 +742,22 @@ impl ParallelWriter {
                 }
             }
 
-            Ok(ParallelWriteReport { bytes_written, block_ranges, write_params: ResolvedWriteParams { use_direct: false, qd: 1, block_size: write_block_size } })
+            Ok(ParallelWriteReport {
+                bytes_written,
+                block_ranges,
+                write_params: ResolvedWriteParams {
+                    use_direct: false,
+                    qd: 1,
+                    block_size: write_block_size,
+                },
+            })
         });
 
-        Ok(Self { tx, finish_handle: Arc::new(Mutex::new(Some(join_handle))) })
+        Ok(Self {
+            tx,
+            finish_handle: Arc::new(Mutex::new(Some(join_handle))),
+        })
     }
-
 }
 
 #[derive(Clone)]
@@ -734,12 +793,21 @@ impl ParallelStream {
             let produced = processor(&inbuf[..n], &mut outbuf)?;
             if produced > 0 {
                 writer.write_all(&outbuf[..produced])?;
-                block_ranges.push(BlockRange { offset: total_written, len: produced as u64 });
-                total_written = total_written.checked_add(produced as u64).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "overflow"))?;
+                block_ranges.push(BlockRange {
+                    offset: total_written,
+                    len: produced as u64,
+                });
+                total_written = total_written
+                    .checked_add(produced as u64)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "overflow"))?;
             }
         }
         let write_params = resolve_writer_params_for_mode(config, "write", "/", IOMode::PageCache);
-        Ok(ParallelWriteReport { bytes_written: total_written, block_ranges, write_params })
+        Ok(ParallelWriteReport {
+            bytes_written: total_written,
+            block_ranges,
+            write_params,
+        })
     }
 
     /// Simple fallback: read from a regular file path and write processed blocks to a pipe (dest File).
@@ -766,18 +834,21 @@ impl ParallelStream {
         let _page_cache = config.get_params_for_path("compute", false, read_path);
 
         // Create the indexed pipe writer and hand it a Sender so it can return buffers
-        let output_stream = ParallelWriter::indexed_pipe(dest.as_raw_fd(), block_count, write_block_size as u64)?;
+        let output_stream =
+            ParallelWriter::indexed_pipe(dest.as_raw_fd(), block_count, write_block_size as u64)?;
         let output_stream_arc = Arc::new(output_stream);
         let output_stream_for_blocks = output_stream_arc.clone();
 
-        let _read_report = input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
-            let produced = processor(raw_bytes)?;
-            output_stream_for_blocks.write_at_index(chunk_index, produced)?;
-            Ok(())
-        })?;
+        let _read_report =
+            input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
+                let produced = processor(raw_bytes)?;
+                output_stream_for_blocks.write_at_index(chunk_index, produced)?;
+                Ok(())
+            })?;
 
         // Unwrap the Arc back into ownership and finish
-        let output_stream = Arc::try_unwrap(output_stream_arc).map_err(|_| std::io::Error::other("failed to unwrap writer Arc"))?;
+        let output_stream = Arc::try_unwrap(output_stream_arc)
+            .map_err(|_| std::io::Error::other("failed to unwrap writer Arc"))?;
         output_stream.finish()
     }
 
@@ -1059,9 +1130,7 @@ impl ParallelStream {
                                 if std::env::var("FRO_PARALLEL_LOG").is_ok() {
                                     eprintln!(
                                         "[thread {}] submit write block_index={} len={}",
-                                        thread_id,
-                                        block_index,
-                                        produced_len,
+                                        thread_id, block_index, produced_len,
                                     );
                                 }
                                 // record pending write length; buffer itself is already in buffers[slot]
@@ -1254,7 +1323,7 @@ impl ParallelStream {
 
     /// Variant that writes directly into an open destination File (no path-based open).
     /// Caller may open the destination with O_DIRECT set if desired.
-    pub fn map_file_fixed_size_to_fd<F>(
+    pub fn map_file_fixed_size_to_file<F>(
         config: &LoadedConfig,
         read_path: &str,
         dest_file: &File,
@@ -1273,8 +1342,11 @@ impl ParallelStream {
         }
 
         // Open reader to query block count and to ensure the file exists.
-        let reader = ParallelFile::open(config, "read", read_path, IOMode::Auto).expect("Failed to ParallelFile::open the input file");
-        let block_count = reader.block_count(read_block_size)?;
+        let reader = ParallelFile::open(config, "read", read_path, IOMode::Auto)
+            .expect("Failed to ParallelFile::open the input file");
+        let block_count = reader
+            .block_count(read_block_size)
+            .expect("Failed to get read block count");
 
         // Prepare writer params for the provided destination file.
         let writer_io_mode =
@@ -1286,15 +1358,20 @@ impl ParallelStream {
             .checked_mul(write_block_size as u64)
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "output size overflowed")
-            })?;
+            })
+            .expect("Failed to get total size");
 
         // If destination file length differs from expected, try to resize it.
         if total_size > 0 {
-            let metadata = dest_file.metadata().expect("Failed to get destination file metadata");
+            let metadata = dest_file
+                .metadata()
+                .expect("Failed to get destination file metadata");
             if metadata.file_type().is_file() {
                 let current_len = metadata.len();
                 if current_len != total_size {
-                    dest_file.set_len(total_size).expect("Failed to set destination file len");
+                    dest_file
+                        .set_len(total_size)
+                        .expect("Failed to set destination file len");
                     unsafe {
                         libc::posix_fallocate(dest_file.as_raw_fd(), 0, total_size as i64);
                     }
@@ -1325,6 +1402,8 @@ impl ParallelStream {
         // shared vector to record produced byte ranges per block
         let shared_block_ranges = Arc::new(Mutex::new(vec![None::<BlockRange>; block_count]));
 
+        //eprintln!("Starting worker threads");
+
         for thread_id in 0..params.num_threads {
             let read_path = read_path.to_string();
             let processor = processor.clone();
@@ -1332,25 +1411,42 @@ impl ParallelStream {
             let write_block_size = write_block_size;
             let write_params = write_params; // copy
             let shared_block_ranges = shared_block_ranges.clone();
-            let dest_file = dest_file.try_clone()?;
+            let dest_file = dest_file.try_clone().expect("Failed to clone dest_file");
 
             threads.push(std::thread::spawn(move || -> std::io::Result<u64> {
                 // Open per-thread reader files and a reader io_uring
-                let (mut file, file_direct) = open_reader_files(&read_path, params.use_direct).expect("Failed to open reader files");
-                let write_flags = get_file_flags(&dest_file).expect("Failed to get file flags");
-                let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
+                let (mut file, file_direct) = open_reader_files(&read_path, params.use_direct)
+                    .expect("Failed to open reader files");
+                let _write_flags = get_file_flags(&dest_file).expect("Failed to get file flags");
+                let mut io_uring = IoUring::new(1024)
+                    .map_err(std::io::Error::other)
+                    .expect("Failed to create IoURing");
                 let mut buffers = Vec::new();
                 let mut write_buffers = Vec::new();
+                let mut write_lengths = Vec::new();
                 for _ in 0..params.qd {
                     buffers.push(AlignedBuffer::new(read_block_size.try_into().unwrap()));
                     write_buffers.push(AlignedBuffer::new(write_block_size.try_into().unwrap()));
+                    write_lengths.push((0, 0));
                 }
 
                 // Use clones of the provided dest_file for per-thread writes
-                let mut write_mode = O_DIRECT;
-                let direct_flags = write_flags | O_DIRECT;
-                let pagecache_flags = write_flags ^ O_DIRECT;
-                set_file_flags(&dest_file, direct_flags).expect("Failed to set file flags");
+                // Assume 'dest_file' is your original File object
+                let fd = dest_file.as_raw_fd();
+                let proc_path = format!("/proc/self/fd/{}", fd);
+
+                // Create an independent Open File Description for Direct I/O
+                let dest_direct = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT) // Set O_DIRECT during open
+                    .open(&proc_path)
+                    .expect("Failed to open independent direct FD");
+
+                // Create another independent one for Page Cache (standard open)
+                let dest_pagecache = OpenOptions::new()
+                    .write(true)
+                    .open(&proc_path)
+                    .expect("Failed to open independent pagecache FD");
 
                 let file_size = file.seek(SeekFrom::End(0)).expect("Failed to seek file");
                 let thread_base = thread_id * read_block_size;
@@ -1376,17 +1472,23 @@ impl ParallelStream {
                                 std::io::ErrorKind::InvalidInput,
                                 "read offset calculation overflowed",
                             )
-                        })?;
-                    let current_offset = thread_base.checked_add(stride).ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "read offset calculation overflowed",
-                        )
-                    })?;
+                        })
+                        .expect("read offset overflow");
+                    let current_offset = thread_base
+                        .checked_add(stride)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "read offset calculation overflowed",
+                            )
+                        })
+                        .expect("read offset overflow");
                     if current_offset >= file_size {
                         break;
                     }
-                    pending.reserve(slot, block_num)?;
+                    pending
+                        .reserve(slot, block_num)
+                        .expect("Failed to reserve pending slot");
                     let is_aligned =
                         (current_offset % 4096 == 0) && ((read_block_size % 4096) == 0);
                     let fd = if params.use_direct && is_aligned {
@@ -1395,12 +1497,16 @@ impl ParallelStream {
                         file.as_raw_fd()
                     };
                     unsafe {
-                        let mut sqe = io_uring.prepare_sqe().ok_or_else(|| {
-                            std::io::Error::other("io_uring submission queue is full")
-                        })?;
+                        let mut sqe = io_uring
+                            .prepare_sqe()
+                            .ok_or_else(|| {
+                                std::io::Error::other("io_uring submission queue is full")
+                            })
+                            .expect("Failed to prepare_sqe");
                         // mark as read state (1)
                         let read_len =
-                            expected_read_len(file_size, current_offset, read_block_size)?;
+                            expected_read_len(file_size, current_offset, read_block_size)
+                                .expect("Failed to get read len");
                         sqe.prep_read(
                             fd,
                             &mut buffers[slot].as_mut_slice()[..read_len],
@@ -1416,22 +1522,51 @@ impl ParallelStream {
                     // nothing to do
                     return Ok(0);
                 }
-                io_uring.submit_sqes().map_err(std::io::Error::other)?;
+                io_uring
+                    .submit_sqes()
+                    .map_err(std::io::Error::other)
+                    .expect("Failed to submit_sqes");
 
                 // total bytes this thread wrote
                 let mut thread_bytes_written: u64 = 0;
 
                 while inflight > 0 {
-                    let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
+                    let cq = io_uring
+                        .wait_for_cqe()
+                        .map_err(std::io::Error::other)
+                        .expect("Failed to wait_for_cqe");
                     let user_data = cq.user_data();
-                    let mut ready = vec![(user_data, cq.result()? as u32)];
+                    let mut write_str = String::from("");
+                    if cq.user_data() >> 40 != 0 && cq.raw_result() < 0 {
+                        let (offset, len) = write_lengths[(user_data & 0xFFFFFFFF) as usize];
+                        write_str =
+                            format!("io_uring cqe failed for write at {} len {}", offset, len);
+                    }
+                    let mut ready = vec![(
+                        user_data,
+                        cq.result().expect(if cq.user_data() >> 40 == 1 {
+                            "io_uring cqe failed for read"
+                        } else {
+                            &write_str
+                        }) as u32,
+                    )];
                     while io_uring.cq_ready() > 0 {
-                        let cq = io_uring.peek_for_cqe().ok_or_else(|| {
-                            std::io::Error::other(
-                                "completion queue reported ready but no CQE was available",
-                            )
-                        })?;
-                        ready.push((cq.user_data(), cq.result()? as u32));
+                        let cq = io_uring
+                            .peek_for_cqe()
+                            .ok_or_else(|| {
+                                std::io::Error::other(
+                                    "completion queue reported ready but no CQE was available",
+                                )
+                            })
+                            .expect("failed to peek_for_cqe");
+                        ready.push((
+                            cq.user_data(),
+                            cq.result().expect(if cq.user_data() >> 40 == 1 {
+                                "io_uring peek cqe failed for read"
+                            } else {
+                                "io_uring cqe failed for write"
+                            }) as u32,
+                        ));
                     }
 
                     for (user_data, result) in ready {
@@ -1441,15 +1576,18 @@ impl ParallelStream {
                         if state == 1 {
                             // Read finished for slot
                             // decrement inflight for the completed read
-                            inflight = inflight.checked_sub(1).ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "inflight underflow on read completion",
-                                )
-                            })?;
+                            inflight = inflight
+                                .checked_sub(1)
+                                .ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "inflight underflow on read completion",
+                                    )
+                                })
+                                .expect("inflight underflow");
 
                             // peek block id (do NOT free the slot yet; keep it reserved until write completes)
-                            let block_id = pending.peek(slot)?;
+                            let block_id = pending.peek(slot).expect("pending.peek failed");
 
                             let stride = block_id
                                 .checked_mul(params.num_threads)
@@ -1459,14 +1597,17 @@ impl ParallelStream {
                                         std::io::ErrorKind::InvalidInput,
                                         "read offset calculation overflowed",
                                     )
-                                })?;
-                            let current_offset =
-                                thread_base.checked_add(stride).ok_or_else(|| {
+                                })
+                                .expect("read offset overflow 2");
+                            let current_offset = thread_base
+                                .checked_add(stride)
+                                .ok_or_else(|| {
                                     std::io::Error::new(
                                         std::io::ErrorKind::InvalidInput,
                                         "read offset calculation overflowed",
                                     )
-                                })?;
+                                })
+                                .expect("read offset overflow 2");
 
                             let expected_len =
                                 expected_read_len(file_size, current_offset, read_block_size)?;
@@ -1495,21 +1636,15 @@ impl ParallelStream {
                                             "destination offset overflowed",
                                         )
                                     })?;
+                                write_lengths[slot] = (dst_offset, produced_len);
 
                                 let is_aligned_write =
-                                    (dst_offset % 4096 == 0) && (produced_len % 4096 == 0);
+                                    dst_offset % 4096 == 0 && produced_len % 4096 == 0;
                                 let fd = if write_params.use_direct && is_aligned_write {
-                                    if write_mode != O_DIRECT {
-                                        set_file_flags(&dest_file, direct_flags).expect("Failed to unset O_DIRECT");
-                                        write_mode = O_DIRECT;
-                                    }
-                                    dest_file.as_raw_fd()
+                                    dest_direct.as_raw_fd()
                                 } else {
-                                    if write_mode == O_DIRECT {
-                                        set_file_flags(&dest_file, pagecache_flags).expect("Failed to set O_DIRECT");
-                                        write_mode = 0;
-                                    }
-                                    dest_file.as_raw_fd()
+                                    // eprintln!("Doing an unaligned write at {} len {} (fd = {}, direct_fd = {})", dst_offset, produced_len, dest_pagecache.as_raw_fd(), dest_direct.as_raw_fd());
+                                    dest_pagecache.as_raw_fd()
                                 };
                                 unsafe {
                                     let mut sqe = io_uring.prepare_sqe().ok_or_else(|| {
@@ -1526,9 +1661,7 @@ impl ParallelStream {
                                 if std::env::var("FRO_PARALLEL_LOG").is_ok() {
                                     eprintln!(
                                         "[thread {}] submit write block_index={} len={}",
-                                        thread_id,
-                                        block_index,
-                                        produced_len,
+                                        thread_id, block_index, produced_len,
                                     );
                                 }
                                 // record pending write length; buffer itself is already in buffers[slot]
@@ -1543,7 +1676,10 @@ impl ParallelStream {
                             }
 
                             // submit any sqes prepared above
-                            io_uring.submit_sqes().map_err(std::io::Error::other).expect("io_uring write failed");
+                            io_uring
+                                .submit_sqes()
+                                .map_err(std::io::Error::other)
+                                .expect("io_uring write failed");
                         } else if state == 2 {
                             // Write finished for slot
                             let written = result as usize;
@@ -1656,7 +1792,10 @@ impl ParallelStream {
                                         "inflight overflowed",
                                     )
                                 })?;
-                                io_uring.submit_sqes().map_err(std::io::Error::other)?;
+                                io_uring
+                                    .submit_sqes()
+                                    .map_err(std::io::Error::other)
+                                    .expect("Failed to submit_sqes for read");
                             }
                         } else {
                             return Err(std::io::Error::new(
@@ -1684,6 +1823,7 @@ impl ParallelStream {
                 )
             })?;
         }
+        // eprintln!("Worker threads done");
 
         // assemble block ranges from per-thread records
         let mut final_block_ranges = Vec::with_capacity(block_count);
@@ -1703,11 +1843,15 @@ impl ParallelStream {
         }
 
         // truncate the destination file to the actual written size to remove unused padding
-        let metadata = dest_file.metadata().expect("Failed to get destination file metadata");
+        let metadata = dest_file
+            .metadata()
+            .expect("Failed to get destination file metadata");
         if metadata.file_type().is_file() {
             let current_len = metadata.len();
             if current_len != total_written {
-                dest_file.set_len(total_written).expect("Failed to truncate destination file");
+                dest_file
+                    .set_len(total_written)
+                    .expect("Failed to truncate destination file");
             }
         }
 
