@@ -88,7 +88,28 @@ fn get_regular_file_path<R: AsRawFd>(reader: &mut R) -> Option<String> {
     }
 }
 
-const WC_STREAM_BLOCK_SIZE: usize = 8 << 20;
+const WC_STREAM_BLOCK_SIZE: usize = 2 << 20;
+
+use libc::{madvise, MADV_HUGEPAGE};
+
+fn get_aligned_wc_block() -> Vec<u8> {
+    let huge_page_size = 2 * 1024 * 1024;
+    let capacity = huge_page_size;
+    let layout =
+        std::alloc::Layout::from_size_align(capacity, huge_page_size).expect("Invalid layout for huge pages");
+
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return vec![0u8; capacity];
+    }
+
+    unsafe {
+        let _ret = madvise(ptr as *mut libc::c_void, capacity, MADV_HUGEPAGE);
+    }
+    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, WC_STREAM_BLOCK_SIZE, capacity) };
+
+    out_vec
+}
 
 #[derive(Debug, Clone, Copy)]
 struct WcCountOptions {
@@ -151,7 +172,7 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
             words: 0,
             bytes: 0,
         };
-        let mut buffer = vec![0_u8; WC_STREAM_BLOCK_SIZE];
+        let mut buffer = get_aligned_wc_block();
         let mut bytes = 0u64;
         loop {
             let read = reader.read(&mut buffer)?;
@@ -170,7 +191,7 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
         bytes: 0,
     };
     let mut previous_ended_in_word = false;
-    let mut buffer = vec![0_u8; WC_STREAM_BLOCK_SIZE];
+    let mut buffer = get_aligned_wc_block();
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -219,7 +240,7 @@ fn wc_totals_from_reader_parallel<R: Read>(
         bytes: 0,
     };
     let mut previous_ended_in_word = false;
-    let mut buffer = vec![0_u8; WC_STREAM_BLOCK_SIZE];
+    let mut buffer = get_aligned_wc_block();
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -267,7 +288,37 @@ fn wc_totals_from_fd_parallel<R: AsRawFd + Read>(
         return Ok(reduce_wc_counts(&blocks.blocks))
     }
 
-    return wc_totals_from_reader_parallel(reader, options)
+    // Set pipe size fcntl to 1MB
+    let fd = reader.as_raw_fd();
+    unsafe {
+        let _res = libc::fcntl(fd, libc::F_SETPIPE_SZ, WC_STREAM_BLOCK_SIZE);
+    }
+    let mut totals = WcTotals {
+        lines: 0,
+        words: 0,
+        bytes: 0,
+    };
+    let mut previous_ended_in_word = false;
+    let mut buffer = get_aligned_wc_block();
+    let mut ptr = buffer.as_ptr();
+    let iov = libc::iovec {
+                           iov_base: ptr as *mut libc::c_void,
+                           iov_len: WC_STREAM_BLOCK_SIZE,
+                        };
+    loop {
+        let read = unsafe { libc::vmsplice(fd, &iov as *const libc::iovec, 1, 0) };
+        if read <= 0 {
+            return Ok(totals);
+        }
+        let block = &buffer[..read as usize];
+        let counts = count_wc_block(block, options);
+        merge_wc_counts(
+            &mut totals,
+            &mut previous_ended_in_word,
+            counts,
+            options.words,
+        );
+    }
 }
 
 fn wc_metadata_totals(
