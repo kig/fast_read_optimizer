@@ -1,4 +1,92 @@
 use super::*;
+use libc::{splice, SPLICE_F_MOVE};
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
+
+fn count_bytes_splice(fd: RawFd) -> std::io::Result<i64> {
+    // Open /dev/null to act as the sink for the spliced data
+    let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
+    let null_fd = dev_null.as_raw_fd();
+    
+    let mut total_bytes: i64 = 0;
+    // 1MB buffer size for the splice operations
+    let chunk_size = 1024 * 1024;
+
+    loop {
+        // splice(fd_in, off_in, fd_out, off_out, len, flags)
+        // This moves data from STDIN directly to /dev/null in kernel space.
+        let bytes_moved = unsafe {
+            splice(
+                fd,
+                std::ptr::null_mut(),
+                null_fd,
+                std::ptr::null_mut(),
+                chunk_size,
+                SPLICE_F_MOVE,
+            )
+        };
+
+        if bytes_moved < 0 {
+            let err = std::io::Error::last_os_error();
+            // Handle interrupted calls; exit on other errors
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+
+        if bytes_moved == 0 {
+            // End of stream (EOF) reached
+            break;
+        }
+
+        total_bytes += bytes_moved as i64;
+    }
+
+    Ok(total_bytes)
+}
+
+fn fast_count_fd<R: AsRawFd>(reader: &mut R) -> Option<u64> {
+    let fd = reader.as_raw_fd();
+    unsafe {
+        let mut s = std::mem::zeroed::<stat>();
+        if fstat(fd, &mut s) != 0 {
+            return None;
+        }
+
+        return match s.st_mode & S_IFMT {
+            // Path 1: Regular File (Instant)
+            S_IFREG =>
+                Some(s.st_size as u64),
+
+            // Path 2: Pipe (Zero-Copy)
+            S_IFIFO => 
+                Some(count_bytes_splice(fd).ok()? as u64),
+
+            // Path 3: Fallback (Standard Read)
+            _ =>
+                None
+        }
+    }
+}
+
+fn get_regular_file_path<R: AsRawFd>(reader: &mut R) -> Option<String> {
+    let fd = reader.as_raw_fd();
+    unsafe {
+        let mut s = std::mem::zeroed::<stat>();
+        if fstat(fd, &mut s) != 0 {
+            return None;
+        }
+
+        return match s.st_mode & S_IFMT {
+            S_IFREG =>
+                Some(format!("/proc/self/fd/{}", fd)),
+
+            _ =>
+                None
+        }
+    }
+}
 
 const WC_STREAM_BLOCK_SIZE: usize = 8 << 20;
 
@@ -54,6 +142,7 @@ fn count_wc_block_scalar(block: &[u8], options: WcCountOptions) -> WcBlockCounts
         ends_in_word: block.last().is_some_and(|byte| !is_wc_whitespace(*byte)),
     }
 }
+use libc::{fstat, stat, S_IFIFO, S_IFMT, S_IFREG};
 
 fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io::Result<WcTotals> {
     if options.bytes && !options.lines && !options.words {
@@ -63,13 +152,16 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
             bytes: 0,
         };
         let mut buffer = vec![0_u8; WC_STREAM_BLOCK_SIZE];
+        let mut bytes = 0u64;
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {
-                return Ok(totals);
+                break;
             }
-            totals.bytes += read as u64;
+            bytes += read as u64;
         }
+        totals.bytes = bytes;
+        return Ok(totals);
     }
 
     let mut totals = WcTotals {
@@ -95,11 +187,87 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
     }
 }
 
+fn wc_totals_from_fd<R: AsRawFd + Read>(reader: &mut R, options: WcCountOptions) -> io::Result<WcTotals> {
+    if options.bytes && !options.lines && !options.words {
+        let mut totals = WcTotals {
+            lines: 0,
+            words: 0,
+            bytes: 0,
+        };
+        if let Some(bytes) = fast_count_fd(reader) {
+            totals.bytes = bytes;
+            return Ok(totals);
+        } else {
+            return wc_totals_from_reader(reader, options);
+        }
+    }
+
+    return wc_totals_from_reader(reader, options)
+}
+
 fn wc_totals_from_reader_parallel<R: Read>(
     reader: &mut R,
     options: WcCountOptions,
 ) -> io::Result<WcTotals> {
-    wc_totals_from_reader(reader, options)
+    if options.bytes && !options.lines && !options.words {
+        return wc_totals_from_reader(reader, options);
+    }
+
+    let mut totals = WcTotals {
+        lines: 0,
+        words: 0,
+        bytes: 0,
+    };
+    let mut previous_ended_in_word = false;
+    let mut buffer = vec![0_u8; WC_STREAM_BLOCK_SIZE];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(totals);
+        }
+        let block = &buffer[..read];
+        let counts = count_wc_block(block, options);
+        merge_wc_counts(
+            &mut totals,
+            &mut previous_ended_in_word,
+            counts,
+            options.words,
+        );
+    }
+}
+
+fn wc_totals_from_fd_parallel<R: AsRawFd + Read>(
+    reader: &mut R,
+    options: WcCountOptions,
+    config: &crate::config::LoadedConfig,
+    io_mode: IOMode,
+) -> io::Result<WcTotals> {
+    if options.bytes && !options.lines && !options.words {
+        let mut totals = WcTotals {
+            lines: 0,
+            words: 0,
+            bytes: 0,
+        };
+        if let Some(bytes) = fast_count_fd(reader) {
+            totals.bytes = bytes;
+            return Ok(totals);
+        } else {
+            return wc_totals_from_reader(reader, options);
+        }
+    }
+
+    if let Some(file) = get_regular_file_path(reader) {
+        let blocks = map_file_blocks_for_mode(
+            &config,
+            "read",
+            &file,
+            internal_io_mode(io_mode),
+            move |block| Ok::<_, io::Error>(count_wc_block(block.data, options)),
+        )?;
+        return Ok(reduce_wc_counts(&blocks.blocks))
+    }
+
+    return wc_totals_from_reader_parallel(reader, options)
 }
 
 fn wc_metadata_totals(
@@ -351,12 +519,11 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<()> {
                     reduce_wc_counts(&blocks.blocks)
                 }
                 StreamInput::File(file) => {
-                    let mut reader = BufReader::new(std::fs::File::open(file)?);
-                    wc_totals_from_reader_parallel(&mut reader, options)?
+                    let mut reader = std::fs::File::open(file)?;
+                    wc_totals_from_fd_parallel(&mut reader, options, &config, io_mode)?
                 }
                 StreamInput::Stdin { .. } => {
-                    let mut reader = stdin_buf_reader()?;
-                    wc_totals_from_reader_parallel(&mut reader, options)?
+                    wc_totals_from_fd_parallel(&mut std::io::stdin(), options, &config, io_mode)?
                 }
             }
         };
