@@ -28,6 +28,7 @@ fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     }
 }
 
+#[allow(unused)]
 fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
@@ -2060,7 +2061,7 @@ mod tests {
         };
 
         // read block size 4, write block size 4
-        let report =
+        let _report =
             ParallelStream::map_file_fixed_size(&cfg, &input_path, &output_path, 4, 4, processor)
                 .unwrap();
         // read produced bytes prefix (should equal input length)

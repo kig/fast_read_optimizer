@@ -1,6 +1,7 @@
 use super::*;
 use crate::stream::ParallelStream;
-use crate::writer::BufWriter;
+use libc::{madvise, MADV_HUGEPAGE};
+use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::fs::File;
 use std::hint::black_box;
 use std::io;
@@ -54,69 +55,6 @@ struct Base64Options {
     wrap_cols: usize,
     io_mode: IOMode,
     input: StreamInput,
-}
-
-fn set_stdout_direct() -> bool {
-    let fd = io::stdout().as_raw_fd();
-
-    unsafe {
-        // 1. Check if stdout is a regular file
-        let mut stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut stat) != 0 {
-            return false;
-        }
-
-        // S_IFMT is the bit mask for the file type bit fields
-        if (stat.st_mode & libc::S_IFMT) == libc::S_IFREG {
-            // 2. Get current flags
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags == -1 {
-                return false;
-            }
-
-            // 3. Set O_DIRECT flag
-            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT) == -1 {
-                return false;
-            }
-            return true;
-        } else {
-            return false;
-        }
-    }
-}
-
-fn is_regular_fd(fd: std::os::unix::io::RawFd) -> bool {
-    unsafe {
-        let mut stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut stat) != 0 {
-            return false;
-        }
-        (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
-    }
-}
-
-fn is_stdout_file() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
-    is_regular_fd(stdout_fd)
-}
-
-fn is_stdout_dev_null() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
-    unsafe {
-        let mut stdout_stat: libc::stat = std::mem::zeroed();
-        let mut dev_null_stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(stdout_fd, &mut stdout_stat) != 0 {
-            return false;
-        }
-        // stat("/dev/null") - ensure C string is NUL terminated
-        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
-        if libc::stat(path, &mut dev_null_stat) != 0 {
-            return false;
-        }
-        stdout_stat.st_dev == dev_null_stat.st_dev && stdout_stat.st_ino == dev_null_stat.st_ino
-    }
 }
 
 fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32>> {
@@ -289,8 +227,7 @@ pub fn encode_base64_block(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-use std::alloc::{alloc, handle_alloc_error, Layout};
-
+#[allow(unused)]
 pub fn encode_base64_block_aligned_small(bytes: &[u8]) -> Vec<u8> {
     let len = encoded_base64_len(bytes.len());
     let alignment = 4096;
@@ -317,8 +254,6 @@ pub fn encode_base64_block_aligned_small(bytes: &[u8]) -> Vec<u8> {
     out_vec.truncate(written);
     out_vec
 }
-
-use libc::{madvise, MADV_HUGEPAGE};
 
 pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
     let len = encoded_base64_len(bytes.len());
@@ -611,23 +546,6 @@ fn write_base64_encoded_bytes_file(
     out.write_all(&wrapped)
 }
 
-fn write_base64_encoded_vec(
-    out: &BufWriter,
-    bytes: Vec<u8>,
-    wrap_cols: usize,
-    current_line_len: &mut usize,
-) -> io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if wrap_cols == 0 {
-        return out.write_vec(bytes);
-    }
-    let mut wrapped = Vec::with_capacity(bytes.len() + (bytes.len() / wrap_cols.max(1)) + 2);
-    append_wrapped_base64_bytes(&mut wrapped, &bytes, wrap_cols, current_line_len);
-    out.write_vec(wrapped)
-}
-
 fn append_wrapped_base64_bytes(
     out: &mut Vec<u8>,
     bytes: &[u8],
@@ -891,6 +809,13 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
                         options.wrap_cols,
                     )?;
                 }
+            } else if is_stdout_dev_null() || is_stdout_file() {
+                encode_base64_pipe_to_file(
+                    &mut stdout,
+                    &options.input,
+                    options.io_mode,
+                    options.wrap_cols,
+                )?;
             } else {
                 encode_base64_pipe_to_pipe(
                     &mut stdout,
@@ -929,6 +854,13 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
                         options.wrap_cols,
                     )?;
                 }
+            } else if is_stdout_dev_null() || is_stdout_file() {
+                encode_base64_pipe_to_file(
+                    &mut stdout,
+                    &options.input,
+                    options.io_mode,
+                    options.wrap_cols,
+                )?;
             } else {
                 encode_base64_pipe_to_pipe(
                     &mut stdout,
@@ -937,6 +869,13 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
                     options.wrap_cols,
                 )?;
             }
+        } else if is_stdout_dev_null() || is_stdout_file() {
+            encode_base64_pipe_to_file(
+                &mut stdout,
+                &options.input,
+                options.io_mode,
+                options.wrap_cols,
+            )?;
         } else {
             encode_base64_pipe_to_pipe(
                 &mut stdout,

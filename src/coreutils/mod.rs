@@ -262,6 +262,40 @@ fn is_regular_input_path(path: &str) -> io::Result<bool> {
     Ok(fs::metadata(path)?.file_type().is_file())
 }
 
+pub fn is_regular_fd(fd: std::os::unix::io::RawFd) -> bool {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 {
+            return false;
+        }
+        (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+    }
+}
+
+pub fn is_stdout_file() -> bool {
+    use std::io::stdout;
+    let stdout_fd = stdout().as_raw_fd();
+    is_regular_fd(stdout_fd)
+}
+
+pub fn is_stdout_dev_null() -> bool {
+    use std::io::stdout;
+    let stdout_fd = stdout().as_raw_fd();
+    unsafe {
+        let mut stdout_stat: libc::stat = std::mem::zeroed();
+        let mut dev_null_stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(stdout_fd, &mut stdout_stat) != 0 {
+            return false;
+        }
+        // stat("/dev/null") - ensure C string is NUL terminated
+        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
+        if libc::stat(path, &mut dev_null_stat) != 0 {
+            return false;
+        }
+        stdout_stat.st_dev == dev_null_stat.st_dev && stdout_stat.st_ino == dev_null_stat.st_ino
+    }
+}
+
 fn visit_reader_blocks<R, F>(reader: &mut R, mut on_block: F) -> io::Result<()>
 where
     R: Read,

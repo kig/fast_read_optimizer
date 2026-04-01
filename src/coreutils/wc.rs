@@ -7,7 +7,7 @@ fn count_bytes_splice(fd: RawFd) -> std::io::Result<i64> {
     // Open /dev/null to act as the sink for the spliced data
     let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
     let null_fd = dev_null.as_raw_fd();
-    
+
     let mut total_bytes: i64 = 0;
     // 1MB buffer size for the splice operations
     let chunk_size = 1024 * 1024;
@@ -56,17 +56,14 @@ fn fast_count_fd<R: AsRawFd>(reader: &mut R) -> Option<u64> {
 
         return match s.st_mode & S_IFMT {
             // Path 1: Regular File (Instant)
-            S_IFREG =>
-                Some(s.st_size as u64),
+            S_IFREG => Some(s.st_size as u64),
 
             // Path 2: Pipe (Zero-Copy)
-            S_IFIFO => 
-                Some(count_bytes_splice(fd).ok()? as u64),
+            S_IFIFO => Some(count_bytes_splice(fd).ok()? as u64),
 
             // Path 3: Fallback (Standard Read)
-            _ =>
-                None
-        }
+            _ => None,
+        };
     }
 }
 
@@ -79,12 +76,10 @@ fn get_regular_file_path<R: AsRawFd>(reader: &mut R) -> Option<String> {
         }
 
         return match s.st_mode & S_IFMT {
-            S_IFREG =>
-                Some(format!("/proc/self/fd/{}", fd)),
+            S_IFREG => Some(format!("/proc/self/fd/{}", fd)),
 
-            _ =>
-                None
-        }
+            _ => None,
+        };
     }
 }
 
@@ -95,8 +90,8 @@ use libc::{madvise, MADV_HUGEPAGE};
 fn get_aligned_wc_block() -> Vec<u8> {
     let huge_page_size = 2 * 1024 * 1024;
     let capacity = huge_page_size;
-    let layout =
-        std::alloc::Layout::from_size_align(capacity, huge_page_size).expect("Invalid layout for huge pages");
+    let layout = std::alloc::Layout::from_size_align(capacity, huge_page_size)
+        .expect("Invalid layout for huge pages");
 
     let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
@@ -106,7 +101,7 @@ fn get_aligned_wc_block() -> Vec<u8> {
     unsafe {
         let _ret = madvise(ptr as *mut libc::c_void, capacity, MADV_HUGEPAGE);
     }
-    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, WC_STREAM_BLOCK_SIZE, capacity) };
+    let out_vec = unsafe { Vec::from_raw_parts(ptr, WC_STREAM_BLOCK_SIZE, capacity) };
 
     out_vec
 }
@@ -165,6 +160,8 @@ fn count_wc_block_scalar(block: &[u8], options: WcCountOptions) -> WcBlockCounts
 }
 use libc::{fstat, stat, S_IFIFO, S_IFMT, S_IFREG};
 
+// Used for testing
+#[allow(unused)]
 fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io::Result<WcTotals> {
     if options.bytes && !options.lines && !options.words {
         let mut totals = WcTotals {
@@ -208,24 +205,8 @@ fn wc_totals_from_reader<R: Read>(reader: &mut R, options: WcCountOptions) -> io
     }
 }
 
-fn wc_totals_from_fd<R: AsRawFd + Read>(reader: &mut R, options: WcCountOptions) -> io::Result<WcTotals> {
-    if options.bytes && !options.lines && !options.words {
-        let mut totals = WcTotals {
-            lines: 0,
-            words: 0,
-            bytes: 0,
-        };
-        if let Some(bytes) = fast_count_fd(reader) {
-            totals.bytes = bytes;
-            return Ok(totals);
-        } else {
-            return wc_totals_from_reader(reader, options);
-        }
-    }
-
-    return wc_totals_from_reader(reader, options)
-}
-
+// Used for testing
+#[allow(unused)]
 fn wc_totals_from_reader_parallel<R: Read>(
     reader: &mut R,
     options: WcCountOptions,
@@ -285,7 +266,7 @@ fn wc_totals_from_fd_parallel<R: AsRawFd + Read>(
             internal_io_mode(io_mode),
             move |block| Ok::<_, io::Error>(count_wc_block(block.data, options)),
         )?;
-        return Ok(reduce_wc_counts(&blocks.blocks))
+        return Ok(reduce_wc_counts(&blocks.blocks));
     }
 
     // Set pipe size fcntl to 1MB
@@ -299,16 +280,24 @@ fn wc_totals_from_fd_parallel<R: AsRawFd + Read>(
         bytes: 0,
     };
     let mut previous_ended_in_word = false;
-    let mut buffer = get_aligned_wc_block();
-    let mut ptr = buffer.as_ptr();
+    let buffer = get_aligned_wc_block();
+    let ptr = buffer.as_ptr();
     let iov = libc::iovec {
-                           iov_base: ptr as *mut libc::c_void,
-                           iov_len: WC_STREAM_BLOCK_SIZE,
-                        };
+        iov_base: ptr as *mut libc::c_void,
+        iov_len: WC_STREAM_BLOCK_SIZE,
+    };
     loop {
-        let read = unsafe { libc::vmsplice(fd, &iov as *const libc::iovec, 1, 0) };
-        if read <= 0 {
+        let read =
+            unsafe { libc::vmsplice(fd, &iov as *const libc::iovec, 1, libc::SPLICE_F_NONBLOCK) };
+        if read == 0 {
             return Ok(totals);
+        } else if read < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => continue,
+                _ => return Err(err),
+            }
         }
         let block = &buffer[..read as usize];
         let counts = count_wc_block(block, options);

@@ -58,6 +58,7 @@ impl AlignedBuffer {
         })
     }
 
+    #[allow(unused)]
     pub fn truncate(&mut self, new_len: usize) -> usize {
         if new_len < self.len {
             self.len = new_len
