@@ -57,7 +57,7 @@ impl ParallelStream {
         processor: F,
     ) -> std::io::Result<ParallelWriteReport>
     where
-        F: for<'a> Fn(&'a [u8]) -> std::io::Result<Vec<u8>> + Send + Sync + 'static,
+        F: for<'a> Fn(&'a [u8], &mut [u8]) -> std::io::Result<usize> + Send + Sync + 'static,
     {
         let input_file = ParallelFile::open(config, "compute", read_path, IOMode::PageCache)?;
         let block_size = read_block_size;
@@ -76,8 +76,10 @@ impl ParallelStream {
 
         let _read_report =
             input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
-                let produced = processor(raw_bytes)?;
-                output_stream_for_blocks.write_at_index(chunk_index, produced)?;
+                let mut out = vec![0u8; write_block_size];
+                let produced = processor(raw_bytes, &mut out)?;
+                out.truncate(produced);
+                output_stream_for_blocks.write_at_index(chunk_index, out)?;
                 Ok(())
             })?;
 

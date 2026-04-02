@@ -1,6 +1,5 @@
 use super::*;
 use crate::stream::ParallelStream;
-use libc::{madvise, MADV_HUGEPAGE};
 use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::fs::File;
 use std::hint::black_box;
@@ -67,27 +66,8 @@ impl Base64DecodeKernel {
 struct Base64ProcessPlan {
     read_block_size: u64,
     write_block_size: usize,
+    input_chunk_multiple: usize,
     process_chunk: fn(&[u8], &mut [u8]) -> io::Result<usize>,
-}
-
-struct Base64ProcessState {
-    carry: Vec<u8>,
-    scratch: Vec<u8>,
-    wrap_line_len: usize,
-    invalid: bool,
-    saw_padding: bool,
-}
-
-impl Base64ProcessState {
-    fn new() -> Self {
-        Self {
-            carry: Vec::new(),
-            scratch: Vec::new(),
-            wrap_line_len: 0,
-            invalid: false,
-            saw_padding: false,
-        }
-    }
 }
 
 #[cfg(target_arch = "x86")]
@@ -222,10 +202,6 @@ fn base64_decoded_len_from_padding(padding: u8) -> Option<usize> {
         2 => Some(1),
         _ => None,
     }
-}
-
-fn decoded_base64_capacity(input_len: usize) -> usize {
-    (input_len / 4) * 3
 }
 
 fn decode_base64_kernel_for_block(
@@ -375,43 +351,6 @@ pub fn encode_base64_block_aligned_small(bytes: &[u8]) -> Vec<u8> {
 
     // Optional: truncate if needed, though usually len is exact for base64
     out_vec.truncate(written);
-    out_vec
-}
-
-pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
-    let len = encoded_base64_len(bytes.len());
-
-    // Huge pages are usually 2MB. Alignment must match this for THP to kick in.
-    let huge_page_size = 2 * 1024 * 1024;
-
-    // Round up the capacity to a full page multiple to satisfy vmsplice alignment
-    let capacity = (len + huge_page_size - 1) & !(huge_page_size - 1);
-
-    let layout =
-        Layout::from_size_align(capacity, huge_page_size).expect("Invalid layout for huge pages");
-
-    let ptr = unsafe { alloc(layout) };
-    if ptr.is_null() {
-        handle_alloc_error(layout);
-    }
-
-    // 1. Give the kernel the hint to use Transparent Huge Pages
-    unsafe {
-        let _ret = madvise(ptr as *mut libc::c_void, capacity, MADV_HUGEPAGE);
-    }
-
-    // 2. Wrap in a Vec.
-    // IMPORTANT: Vec capacity must match the Layout exactly for safe deallocation.
-    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
-
-    // 3. Perform encoding
-    let written = encode_base64_block_into(bytes, &mut out_vec);
-
-    // Set the length to the actual written bytes for the caller
-    unsafe {
-        out_vec.set_len(written);
-    }
-
     out_vec
 }
 
@@ -790,10 +729,6 @@ fn decode_base64_block_into_with_kernel(
     }
 }
 
-fn decode_base64_clean_block(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
-    decode_base64_block_into_with_kernel(bytes, out, Base64DecodeKernel::Auto)
-}
-
 fn decode_base64_block_processor_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
     decode_base64_block_into_scalar(bytes, out)
 }
@@ -805,10 +740,6 @@ fn decode_base64_block_processor_avx2(bytes: &[u8], out: &mut [u8]) -> io::Resul
     }
     // SAFETY: this processor is only selected after runtime AVX2 detection.
     unsafe { decode_base64_block_into_avx2(bytes, out) }
-}
-
-fn decode_base64_block_processor(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
-    decode_base64_clean_block(bytes, out)
 }
 
 pub(crate) fn bench_base64_encode(

@@ -1,59 +1,5 @@
 use super::*;
 
-fn process_regular_file_blocks_in_order<T, X, D>(
-    path: &str,
-    io_mode: IOMode,
-    read_block_size: u64,
-    transform: X,
-    mut drain: D,
-) -> io::Result<()>
-where
-    T: Send + 'static,
-    X: Fn(&[u8]) -> io::Result<T> + Send + Sync + 'static,
-    D: FnMut(usize, T) -> io::Result<()>,
-{
-    let config = load_config(None);
-    let page_cache = config.get_params_for_path("compute", false, path);
-    let direct = config.get_params_for_path("compute", true, path);
-    let transform = Arc::new(transform);
-    let (tx, rx) = mpsc::channel::<(usize, io::Result<T>)>();
-    let sender = tx.clone();
-    let visit_result = crate::reader::visit_file_blocks(
-        path,
-        page_cache.num_threads,
-        read_block_size,
-        page_cache.qd,
-        direct.num_threads,
-        read_block_size,
-        direct.qd,
-        internal_io_mode(io_mode),
-        move |block| {
-            let result = transform(block.data);
-            sender
-                .send((block.block_index, result))
-                .map_err(|_| io::Error::other("failed to queue transformed block"))
-        },
-    )?;
-    drop(tx);
-
-    let mut next_block = 0usize;
-    let mut pending = BTreeMap::<usize, io::Result<T>>::new();
-    while let Ok((block_index, item)) = rx.recv() {
-        pending.insert(block_index, item);
-        while let Some(item) = pending.remove(&next_block) {
-            drain(next_block, item?)?;
-            next_block += 1;
-        }
-    }
-    if !pending.is_empty() {
-        return Err(io::Error::other(
-            "missing transformed block data while finalizing ordered output",
-        ));
-    }
-    let _ = visit_result;
-    Ok(())
-}
-
 fn process_pipe_to_pipe(
     dest: &mut File,
     input: &StreamInput,
@@ -66,6 +12,7 @@ fn process_pipe_to_pipe(
         input,
         plan.read_block_size,
         plan.write_block_size,
+        plan.input_chunk_multiple,
     )?;
     return Ok(false);
 }
@@ -168,6 +115,7 @@ fn process_pipe_input_to_pipe_fast(
     input: &StreamInput,
     read_block_size: u64,
     write_block_size: usize,
+    input_chunk_multiple: usize,
 ) -> io::Result<()> {
     use std::os::unix::io::RawFd;
 
@@ -216,6 +164,7 @@ fn process_pipe_input_to_pipe_fast(
     let mut read_bufs = (0..3)
         .map(|_| vec![0u8; read_block_size as usize])
         .collect::<Vec<_>>();
+    let mut carry = Vec::new();
     let (free_tx, free_rx) = mpsc::sync_channel::<Vec<u8>>(3);
     for _ in 0..3 {
         free_tx
@@ -250,14 +199,51 @@ fn process_pipe_input_to_pipe_fast(
         if read == 0 {
             break;
         }
+        let ready_len = if input_chunk_multiple <= 1 {
+            read
+        } else {
+            let total = carry.len() + read;
+            (total / input_chunk_multiple) * input_chunk_multiple
+        };
+        if ready_len == 0 {
+            carry.extend_from_slice(&read_bufs[read_slot][..read]);
+            read_slot = (read_slot + 1) % read_bufs.len();
+            continue;
+        }
         let out = free_rx
             .recv()
             .map_err(|err| io::Error::other(err.to_string()))?;
         let mut out = out;
-        let produced = processor(&read_bufs[read_slot][..read], &mut out[..])?;
+        let produced = if carry.is_empty() {
+            let process_len = ready_len.min(read);
+            let produced = processor(&read_bufs[read_slot][..process_len], &mut out[..])?;
+            if process_len < read {
+                carry.extend_from_slice(&read_bufs[read_slot][process_len..read]);
+            }
+            produced
+        } else {
+            let mut merged = Vec::with_capacity(ready_len);
+            let take_from_read = ready_len - carry.len();
+            merged.extend_from_slice(&carry);
+            merged.extend_from_slice(&read_bufs[read_slot][..take_from_read]);
+            carry.clear();
+            if take_from_read < read {
+                carry.extend_from_slice(&read_bufs[read_slot][take_from_read..read]);
+            }
+            processor(&merged, &mut out[..])?
+        };
         tx.send(Ok((out, produced)))
             .map_err(|err| io::Error::other(err.to_string()))?;
         read_slot = (read_slot + 1) % read_bufs.len();
+    }
+    if !carry.is_empty() {
+        let out = free_rx
+            .recv()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let mut out = out;
+        let produced = processor(&carry, &mut out[..])?;
+        tx.send(Ok((out, produced)))
+            .map_err(|err| io::Error::other(err.to_string()))?;
     }
     drop(tx);
     writer_thread
@@ -396,6 +382,7 @@ fn encode_process_plan() -> Base64ProcessPlan {
     Base64ProcessPlan {
         read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
         write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
+        input_chunk_multiple: 3,
         process_chunk: encode_base64_block_processor,
     }
 }
@@ -418,6 +405,7 @@ fn decode_process_plan() -> Base64ProcessPlan {
     Base64ProcessPlan {
         read_block_size: BASE64_DECODE_FAST_READ_BLOCK_SIZE,
         write_block_size: BASE64_DECODE_FAST_WRITE_BLOCK_SIZE,
+        input_chunk_multiple: 4,
         process_chunk,
     }
 }
