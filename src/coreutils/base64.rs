@@ -89,6 +89,7 @@ struct Base64Options {
 }
 
 mod process;
+mod bench;
 #[cfg(test)]
 mod tests;
 #[cfg(kani)]
@@ -96,6 +97,21 @@ mod kani_proofs;
 
 pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
     process::run_base64(args)
+}
+
+pub(crate) fn bench_base64_wrapped_encode(iterations: u64, wrap_cols: usize) -> io::Result<()> {
+    bench::bench_base64_wrapped_encode(iterations, wrap_cols)
+}
+
+pub(crate) fn bench_base64_wrapped_decode(iterations: u64, ignore_garbage: bool) -> io::Result<()> {
+    bench::bench_base64_wrapped_decode(iterations, ignore_garbage)
+}
+
+pub(crate) fn bench_base64_decode_detect_fallback(
+    iterations: u64,
+    kernel: Base64DecodeKernel,
+) -> io::Result<()> {
+    bench::bench_base64_decode_detect_fallback(iterations, kernel)
 }
 
 fn print_base64_help() {
@@ -627,9 +643,26 @@ fn decode_base64_block_into_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<u
     Ok(out_index)
 }
 
+enum Base64DecodeFastOutcome {
+    Decoded(usize),
+    NeedsFallback,
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    match decode_base64_block_into_avx2_with_fused_fallback(bytes, out)? {
+        Base64DecodeFastOutcome::Decoded(written) => Ok(written),
+        Base64DecodeFastOutcome::NeedsFallback => decode_base64_block_into_scalar(bytes, out),
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_base64_block_into_avx2_with_fused_fallback(
+    bytes: &[u8],
+    out: &mut [u8],
+) -> io::Result<Base64DecodeFastOutcome> {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
         _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8,
@@ -674,6 +707,9 @@ unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Res
 
         let is_plus = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'+' as i8));
         let is_slash = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'/' as i8));
+        let is_pad = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'=' as i8));
+        let is_lf = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\n' as i8));
+        let is_cr = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\r' as i8));
 
         let upper_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8(b'A' as i8));
         let lower_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8(71));
@@ -693,8 +729,16 @@ unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Res
             _mm256_or_si256(is_upper, is_lower),
             _mm256_or_si256(is_digit, _mm256_or_si256(is_plus, is_slash)),
         );
-        if _mm256_movemask_epi8(valid) != -1 {
-            break;
+        let valid_mask = _mm256_movemask_epi8(valid);
+        if valid_mask != -1 {
+            let acceptable = _mm256_or_si256(valid, _mm256_or_si256(is_pad, _mm256_or_si256(is_lf, is_cr)));
+            if _mm256_movemask_epi8(acceptable) == -1 {
+                return Ok(Base64DecodeFastOutcome::NeedsFallback);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid base64 quartet",
+            ));
         }
 
         let merged_pairs = _mm256_maddubs_epi16(sextets, pack_pairs);
@@ -712,9 +756,16 @@ unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Res
     }
 
     if in_index < input_len {
-        out_index += decode_base64_block_into_scalar(&bytes[in_index..], &mut out[out_index..])?;
+        let remainder = &bytes[in_index..];
+        if remainder
+            .iter()
+            .any(|&byte| base64_is_ignored_decode_byte(byte) || byte == b'=')
+        {
+            return Ok(Base64DecodeFastOutcome::NeedsFallback);
+        }
+        out_index += decode_base64_block_into_scalar(remainder, &mut out[out_index..])?;
     }
-    Ok(out_index)
+    Ok(Base64DecodeFastOutcome::Decoded(out_index))
 }
 
 fn decode_base64_block_into_with_kernel(
@@ -729,6 +780,27 @@ fn decode_base64_block_into_with_kernel(
     }
 }
 
+fn decode_base64_block_into_with_fused_fallback(
+    bytes: &[u8],
+    out: &mut [u8],
+    requested: Base64DecodeKernel,
+) -> io::Result<Base64DecodeFastOutcome> {
+    match decode_base64_kernel_for_block(bytes.len(), requested) {
+        Base64DecodeKernel::Scalar | Base64DecodeKernel::Auto => {
+            if bytes
+                .iter()
+                .any(|&byte| base64_is_ignored_decode_byte(byte) || byte == b'=')
+            {
+                Ok(Base64DecodeFastOutcome::NeedsFallback)
+            } else {
+                Ok(Base64DecodeFastOutcome::Decoded(decode_base64_block_into_scalar(bytes, out)?))
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64DecodeKernel::Avx2 => unsafe { decode_base64_block_into_avx2_with_fused_fallback(bytes, out) },
+    }
+}
+
 fn decode_base64_block_processor_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
     decode_base64_block_into_scalar(bytes, out)
 }
@@ -739,7 +811,10 @@ fn decode_base64_block_processor_avx2(bytes: &[u8], out: &mut [u8]) -> io::Resul
         return decode_base64_block_into_scalar(bytes, out);
     }
     // SAFETY: this processor is only selected after runtime AVX2 detection.
-    unsafe { decode_base64_block_into_avx2(bytes, out) }
+    match unsafe { decode_base64_block_into_avx2_with_fused_fallback(bytes, out) }? {
+        Base64DecodeFastOutcome::Decoded(written) => Ok(written),
+        Base64DecodeFastOutcome::NeedsFallback => decode_base64_block_into_scalar(bytes, out),
+    }
 }
 
 pub(crate) fn bench_base64_encode(

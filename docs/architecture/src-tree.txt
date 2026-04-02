@@ -4,6 +4,9 @@ src/
     fro-optimize.rs
   coreutils/
     base64/
+      process/
+        decode_reorg.rs
+      bench.rs
       kani_proofs.rs
       process.rs
       tests.rs

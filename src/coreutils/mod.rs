@@ -116,6 +116,21 @@ pub(crate) fn bench_base64_decode(iterations: u64, kernel: Base64DecodeKernel) -
     base64::bench_base64_decode(iterations, kernel)
 }
 
+pub(crate) fn bench_base64_decode_detect_fallback(
+    iterations: u64,
+    kernel: Base64DecodeKernel,
+) -> io::Result<()> {
+    base64::bench_base64_decode_detect_fallback(iterations, kernel)
+}
+
+pub(crate) fn bench_base64_wrapped_encode(iterations: u64, wrap_cols: usize) -> io::Result<()> {
+    base64::bench_base64_wrapped_encode(iterations, wrap_cols)
+}
+
+pub(crate) fn bench_base64_wrapped_decode(iterations: u64, ignore_garbage: bool) -> io::Result<()> {
+    base64::bench_base64_wrapped_decode(iterations, ignore_garbage)
+}
+
 fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
     if !is_coreutils_command(invoked) {
         return Ok(None);

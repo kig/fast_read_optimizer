@@ -2011,6 +2011,45 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "bench-base64-decode -n 1000000",
             )],
         }),
+        "bench-base64-decode-detect-fallback" => Some(CommandHelp {
+            name: "bench-base64-decode-detect-fallback",
+            usage: "bench-base64-decode-detect-fallback [-n iterations] [--variant auto|scalar|avx2]",
+            summary: "Hot-loop decode with a pre-scan that falls back to the wrapped/dirty path when needed.",
+            notes: &[
+                "Uses clean unwrapped base64 generated from the fixed 12 KiB source buffer.",
+                "Measures the cost of checking for garbage/newlines before choosing the fast decode kernel.",
+            ],
+            examples: &[(
+                "Run one million detect+fallback decode iterations",
+                "bench-base64-decode-detect-fallback -n 1000000 --variant avx2",
+            )],
+        }),
+        "bench-base64-wrapped-encode" => Some(CommandHelp {
+            name: "bench-base64-wrapped-encode",
+            usage: "bench-base64-wrapped-encode [-n iterations] [--wrap COLS]",
+            summary: "Hot-loop the wrapped base64 encode path on one core.",
+            notes: &[
+                "Uses the wrapped slow-path implementation over a fixed 12 KiB source buffer.",
+                "Reports iterations per second and effective input GB/s per core.",
+            ],
+            examples: &[(
+                "Run one million wrapped encode iterations at 76 columns",
+                "bench-base64-wrapped-encode -n 1000000 --wrap 76",
+            )],
+        }),
+        "bench-base64-wrapped-decode" => Some(CommandHelp {
+            name: "bench-base64-wrapped-decode",
+            usage: "bench-base64-wrapped-decode [-n iterations] [--ignore-garbage]",
+            summary: "Hot-loop the wrapped/dirty base64 decode reorganization path on one core.",
+            notes: &[
+                "Uses wrapped base64 generated from the fixed 12 KiB source buffer.",
+                "Reports iterations per second and effective decoded GB/s per core.",
+            ],
+            examples: &[(
+                "Run one million wrapped decode iterations",
+                "bench-base64-wrapped-decode -n 1000000",
+            )],
+        }),
         "bench-mmap-write" => Some(CommandHelp {
             name: "bench-mmap-write",
             usage: "bench-mmap-write <filename>",
@@ -2121,6 +2160,8 @@ fn print_general_help(program: &str) {
     println!("  bench-memcpy       in-memory memcpy microbenchmark");
     println!("  bench-base64-encode base64 encode kernel microbenchmark");
     println!("  bench-base64-decode base64 decode kernel microbenchmark");
+    println!("  bench-base64-wrapped-encode wrapped base64 encode path microbenchmark");
+    println!("  bench-base64-wrapped-decode wrapped base64 decode path microbenchmark");
     println!("  bench-mmap-write   mmap write microbenchmark");
     println!("  bench-write        plain write microbenchmark");
     println!();
@@ -2220,7 +2261,12 @@ fn try_main() -> io::Result<i32> {
     let mut create_size: Option<u64> = None;
     let mut iterations = if mode == "read" {
         1000
-    } else if mode == "bench-base64-encode" || mode == "bench-base64-decode" {
+    } else if mode == "bench-base64-encode"
+        || mode == "bench-base64-decode"
+        || mode == "bench-base64-decode-detect-fallback"
+        || mode == "bench-base64-wrapped-encode"
+        || mode == "bench-base64-wrapped-decode"
+    {
         1_000_000
     } else {
         1
@@ -2231,6 +2277,8 @@ fn try_main() -> io::Result<i32> {
     let mut bench_threads: Option<usize> = None;
     let mut base64_kernel = coreutils::Base64EncodeKernel::Auto;
     let mut base64_decode_kernel = coreutils::Base64DecodeKernel::Auto;
+    let mut base64_wrap_cols: usize = 76;
+    let mut base64_ignore_garbage = false;
 
     let mut i = 2;
     let mut end_flags = false;
@@ -2274,7 +2322,9 @@ fn try_main() -> io::Result<i32> {
                 if i < args.len() {
                     if mode == "bench-base64-encode" {
                         base64_kernel = coreutils::parse_base64_encode_kernel(args[i].as_str())?;
-                    } else if mode == "bench-base64-decode" {
+                    } else if mode == "bench-base64-decode"
+                        || mode == "bench-base64-decode-detect-fallback"
+                    {
                         base64_decode_kernel =
                             coreutils::parse_base64_decode_kernel(args[i].as_str())?;
                     } else {
@@ -2282,6 +2332,18 @@ fn try_main() -> io::Result<i32> {
                         return Ok(1);
                     }
                 }
+            } else if args[i] == "--wrap" {
+                i += 1;
+                if i < args.len() {
+                    base64_wrap_cols = args[i].parse().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid wrap size: {}", err),
+                        )
+                    })?;
+                }
+            } else if args[i] == "--ignore-garbage" {
+                base64_ignore_garbage = true;
             } else if args[i] == "--threads" {
                 i += 1;
                 if i < args.len() {
@@ -2474,6 +2536,18 @@ fn try_main() -> io::Result<i32> {
     }
     if mode == "bench-base64-decode" {
         coreutils::bench_base64_decode(iterations as u64, base64_decode_kernel)?;
+        return Ok(0);
+    }
+    if mode == "bench-base64-decode-detect-fallback" {
+        coreutils::bench_base64_decode_detect_fallback(iterations as u64, base64_decode_kernel)?;
+        return Ok(0);
+    }
+    if mode == "bench-base64-wrapped-encode" {
+        coreutils::bench_base64_wrapped_encode(iterations as u64, base64_wrap_cols)?;
+        return Ok(0);
+    }
+    if mode == "bench-base64-wrapped-decode" {
+        coreutils::bench_base64_wrapped_decode(iterations as u64, base64_ignore_garbage)?;
         return Ok(0);
     }
     if mode == "bench-mmap-write" {

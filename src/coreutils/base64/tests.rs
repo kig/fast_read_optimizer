@@ -1,5 +1,7 @@
 use super::*;
-use super::process::{append_sanitized_base64_bytes, append_wrapped_base64_bytes};
+use super::process::{
+    append_sanitized_base64_bytes, append_wrapped_base64_bytes, decode_base64_bytes_with_detect_fallback,
+};
 
 #[test]
 fn base64_encode_ascii_scalar_glsl_matches_table() {
@@ -122,4 +124,35 @@ fn base64_avx2_block_matches_scalar_block() {
         out.truncate(written);
         assert_eq!(out, scalar);
     }
+}
+
+#[test]
+fn decode_detect_fallback_decodes_clean_input() {
+    let bytes = (0..(12 * 1024))
+        .map(|i| ((i * 29 + 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut encoded = vec![0u8; encoded_base64_len(bytes.len())];
+    let written = encode_base64_block_into(&bytes, &mut encoded);
+    encoded.truncate(written);
+    let decoded =
+        decode_base64_bytes_with_detect_fallback(&encoded, false, Base64DecodeKernel::Auto).unwrap();
+    assert_eq!(decoded, bytes);
+}
+
+#[test]
+fn decode_detect_fallback_decodes_wrapped_input() {
+    let bytes = (0..(12 * 1024))
+        .map(|i| ((i * 19 + 11) % 251) as u8)
+        .collect::<Vec<_>>();
+    let encoded = super::process::encode_base64_bytes_via_wrapped_path(&bytes, 76).unwrap();
+    let decoded =
+        decode_base64_bytes_with_detect_fallback(&encoded, false, Base64DecodeKernel::Auto).unwrap();
+    assert_eq!(decoded, bytes);
+}
+
+#[test]
+fn decode_detect_fallback_rejects_invalid_input() {
+    let err =
+        decode_base64_bytes_with_detect_fallback(b"Zm9v!!", false, Base64DecodeKernel::Auto).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }

@@ -1,4 +1,6 @@
 use super::*;
+mod decode_reorg;
+use decode_reorg::Base64DecodeReorg;
 
 fn process_pipe_to_pipe(
     dest: &mut File,
@@ -76,6 +78,7 @@ fn process_file_to_file(
     return Ok(false);
 }
 
+#[cfg(test)]
 pub(super) fn append_wrapped_base64_bytes(
     out: &mut Vec<u8>,
     bytes: &[u8],
@@ -99,6 +102,89 @@ pub(super) fn append_wrapped_base64_bytes(
             *current_line_len = 0;
         }
     }
+}
+
+fn wrapped_base64_output_capacity(
+    encoded_len: usize,
+    wrap_cols: usize,
+    current_line_len: usize,
+) -> usize {
+    if wrap_cols == 0 {
+        encoded_len
+    } else {
+        encoded_len + ((current_line_len + encoded_len) / wrap_cols)
+    }
+}
+
+fn ordered_input_block_bound(input: &StreamInput, io_mode: IOMode) -> io::Result<usize> {
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            let config = load_config(None);
+            let page_cache = config.get_params_for_path("read", false, path);
+            let direct = config.get_params_for_path("read", true, path);
+            let block_size = match io_mode {
+                IOMode::Direct => direct.block_size,
+                IOMode::PageCache => page_cache.block_size,
+                IOMode::Auto => page_cache.block_size.max(direct.block_size),
+            };
+            Ok(block_size as usize)
+        }
+        _ => Ok(1 << 20),
+    }
+}
+
+fn wrap_encoded_bytes_into(
+    encoded: &[u8],
+    wrap_cols: usize,
+    current_line_len: &mut usize,
+    out: &mut [u8],
+) -> usize {
+    if wrap_cols == 0 {
+        out[..encoded.len()].copy_from_slice(encoded);
+        return encoded.len();
+    }
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    let mut line_len = *current_line_len;
+    while src < encoded.len() {
+        let available = wrap_cols.saturating_sub(line_len);
+        let take = available.min(encoded.len() - src);
+        out[dst..dst + take].copy_from_slice(&encoded[src..src + take]);
+        dst += take;
+        src += take;
+        line_len += take;
+        if line_len == wrap_cols {
+            out[dst] = b'\n';
+            dst += 1;
+            line_len = 0;
+        }
+    }
+    *current_line_len = line_len;
+    dst
+}
+
+fn encode_full_wrapped_lines_in_place(
+    bytes: &[u8],
+    line_input_bytes: usize,
+    wrap_cols: usize,
+    out: &mut [u8],
+) -> usize {
+    debug_assert_eq!(bytes.len() % line_input_bytes, 0);
+    let full_lines = bytes.len() / line_input_bytes;
+    let encoded_len = full_lines * wrap_cols;
+    let wrapped_len = full_lines * (wrap_cols + 1);
+    let written = encode_base64_block_into(bytes, &mut out[..encoded_len]);
+    debug_assert_eq!(written, encoded_len);
+    for line_index in (0..full_lines).rev() {
+        let src_start = line_index * wrap_cols;
+        let dst_start = line_index * (wrap_cols + 1);
+        if src_start != dst_start {
+            out.copy_within(src_start..src_start + wrap_cols, dst_start);
+        }
+        out[dst_start + wrap_cols] = b'\n';
+    }
+    wrapped_len
 }
 
 use libc::{fcntl, F_SETPIPE_SZ};
@@ -258,51 +344,54 @@ fn decode_base64_input<W: Write>(
     io_mode: IOMode,
     ignore_garbage: bool,
 ) -> io::Result<bool> {
-    let mut quartet = [0_u8; 4];
-    let mut quartet_len = 0usize;
+    let compacted_capacity = ordered_input_block_bound(input, io_mode)?.max(32 * 1024);
+    let mut reorg = Base64DecodeReorg::new(compacted_capacity, ignore_garbage);
     let mut invalid = false;
     visit_ordered_input(input, io_mode, |block| {
-        for &byte in block {
-            if invalid {
-                break;
-            }
-            if base64_is_ignored_decode_byte(byte) {
-                continue;
-            }
-            if byte == b'=' || base64_decode_value(byte).is_some() {
-                quartet[quartet_len] = byte;
-                quartet_len += 1;
-                if quartet_len == 4 {
-                    let Some((decoded, decoded_len)) = decode_base64_quartet(quartet) else {
-                        invalid = true;
-                        break;
-                    };
-                    out.write_all(&decoded[..decoded_len])?;
-                    quartet_len = 0;
-                }
-                continue;
-            }
-            if ignore_garbage {
-                continue;
-            }
+        if invalid {
+            return Ok(());
+        }
+        if let Err(err) = reorg.consume_block(out, block) {
             invalid = true;
-            break;
+            if err.kind() != io::ErrorKind::InvalidData {
+                return Err(err);
+            }
+            return Ok(());
         }
         Ok(())
     })?;
-    Ok(invalid || quartet_len != 0)
+    if invalid {
+        return Ok(true);
+    }
+    if let Err(err) = reorg.finish(out) {
+        if err.kind() == io::ErrorKind::InvalidData {
+            return Ok(true);
+        }
+        return Err(err);
+    }
+    Ok(false)
 }
 
 fn regular_decode_file_is_fast_path_compatible(path: &str) -> io::Result<bool> {
+    const FAST_PATH_COMPAT_PROBE_BYTES: u64 = 256 * 1024;
     let mut file = File::open(path)?;
     let mut buf = [0u8; 64 * 1024];
+    let mut remaining = FAST_PATH_COMPAT_PROBE_BYTES;
     loop {
-        let read = file.read(&mut buf)?;
+        if remaining == 0 {
+            return Ok(true);
+        }
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        let read = file.read(&mut buf[..to_read])?;
         if read == 0 {
             return Ok(true);
         }
+        remaining -= read as u64;
         let chunk = &buf[..read];
-        if chunk.contains(&b'\n') || chunk.contains(&b'\r') {
+        if chunk
+            .iter()
+            .any(|&byte| byte != b'=' && base64_decode_value(byte).is_none())
+        {
             return Ok(false);
         }
     }
@@ -334,22 +423,333 @@ fn encode_base64_input<W: Write>(
     io_mode: IOMode,
     wrap_cols: usize,
 ) -> io::Result<()> {
+    if wrap_cols != 0 && wrap_cols % 4 == 0 {
+        let line_input_bytes = (wrap_cols / 4) * 3;
+        let block_bound = ordered_input_block_bound(input, io_mode)?;
+        let full_line_input_bound = (block_bound / line_input_bytes) * line_input_bytes;
+        let mut carry = vec![0u8; line_input_bytes];
+        let mut carry_len = 0usize;
+        let mut line_buf = vec![0u8; wrap_cols + 1];
+        let mut wrapped_slab = vec![
+            0u8;
+            (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)
+        ];
+        visit_ordered_input(input, io_mode, |block| {
+            let mut start = 0usize;
+
+            if carry_len != 0 {
+                let needed = line_input_bytes - carry_len;
+                let take = needed.min(block.len());
+                carry[carry_len..carry_len + take].copy_from_slice(&block[..take]);
+                carry_len += take;
+                start = take;
+                if carry_len == line_input_bytes {
+                    let written =
+                        encode_base64_block_into(&carry[..line_input_bytes], &mut line_buf[..wrap_cols]);
+                    debug_assert_eq!(written, wrap_cols);
+                    line_buf[wrap_cols] = b'\n';
+                    out.write_all(&line_buf)?;
+                    carry_len = 0;
+                }
+            }
+
+            let remaining = &block[start..];
+            let full_line_input_len = (remaining.len() / line_input_bytes) * line_input_bytes;
+            if full_line_input_len != 0 {
+                let wrapped_len = encode_full_wrapped_lines_in_place(
+                    &remaining[..full_line_input_len],
+                    line_input_bytes,
+                    wrap_cols,
+                    &mut wrapped_slab,
+                );
+                out.write_all(&wrapped_slab[..wrapped_len])?;
+            }
+
+            let leftover = &remaining[full_line_input_len..];
+            if !leftover.is_empty() {
+                carry[..leftover.len()].copy_from_slice(leftover);
+                carry_len = leftover.len();
+            }
+            Ok(())
+        })?;
+        if carry_len != 0 {
+            let encoded_len = encoded_base64_len(carry_len);
+            let written = encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
+            debug_assert_eq!(written, encoded_len);
+            line_buf[encoded_len] = b'\n';
+            out.write_all(&line_buf[..encoded_len + 1])?;
+        }
+        return Ok(());
+    }
+
+    let block_bound = ordered_input_block_bound(input, io_mode)?;
+    let max_process_len = ((block_bound + 2) / 3) * 3;
+    let max_encoded_len = encoded_base64_len(max_process_len);
+    let mut carry = [0u8; 2];
+    let mut carry_len = 0usize;
     let mut current_line_len = 0usize;
+    let mut encoded_slab = vec![0u8; max_encoded_len.max(4)];
+    let mut wrapped_slab = vec![
+        0u8;
+        wrapped_base64_output_capacity(max_encoded_len.max(4), wrap_cols, wrap_cols.saturating_sub(1))
+    ];
     visit_ordered_input(input, io_mode, |block| {
-        let encoded = encode_base64_block(block);
-        if wrap_cols == 0 {
-            out.write_all(&encoded)?;
+        let total_len = carry_len + block.len();
+        let process_len = (total_len / 3) * 3;
+        if process_len == 0 {
+            carry[..block.len()].copy_from_slice(block);
+            carry_len = block.len();
+            return Ok(());
+        }
+        let mut block_start = 0usize;
+        if carry_len != 0 {
+            let needed = 3 - carry_len;
+            let mut merged = [0u8; 3];
+            merged[..carry_len].copy_from_slice(&carry[..carry_len]);
+            merged[carry_len..].copy_from_slice(&block[..needed]);
+            let written = encode_base64_block_into(&merged, &mut encoded_slab[..4]);
+            debug_assert_eq!(written, 4);
+            let wrapped_len = wrap_encoded_bytes_into(
+                &encoded_slab[..4],
+                wrap_cols,
+                &mut current_line_len,
+                &mut wrapped_slab,
+            );
+            out.write_all(&wrapped_slab[..wrapped_len])?;
+            block_start = needed;
+            carry_len = 0;
+        }
+        let remaining_process_len = process_len - block_start;
+        if remaining_process_len != 0 {
+            let input_slice = &block[block_start..block_start + remaining_process_len];
+            let encoded_len = encoded_base64_len(input_slice.len());
+            let written = encode_base64_block_into(input_slice, &mut encoded_slab[..encoded_len]);
+            let wrapped_len = wrap_encoded_bytes_into(
+                &encoded_slab[..written],
+                wrap_cols,
+                &mut current_line_len,
+                &mut wrapped_slab,
+            );
+            out.write_all(&wrapped_slab[..wrapped_len])?;
+            block_start += remaining_process_len;
+        }
+        let remainder = &block[block_start..];
+        if !remainder.is_empty() {
+            carry[..remainder.len()].copy_from_slice(remainder);
+            carry_len = remainder.len();
         } else {
-            let mut wrapped = Vec::with_capacity(encoded.len() + (encoded.len() / wrap_cols.max(1)) + 2);
-            append_wrapped_base64_bytes(&mut wrapped, &encoded, wrap_cols, &mut current_line_len);
-            out.write_all(&wrapped)?;
+            carry_len = 0;
         }
         Ok(())
     })?;
+    if carry_len != 0 {
+        let encoded_len = encoded_base64_len(carry_len);
+        let written = encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
+        let wrapped_len = wrap_encoded_bytes_into(
+            &encoded_slab[..written],
+            wrap_cols,
+            &mut current_line_len,
+            &mut wrapped_slab,
+        );
+        out.write_all(&wrapped_slab[..wrapped_len])?;
+    }
     if wrap_cols != 0 && current_line_len != 0 {
         out.write_all(b"\n")?;
     }
     Ok(())
+}
+
+pub(super) fn encode_base64_bytes_via_wrapped_path(
+    bytes: &[u8],
+    wrap_cols: usize,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(wrapped_base64_output_capacity(
+        encoded_base64_len(bytes.len()),
+        wrap_cols,
+        0,
+    ));
+    let mut stdin_reader = io::Cursor::new(bytes);
+
+    if wrap_cols != 0 && wrap_cols % 4 == 0 {
+        let line_input_bytes = (wrap_cols / 4) * 3;
+        let block_bound = 32 * 1024;
+        let full_line_input_bound = (block_bound / line_input_bytes) * line_input_bytes;
+        let mut carry = vec![0u8; line_input_bytes];
+        let mut carry_len = 0usize;
+        let mut line_buf = vec![0u8; wrap_cols + 1];
+        let mut wrapped_slab = vec![
+            0u8;
+            (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)
+        ];
+        let mut block = vec![0u8; 32 * 1024];
+        loop {
+            let read = stdin_reader.read(&mut block)?;
+            if read == 0 {
+                break;
+            }
+            let slice = &block[..read];
+            let mut start = 0usize;
+
+            if carry_len != 0 {
+                let needed = line_input_bytes - carry_len;
+                let take = needed.min(slice.len());
+                carry[carry_len..carry_len + take].copy_from_slice(&slice[..take]);
+                carry_len += take;
+                start = take;
+                if carry_len == line_input_bytes {
+                    let written = encode_base64_block_into(
+                        &carry[..line_input_bytes],
+                        &mut line_buf[..wrap_cols],
+                    );
+                    debug_assert_eq!(written, wrap_cols);
+                    line_buf[wrap_cols] = b'\n';
+                    out.extend_from_slice(&line_buf);
+                    carry_len = 0;
+                }
+            }
+
+            let remaining = &slice[start..];
+            let full_line_input_len = (remaining.len() / line_input_bytes) * line_input_bytes;
+            if full_line_input_len != 0 {
+                let wrapped_len = encode_full_wrapped_lines_in_place(
+                    &remaining[..full_line_input_len],
+                    line_input_bytes,
+                    wrap_cols,
+                    &mut wrapped_slab,
+                );
+                out.extend_from_slice(&wrapped_slab[..wrapped_len]);
+            }
+
+            let leftover = &remaining[full_line_input_len..];
+            if !leftover.is_empty() {
+                carry[..leftover.len()].copy_from_slice(leftover);
+                carry_len = leftover.len();
+            }
+        }
+
+        if carry_len != 0 {
+            let encoded_len = encoded_base64_len(carry_len);
+            let written = encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
+            line_buf[written] = b'\n';
+            out.extend_from_slice(&line_buf[..written + 1]);
+        }
+        return Ok(out);
+    }
+
+    let mut current_line_len = 0usize;
+    let max_process_len = ((32 * 1024 + 2) / 3) * 3;
+    let max_encoded_len = encoded_base64_len(max_process_len);
+    let mut carry = [0u8; 2];
+    let mut carry_len = 0usize;
+    let mut encoded_slab = vec![0u8; max_encoded_len.max(4)];
+    let mut wrapped_slab = vec![
+        0u8;
+        wrapped_base64_output_capacity(max_encoded_len.max(4), wrap_cols, wrap_cols.saturating_sub(1))
+    ];
+    let mut block = vec![0u8; 32 * 1024];
+    loop {
+        let read = stdin_reader.read(&mut block)?;
+        if read == 0 {
+            break;
+        }
+        let slice = &block[..read];
+        let total_len = carry_len + slice.len();
+        let process_len = (total_len / 3) * 3;
+        if process_len == 0 {
+            carry[..slice.len()].copy_from_slice(slice);
+            carry_len = slice.len();
+            continue;
+        }
+        let mut block_start = 0usize;
+        if carry_len != 0 {
+            let needed = 3 - carry_len;
+            let mut merged = [0u8; 3];
+            merged[..carry_len].copy_from_slice(&carry[..carry_len]);
+            merged[carry_len..].copy_from_slice(&slice[..needed]);
+            let written = encode_base64_block_into(&merged, &mut encoded_slab[..4]);
+            let wrapped_len = wrap_encoded_bytes_into(
+                &encoded_slab[..written],
+                wrap_cols,
+                &mut current_line_len,
+                &mut wrapped_slab,
+            );
+            out.extend_from_slice(&wrapped_slab[..wrapped_len]);
+            block_start = needed;
+        }
+        let remaining_process_len = process_len - block_start;
+        if remaining_process_len != 0 {
+            let input_slice = &slice[block_start..block_start + remaining_process_len];
+            let encoded_len = encoded_base64_len(input_slice.len());
+            let written = encode_base64_block_into(input_slice, &mut encoded_slab[..encoded_len]);
+            let wrapped_len = wrap_encoded_bytes_into(
+                &encoded_slab[..written],
+                wrap_cols,
+                &mut current_line_len,
+                &mut wrapped_slab,
+            );
+            out.extend_from_slice(&wrapped_slab[..wrapped_len]);
+            block_start += remaining_process_len;
+        }
+        let remainder = &slice[block_start..];
+        if !remainder.is_empty() {
+            carry[..remainder.len()].copy_from_slice(remainder);
+            carry_len = remainder.len();
+        } else {
+            carry_len = 0;
+        }
+    }
+    if carry_len != 0 {
+        let encoded_len = encoded_base64_len(carry_len);
+        let written = encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
+        let wrapped_len = wrap_encoded_bytes_into(
+            &encoded_slab[..written],
+            wrap_cols,
+            &mut current_line_len,
+            &mut wrapped_slab,
+        );
+        out.extend_from_slice(&wrapped_slab[..wrapped_len]);
+    }
+    if wrap_cols != 0 && current_line_len != 0 {
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+pub(super) fn decode_base64_bytes_via_reorg_path(
+    bytes: &[u8],
+    ignore_garbage: bool,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
+    let mut reorg = Base64DecodeReorg::new(32 * 1024, ignore_garbage);
+    let mut cursor = io::Cursor::new(bytes);
+    let mut block = vec![0u8; 32 * 1024];
+    loop {
+        let read = cursor.read(&mut block)?;
+        if read == 0 {
+            break;
+        }
+        reorg.consume_block(&mut out, &block[..read])?;
+    }
+    reorg.finish(&mut out)?;
+    Ok(out)
+}
+
+pub(super) fn decode_base64_bytes_with_detect_fallback(
+    bytes: &[u8],
+    ignore_garbage: bool,
+    kernel: Base64DecodeKernel,
+) -> io::Result<Vec<u8>> {
+    if ignore_garbage {
+        return decode_base64_bytes_via_reorg_path(bytes, true);
+    }
+    let mut out = vec![0u8; (bytes.len() / 4) * 3];
+    match decode_base64_block_into_with_fused_fallback(bytes, &mut out, kernel)? {
+        Base64DecodeFastOutcome::Decoded(written) => {
+            out.truncate(written);
+            Ok(out)
+        }
+        Base64DecodeFastOutcome::NeedsFallback => decode_base64_bytes_via_reorg_path(bytes, false),
+    }
 }
 
 #[cfg(test)]
