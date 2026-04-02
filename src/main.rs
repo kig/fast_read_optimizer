@@ -1997,6 +1997,20 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "bench-base64-encode -n 1000000",
             )],
         }),
+        "bench-base64-decode" => Some(CommandHelp {
+            name: "bench-base64-decode",
+            usage: "bench-base64-decode [-n iterations] [--variant auto|scalar|avx2]",
+            summary: "Hot-loop the in-memory 16 KiB -> 12 KiB base64 decode kernel on one core.",
+            notes: &[
+                "Uses a fixed 16 KiB encoded buffer generated from a fixed 12 KiB source buffer.",
+                "Reports iterations per second and effective decoded GB/s per core.",
+                "Use --variant to compare scalar and AVX2 decode kernels.",
+            ],
+            examples: &[(
+                "Run one million decode kernel iterations",
+                "bench-base64-decode -n 1000000",
+            )],
+        }),
         "bench-mmap-write" => Some(CommandHelp {
             name: "bench-mmap-write",
             usage: "bench-mmap-write <filename>",
@@ -2106,6 +2120,7 @@ fn print_general_help(program: &str) {
     println!("  bench-diff         in-memory diff microbenchmark");
     println!("  bench-memcpy       in-memory memcpy microbenchmark");
     println!("  bench-base64-encode base64 encode kernel microbenchmark");
+    println!("  bench-base64-decode base64 decode kernel microbenchmark");
     println!("  bench-mmap-write   mmap write microbenchmark");
     println!("  bench-write        plain write microbenchmark");
     println!();
@@ -2205,7 +2220,7 @@ fn try_main() -> io::Result<i32> {
     let mut create_size: Option<u64> = None;
     let mut iterations = if mode == "read" {
         1000
-    } else if mode == "bench-base64-encode" {
+    } else if mode == "bench-base64-encode" || mode == "bench-base64-decode" {
         1_000_000
     } else {
         1
@@ -2215,6 +2230,7 @@ fn try_main() -> io::Result<i32> {
     let mut bench_size: Option<u64> = None;
     let mut bench_threads: Option<usize> = None;
     let mut base64_kernel = coreutils::Base64EncodeKernel::Auto;
+    let mut base64_decode_kernel = coreutils::Base64DecodeKernel::Auto;
 
     let mut i = 2;
     let mut end_flags = false;
@@ -2258,8 +2274,11 @@ fn try_main() -> io::Result<i32> {
                 if i < args.len() {
                     if mode == "bench-base64-encode" {
                         base64_kernel = coreutils::parse_base64_encode_kernel(args[i].as_str())?;
+                    } else if mode == "bench-base64-decode" {
+                        base64_decode_kernel =
+                            coreutils::parse_base64_decode_kernel(args[i].as_str())?;
                     } else {
-                        eprintln!("--variant is only supported for bench-base64-encode");
+                        eprintln!("--variant is only supported for bench-base64-encode/decode");
                         return Ok(1);
                     }
                 }
@@ -2451,6 +2470,10 @@ fn try_main() -> io::Result<i32> {
     }
     if mode == "bench-base64-encode" {
         coreutils::bench_base64_encode(iterations as u64, base64_kernel)?;
+        return Ok(0);
+    }
+    if mode == "bench-base64-decode" {
+        coreutils::bench_base64_decode(iterations as u64, base64_decode_kernel)?;
         return Ok(0);
     }
     if mode == "bench-mmap-write" {

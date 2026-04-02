@@ -15,8 +15,10 @@ const BASE64_ENCODE: [u8; 64] =
     *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const BASE64_DEFAULT_WRAP: usize = 76;
 const BASE64_ENCODE_INPUT_ALIGN: u64 = 3 * 4096;
-const BASE64_DECODE_FAST_READ_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
-const BASE64_DECODE_FAST_WRITE_BLOCK_SIZE: usize = 6 * 1024 * 1024;
+const BASE64_ENCODE_FAST_READ_BLOCK_SIZE: u64 = 768 * 1024;
+const BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE: usize = 1024 * 1024;
+const BASE64_DECODE_FAST_READ_BLOCK_SIZE: u64 = 1024 * 1024;
+const BASE64_DECODE_FAST_WRITE_BLOCK_SIZE: usize = 768 * 1024;
 const BASE64_BENCH_INPUT_SIZE: usize = 12 * 1024;
 const BASE64_BENCH_OUTPUT_SIZE: usize = 16 * 1024;
 
@@ -44,19 +46,28 @@ impl Base64EncodeKernel {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Base64DecodeKernel {
+pub(crate) enum Base64DecodeKernel {
     Auto,
     Scalar,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2,
 }
 
+impl Base64DecodeKernel {
+    fn bench_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Scalar => "scalar",
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2 => "avx2",
+        }
+    }
+}
+
 struct Base64ProcessPlan {
     read_block_size: u64,
     write_block_size: usize,
-    process_chunk:
-        fn(&Base64Options, &[u8], &mut Vec<u8>, &mut Base64ProcessState) -> io::Result<()>,
-    finish: fn(&Base64Options, &mut Vec<u8>, &mut Base64ProcessState) -> io::Result<()>,
+    process_chunk: fn(&[u8], &mut [u8]) -> io::Result<usize>,
 }
 
 struct Base64ProcessState {
@@ -272,6 +283,19 @@ pub(crate) fn parse_base64_encode_kernel(value: &str) -> io::Result<Base64Encode
     }
 }
 
+pub(crate) fn parse_base64_decode_kernel(value: &str) -> io::Result<Base64DecodeKernel> {
+    match value {
+        "auto" => Ok(Base64DecodeKernel::Auto),
+        "scalar" => Ok(Base64DecodeKernel::Scalar),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "avx2" => Ok(Base64DecodeKernel::Avx2),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown base64 decode kernel variant '{value}'"),
+        )),
+    }
+}
+
 fn encode_base64_kernel_for_block(
     bytes_len: usize,
     requested: Base64EncodeKernel,
@@ -393,6 +417,10 @@ pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
 
 fn encode_base64_block_into(bytes: &[u8], out: &mut [u8]) -> usize {
     encode_base64_block_into_with_kernel(bytes, out, Base64EncodeKernel::Auto)
+}
+
+fn encode_base64_block_processor(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    Ok(encode_base64_block_into(bytes, out))
 }
 
 fn encode_base64_block_into_with_kernel(
@@ -665,20 +693,30 @@ fn decode_base64_block_into_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<u
 unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
-        _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8, _mm256_storeu_si256,
-        _mm256_sub_epi8,
+        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8,
+        _mm256_extract_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi32,
+        _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_sub_epi8, _mm_storel_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
-        _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8, _mm256_storeu_si256,
-        _mm256_sub_epi8,
+        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8,
+        _mm256_extract_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi32,
+        _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_sub_epi8, _mm_storel_epi64,
     };
+
+    const PACK_SHUFFLE: [i8; 32] = [
+        2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1, 2, 1, 0, 6, 5, 4, 10, 9, 8,
+        14, 13, 12, -1, -1, -1, -1,
+    ];
 
     let mut in_index = 0usize;
     let mut out_index = 0usize;
     let input_len = bytes.len();
+    let pack_shuffle = _mm256_loadu_si256(PACK_SHUFFLE.as_ptr() as *const _);
+    let pack_pairs = _mm256_set1_epi32(0x0140_0140);
+    let pack_quartets = _mm256_set1_epi32(0x0001_1000);
 
     while in_index + 32 <= input_len {
         let chunk = _mm256_loadu_si256(bytes.as_ptr().add(in_index) as *const _);
@@ -720,18 +758,17 @@ unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Res
             break;
         }
 
-        let mut sextet_bytes = [0u8; 32];
-        _mm256_storeu_si256(sextet_bytes.as_mut_ptr() as *mut _, sextets);
-        for lane in 0..8 {
-            let s0 = sextet_bytes[lane * 4];
-            let s1 = sextet_bytes[(lane * 4) + 1];
-            let s2 = sextet_bytes[(lane * 4) + 2];
-            let s3 = sextet_bytes[(lane * 4) + 3];
-            out[out_index] = (s0 << 2) | (s1 >> 4);
-            out[out_index + 1] = (s1 << 4) | (s2 >> 2);
-            out[out_index + 2] = (s2 << 6) | s3;
-            out_index += 3;
-        }
+        let merged_pairs = _mm256_maddubs_epi16(sextets, pack_pairs);
+        let merged_quartets = _mm256_madd_epi16(merged_pairs, pack_quartets);
+        let packed = _mm256_shuffle_epi8(merged_quartets, pack_shuffle);
+        let lower = _mm256_castsi256_si128(packed);
+        let upper = _mm256_extracti128_si256(packed, 1);
+        let out_ptr = out.as_mut_ptr().add(out_index);
+        _mm_storel_epi64(out_ptr as *mut _, lower);
+        *(out_ptr.add(8) as *mut u32) = _mm256_extract_epi32::<2>(packed) as u32;
+        _mm_storel_epi64(out_ptr.add(12) as *mut _, upper);
+        *(out_ptr.add(20) as *mut u32) = _mm256_extract_epi32::<6>(packed) as u32;
+        out_index += 24;
         in_index += 32;
     }
 
@@ -755,6 +792,23 @@ fn decode_base64_block_into_with_kernel(
 
 fn decode_base64_clean_block(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
     decode_base64_block_into_with_kernel(bytes, out, Base64DecodeKernel::Auto)
+}
+
+fn decode_base64_block_processor_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    decode_base64_block_into_scalar(bytes, out)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn decode_base64_block_processor_avx2(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    if bytes.len() < 32 {
+        return decode_base64_block_into_scalar(bytes, out);
+    }
+    // SAFETY: this processor is only selected after runtime AVX2 detection.
+    unsafe { decode_base64_block_into_avx2(bytes, out) }
+}
+
+fn decode_base64_block_processor(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    decode_base64_clean_block(bytes, out)
 }
 
 pub(crate) fn bench_base64_encode(
@@ -798,6 +852,56 @@ pub(crate) fn bench_base64_encode(
         iterations,
         BASE64_BENCH_INPUT_SIZE,
         BASE64_BENCH_OUTPUT_SIZE,
+        elapsed,
+        iterations_per_second,
+        gb_per_second
+    );
+    black_box(sink);
+    Ok(())
+}
+
+pub(crate) fn bench_base64_decode(
+    iterations: u64,
+    requested_kernel: Base64DecodeKernel,
+) -> io::Result<()> {
+    if iterations == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "iterations must be greater than zero",
+        ));
+    }
+
+    let decoded = (0..BASE64_BENCH_INPUT_SIZE)
+        .map(|i| ((i * 29 + 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    let encoded = encode_base64_block(&decoded);
+    debug_assert_eq!(encoded.len(), BASE64_BENCH_OUTPUT_SIZE);
+    let mut output = vec![0_u8; BASE64_BENCH_INPUT_SIZE];
+
+    let selected_kernel = decode_base64_kernel_for_block(encoded.len(), requested_kernel);
+
+    for _ in 0..1024 {
+        let written = decode_base64_block_into_with_kernel(&encoded, &mut output, selected_kernel)?;
+        black_box(written);
+    }
+
+    let start = Instant::now();
+    let mut sink = 0_u64;
+    for _ in 0..iterations {
+        let written = decode_base64_block_into_with_kernel(&encoded, &mut output, selected_kernel)?;
+        sink ^= u64::from(output[0]);
+        sink ^= u64::from(output[written - 1]);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let iterations_per_second = iterations as f64 / elapsed;
+    let gb_per_second = (iterations as f64 * decoded.len() as f64) / elapsed / 1e9;
+
+    println!(
+        "Base64 decode kernel [{}] {} iterations of {} -> {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
+        selected_kernel.bench_name(),
+        iterations,
+        encoded.len(),
+        decoded.len(),
         elapsed,
         iterations_per_second,
         gb_per_second

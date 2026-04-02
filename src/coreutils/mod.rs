@@ -31,7 +31,9 @@ mod shred;
 mod tac;
 mod wc;
 
-pub(crate) use base64::{parse_base64_encode_kernel, Base64EncodeKernel};
+pub(crate) use base64::{
+    parse_base64_decode_kernel, parse_base64_encode_kernel, Base64DecodeKernel, Base64EncodeKernel,
+};
 const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn is_coreutils_command(name: &str) -> bool {
@@ -108,6 +110,10 @@ pub fn try_run_subcommand(
 
 pub(crate) fn bench_base64_encode(iterations: u64, kernel: Base64EncodeKernel) -> io::Result<()> {
     base64::bench_base64_encode(iterations, kernel)
+}
+
+pub(crate) fn bench_base64_decode(iterations: u64, kernel: Base64DecodeKernel) -> io::Result<()> {
+    base64::bench_base64_decode(iterations, kernel)
 }
 
 fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
