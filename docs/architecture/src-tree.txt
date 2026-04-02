@@ -3,6 +3,10 @@ src/
     fro-benchmark.rs
     fro-optimize.rs
   coreutils/
+    base64/
+      kani_proofs.rs
+      process.rs
+      tests.rs
     base64.rs
     cat.rs
     cmp.rs
@@ -14,6 +18,10 @@ src/
     shred.rs
     tac.rs
     wc.rs
+  stream/
+    parallel_stream.rs
+    parallel_stream_to_file.rs
+    tests.rs
   api.rs
   blake3_hash.rs
   block_hash.rs

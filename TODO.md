@@ -17,6 +17,7 @@
   - `io_uring` `GETDENTS` remains blocked in this environment because the shipped kernel headers and current Rust crate surfaces do not expose `IORING_OP_GETDENTS`
 - The public API now exposes a first application-level benchmark hook for the "cold direct read to program memory while warming the page cache in the background" workflow via `benchmark_page_cache_lift()`, with ordered checkpoint reporting and a bounded Kani proof for the checkpoint helper.
 - `read` and `grep` now also have a user-facing `--auto-lift` mode that starts cold files on the direct path, warms the page cache in a background thread for later iterations in the same process, and measurably improves cold-start repeated scans on `checkpoints.tar.gz`.
+- `base64` now has a working GNU-style `--help` path again, a large wrapped decode regression test, and the base64/stream internals were split into submodules so janitor line-count checks pass without dropping the current fast paths.
 
 ## Current active items
 

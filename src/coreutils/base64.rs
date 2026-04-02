@@ -4,15 +4,19 @@ use libc::{madvise, MADV_HUGEPAGE};
 use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::fs::File;
 use std::hint::black_box;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 const BASE64_ENCODE: [u8; 64] =
     *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const BASE64_DEFAULT_WRAP: usize = 76;
 const BASE64_ENCODE_INPUT_ALIGN: u64 = 3 * 4096;
+const BASE64_DECODE_FAST_READ_BLOCK_SIZE: u64 = 8 * 1024 * 1024;
+const BASE64_DECODE_FAST_WRITE_BLOCK_SIZE: usize = 6 * 1024 * 1024;
 const BASE64_BENCH_INPUT_SIZE: usize = 12 * 1024;
 const BASE64_BENCH_OUTPUT_SIZE: usize = 16 * 1024;
 
@@ -39,6 +43,42 @@ impl Base64EncodeKernel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Base64DecodeKernel {
+    Auto,
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx2,
+}
+
+struct Base64ProcessPlan {
+    read_block_size: u64,
+    write_block_size: usize,
+    process_chunk:
+        fn(&Base64Options, &[u8], &mut Vec<u8>, &mut Base64ProcessState) -> io::Result<()>,
+    finish: fn(&Base64Options, &mut Vec<u8>, &mut Base64ProcessState) -> io::Result<()>,
+}
+
+struct Base64ProcessState {
+    carry: Vec<u8>,
+    scratch: Vec<u8>,
+    wrap_line_len: usize,
+    invalid: bool,
+    saw_padding: bool,
+}
+
+impl Base64ProcessState {
+    fn new() -> Self {
+        Self {
+            carry: Vec::new(),
+            scratch: Vec::new(),
+            wrap_line_len: 0,
+            invalid: false,
+            saw_padding: false,
+        }
+    }
+}
+
 #[cfg(target_arch = "x86")]
 type M128i = std::arch::x86::__m128i;
 #[cfg(target_arch = "x86")]
@@ -57,6 +97,30 @@ struct Base64Options {
     input: StreamInput,
 }
 
+mod process;
+#[cfg(test)]
+mod tests;
+#[cfg(kani)]
+mod kani_proofs;
+
+pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
+    process::run_base64(args)
+}
+
+fn print_base64_help() {
+    println!("Usage: base64 [OPTION]... [FILE]");
+    println!("Base64 encode or decode FILE, or standard input, to standard output.");
+    println!();
+    println!("  -d, --decode          decode data");
+    println!("  -i, --ignore-garbage  when decoding, ignore non-alphabet characters");
+    println!("  -w, --wrap=COLS       wrap encoded lines after COLS characters (default 76, 0 disables)");
+    println!("      --auto            choose I/O mode automatically");
+    println!("      --direct          force direct I/O where supported");
+    println!("      --no-direct       force page-cache I/O");
+    println!("      --help            display this help and exit");
+    println!("      --version         output version information and exit");
+}
+
 fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32>> {
     let mut decode = false;
     let mut ignore_garbage = false;
@@ -66,6 +130,10 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" => {
+                print_base64_help();
+                return Ok(Err(0));
+            }
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
@@ -142,6 +210,37 @@ fn base64_decoded_len_from_padding(padding: u8) -> Option<usize> {
         1 => Some(2),
         2 => Some(1),
         _ => None,
+    }
+}
+
+fn decoded_base64_capacity(input_len: usize) -> usize {
+    (input_len / 4) * 3
+}
+
+fn decode_base64_kernel_for_block(
+    bytes_len: usize,
+    requested: Base64DecodeKernel,
+) -> Base64DecodeKernel {
+    if bytes_len < 32 {
+        return Base64DecodeKernel::Scalar;
+    }
+    match requested {
+        Base64DecodeKernel::Auto => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Base64DecodeKernel::Avx2;
+            }
+            Base64DecodeKernel::Scalar
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64DecodeKernel::Avx2 => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return requested;
+            }
+            Base64DecodeKernel::Scalar
+        }
+        Base64DecodeKernel::Scalar => Base64DecodeKernel::Scalar,
     }
 }
 
@@ -518,379 +617,144 @@ fn decode_base64_quartet(quartet: [u8; 4]) -> Option<([u8; 3], usize)> {
     ))
 }
 
-fn write_base64_encoded_bytes<W: Write>(
-    out: &mut W,
-    bytes: &[u8],
-    wrap_cols: usize,
-    current_line_len: &mut usize,
-) -> io::Result<()> {
-    if wrap_cols == 0 {
-        return out.write_all(bytes);
-    }
-    let mut wrapped = Vec::with_capacity(bytes.len() + (bytes.len() / wrap_cols.max(1)) + 2);
-    append_wrapped_base64_bytes(&mut wrapped, bytes, wrap_cols, current_line_len);
-    out.write_all(&wrapped)
-}
-
-fn write_base64_encoded_bytes_file(
-    out: &mut std::fs::File,
-    bytes: &[u8],
-    wrap_cols: usize,
-    current_line_len: &mut usize,
-) -> io::Result<()> {
-    if wrap_cols == 0 {
-        return out.write_all(bytes);
-    }
-    let mut wrapped = Vec::with_capacity(bytes.len() + (bytes.len() / wrap_cols.max(1)) + 2);
-    append_wrapped_base64_bytes(&mut wrapped, bytes, wrap_cols, current_line_len);
-    out.write_all(&wrapped)
-}
-
-fn append_wrapped_base64_bytes(
-    out: &mut Vec<u8>,
-    bytes: &[u8],
-    wrap_cols: usize,
-    current_line_len: &mut usize,
-) {
-    if wrap_cols == 0 {
-        out.extend_from_slice(bytes);
-        return;
-    }
-
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let available = wrap_cols.saturating_sub(*current_line_len);
-        let take = available.min(bytes.len() - start);
-        out.extend_from_slice(&bytes[start..(start + take)]);
-        *current_line_len += take;
-        start += take;
-        if *current_line_len == wrap_cols {
-            out.push(b'\n');
-            *current_line_len = 0;
+fn decode_base64_block_into_scalar(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    let mut in_index = 0usize;
+    let mut out_index = 0usize;
+    while in_index < bytes.len() {
+        if in_index + 4 > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid base64 input length",
+            ));
+        }
+        let quartet = [
+            bytes[in_index],
+            bytes[in_index + 1],
+            bytes[in_index + 2],
+            bytes[in_index + 3],
+        ];
+        let Some((decoded, decoded_len)) = decode_base64_quartet(quartet) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid base64 quartet",
+            ));
+        };
+        if out_index + decoded_len > out.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "decode output buffer too small",
+            ));
+        }
+        out[out_index..out_index + decoded_len].copy_from_slice(&decoded[..decoded_len]);
+        out_index += decoded_len;
+        in_index += 4;
+        if quartet[2] == b'=' || quartet[3] == b'=' {
+            if in_index != bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "padding must terminate base64 stream",
+                ));
+            }
         }
     }
+    Ok(out_index)
 }
 
-pub fn encode_base64_pipe_to_pipe<W: Write>(
-    dest: &mut W,
-    input: &StreamInput,
-    _io_mode: IOMode,
-    _wrap_cols: usize,
-) -> io::Result<()> {
-    // eprintln!("pipe_to_pipe");
-    // Sequential fallback: process ordered input blocks and write encoded bytes to dest
-    let _config = load_config(None);
-    // let page_cache = config.get_params_for_path("compute", true, "/");
-    // let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    let read_block = base64_parallel_encode_block_size(1572864u64) as usize; // 1.5 MiB
-    let mut outbuf = vec![0u8; encoded_base64_len(read_block)];
-    let mut current_line_len = 0usize;
-
-    visit_ordered_input(input, _io_mode, |block| {
-        let produced = encode_base64_block_into(block, &mut outbuf);
-        write_base64_encoded_bytes(dest, &outbuf[..produced], _wrap_cols, &mut current_line_len)?;
-        Ok(())
-    })?;
-    if _wrap_cols != 0 {
-        dest.write_all(b"\n")?;
-    }
-    Ok(())
-}
-
-pub fn encode_base64_pipe_to_file(
-    dest: &mut std::fs::File,
-    input: &StreamInput,
-    _io_mode: IOMode,
-    _wrap_cols: usize,
-) -> io::Result<()> {
-    // eprintln!("pipe_to_file");
-    // Sequential fallback: process ordered input blocks and write encoded bytes to dest
-    let _config = load_config(None);
-    // let page_cache = config.get_params_for_path("compute", true, "/");
-    // let page_cache_block_size = base64_parallel_encode_block_size(page_cache.block_size);
-    let read_block = base64_parallel_encode_block_size(1572864u64) as usize; // 1.5 MiB
-    let mut outbuf = vec![0u8; encoded_base64_len(read_block)];
-    let mut current_line_len = 0usize;
-
-    visit_ordered_input(input, _io_mode, |block| {
-        let produced = encode_base64_block_into(block, &mut outbuf);
-        write_base64_encoded_bytes_file(
-            dest,
-            &outbuf[..produced],
-            _wrap_cols,
-            &mut current_line_len,
-        )?;
-        Ok(())
-    })?;
-    if _wrap_cols != 0 {
-        dest.write_all(b"\n")?;
-    }
-    Ok(())
-}
-
-use libc::{fcntl, F_SETPIPE_SZ};
-
-fn increase_pipe_capacity(pipe_fd: i32, new_size: usize) {
-    unsafe {
-        let _res = fcntl(pipe_fd, F_SETPIPE_SZ, new_size);
-    }
-}
-
-pub fn encode_base64_file_to_pipe(
-    dest: &mut std::fs::File,
-    path: &str,
-    _io_mode: IOMode,
-    _wrap_cols: usize,
-) -> io::Result<()> {
-    // eprintln!("file_to_pipe");
-    // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
-    if _wrap_cols != 0 {
-        return encode_base64_pipe_to_pipe(
-            dest,
-            &StreamInput::File(path.to_string()),
-            _io_mode,
-            _wrap_cols,
-        );
-    }
-
-    // Use fixed block sizes optimized for base64: 1.5MiB input -> 2MiB encoded output
-    let config = load_config(None);
-    let read_block = 1572864u64; // 1.5 MiB
-    let write_block = 2097152usize; // 2 MiB (encoded base64 size for 1.5MiB)
-
-    increase_pipe_capacity(dest.as_raw_fd(), write_block);
-
-    let processor =
-        |input: &[u8]| -> io::Result<Vec<u8>> { Ok(encode_base64_block_aligned(input)) };
-
-    let _report = ParallelStream::map_file_fixed_size_to_pipe(
-        &config,
-        path,
-        dest,
-        read_block,
-        write_block,
-        processor,
-    )?;
-
-    Ok(())
-}
-
-/// Variant that writes raw encoded blocks directly into an open destination File.
-/// Caller must ensure the destination file is prepared (opened with desired flags).
-pub fn encode_base64_file_to_file(
-    dest: &mut std::fs::File,
-    path: &str,
-    _io_mode: IOMode,
-    _wrap_cols: usize,
-) -> io::Result<()> {
-    // eprintln!("file_to_file");
-    // If wrapping is requested, fall back to the sequential path which preserves exact newline wrapping.
-    if _wrap_cols != 0 {
-        return encode_base64_pipe_to_pipe(
-            dest,
-            &StreamInput::File(path.to_string()),
-            _io_mode,
-            _wrap_cols,
-        );
-    }
-
-    // Use fixed block sizes optimized for base64: 1.5MiB input -> 2MiB encoded output
-    let config = load_config(None);
-    let read_block = 1572864u64; // 1.5 MiB
-    let write_block = 2097152usize; // 2 MiB (encoded base64 size for 1.5MiB)
-
-    let processor = |input: &[u8], out: &mut [u8]| -> io::Result<usize> {
-        Ok(encode_base64_block_into(input, out))
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_base64_block_into_avx2(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8, _mm256_storeu_si256,
+        _mm256_sub_epi8,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8, _mm256_storeu_si256,
+        _mm256_sub_epi8,
     };
 
-    let _report = ParallelStream::map_file_fixed_size_to_file(
-        &config,
-        path,
-        dest,
-        read_block,
-        write_block,
-        processor,
-    )?;
-    Ok(())
-}
+    let mut in_index = 0usize;
+    let mut out_index = 0usize;
+    let input_len = bytes.len();
 
-fn decode_base64_input<W: Write>(
-    out: &mut W,
-    input: &StreamInput,
-    io_mode: IOMode,
-    ignore_garbage: bool,
-) -> io::Result<bool> {
-    let mut quartet = [0_u8; 4];
-    let mut quartet_len = 0usize;
-    let mut invalid = false;
-    visit_ordered_input(input, io_mode, |block| {
-        for &byte in block {
-            if invalid {
-                break;
-            }
-            if base64_is_ignored_decode_byte(byte) {
-                continue;
-            }
-            if byte == b'=' || base64_decode_value(byte).is_some() {
-                quartet[quartet_len] = byte;
-                quartet_len += 1;
-                if quartet_len == 4 {
-                    let Some((decoded, decoded_len)) = decode_base64_quartet(quartet) else {
-                        invalid = true;
-                        break;
-                    };
-                    out.write_all(&decoded[..decoded_len])?;
-                    quartet_len = 0;
-                }
-                continue;
-            }
-            if ignore_garbage {
-                continue;
-            }
-            invalid = true;
+    while in_index + 32 <= input_len {
+        let chunk = _mm256_loadu_si256(bytes.as_ptr().add(in_index) as *const _);
+
+        let ge_upper_a = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8((b'A' as i8) - 1));
+        let le_upper_z = _mm256_cmpgt_epi8(_mm256_set1_epi8((b'Z' as i8) + 1), chunk);
+        let is_upper = _mm256_and_si256(ge_upper_a, le_upper_z);
+
+        let ge_lower_a = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8((b'a' as i8) - 1));
+        let le_lower_z = _mm256_cmpgt_epi8(_mm256_set1_epi8((b'z' as i8) + 1), chunk);
+        let is_lower = _mm256_and_si256(ge_lower_a, le_lower_z);
+
+        let ge_digit_0 = _mm256_cmpgt_epi8(chunk, _mm256_set1_epi8((b'0' as i8) - 1));
+        let le_digit_9 = _mm256_cmpgt_epi8(_mm256_set1_epi8((b'9' as i8) + 1), chunk);
+        let is_digit = _mm256_and_si256(ge_digit_0, le_digit_9);
+
+        let is_plus = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'+' as i8));
+        let is_slash = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'/' as i8));
+
+        let upper_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8(b'A' as i8));
+        let lower_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8(71));
+        let digit_vals = _mm256_sub_epi8(chunk, _mm256_set1_epi8(-4));
+        let plus_vals = _mm256_and_si256(is_plus, _mm256_set1_epi8(62));
+        let slash_vals = _mm256_and_si256(is_slash, _mm256_set1_epi8(63));
+
+        let mut sextets = _mm256_or_si256(
+            _mm256_and_si256(is_upper, upper_vals),
+            _mm256_and_si256(is_lower, lower_vals),
+        );
+        sextets = _mm256_or_si256(sextets, _mm256_and_si256(is_digit, digit_vals));
+        sextets = _mm256_or_si256(sextets, plus_vals);
+        sextets = _mm256_or_si256(sextets, slash_vals);
+
+        let valid = _mm256_or_si256(
+            _mm256_or_si256(is_upper, is_lower),
+            _mm256_or_si256(is_digit, _mm256_or_si256(is_plus, is_slash)),
+        );
+        if _mm256_movemask_epi8(valid) != -1 {
             break;
         }
-        Ok(())
-    })?;
-    Ok(invalid || quartet_len != 0)
+
+        let mut sextet_bytes = [0u8; 32];
+        _mm256_storeu_si256(sextet_bytes.as_mut_ptr() as *mut _, sextets);
+        for lane in 0..8 {
+            let s0 = sextet_bytes[lane * 4];
+            let s1 = sextet_bytes[(lane * 4) + 1];
+            let s2 = sextet_bytes[(lane * 4) + 2];
+            let s3 = sextet_bytes[(lane * 4) + 3];
+            out[out_index] = (s0 << 2) | (s1 >> 4);
+            out[out_index + 1] = (s1 << 4) | (s2 >> 2);
+            out[out_index + 2] = (s2 << 6) | s3;
+            out_index += 3;
+        }
+        in_index += 32;
+    }
+
+    if in_index < input_len {
+        out_index += decode_base64_block_into_scalar(&bytes[in_index..], &mut out[out_index..])?;
+    }
+    Ok(out_index)
 }
 
-pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
-    let options = match parse_base64_options(args)? {
-        Ok(options) => options,
-        Err(code) => return Ok(code),
-    };
-    //eprintln!("What is going on:");
-
-    let invalid = if options.decode {
-        let mut out = stdout_buf_writer()?;
-        //eprintln!("Decoding file");
-        let invalid = decode_base64_input(
-            &mut out,
-            &options.input,
-            options.io_mode,
-            options.ignore_garbage,
-        )?;
-        // Ensure buffered stdout writer flushes and joins the background thread before exiting
-        out.into_inner()?;
-        invalid
-    } else {
-        let mut stdout = {
-            let dupfd = unsafe { libc::dup(io::stdout().as_raw_fd()) };
-            if dupfd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            unsafe { File::from_raw_fd(dupfd) }
-        };
-        if options.wrap_cols != 0 {
-            encode_base64_pipe_to_pipe(
-                &mut stdout,
-                &options.input,
-                options.io_mode,
-                options.wrap_cols,
-            )?;
-        } else if let StreamInput::File(path) = &options.input {
-            // Handle File, Stdin (maybe a regular file), and other inputs uniformly.
-            if is_regular_input_path(path)? {
-                // If stdout is /dev/null prefer the file write path; otherwise if stdout is a regular
-                // file and O_DIRECT can be set use the direct path, else fall back to the temp-file path.
-                if is_stdout_dev_null() || is_stdout_file() {
-                    encode_base64_file_to_file(
-                        &mut stdout,
-                        path,
-                        options.io_mode,
-                        options.wrap_cols,
-                    )?;
-                } else {
-                    encode_base64_file_to_pipe(
-                        &mut stdout,
-                        path,
-                        options.io_mode,
-                        options.wrap_cols,
-                    )?;
-                }
-            } else if is_stdout_dev_null() || is_stdout_file() {
-                encode_base64_pipe_to_file(
-                    &mut stdout,
-                    &options.input,
-                    options.io_mode,
-                    options.wrap_cols,
-                )?;
-            } else {
-                encode_base64_pipe_to_pipe(
-                    &mut stdout,
-                    &options.input,
-                    options.io_mode,
-                    options.wrap_cols,
-                )?;
-            }
-        } else if let StreamInput::Stdin { .. } = &options.input {
-            // Detect if stdin is actually a regular file (e.g., redirected from a file)
-            let stdin_fd = io::stdin().as_raw_fd();
-            if is_regular_fd(stdin_fd) {
-                let read_path_buf = fs::read_link(format!("/proc/self/fd/{}", stdin_fd))
-                    .expect("Could not resolve symlink");
-
-                let read_path = read_path_buf.to_str().expect("Path contains invalid UTF-8");
-                if is_stdout_dev_null() || is_stdout_file() {
-                    let mut stdout = {
-                        let dupfd = unsafe { libc::dup(io::stdout().as_raw_fd()) };
-                        if dupfd < 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        unsafe { File::from_raw_fd(dupfd) }
-                    };
-                    encode_base64_file_to_file(
-                        &mut stdout,
-                        read_path,
-                        options.io_mode,
-                        options.wrap_cols,
-                    )?;
-                } else {
-                    encode_base64_file_to_pipe(
-                        &mut stdout,
-                        read_path,
-                        options.io_mode,
-                        options.wrap_cols,
-                    )?;
-                }
-            } else if is_stdout_dev_null() || is_stdout_file() {
-                encode_base64_pipe_to_file(
-                    &mut stdout,
-                    &options.input,
-                    options.io_mode,
-                    options.wrap_cols,
-                )?;
-            } else {
-                encode_base64_pipe_to_pipe(
-                    &mut stdout,
-                    &options.input,
-                    options.io_mode,
-                    options.wrap_cols,
-                )?;
-            }
-        } else if is_stdout_dev_null() || is_stdout_file() {
-            encode_base64_pipe_to_file(
-                &mut stdout,
-                &options.input,
-                options.io_mode,
-                options.wrap_cols,
-            )?;
-        } else {
-            encode_base64_pipe_to_pipe(
-                &mut stdout,
-                &options.input,
-                options.io_mode,
-                options.wrap_cols,
-            )?;
-        }
-        false
-    };
-    if invalid {
-        eprintln!("base64: invalid input");
-        return Ok(1);
+fn decode_base64_block_into_with_kernel(
+    bytes: &[u8],
+    out: &mut [u8],
+    requested: Base64DecodeKernel,
+) -> io::Result<usize> {
+    match decode_base64_kernel_for_block(bytes.len(), requested) {
+        Base64DecodeKernel::Scalar | Base64DecodeKernel::Auto => decode_base64_block_into_scalar(bytes, out),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Base64DecodeKernel::Avx2 => unsafe { decode_base64_block_into_avx2(bytes, out) },
     }
-    Ok(0)
+}
+
+fn decode_base64_clean_block(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    decode_base64_block_into_with_kernel(bytes, out, Base64DecodeKernel::Auto)
 }
 
 pub(crate) fn bench_base64_encode(
@@ -940,151 +804,4 @@ pub(crate) fn bench_base64_encode(
     );
     black_box(sink);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64_encode_ascii_scalar_glsl_matches_table() {
-        for sextet in 0_u8..64 {
-            assert_eq!(
-                base64_encode_ascii_scalar_glsl(sextet),
-                BASE64_ENCODE[sextet as usize]
-            );
-        }
-    }
-
-    #[test]
-    fn decode_base64_quartet_matches_expected_lengths() {
-        assert_eq!(decode_base64_quartet(*b"Zg=="), Some(([b'f', 0, 0], 1)));
-        assert_eq!(decode_base64_quartet(*b"Zm8="), Some(([b'f', b'o', 0], 2)));
-        assert_eq!(
-            decode_base64_quartet(*b"Zm9v"),
-            Some(([b'f', b'o', b'o'], 3))
-        );
-    }
-
-    #[test]
-    fn write_base64_encoded_bytes_wraps_at_requested_columns() {
-        let mut out = Vec::new();
-        let mut current_line_len = 0usize;
-        write_base64_encoded_bytes(&mut out, b"YWJjZGVm", 5, &mut current_line_len).unwrap();
-        assert_eq!(out, b"YWJjZ\nGVm");
-        assert_eq!(current_line_len, 3);
-    }
-
-    #[test]
-    fn append_wrapped_base64_bytes_batches_newlines_without_tiny_writes() {
-        let mut out = Vec::new();
-        let mut current_line_len = 2usize;
-        append_wrapped_base64_bytes(&mut out, b"ABCDEFGH", 5, &mut current_line_len);
-        assert_eq!(out, b"ABC\nDEFGH\n");
-        assert_eq!(current_line_len, 0);
-    }
-
-    #[test]
-    fn write_base64_encoded_vec_wraps_like_slice_path() {
-        let mut out = Vec::new();
-        let mut current_line_len = 2usize;
-        append_wrapped_base64_bytes(&mut out, b"ABCDEFGH", 5, &mut current_line_len);
-        assert_eq!(out, b"ABC\nDEFGH\n");
-        assert_eq!(current_line_len, 0);
-    }
-
-    #[test]
-    fn base64_parallel_encode_block_size_rounds_to_3page_multiple() {
-        assert_eq!(
-            base64_parallel_encode_block_size(4096),
-            BASE64_ENCODE_INPUT_ALIGN
-        );
-        assert_eq!(
-            base64_parallel_encode_block_size(BASE64_ENCODE_INPUT_ALIGN),
-            BASE64_ENCODE_INPUT_ALIGN
-        );
-        assert_eq!(
-            base64_parallel_encode_block_size((10 * 4096) + 17),
-            3 * BASE64_ENCODE_INPUT_ALIGN
-        );
-    }
-
-    #[test]
-    fn encode_base64_block_matches_known_output() {
-        assert_eq!(encode_base64_block(b""), b"");
-        assert_eq!(encode_base64_block(b"foobar"), b"Zm9vYmFy");
-        assert_eq!(encode_base64_block(b"fooba"), b"Zm9vYmE=");
-    }
-
-    #[test]
-    fn encode_base64_block_into_matches_known_output() {
-        let mut out = [0_u8; 8];
-        let written = encode_base64_block_into(b"foobar", &mut out);
-        assert_eq!(written, 8);
-        assert_eq!(&out[..written], b"Zm9vYmFy");
-    }
-
-    #[test]
-    fn encode_base64_block_scalar_matches_known_output() {
-        assert_eq!(encode_base64_block_scalar(b""), b"");
-        assert_eq!(encode_base64_block_scalar(b"foobar"), b"Zm9vYmFy");
-        assert_eq!(encode_base64_block_scalar(b"fooba"), b"Zm9vYmE=");
-    }
-
-    #[test]
-    fn base64_avx2_block_matches_scalar_block() {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if !std::arch::is_x86_feature_detected!("avx2") {
-                return;
-            }
-            let bytes = (0..(24 * 7 + 5))
-                .map(|i| ((i * 29 + 7) % 251) as u8)
-                .collect::<Vec<_>>();
-            let scalar = encode_base64_block_scalar(&bytes);
-            let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
-            let written = unsafe { encode_base64_block_into_avx2_spmd(&bytes, &mut out) };
-            out.truncate(written);
-            assert_eq!(out, scalar);
-
-            let mut out = vec![0_u8; encoded_base64_len(bytes.len())];
-            let written = unsafe { encode_base64_block_into_avx2_shuffle(&bytes, &mut out) };
-            out.truncate(written);
-            assert_eq!(out, scalar);
-        }
-    }
-}
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    #[kani::proof]
-    fn decoded_len_from_padding_only_accepts_zero_to_two() {
-        let padding: u8 = kani::any();
-        let result = base64_decoded_len_from_padding(padding);
-        if padding <= 2 {
-            assert!(matches!(result, Some(1..=3)));
-        } else {
-            assert!(result.is_none());
-        }
-    }
-
-    #[kani::proof]
-    fn parallel_encode_block_size_stays_aligned() {
-        let block_size: u64 = kani::any();
-        let result = base64_parallel_encode_block_size(block_size);
-        assert!(result >= BASE64_ENCODE_INPUT_ALIGN);
-        assert_eq!(result % BASE64_ENCODE_INPUT_ALIGN, 0);
-    }
-
-    #[kani::proof]
-    fn base64_encode_ascii_scalar_glsl_matches_table() {
-        let sextet: u8 = kani::any();
-        kani::assume(sextet < 64);
-        assert_eq!(
-            base64_encode_ascii_scalar_glsl(sextet),
-            BASE64_ENCODE[sextet as usize]
-        );
-    }
 }
