@@ -8,12 +8,17 @@ fn process_pipe_to_pipe(
     _options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
+    let pipe_write_block_size = if _options.decode {
+        BASE64_DECODE_PIPE_WRITE_BLOCK_SIZE
+    } else {
+        BASE64_ENCODE_PIPE_WRITE_BLOCK_SIZE
+    };
     process_pipe_input_to_pipe_fast(
         plan.process_chunk,
         dest,
         input,
         plan.read_block_size,
-        plan.write_block_size,
+        pipe_write_block_size,
         plan.input_chunk_multiple,
     )?;
     return Ok(false);
@@ -22,10 +27,57 @@ fn process_pipe_to_pipe(
 fn process_pipe_to_file(
     dest: &mut File,
     input: &StreamInput,
-    options: &Base64Options,
+    _options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
-    process_pipe_to_pipe(dest, input, options, plan)
+    let mut reader = open_stream_input_file(input)?;
+    let mut read_buf = vec![0u8; plan.read_block_size as usize];
+    let mut write_buf = vec![0u8; plan.write_block_size];
+    let mut carry = Vec::new();
+    loop {
+        let read = reader.read(&mut read_buf)?;
+        if read == 0 {
+            break;
+        }
+        let ready_len = if plan.input_chunk_multiple <= 1 {
+            read
+        } else {
+            let total = carry.len() + read;
+            (total / plan.input_chunk_multiple) * plan.input_chunk_multiple
+        };
+        if ready_len == 0 {
+            carry.extend_from_slice(&read_buf[..read]);
+            continue;
+        }
+        let produced = if carry.is_empty() {
+            let process_len = ready_len.min(read);
+            let produced = (plan.process_chunk)(&read_buf[..process_len], &mut write_buf[..])?;
+            if process_len < read {
+                carry.extend_from_slice(&read_buf[process_len..read]);
+            }
+            produced
+        } else {
+            let take_from_read = ready_len - carry.len();
+            let mut merged = Vec::with_capacity(ready_len);
+            merged.extend_from_slice(&carry);
+            merged.extend_from_slice(&read_buf[..take_from_read]);
+            carry.clear();
+            if take_from_read < read {
+                carry.extend_from_slice(&read_buf[take_from_read..read]);
+            }
+            (plan.process_chunk)(&merged, &mut write_buf[..])?
+        };
+        if produced != 0 {
+            dest.write_all(&write_buf[..produced])?;
+        }
+    }
+    if !carry.is_empty() {
+        let produced = (plan.process_chunk)(&carry, &mut write_buf[..])?;
+        if produced != 0 {
+            dest.write_all(&write_buf[..produced])?;
+        }
+    }
+    Ok(false)
 }
 
 fn open_stream_input_file(input: &StreamInput) -> io::Result<File> {
@@ -44,17 +96,22 @@ fn open_stream_input_file(input: &StreamInput) -> io::Result<File> {
 fn process_file_to_pipe(
     dest: &mut File,
     path: &str,
-    _options: &Base64Options,
+    options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
     let config = load_config(None);
-    increase_pipe_capacity(dest.as_raw_fd(), plan.write_block_size);
+    let pipe_write_block_size = if options.decode {
+        BASE64_DECODE_PIPE_WRITE_BLOCK_SIZE
+    } else {
+        BASE64_ENCODE_PIPE_WRITE_BLOCK_SIZE
+    };
+    increase_pipe_capacity(dest.as_raw_fd(), pipe_write_block_size);
     let _report = ParallelStream::map_file_fixed_size_to_pipe(
         &config,
         path,
         dest,
         plan.read_block_size,
-        plan.write_block_size,
+        pipe_write_block_size,
         plan.process_chunk,
     )?;
     return Ok(false);
