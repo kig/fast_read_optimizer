@@ -1,5 +1,4 @@
 use super::*;
-use crate::stream::ParallelStream;
 use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::fs::File;
 use std::hint::black_box;

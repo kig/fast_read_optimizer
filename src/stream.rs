@@ -21,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
 
-fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
+pub fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
         let flags = fcntl(fd, F_GETFL);
@@ -29,8 +29,7 @@ fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     }
 }
 
-#[allow(unused)]
-fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> {
+pub fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
         let flags = fcntl(fd, F_SETFL, flags);
@@ -38,13 +37,13 @@ fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> {
     }
 }
 
-fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> u64 {
+pub fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> u64 {
     let page_cache = config.get_params_for_path(mode, false, path);
     let direct = config.get_params_for_path(mode, true, path);
     page_cache.block_size.max(direct.block_size)
 }
 
-fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode {
+pub fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode {
     if block_size % 4096 == 0 {
         io_mode
     } else {
@@ -52,7 +51,7 @@ fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode 
     }
 }
 
-pub(crate) fn allocate_pipe_output_buffer(min_capacity: usize) -> Vec<u8> {
+pub fn allocate_pipe_output_buffer(min_capacity: usize) -> Vec<u8> {
     let huge_page_size = 2 * 1024 * 1024;
     let capacity = min_capacity.max(1).next_multiple_of(huge_page_size);
     let layout =

@@ -29,5 +29,10 @@ pub use reader::{BufReader, MappedReadBuffer};
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,
 };
+pub use stream::transform::{
+    ReaderTransformGeometry, PipeOutputPolicy, grow_pipe_capacity_best_effort,
+    run_reader_transform_to_file, run_file_transform_to_file,
+    run_reader_transform_to_pipe, run_file_transform_to_pipe_with_owned_output
+};
 pub use verified_copy::{copy_file_verified, copy_file_verified_with_options, VerifiedCopyReport};
 pub use writer::{BufWriter, OffsetWriter, SequentialWriter};

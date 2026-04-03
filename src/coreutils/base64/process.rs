@@ -4,7 +4,9 @@ use super::process_layout::{decode_input_can_use_fast_path, decode_input_can_use
     wrapped_decode_block_sizes, wrapped_encode_block_sizes, RegularDecodeLayout, SliceWriter};
 use crate::stream::allocate_pipe_output_buffer;
 use crate::stream::transform::{
-    increase_pipe_capacity, process_reader_to_file_fast, process_reader_to_pipe_fast,
+    run_file_transform_to_file, run_file_transform_to_pipe_with_owned_output,
+    run_reader_transform_to_file, run_reader_transform_to_pipe, PipeOutputPolicy,
+    ReaderTransformGeometry,
 };
 mod decode_reorg;
 use decode_reorg::Base64DecodeReorg;
@@ -20,13 +22,16 @@ fn process_pipe_to_pipe(
         let (prefix, compatible) = read_decode_fast_path_probe(&mut reader)?;
         let mut replay = io::Cursor::new(prefix).chain(reader);
         if compatible {
-            process_reader_to_pipe_fast(
-                plan.process_chunk,
+            run_reader_transform_to_pipe(
                 dest,
                 &mut replay,
-                plan.pipe_input_read_block_size,
-                plan.pipe_input_write_block_size,
-                plan.input_chunk_multiple,
+                ReaderTransformGeometry {
+                    read_block_size: plan.pipe_input_read_block_size,
+                    write_block_size: plan.pipe_input_write_block_size,
+                    input_chunk_multiple: plan.input_chunk_multiple,
+                },
+                PipeOutputPolicy::GiftedAlignedPages,
+                plan.process_chunk,
             )?;
             return Ok(false);
         }
@@ -59,12 +64,14 @@ fn process_pipe_to_file(
         let (prefix, compatible) = read_decode_fast_path_probe(&mut reader)?;
         let mut replay = io::Cursor::new(prefix).chain(reader);
         if compatible {
-            process_reader_to_file_fast(
+            run_reader_transform_to_file(
                 &mut replay,
                 dest,
-                plan.pipe_file_read_block_size,
-                plan.pipe_file_write_block_size,
-                plan.input_chunk_multiple,
+                ReaderTransformGeometry {
+                    read_block_size: plan.pipe_file_read_block_size,
+                    write_block_size: plan.pipe_file_write_block_size,
+                    input_chunk_multiple: plan.input_chunk_multiple,
+                },
                 plan.process_chunk,
             )?;
             return Ok(false);
@@ -77,54 +84,16 @@ fn process_pipe_to_file(
         );
     }
     let mut reader = open_stream_input_file(input)?;
-    let mut read_buf = vec![0u8; plan.pipe_file_read_block_size as usize];
-    let mut write_buf = vec![0u8; plan.pipe_file_write_block_size];
-    let mut carry = Vec::new();
-    let mut merged =
-        Vec::with_capacity(plan.pipe_file_read_block_size as usize + plan.input_chunk_multiple);
-    loop {
-        let read = reader.read(&mut read_buf)?;
-        if read == 0 {
-            break;
-        }
-        let ready_len = if plan.input_chunk_multiple <= 1 {
-            read
-        } else {
-            let total = carry.len() + read;
-            (total / plan.input_chunk_multiple) * plan.input_chunk_multiple
-        };
-        if ready_len == 0 {
-            carry.extend_from_slice(&read_buf[..read]);
-            continue;
-        }
-        let produced = if carry.is_empty() {
-            let process_len = ready_len.min(read);
-            let produced = (plan.process_chunk)(&read_buf[..process_len], &mut write_buf[..])?;
-            if process_len < read {
-                carry.extend_from_slice(&read_buf[process_len..read]);
-            }
-            produced
-        } else {
-            let take_from_read = ready_len - carry.len();
-            merged.clear();
-            merged.extend_from_slice(&carry);
-            merged.extend_from_slice(&read_buf[..take_from_read]);
-            carry.clear();
-            if take_from_read < read {
-                carry.extend_from_slice(&read_buf[take_from_read..read]);
-            }
-            (plan.process_chunk)(&merged, &mut write_buf[..])?
-        };
-        if produced != 0 {
-            dest.write_all(&write_buf[..produced])?;
-        }
-    }
-    if !carry.is_empty() {
-        let produced = (plan.process_chunk)(&carry, &mut write_buf[..])?;
-        if produced != 0 {
-            dest.write_all(&write_buf[..produced])?;
-        }
-    }
+    run_reader_transform_to_file(
+        &mut reader,
+        dest,
+        ReaderTransformGeometry {
+            read_block_size: plan.pipe_file_read_block_size,
+            write_block_size: plan.pipe_file_write_block_size,
+            input_chunk_multiple: plan.input_chunk_multiple,
+        },
+        plan.process_chunk,
+    )?;
     Ok(false)
 }
 
@@ -148,17 +117,18 @@ fn process_file_to_pipe(
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
     if !options.decode && options.wrap_cols != 0 && options.wrap_cols % 4 == 0 {
-        let config = load_config(None);
         let wrap_cols = options.wrap_cols;
         let (read_block_size, write_block_size) =
             wrapped_encode_block_sizes(wrap_cols, BASE64_ENCODE_FILE_PIPE_READ_BLOCK_SIZE);
-        increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
-        ParallelStream::map_file_to_pipe_with_owned_buffers(
-            &config,
+        run_file_transform_to_pipe_with_owned_output(
             path,
             dest,
-            read_block_size,
-            write_block_size,
+            ReaderTransformGeometry {
+                read_block_size,
+                write_block_size,
+                input_chunk_multiple: 1,
+            },
+            PipeOutputPolicy::GiftedAlignedPages,
             move |input: &[u8]| -> io::Result<Vec<u8>> {
                 let mut out = allocate_pipe_output_buffer(write_block_size);
                 let produced = encode_wrapped_block_into(input, wrap_cols, &mut out[..])?;
@@ -169,16 +139,17 @@ fn process_file_to_pipe(
         return Ok(false);
     }
     if options.decode && detect_regular_decode_layout(path)? == RegularDecodeLayout::WrappedLf76 {
-        let config = load_config(None);
         let (read_block_size, write_block_size) =
             wrapped_decode_block_sizes(BASE64_DECODE_FILE_PIPE_READ_BLOCK_SIZE);
-        increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
-        ParallelStream::map_file_to_pipe_with_owned_buffers(
-            &config,
+        run_file_transform_to_pipe_with_owned_output(
             path,
             dest,
-            read_block_size,
-            write_block_size,
+            ReaderTransformGeometry {
+                read_block_size,
+                write_block_size,
+                input_chunk_multiple: 1,
+            },
+            PipeOutputPolicy::GiftedAlignedPages,
             move |input: &[u8]| -> io::Result<Vec<u8>> {
                 let mut out = allocate_pipe_output_buffer(write_block_size);
                 let produced = decode_wrapped_block_into(input, &mut out[..])?;
@@ -188,17 +159,18 @@ fn process_file_to_pipe(
         )?;
         return Ok(false);
     }
-    let config = load_config(None);
     let decode = options.decode;
     let pipe_write_block_size = plan.file_pipe_write_block_size;
     let process_chunk = plan.process_chunk;
-    increase_pipe_capacity(dest.as_raw_fd(), pipe_write_block_size);
-    let _report = ParallelStream::map_file_to_pipe_with_owned_buffers(
-        &config,
+    run_file_transform_to_pipe_with_owned_output(
         path,
         dest,
-        plan.file_pipe_read_block_size,
-        pipe_write_block_size,
+        ReaderTransformGeometry {
+            read_block_size: plan.file_pipe_read_block_size,
+            write_block_size: pipe_write_block_size,
+            input_chunk_multiple: plan.input_chunk_multiple,
+        },
+        PipeOutputPolicy::GiftedAlignedPages,
         move |input: &[u8]| -> io::Result<Vec<u8>> {
             if decode {
                 let mut out = allocate_pipe_output_buffer(pipe_write_block_size);
@@ -220,16 +192,17 @@ fn process_file_to_file(
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
     if !options.decode && options.wrap_cols != 0 && options.wrap_cols % 4 == 0 {
-        let config = load_config(None);
         let wrap_cols = options.wrap_cols;
         let (read_block_size, write_block_size) =
             wrapped_encode_block_sizes(wrap_cols, BASE64_ENCODE_FAST_READ_BLOCK_SIZE);
-        ParallelStream::map_file_fixed_size_to_file(
-            &config,
+        run_file_transform_to_file(
             path,
             dest,
-            read_block_size,
-            write_block_size,
+            ReaderTransformGeometry {
+                read_block_size,
+                write_block_size,
+                input_chunk_multiple: 1,
+            },
             move |input: &[u8], out: &mut [u8]| {
                 encode_wrapped_block_into(input, wrap_cols, out)
             },
@@ -237,26 +210,28 @@ fn process_file_to_file(
         return Ok(false);
     }
     if options.decode && detect_regular_decode_layout(path)? == RegularDecodeLayout::WrappedLf76 {
-        let config = load_config(None);
         let (read_block_size, write_block_size) =
             wrapped_decode_block_sizes(BASE64_DECODE_FAST_READ_BLOCK_SIZE);
-        ParallelStream::map_file_fixed_size_to_file(
-            &config,
+        run_file_transform_to_file(
             path,
             dest,
-            read_block_size,
-            write_block_size,
+            ReaderTransformGeometry {
+                read_block_size,
+                write_block_size,
+                input_chunk_multiple: 1,
+            },
             move |input: &[u8], out: &mut [u8]| decode_wrapped_block_into(input, out),
         )?;
         return Ok(false);
     }
-    let config = load_config(None);
-    let _report = ParallelStream::map_file_fixed_size_to_file(
-        &config,
+    run_file_transform_to_file(
         path,
         dest,
-        plan.read_block_size,
-        plan.write_block_size,
+        ReaderTransformGeometry {
+            read_block_size: plan.read_block_size,
+            write_block_size: plan.write_block_size,
+            input_chunk_multiple: plan.input_chunk_multiple,
+        },
         plan.process_chunk,
     )?;
     return Ok(false);
@@ -412,13 +387,16 @@ fn process_pipe_input_to_pipe_fast(
     input_chunk_multiple: usize,
 ) -> io::Result<()> {
     let mut reader = open_stream_input_file(input)?;
-    process_reader_to_pipe_fast(
-        processor,
+    run_reader_transform_to_pipe(
         dest,
         &mut reader,
-        read_block_size,
-        write_block_size,
-        input_chunk_multiple,
+        ReaderTransformGeometry {
+            read_block_size,
+            write_block_size,
+            input_chunk_multiple,
+        },
+        PipeOutputPolicy::GiftedAlignedPages,
+        processor,
     )
 }
 

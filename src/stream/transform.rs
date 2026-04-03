@@ -1,4 +1,6 @@
 use super::allocate_pipe_output_buffer;
+use super::ParallelStream;
+use crate::config::load_config;
 use libc::{fcntl, F_SETPIPE_SZ};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -6,34 +8,45 @@ use std::os::unix::io::AsRawFd;
 use std::sync::mpsc;
 use std::thread;
 
-pub(crate) fn increase_pipe_capacity(pipe_fd: i32, new_size: usize) {
+#[derive(Clone, Copy, Debug)]
+pub struct ReaderTransformGeometry {
+    pub read_block_size: u64,
+    pub write_block_size: usize,
+    pub input_chunk_multiple: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipeOutputPolicy {
+    GiftedAlignedPages,
+}
+
+pub fn grow_pipe_capacity_best_effort(pipe_fd: i32, new_size: usize) {
     unsafe {
         let _res = fcntl(pipe_fd, F_SETPIPE_SZ, new_size);
     }
 }
 
-pub(crate) fn process_reader_to_file_fast<R: Read>(
+pub fn run_reader_transform_to_file<R: Read>(
     reader: &mut R,
     dest: &mut File,
-    read_block_size: u64,
-    write_block_size: usize,
-    input_chunk_multiple: usize,
+    geometry: ReaderTransformGeometry,
     processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
-    let mut read_buf = vec![0u8; read_block_size as usize];
-    let mut write_buf = vec![0u8; write_block_size];
+    let mut read_buf = vec![0u8; geometry.read_block_size as usize];
+    let mut write_buf = vec![0u8; geometry.write_block_size];
     let mut carry = Vec::new();
-    let mut merged = Vec::with_capacity(read_block_size as usize + input_chunk_multiple);
+    let mut merged =
+        Vec::with_capacity(geometry.read_block_size as usize + geometry.input_chunk_multiple);
     loop {
         let read = reader.read(&mut read_buf)?;
         if read == 0 {
             break;
         }
-        let ready_len = if input_chunk_multiple <= 1 {
+        let ready_len = if geometry.input_chunk_multiple <= 1 {
             read
         } else {
             let total = carry.len() + read;
-            (total / input_chunk_multiple) * input_chunk_multiple
+            (total / geometry.input_chunk_multiple) * geometry.input_chunk_multiple
         };
         if ready_len == 0 {
             carry.extend_from_slice(&read_buf[..read]);
@@ -70,13 +83,33 @@ pub(crate) fn process_reader_to_file_fast<R: Read>(
     Ok(())
 }
 
-pub(crate) fn process_reader_to_pipe_fast<R: Read>(
-    processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
+pub fn run_file_transform_to_file<F>(
+    path: &str,
+    dest: &mut File,
+    geometry: ReaderTransformGeometry,
+    processor: F,
+) -> io::Result<()>
+where
+    F: for<'a> Fn(&'a [u8], &mut [u8]) -> io::Result<usize> + Send + Sync + 'static,
+{
+    let config = load_config(None);
+    let _report = ParallelStream::map_file_fixed_size_to_file(
+        &config,
+        path,
+        dest,
+        geometry.read_block_size,
+        geometry.write_block_size,
+        processor,
+    )?;
+    Ok(())
+}
+
+pub fn run_reader_transform_to_pipe<R: Read>(
     dest: &mut File,
     reader: &mut R,
-    read_block_size: u64,
-    write_block_size: usize,
-    input_chunk_multiple: usize,
+    geometry: ReaderTransformGeometry,
+    output_policy: PipeOutputPolicy,
+    processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     use std::os::unix::io::RawFd;
 
@@ -111,16 +144,18 @@ pub(crate) fn process_reader_to_pipe_fast<R: Read>(
         Ok(written_total)
     }
 
-    increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
+    let _ = output_policy;
+    grow_pipe_capacity_best_effort(dest.as_raw_fd(), geometry.write_block_size);
     let mut read_bufs = (0..3)
-        .map(|_| vec![0u8; read_block_size as usize])
+        .map(|_| vec![0u8; geometry.read_block_size as usize])
         .collect::<Vec<_>>();
     let mut carry = Vec::new();
-    let mut merged = Vec::with_capacity(read_block_size as usize + input_chunk_multiple);
+    let mut merged =
+        Vec::with_capacity(geometry.read_block_size as usize + geometry.input_chunk_multiple);
     let (free_tx, free_rx) = mpsc::sync_channel::<Vec<u8>>(3);
     for _ in 0..3 {
         free_tx
-            .send(allocate_pipe_output_buffer(write_block_size))
+            .send(allocate_pipe_output_buffer(geometry.write_block_size))
             .map_err(|err| io::Error::other(err.to_string()))?;
     }
     let writer_pool_tx = free_tx.clone();
@@ -138,7 +173,7 @@ pub(crate) fn process_reader_to_pipe_fast<R: Read>(
                     written += unsafe { vmsplice_all(pipe_fd, &buf[written..len])? };
                 }
                 writer_pool_tx
-                    .send(allocate_pipe_output_buffer(write_block_size))
+                    .send(allocate_pipe_output_buffer(geometry.write_block_size))
                     .map_err(|err| io::Error::other(err.to_string()))?;
             } else {
                 writer_pool_tx
@@ -155,11 +190,11 @@ pub(crate) fn process_reader_to_pipe_fast<R: Read>(
         if read == 0 {
             break;
         }
-        let ready_len = if input_chunk_multiple <= 1 {
+        let ready_len = if geometry.input_chunk_multiple <= 1 {
             read
         } else {
             let total = carry.len() + read;
-            (total / input_chunk_multiple) * input_chunk_multiple
+            (total / geometry.input_chunk_multiple) * geometry.input_chunk_multiple
         };
         if ready_len == 0 {
             carry.extend_from_slice(&read_bufs[read_slot][..read]);
@@ -206,4 +241,31 @@ pub(crate) fn process_reader_to_pipe_fast<R: Read>(
         .join()
         .map_err(|_| io::Error::other("transform pipe writer thread panicked"))??;
     Ok(())
+}
+
+pub fn run_file_transform_to_pipe_with_owned_output<F>(
+    path: &str,
+    dest: &mut File,
+    geometry: ReaderTransformGeometry,
+    output_policy: PipeOutputPolicy,
+    processor: F,
+) -> io::Result<()>
+where
+    F: for<'a> Fn(&'a [u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
+{
+    let config = load_config(None);
+    match output_policy {
+        PipeOutputPolicy::GiftedAlignedPages => {
+            grow_pipe_capacity_best_effort(dest.as_raw_fd(), geometry.write_block_size);
+            let _report = ParallelStream::map_file_to_pipe_with_owned_buffers(
+                &config,
+                path,
+                dest,
+                geometry.read_block_size,
+                geometry.write_block_size,
+                processor,
+            )?;
+            Ok(())
+        }
+    }
 }
