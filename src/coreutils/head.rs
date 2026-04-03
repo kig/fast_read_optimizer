@@ -10,6 +10,14 @@ enum HeadMode {
     Bytes(u64),
 }
 
+fn regular_stdin_path() -> io::Result<Option<&'static str>> {
+    if fd_is_regular(libc::STDIN_FILENO)? {
+        Ok(Some("/proc/self/fd/0"))
+    } else {
+        Ok(None)
+    }
+}
+
 fn parse_head_count(value: &str, flag: &str) -> io::Result<u64> {
     let value = value.trim();
     if value.is_empty() {
@@ -137,7 +145,7 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
     }
 }
 
-fn write_head_lines_regular_file<W: Write>(
+fn write_head_lines_regular_input<W: Write>(
     out: &mut W,
     path: &str,
     mut remaining_lines: u64,
@@ -145,27 +153,18 @@ fn write_head_lines_regular_file<W: Write>(
     if remaining_lines == 0 {
         return Ok(());
     }
-    let mut pending = Vec::new();
     visit_path_range_ordered(path, ByteRange::default(), |_, block| {
         if remaining_lines == 0 {
             return Ok(OrderedVisitDecision::Stop);
         }
-        let mut line_start = 0usize;
         for newline_offset in memchr_iter(b'\n', block) {
-            pending.extend_from_slice(&block[line_start..=newline_offset]);
-            out.write_all(&pending)?;
-            pending.clear();
             remaining_lines -= 1;
             if remaining_lines == 0 {
+                out.write_all(&block[..=newline_offset])?;
                 return Ok(OrderedVisitDecision::Stop);
             }
-            line_start = newline_offset + 1;
         }
-        if line_start < block.len() {
-            pending.extend_from_slice(&block[line_start..]);
-            out.write_all(&pending)?;
-            pending.clear();
-        }
+        out.write_all(block)?;
         Ok(OrderedVisitDecision::Continue)
     })?;
     Ok(())
@@ -180,30 +179,20 @@ fn write_head_lines<W: Write>(
     if remaining_lines == 0 {
         return Ok(());
     }
-    let mut pending = Vec::new();
     visit_ordered_input(input, io_mode, |block| {
         if remaining_lines == 0 {
             return Ok(());
         }
-        let mut line_start = 0usize;
         for newline_offset in memchr_iter(b'\n', block) {
-            pending.extend_from_slice(&block[line_start..=newline_offset]);
-            out.write_all(&pending)?;
-            pending.clear();
             remaining_lines -= 1;
             if remaining_lines == 0 {
+                out.write_all(&block[..=newline_offset])?;
                 return Ok(());
             }
-            line_start = newline_offset + 1;
         }
-        if line_start < block.len() {
-            pending.extend_from_slice(&block[line_start..]);
-        }
+        out.write_all(block)?;
         Ok(())
     })?;
-    if remaining_lines != 0 && !pending.is_empty() {
-        out.write_all(&pending)?;
-    }
     Ok(())
 }
 
@@ -225,11 +214,18 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
         }
         match mode {
             HeadMode::Lines(lines) => {
-                if let StreamInput::File(path) = input {
-                    if is_regular_input_path(path)? {
-                        write_head_lines_regular_file(&mut out, path, lines)?;
+                match input {
+                    StreamInput::File(path) if is_regular_input_path(path)? => {
+                        write_head_lines_regular_input(&mut out, path, lines)?;
                         continue;
                     }
+                    StreamInput::Stdin { .. } => {
+                        if let Some(path) = regular_stdin_path()? {
+                            write_head_lines_regular_input(&mut out, path, lines)?;
+                            continue;
+                        }
+                    }
+                    _ => {}
                 }
                 write_head_lines(&mut out, input, io_mode, lines)?
             }

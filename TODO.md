@@ -523,20 +523,40 @@
   - [ ] replace `cksum`'s CRC32 core with a fast-crc32-grade implementation (e.g. corsix/fast-crc32 approach)
 - [x] shred (this is basically write)
 - [x] wc
-  - counts the number of characters in the file (space, \n)
+- [x] head
+  - [x] `-c` fast path for regular files and regular stdin
+  - [x] suffixed counts like `1KiB`, `1MiB`, `1GiB`
+  - [ ] beat system `head -n` consistently on the small-cutoff pipe case
+- [ ] tail
+  - [ ] share the same range/offset library primitives as `head`
 - [x] cat / tac
+- [x] pv that's a hugepages splice + print to stderr
 - [x] find, as part of dirwalk work
+  - [ ] fd walk.rs is faster than our dirwalk, use that
+- [ ] dd
+  - [ ] beat system `dd` on small and medium transfers
+- [ ] cp -r / optimized recursive copy
+  - [ ] tree walk and async create scheduling
+  - [ ] issue `copy_file_range`/io_uring copies for small files in flight
+  - [ ] kick off parallel large-file copies once observed copy speed falls below threshold
+  - [ ] target average 3.6-10 GB/s across large directory trees
+- [ ] mv
+  - [ ] same-fs fast path
+  - [ ] cross-fs path built on optimized recursive copy
 - [ ] parallel zstd that produces archives that can be decompressed by zstd
-- [ ] multi-file versions
-  - [ ] diff
-  - [ ] copy with directory target
-  - [ ] after dirwalk work, copy -r
-- [ ] mv (across mounts using the optimized copy -r)
 - [ ] tar
   - [ ] uncompressed dirtree to file optimized as `fallocate(file, tar_size(du_result))` + parallel
         `file.write(offset, tar_header(file_stat)); file.copy_file_range_into(offset+header_len, file_stat);`
   - [ ] compressing version that builds ~8MB compressed chunks in parallel in RAM, then writes them out in order
-- [ ] pv that's a hugepages splice + print to stderr
+- [ ] file encryption
+  - [ ] fast file encryption/decryption on the optimized IO paths
+- [ ] grep
+  - [ ] fuller grep implementation using rg libraries where practical
+- [ ] make the library primitives the default acceleration path for all coreutils and future tools
+- [ ] small-IO policy
+  - [ ] prefer page-cache reads over direct IO for files under ~1 MiB when that wins
+- [ ] overall goal
+  - [ ] keep pushing library and tools toward memory-speed / NVMe-speed ceilings so applications and multicall tools inherit wins by default
 
 ### Streaming I/O for pipes & spinning disks
 
