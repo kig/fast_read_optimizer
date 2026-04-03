@@ -1,4 +1,49 @@
 use super::*;
+use openssl::hash::Hasher;
+
+fn regular_stdin_path() -> io::Result<Option<String>> {
+    if fd_is_regular(libc::STDIN_FILENO)? {
+        Ok(Some("/proc/self/fd/0".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn hash_stream_input(
+    input: &StreamInput,
+    algorithm: HashAlgorithm,
+    io_mode: IOMode,
+) -> io::Result<Vec<u8>> {
+    match algorithm {
+        HashAlgorithm::Md5
+        | HashAlgorithm::Blake2b512
+        | HashAlgorithm::Sha224
+        | HashAlgorithm::Sha256
+        | HashAlgorithm::Sha384
+        | HashAlgorithm::Sha512 => {
+            let mut hasher = Hasher::new(ordered_digest(algorithm).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unsupported digest")
+            })?)
+            .map_err(io::Error::other)?;
+            visit_ordered_input(input, io_mode, |block| {
+                hasher.update(block).map_err(io::Error::other)
+            })?;
+            hasher.finish().map_err(io::Error::other).map(|d| d.to_vec())
+        }
+        HashAlgorithm::Blake3 => {
+            let mut hasher = blake3::Hasher::new();
+            visit_ordered_input(input, io_mode, |block| {
+                hasher.update(block);
+                Ok(())
+            })?;
+            Ok(hasher.finalize().as_bytes().to_vec())
+        }
+        HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block hash sums do not support stream input",
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HashSumFormat {
@@ -372,41 +417,11 @@ pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Res
             StreamInput::File(file) if is_regular_input_path(file)? => {
                 hash_file(file, algorithm, options.io_mode)?
             }
-            _ => {
-                let mut data = Vec::new();
-                visit_ordered_input(&input, options.io_mode, |block| {
-                    data.extend_from_slice(block);
-                    Ok(())
-                })?;
-                match algorithm {
-                    HashAlgorithm::Md5
-                    | HashAlgorithm::Blake2b512
-                    | HashAlgorithm::Sha224
-                    | HashAlgorithm::Sha256
-                    | HashAlgorithm::Sha384
-                    | HashAlgorithm::Sha512 => {
-                        let digest = openssl::hash::hash(
-                            ordered_digest(algorithm).ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidInput, "unsupported digest")
-                            })?,
-                            &data,
-                        )
-                        .map_err(io::Error::other)?;
-                        digest.to_vec()
-                    }
-                    HashAlgorithm::Blake3 => {
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update(&data);
-                        hasher.finalize().as_bytes().to_vec()
-                    }
-                    HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "block hash sums do not support stream input",
-                        ));
-                    }
-                }
-            }
+            StreamInput::Stdin { .. } => match regular_stdin_path()? {
+                Some(path) => hash_file(&path, algorithm, options.io_mode)?,
+                None => hash_stream_input(&input, algorithm, options.io_mode)?,
+            },
+            _ => hash_stream_input(&input, algorithm, options.io_mode)?,
         };
         if let Some(label) = label {
             write_hash_sum_line(
@@ -566,5 +581,28 @@ mod tests {
         assert_eq!(hash_check_exit_code(true, 0, false, false), 1);
         assert_eq!(hash_check_exit_code(true, 1, true, false), 1);
         assert_eq!(hash_check_exit_code(false, 0, false, true), 1);
+    }
+
+    #[test]
+    fn hash_stream_input_matches_hash_file_for_sha256() {
+        let path = std::env::temp_dir().join(format!(
+            "fro-hash-stream-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = (0..(1024 * 1024 + 123))
+            .map(|i| ((i * 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+        let stream_input = StreamInput::File(path.to_string_lossy().into_owned());
+        let streamed = hash_stream_input(&stream_input, HashAlgorithm::Sha256, IOMode::PageCache)
+            .unwrap();
+        let file = hash_file(path.to_str().unwrap(), HashAlgorithm::Sha256, IOMode::PageCache)
+            .unwrap();
+        assert_eq!(streamed, file);
+        let _ = std::fs::remove_file(path);
     }
 }
