@@ -12,6 +12,7 @@ use crate::writer::{
 };
 use iou::IoUring;
 use libc::{fcntl, F_GETFL, F_SETFL};
+use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -49,6 +50,21 @@ fn effective_io_mode_for_block_size(io_mode: IOMode, block_size: u64) -> IOMode 
     } else {
         IOMode::PageCache
     }
+}
+
+pub(crate) fn allocate_pipe_output_buffer(min_capacity: usize) -> Vec<u8> {
+    let huge_page_size = 2 * 1024 * 1024;
+    let capacity = min_capacity.max(1).next_multiple_of(huge_page_size);
+    let layout =
+        Layout::from_size_align(capacity, huge_page_size).expect("invalid pipe buffer layout");
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+    unsafe {
+        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, libc::MADV_HUGEPAGE);
+    }
+    unsafe { Vec::from_raw_parts(ptr, capacity, capacity) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,8 +775,8 @@ impl ParallelWriter {
 #[derive(Clone)]
 pub struct ParallelStream {}
 
-
 mod parallel_stream;
+pub(crate) mod transform;
 mod parallel_stream_to_file;
 #[cfg(test)]
 mod tests;

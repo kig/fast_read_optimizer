@@ -9,6 +9,7 @@ src/
       bench.rs
       kani_proofs.rs
       process.rs
+      process_layout.rs
       tests.rs
     base64.rs
     cat.rs
@@ -25,6 +26,7 @@ src/
     parallel_stream.rs
     parallel_stream_to_file.rs
     tests.rs
+    transform.rs
   api.rs
   blake3_hash.rs
   block_hash.rs

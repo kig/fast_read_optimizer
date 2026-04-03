@@ -76,7 +76,7 @@ impl ParallelStream {
 
         let _read_report =
             input_file.foreach_block_parallel(block_size, move |chunk_index, raw_bytes| {
-                let mut out = vec![0u8; write_block_size];
+                let mut out = allocate_pipe_output_buffer(write_block_size);
                 let produced = processor(raw_bytes, &mut out)?;
                 out.truncate(produced);
                 output_stream_for_blocks.write_at_index(chunk_index, out)?;
@@ -84,6 +84,43 @@ impl ParallelStream {
             })?;
 
         // Unwrap the Arc back into ownership and finish
+        let output_stream = Arc::try_unwrap(output_stream_arc)
+            .map_err(|_| std::io::Error::other("failed to unwrap writer Arc"))?;
+        output_stream.finish()
+    }
+
+    /// Map an input file to a pipe using processor-owned output buffers.
+    /// This preserves any caller-provided alignment/allocation strategy so the
+    /// pipe writer can stay on its vmsplice fast path.
+    pub fn map_file_to_pipe_with_owned_buffers<F>(
+        config: &LoadedConfig,
+        read_path: &str,
+        dest: &File,
+        read_block_size: u64,
+        write_block_size: usize,
+        processor: F,
+    ) -> std::io::Result<ParallelWriteReport>
+    where
+        F: for<'a> Fn(&'a [u8]) -> std::io::Result<Vec<u8>> + Send + Sync + 'static,
+    {
+        let input_file = ParallelFile::open(config, "compute", read_path, IOMode::PageCache)?;
+        if read_block_size == 0 {
+            return Err(std::io::Error::other("block size must be greater than zero").into());
+        }
+        let block_count = input_file.block_count(read_block_size)?;
+
+        let output_stream =
+            ParallelWriter::indexed_pipe(dest.as_raw_fd(), block_count, write_block_size as u64)?;
+        let output_stream_arc = Arc::new(output_stream);
+        let output_stream_for_blocks = output_stream_arc.clone();
+
+        let _read_report =
+            input_file.foreach_block_parallel(read_block_size, move |chunk_index, raw_bytes| {
+                let produced = processor(raw_bytes)?;
+                output_stream_for_blocks.write_at_index(chunk_index, produced)?;
+                Ok(())
+            })?;
+
         let output_stream = Arc::try_unwrap(output_stream_arc)
             .map_err(|_| std::io::Error::other("failed to unwrap writer Arc"))?;
         output_stream.finish()

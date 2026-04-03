@@ -6,8 +6,6 @@ use std::hint::black_box;
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Instant;
 
 const BASE64_ENCODE: [u8; 64] =
@@ -16,10 +14,12 @@ const BASE64_DEFAULT_WRAP: usize = 76;
 const BASE64_ENCODE_INPUT_ALIGN: u64 = 3 * 4096;
 const BASE64_ENCODE_FAST_READ_BLOCK_SIZE: u64 = 768 * 1024;
 const BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE: usize = 1024 * 1024;
-const BASE64_ENCODE_PIPE_WRITE_BLOCK_SIZE: usize = 1024 * 1024;
+const BASE64_ENCODE_FILE_PIPE_READ_BLOCK_SIZE: u64 = 1_572_864;
+const BASE64_ENCODE_FILE_PIPE_WRITE_BLOCK_SIZE: usize = 2 * 1024 * 1024;
+const BASE64_DECODE_FILE_PIPE_READ_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
+const BASE64_DECODE_FILE_PIPE_WRITE_BLOCK_SIZE: usize = 1_572_864;
 const BASE64_DECODE_FAST_READ_BLOCK_SIZE: u64 = 1024 * 1024;
 const BASE64_DECODE_FAST_WRITE_BLOCK_SIZE: usize = 768 * 1024;
-const BASE64_DECODE_PIPE_WRITE_BLOCK_SIZE: usize = 1024 * 1024;
 const BASE64_BENCH_INPUT_SIZE: usize = 12 * 1024;
 const BASE64_BENCH_OUTPUT_SIZE: usize = 16 * 1024;
 
@@ -68,6 +68,12 @@ impl Base64DecodeKernel {
 struct Base64ProcessPlan {
     read_block_size: u64,
     write_block_size: usize,
+    file_pipe_read_block_size: u64,
+    file_pipe_write_block_size: usize,
+    pipe_file_read_block_size: u64,
+    pipe_file_write_block_size: usize,
+    pipe_input_read_block_size: u64,
+    pipe_input_write_block_size: usize,
     input_chunk_multiple: usize,
     process_chunk: fn(&[u8], &mut [u8]) -> io::Result<usize>,
 }
@@ -91,6 +97,7 @@ struct Base64Options {
 }
 
 mod process;
+mod process_layout;
 mod bench;
 #[cfg(test)]
 mod tests;
@@ -369,6 +376,31 @@ pub fn encode_base64_block_aligned_small(bytes: &[u8]) -> Vec<u8> {
 
     // Optional: truncate if needed, though usually len is exact for base64
     out_vec.truncate(written);
+    out_vec
+}
+
+#[allow(unused)]
+pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
+    let len = encoded_base64_len(bytes.len());
+    let huge_page_size = 2 * 1024 * 1024;
+    let capacity = (len + huge_page_size - 1) & !(huge_page_size - 1);
+    let layout =
+        Layout::from_size_align(capacity, huge_page_size).expect("Invalid layout for huge pages");
+
+    let ptr = unsafe { alloc(layout) };
+    if ptr.is_null() {
+        handle_alloc_error(layout);
+    }
+
+    unsafe {
+        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, libc::MADV_HUGEPAGE);
+    }
+
+    let mut out_vec = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };
+    let written = encode_base64_block_into(bytes, &mut out_vec);
+    unsafe {
+        out_vec.set_len(written);
+    }
     out_vec
 }
 

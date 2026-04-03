@@ -1,24 +1,48 @@
 use super::*;
+use super::process_layout::{decode_input_can_use_fast_path, decode_input_can_use_wrapped_fast_path,
+    detect_regular_decode_layout, encode_input_can_use_wrapped_fast_path, read_decode_fast_path_probe,
+    wrapped_decode_block_sizes, wrapped_encode_block_sizes, RegularDecodeLayout, SliceWriter};
+use crate::stream::allocate_pipe_output_buffer;
+use crate::stream::transform::{
+    increase_pipe_capacity, process_reader_to_file_fast, process_reader_to_pipe_fast,
+};
 mod decode_reorg;
 use decode_reorg::Base64DecodeReorg;
 
 fn process_pipe_to_pipe(
     dest: &mut File,
     input: &StreamInput,
-    _options: &Base64Options,
+    options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
-    let pipe_write_block_size = if _options.decode {
-        BASE64_DECODE_PIPE_WRITE_BLOCK_SIZE
-    } else {
-        BASE64_ENCODE_PIPE_WRITE_BLOCK_SIZE
-    };
+    if options.decode {
+        let mut reader = open_stream_input_file(input)?;
+        let (prefix, compatible) = read_decode_fast_path_probe(&mut reader)?;
+        let mut replay = io::Cursor::new(prefix).chain(reader);
+        if compatible {
+            process_reader_to_pipe_fast(
+                plan.process_chunk,
+                dest,
+                &mut replay,
+                plan.pipe_input_read_block_size,
+                plan.pipe_input_write_block_size,
+                plan.input_chunk_multiple,
+            )?;
+            return Ok(false);
+        }
+        return decode_base64_from_reader(
+            dest,
+            &mut replay,
+            plan.pipe_input_read_block_size as usize,
+            options.ignore_garbage,
+        );
+    }
     process_pipe_input_to_pipe_fast(
         plan.process_chunk,
         dest,
         input,
-        plan.read_block_size,
-        pipe_write_block_size,
+        plan.pipe_input_read_block_size,
+        plan.pipe_input_write_block_size,
         plan.input_chunk_multiple,
     )?;
     return Ok(false);
@@ -27,13 +51,37 @@ fn process_pipe_to_pipe(
 fn process_pipe_to_file(
     dest: &mut File,
     input: &StreamInput,
-    _options: &Base64Options,
+    options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
+    if options.decode {
+        let mut reader = open_stream_input_file(input)?;
+        let (prefix, compatible) = read_decode_fast_path_probe(&mut reader)?;
+        let mut replay = io::Cursor::new(prefix).chain(reader);
+        if compatible {
+            process_reader_to_file_fast(
+                &mut replay,
+                dest,
+                plan.pipe_file_read_block_size,
+                plan.pipe_file_write_block_size,
+                plan.input_chunk_multiple,
+                plan.process_chunk,
+            )?;
+            return Ok(false);
+        }
+        return decode_base64_from_reader(
+            dest,
+            &mut replay,
+            plan.pipe_file_read_block_size as usize,
+            options.ignore_garbage,
+        );
+    }
     let mut reader = open_stream_input_file(input)?;
-    let mut read_buf = vec![0u8; plan.read_block_size as usize];
-    let mut write_buf = vec![0u8; plan.write_block_size];
+    let mut read_buf = vec![0u8; plan.pipe_file_read_block_size as usize];
+    let mut write_buf = vec![0u8; plan.pipe_file_write_block_size];
     let mut carry = Vec::new();
+    let mut merged =
+        Vec::with_capacity(plan.pipe_file_read_block_size as usize + plan.input_chunk_multiple);
     loop {
         let read = reader.read(&mut read_buf)?;
         if read == 0 {
@@ -58,7 +106,7 @@ fn process_pipe_to_file(
             produced
         } else {
             let take_from_read = ready_len - carry.len();
-            let mut merged = Vec::with_capacity(ready_len);
+            merged.clear();
             merged.extend_from_slice(&carry);
             merged.extend_from_slice(&read_buf[..take_from_read]);
             carry.clear();
@@ -99,20 +147,68 @@ fn process_file_to_pipe(
     options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
+    if !options.decode && options.wrap_cols != 0 && options.wrap_cols % 4 == 0 {
+        let config = load_config(None);
+        let wrap_cols = options.wrap_cols;
+        let (read_block_size, write_block_size) =
+            wrapped_encode_block_sizes(wrap_cols, BASE64_ENCODE_FILE_PIPE_READ_BLOCK_SIZE);
+        increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
+        ParallelStream::map_file_to_pipe_with_owned_buffers(
+            &config,
+            path,
+            dest,
+            read_block_size,
+            write_block_size,
+            move |input: &[u8]| -> io::Result<Vec<u8>> {
+                let mut out = allocate_pipe_output_buffer(write_block_size);
+                let produced = encode_wrapped_block_into(input, wrap_cols, &mut out[..])?;
+                out.truncate(produced);
+                Ok(out)
+            },
+        )?;
+        return Ok(false);
+    }
+    if options.decode && detect_regular_decode_layout(path)? == RegularDecodeLayout::WrappedLf76 {
+        let config = load_config(None);
+        let (read_block_size, write_block_size) =
+            wrapped_decode_block_sizes(BASE64_DECODE_FILE_PIPE_READ_BLOCK_SIZE);
+        increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
+        ParallelStream::map_file_to_pipe_with_owned_buffers(
+            &config,
+            path,
+            dest,
+            read_block_size,
+            write_block_size,
+            move |input: &[u8]| -> io::Result<Vec<u8>> {
+                let mut out = allocate_pipe_output_buffer(write_block_size);
+                let produced = decode_wrapped_block_into(input, &mut out[..])?;
+                out.truncate(produced);
+                Ok(out)
+            },
+        )?;
+        return Ok(false);
+    }
     let config = load_config(None);
-    let pipe_write_block_size = if options.decode {
-        BASE64_DECODE_PIPE_WRITE_BLOCK_SIZE
-    } else {
-        BASE64_ENCODE_PIPE_WRITE_BLOCK_SIZE
-    };
+    let decode = options.decode;
+    let pipe_write_block_size = plan.file_pipe_write_block_size;
+    let process_chunk = plan.process_chunk;
     increase_pipe_capacity(dest.as_raw_fd(), pipe_write_block_size);
-    let _report = ParallelStream::map_file_fixed_size_to_pipe(
+    let _report = ParallelStream::map_file_to_pipe_with_owned_buffers(
         &config,
         path,
         dest,
-        plan.read_block_size,
+        plan.file_pipe_read_block_size,
         pipe_write_block_size,
-        plan.process_chunk,
+        move |input: &[u8]| -> io::Result<Vec<u8>> {
+            if decode {
+                let mut out = allocate_pipe_output_buffer(pipe_write_block_size);
+                let produced = process_chunk(input, &mut out[..])?;
+                out.truncate(produced);
+                Ok(out)
+            } else {
+                Ok(encode_base64_block_aligned(input))
+            }
+        },
     )?;
     return Ok(false);
 }
@@ -120,9 +216,40 @@ fn process_file_to_pipe(
 fn process_file_to_file(
     dest: &mut File,
     path: &str,
-    _options: &Base64Options,
+    options: &Base64Options,
     plan: &Base64ProcessPlan,
 ) -> io::Result<bool> {
+    if !options.decode && options.wrap_cols != 0 && options.wrap_cols % 4 == 0 {
+        let config = load_config(None);
+        let wrap_cols = options.wrap_cols;
+        let (read_block_size, write_block_size) =
+            wrapped_encode_block_sizes(wrap_cols, BASE64_ENCODE_FAST_READ_BLOCK_SIZE);
+        ParallelStream::map_file_fixed_size_to_file(
+            &config,
+            path,
+            dest,
+            read_block_size,
+            write_block_size,
+            move |input: &[u8], out: &mut [u8]| {
+                encode_wrapped_block_into(input, wrap_cols, out)
+            },
+        )?;
+        return Ok(false);
+    }
+    if options.decode && detect_regular_decode_layout(path)? == RegularDecodeLayout::WrappedLf76 {
+        let config = load_config(None);
+        let (read_block_size, write_block_size) =
+            wrapped_decode_block_sizes(BASE64_DECODE_FAST_READ_BLOCK_SIZE);
+        ParallelStream::map_file_fixed_size_to_file(
+            &config,
+            path,
+            dest,
+            read_block_size,
+            write_block_size,
+            move |input: &[u8], out: &mut [u8]| decode_wrapped_block_into(input, out),
+        )?;
+        return Ok(false);
+    }
     let config = load_config(None);
     let _report = ParallelStream::map_file_fixed_size_to_file(
         &config,
@@ -190,6 +317,38 @@ fn ordered_input_block_bound(input: &StreamInput, io_mode: IOMode) -> io::Result
     }
 }
 
+
+fn encode_wrapped_block_into(bytes: &[u8], wrap_cols: usize, out: &mut [u8]) -> io::Result<usize> {
+    let line_input_bytes = (wrap_cols / 4) * 3;
+    let full_line_input_len = (bytes.len() / line_input_bytes) * line_input_bytes;
+    let mut written = 0usize;
+    if full_line_input_len != 0 {
+        written += encode_full_wrapped_lines_in_place(
+            &bytes[..full_line_input_len],
+            line_input_bytes,
+            wrap_cols,
+            out,
+        );
+    }
+    let leftover = &bytes[full_line_input_len..];
+    if !leftover.is_empty() {
+        let encoded_len = encoded_base64_len(leftover.len());
+        let line_buf = &mut out[written..written + encoded_len + 1];
+        let tail_written = encode_base64_block_into(leftover, &mut line_buf[..encoded_len]);
+        line_buf[tail_written] = b'\n';
+        written += tail_written + 1;
+    }
+    Ok(written)
+}
+
+fn decode_wrapped_block_into(bytes: &[u8], out: &mut [u8]) -> io::Result<usize> {
+    let mut writer = SliceWriter { out, written: 0 };
+    let mut reorg = Base64DecodeReorg::new(bytes.len().max(32 * 1024), false);
+    reorg.consume_block(&mut writer, bytes)?;
+    reorg.finish(&mut writer)?;
+    Ok(writer.written)
+}
+
 fn wrap_encoded_bytes_into(
     encoded: &[u8],
     wrap_cols: usize,
@@ -244,14 +403,6 @@ fn encode_full_wrapped_lines_in_place(
     wrapped_len
 }
 
-use libc::{fcntl, F_SETPIPE_SZ};
-
-fn increase_pipe_capacity(pipe_fd: i32, new_size: usize) {
-    unsafe {
-        let _res = fcntl(pipe_fd, F_SETPIPE_SZ, new_size);
-    }
-}
-
 fn process_pipe_input_to_pipe_fast(
     processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
     dest: &mut File,
@@ -260,139 +411,15 @@ fn process_pipe_input_to_pipe_fast(
     write_block_size: usize,
     input_chunk_multiple: usize,
 ) -> io::Result<()> {
-    use std::os::unix::io::RawFd;
-
-    unsafe fn vmsplice_all(pipe_fd: RawFd, buf: &[u8]) -> io::Result<usize> {
-        let mut written_total = 0usize;
-        let mut ptr = buf.as_ptr();
-        let mut remaining = buf.len();
-        while remaining > 0 {
-            let rc = if remaining % 4096 == 0 && ptr.align_offset(4096) == 0 {
-                let iov = libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: remaining,
-                };
-                libc::vmsplice(pipe_fd, &iov as *const libc::iovec, 1, libc::SPLICE_F_GIFT)
-            } else {
-                libc::write(pipe_fd, ptr as *mut libc::c_void, remaining)
-            };
-            if rc < 0 {
-                let err = io::Error::last_os_error();
-                match err.raw_os_error() {
-                    Some(libc::EINTR | libc::EAGAIN) => continue,
-                    _ => return Err(err),
-                }
-            }
-            let n = rc as usize;
-            written_total = written_total
-                .checked_add(n)
-                .ok_or_else(|| io::Error::other("vmsplice overflow"))?;
-            ptr = ptr.add(n);
-            remaining -= n;
-        }
-        Ok(written_total)
-    }
-
-    fn aligned_output_buffer(capacity: usize) -> Vec<u8> {
-        let layout = Layout::from_size_align(capacity, 4096).expect("invalid aligned vec layout");
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            handle_alloc_error(layout);
-        }
-        unsafe { Vec::from_raw_parts(ptr, capacity, capacity) }
-    }
-
-    increase_pipe_capacity(dest.as_raw_fd(), write_block_size);
     let mut reader = open_stream_input_file(input)?;
-    let mut read_bufs = (0..3)
-        .map(|_| vec![0u8; read_block_size as usize])
-        .collect::<Vec<_>>();
-    let mut carry = Vec::new();
-    let (free_tx, free_rx) = mpsc::sync_channel::<Vec<u8>>(3);
-    for _ in 0..3 {
-        free_tx
-            .send(aligned_output_buffer(write_block_size))
-            .map_err(|err| io::Error::other(err.to_string()))?;
-    }
-    let writer_pool_tx = free_tx.clone();
-    drop(free_tx);
-
-    let (tx, rx) = mpsc::sync_channel::<io::Result<(Vec<u8>, usize)>>(3);
-    let writer = dest.try_clone()?;
-    let writer_thread = thread::spawn(move || -> io::Result<()> {
-        let pipe_fd = writer.as_raw_fd();
-        for item in rx {
-            let (buf, len) = item?;
-            if len != 0 {
-                let mut written = 0usize;
-                while written < len {
-                    written += unsafe { vmsplice_all(pipe_fd, &buf[written..len])? };
-                }
-            }
-            writer_pool_tx
-                .send(buf)
-                .map_err(|err| io::Error::other(err.to_string()))?;
-        }
-        Ok(())
-    });
-
-    let mut read_slot = 0usize;
-    loop {
-        let read = reader.read(&mut read_bufs[read_slot])?;
-        if read == 0 {
-            break;
-        }
-        let ready_len = if input_chunk_multiple <= 1 {
-            read
-        } else {
-            let total = carry.len() + read;
-            (total / input_chunk_multiple) * input_chunk_multiple
-        };
-        if ready_len == 0 {
-            carry.extend_from_slice(&read_bufs[read_slot][..read]);
-            read_slot = (read_slot + 1) % read_bufs.len();
-            continue;
-        }
-        let out = free_rx
-            .recv()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        let mut out = out;
-        let produced = if carry.is_empty() {
-            let process_len = ready_len.min(read);
-            let produced = processor(&read_bufs[read_slot][..process_len], &mut out[..])?;
-            if process_len < read {
-                carry.extend_from_slice(&read_bufs[read_slot][process_len..read]);
-            }
-            produced
-        } else {
-            let mut merged = Vec::with_capacity(ready_len);
-            let take_from_read = ready_len - carry.len();
-            merged.extend_from_slice(&carry);
-            merged.extend_from_slice(&read_bufs[read_slot][..take_from_read]);
-            carry.clear();
-            if take_from_read < read {
-                carry.extend_from_slice(&read_bufs[read_slot][take_from_read..read]);
-            }
-            processor(&merged, &mut out[..])?
-        };
-        tx.send(Ok((out, produced)))
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        read_slot = (read_slot + 1) % read_bufs.len();
-    }
-    if !carry.is_empty() {
-        let out = free_rx
-            .recv()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        let mut out = out;
-        let produced = processor(&carry, &mut out[..])?;
-        tx.send(Ok((out, produced)))
-            .map_err(|err| io::Error::other(err.to_string()))?;
-    }
-    drop(tx);
-    writer_thread
-        .join()
-        .map_err(|_| io::Error::other("base64 pipe writer thread panicked"))??;
-    Ok(())
+    process_reader_to_pipe_fast(
+        processor,
+        dest,
+        &mut reader,
+        read_block_size,
+        write_block_size,
+        input_chunk_multiple,
+    )
 }
 
 fn decode_base64_input<W: Write>(
@@ -429,49 +456,38 @@ fn decode_base64_input<W: Write>(
     Ok(false)
 }
 
-fn regular_decode_file_is_fast_path_compatible(path: &str) -> io::Result<bool> {
-    const FAST_PATH_COMPAT_PROBE_BYTES: u64 = 256 * 1024;
-    let mut file = File::open(path)?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut remaining = FAST_PATH_COMPAT_PROBE_BYTES;
+fn decode_base64_from_reader<W: Write, R: Read>(
+    out: &mut W,
+    reader: &mut R,
+    compacted_capacity: usize,
+    ignore_garbage: bool,
+) -> io::Result<bool> {
+    let mut reorg = Base64DecodeReorg::new(compacted_capacity.max(32 * 1024), ignore_garbage);
+    let mut invalid = false;
+    let mut block = vec![0u8; compacted_capacity.max(32 * 1024)];
     loop {
-        if remaining == 0 {
-            return Ok(true);
-        }
-        let to_read = remaining.min(buf.len() as u64) as usize;
-        let read = file.read(&mut buf[..to_read])?;
+        let read = reader.read(&mut block)?;
         if read == 0 {
+            break;
+        }
+        if let Err(err) = reorg.consume_block(out, &block[..read]) {
+            invalid = true;
+            if err.kind() != io::ErrorKind::InvalidData {
+                return Err(err);
+            }
+            break;
+        }
+    }
+    if invalid {
+        return Ok(true);
+    }
+    if let Err(err) = reorg.finish(out) {
+        if err.kind() == io::ErrorKind::InvalidData {
             return Ok(true);
         }
-        remaining -= read as u64;
-        let chunk = &buf[..read];
-        if chunk
-            .iter()
-            .any(|&byte| byte != b'=' && base64_decode_value(byte).is_none())
-        {
-            return Ok(false);
-        }
+        return Err(err);
     }
-}
-
-fn decode_input_can_use_fast_path(input: &StreamInput) -> io::Result<bool> {
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
-            regular_decode_file_is_fast_path_compatible(path)
-        }
-        StreamInput::Stdin { .. } => {
-            let stdin_fd = io::stdin().as_raw_fd();
-            if !is_regular_fd(stdin_fd) {
-                return Ok(false);
-            }
-            let read_path_buf = fs::read_link(format!("/proc/self/fd/{stdin_fd}"))?;
-            let read_path = read_path_buf.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
-            })?;
-            regular_decode_file_is_fast_path_compatible(read_path)
-        }
-        _ => Ok(false),
-    }
+    Ok(false)
 }
 
 fn encode_base64_input<W: Write>(
@@ -839,6 +855,12 @@ fn encode_process_plan() -> Base64ProcessPlan {
     Base64ProcessPlan {
         read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
         write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
+        file_pipe_read_block_size: BASE64_ENCODE_FILE_PIPE_READ_BLOCK_SIZE,
+        file_pipe_write_block_size: BASE64_ENCODE_FILE_PIPE_WRITE_BLOCK_SIZE,
+        pipe_file_read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
+        pipe_file_write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
+        pipe_input_read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
+        pipe_input_write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
         input_chunk_multiple: 3,
         process_chunk: encode_base64_block_processor,
     }
@@ -862,6 +884,12 @@ fn decode_process_plan() -> Base64ProcessPlan {
     Base64ProcessPlan {
         read_block_size: BASE64_DECODE_FAST_READ_BLOCK_SIZE,
         write_block_size: BASE64_DECODE_FAST_WRITE_BLOCK_SIZE,
+        file_pipe_read_block_size: BASE64_DECODE_FILE_PIPE_READ_BLOCK_SIZE,
+        file_pipe_write_block_size: BASE64_DECODE_FILE_PIPE_WRITE_BLOCK_SIZE,
+        pipe_file_read_block_size: BASE64_DECODE_FILE_PIPE_READ_BLOCK_SIZE,
+        pipe_file_write_block_size: BASE64_DECODE_FILE_PIPE_WRITE_BLOCK_SIZE,
+        pipe_input_read_block_size: BASE64_DECODE_FAST_READ_BLOCK_SIZE,
+        pipe_input_write_block_size: BASE64_DECODE_FAST_WRITE_BLOCK_SIZE,
         input_chunk_multiple: 4,
         process_chunk,
     }
@@ -876,13 +904,20 @@ pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
 }
 
 fn run_base64_io(options: Base64Options) -> io::Result<i32> {
-    let use_slow_path = if options.decode {
-        options.ignore_garbage || !decode_input_can_use_fast_path(&options.input)?
+    // This branch is still required because the fast runners are stateless block
+    // transforms. Wrapped encode needs cross-block line-length state, and wrapped
+    // / whitespace-tolerant / ignore-garbage decode needs cross-block sanitized
+    // quartet state that the current process_chunk contract cannot carry.
+    let requires_stateful_path = if options.decode {
+        options.ignore_garbage
+            || (!decode_input_can_use_fast_path(&options.input)?
+                && !decode_input_can_use_wrapped_fast_path(&options.input)?)
     } else {
         options.wrap_cols != 0
+            && !encode_input_can_use_wrapped_fast_path(&options.input, options.wrap_cols)?
     };
 
-    if use_slow_path {
+    if requires_stateful_path {
         let mut out = stdout_buf_writer()?;
         let invalid = if options.decode {
             decode_base64_input(
