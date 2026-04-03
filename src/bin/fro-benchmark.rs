@@ -2,9 +2,9 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::process;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 enum CacheState {
@@ -15,10 +15,26 @@ enum CacheState {
 
 struct TestCase {
     name: &'static str,
+    program: &'static str,
     args: Vec<String>,
     target: f64,
     cache_state: CacheState,
     files_to_prep: Vec<String>,
+    bytes_hint: BytesHint,
+    kind: CommandKind,
+}
+
+#[derive(Clone, Copy)]
+enum BytesHint {
+    None,
+    SourceFile,
+    RecursiveTree,
+}
+
+#[derive(Clone, Copy)]
+enum CommandKind {
+    Fro,
+    ExternalDiscardStdout,
 }
 
 const RECURSIVE_TREE_TARGET_FILES: usize = 100_000;
@@ -26,9 +42,12 @@ const RECURSIVE_TREE_MIN_FILE_SIZE: u64 = 4 * 1024;
 const RECURSIVE_TREE_FILES_PER_DIR: usize = 100;
 const RECURSIVE_TREE_POWER_ALPHA: f64 = 1.15;
 
-fn parse_first_gbps(text: &str) -> Option<f64> {
-    for line in text.lines() {
-        if let Some(idx) = line.find(" GB/s") {
+fn parse_reported_gbps(text: &str) -> Option<f64> {
+    for line in text.lines().rev() {
+        if !(line.contains(" bytes in ") || line.contains(" bytes across ")) {
+            continue;
+        }
+        if let Some(idx) = line.rfind(" GB/s") {
             let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
             if let Ok(num) = line[start..idx].trim().parse::<f64>() {
                 return Some(num);
@@ -36,6 +55,23 @@ fn parse_first_gbps(text: &str) -> Option<f64> {
         }
     }
     None
+}
+
+fn run_test_command(
+    fro_exe: &std::path::Path,
+    test: &TestCase,
+) -> std::io::Result<(std::process::Output, Duration)> {
+    let mut command = match test.kind {
+        CommandKind::Fro => Command::new(fro_exe),
+        CommandKind::ExternalDiscardStdout => Command::new(test.program),
+    };
+    command.args(&test.args);
+    if matches!(test.kind, CommandKind::ExternalDiscardStdout) {
+        command.stdout(Stdio::null());
+    }
+    let start = Instant::now();
+    let output = command.output()?;
+    Ok((output, start.elapsed()))
 }
 
 fn evict_cache(path: &str) {
@@ -298,6 +334,14 @@ fn recursive_tree_fixture_stats(root: &std::path::Path) -> Option<(u64, usize)> 
     Some((total_bytes, file_count))
 }
 
+fn recursive_tree_effective_bytes(
+    recursive_tree_fixture_bytes: u64,
+    recursive_tree_equiv_files: u64,
+    size: u64,
+) -> u64 {
+    recursive_tree_fixture_bytes.max(size.saturating_mul(recursive_tree_equiv_files))
+}
+
 fn align_down(bytes: u64, align: u64) -> u64 {
     if align == 0 {
         return bytes;
@@ -470,13 +514,17 @@ fn main() {
     let tests = vec![
         TestCase {
             name: "bench-diff (memory)",
+            program: "fro",
             args: vec!["bench-diff".into()],
             target: 60.0,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "write (direct)",
+            program: "fro",
             args: vec![
                 "write".into(),
                 "--direct-write".into(),
@@ -488,9 +536,12 @@ fn main() {
             target: 10.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_dir.clone()],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "write (page cache, cold)",
+            program: "fro",
             args: vec![
                 "write".into(),
                 "--no-direct-write".into(),
@@ -502,9 +553,12 @@ fn main() {
             target: 1.6,
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_cache.clone()],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "write (page cache, hot)",
+            program: "fro",
             args: vec![
                 "write".into(),
                 "--no-direct-write".into(),
@@ -516,9 +570,12 @@ fn main() {
             target: 3.6,
             cache_state: CacheState::Hot,
             files_to_prep: vec![target_file_cache.clone()],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "write (auto, cold)",
+            program: "fro",
             args: vec![
                 "write".into(),
                 "-v".into(),
@@ -529,9 +586,12 @@ fn main() {
             target: 8.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_cache.clone()],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "write (auto, hot)",
+            program: "fro",
             args: vec![
                 "write".into(),
                 "-v".into(),
@@ -542,9 +602,12 @@ fn main() {
             target: 10.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![target_file_cache.clone()],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (direct)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--direct".into(),
@@ -556,9 +619,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::None,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (forced page cache, hot)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--no-direct".into(),
@@ -570,9 +636,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (auto, cold)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "-v".into(),
@@ -583,9 +652,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (auto, hot)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "-v".into(),
@@ -596,9 +668,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (to memory, hot)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--to-memory".into(),
@@ -610,9 +685,12 @@ fn main() {
             target: 5.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (to memory, cold)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--to-memory".into(),
@@ -624,9 +702,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (to memory, direct)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--to-memory".into(),
@@ -639,9 +720,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::None,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "read (to memory, paged shared buffer, hot)",
+            program: "fro",
             args: vec![
                 "read".into(),
                 "--to-memory".into(),
@@ -655,9 +739,12 @@ fn main() {
             target: 8.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "recursive-read-bench (hot)",
+            program: "fro",
             args: vec![
                 "recursive-read-bench".into(),
                 "--no-direct".into(),
@@ -668,9 +755,36 @@ fn main() {
             target: 0.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "fd read tree (hot)",
+            program: "fd",
+            args: vec!["-u".into(), ".".into(), recursive_tree_str.clone()],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::ExternalDiscardStdout,
+        },
+        TestCase {
+            name: "rg tree scan (hot)",
+            program: "rg",
+            args: vec![
+                "-Fboauuu".into(),
+                "__fro_bench_pattern_that_should_not_match__".into(),
+                recursive_tree_str.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
             name: "copy (recursive, hot)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--recursive".into(),
@@ -683,9 +797,32 @@ fn main() {
             target: 0.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "cp -r (recursive, hot)",
+            program: "cp",
+            args: vec!["-r".into(), recursive_tree_str.clone(), recursive_copy_target.clone()],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::ExternalDiscardStdout,
+        },
+        TestCase {
+            name: "rsync (recursive, hot)",
+            program: "rsync",
+            args: vec!["-a".into(), recursive_tree_str.clone(), recursive_copy_target.clone()],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
             name: "copy (direct)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--direct".into(),
@@ -698,9 +835,12 @@ fn main() {
             target: 5.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (threaded, page cache, cold)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--threaded-copy".into(),
@@ -714,9 +854,12 @@ fn main() {
             target: 1.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (range, cold)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--copy-file-range".into(),
@@ -730,9 +873,12 @@ fn main() {
             target: 1.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (range, hot)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--copy-file-range".into(),
@@ -746,9 +892,12 @@ fn main() {
             target: 3.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (range 1T, cold)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--copy-file-range-single".into(),
@@ -762,9 +911,12 @@ fn main() {
             target: 0.8,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (range 1T, hot)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--copy-file-range-single".into(),
@@ -778,9 +930,12 @@ fn main() {
             target: 3.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (hot R, direct W)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--no-direct".into(),
@@ -794,9 +949,12 @@ fn main() {
             target: 2.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (hot R, direct W, pre-sized target)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--keep-target-size".into(),
@@ -811,9 +969,12 @@ fn main() {
             target: 3.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (via-mem, hot R, direct W)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "--via-memory".into(),
@@ -828,9 +989,12 @@ fn main() {
             target: 0.8,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (auto, cold)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "-v".into(),
@@ -842,9 +1006,12 @@ fn main() {
             target: 5.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "copy (auto, hot)",
+            program: "fro",
             args: vec![
                 "copy".into(),
                 "-v".into(),
@@ -856,9 +1023,12 @@ fn main() {
             target: 4.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "diff (direct)",
+            program: "fro",
             args: vec![
                 "diff".into(),
                 "--direct".into(),
@@ -869,9 +1039,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "diff (page cache, cold)",
+            program: "fro",
             args: vec![
                 "diff".into(),
                 "--no-direct".into(),
@@ -882,9 +1055,12 @@ fn main() {
             target: 3.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "diff (page cache, hot)",
+            program: "fro",
             args: vec![
                 "diff".into(),
                 "--no-direct".into(),
@@ -895,9 +1071,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "diff (auto, cold)",
+            program: "fro",
             args: vec![
                 "diff".into(),
                 "-v".into(),
@@ -907,9 +1086,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "diff (auto, hot)",
+            program: "fro",
             args: vec![
                 "diff".into(),
                 "-v".into(),
@@ -919,9 +1101,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "dual-read-bench (direct)",
+            program: "fro",
             args: vec![
                 "dual-read-bench".into(),
                 "--direct".into(),
@@ -932,9 +1117,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "dual-read-bench (page cache, cold)",
+            program: "fro",
             args: vec![
                 "dual-read-bench".into(),
                 "--no-direct".into(),
@@ -945,9 +1133,12 @@ fn main() {
             target: 3.5,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "dual-read-bench (page cache, hot)",
+            program: "fro",
             args: vec![
                 "dual-read-bench".into(),
                 "--no-direct".into(),
@@ -958,9 +1149,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "dual-read-bench (auto, cold)",
+            program: "fro",
             args: vec![
                 "dual-read-bench".into(),
                 "-v".into(),
@@ -970,9 +1164,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "dual-read-bench (auto, hot)",
+            program: "fro",
             args: vec![
                 "dual-read-bench".into(),
                 "-v".into(),
@@ -982,9 +1179,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "grep (direct)",
+            program: "fro",
             args: vec![
                 "grep".into(),
                 "--direct".into(),
@@ -997,9 +1197,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "grep (forced page cache, hot)",
+            program: "fro",
             args: vec![
                 "grep".into(),
                 "--no-direct".into(),
@@ -1012,9 +1215,12 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "grep (auto, cold)",
+            program: "fro",
             args: vec![
                 "grep".into(),
                 "-v".into(),
@@ -1026,9 +1232,12 @@ fn main() {
             target: 20.0,
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "grep (auto, hot)",
+            program: "fro",
             args: vec![
                 "grep".into(),
                 "-v".into(),
@@ -1040,20 +1249,28 @@ fn main() {
             target: 50.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
+            bytes_hint: BytesHint::SourceFile,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "bench-mmap-write",
+            program: "fro",
             args: vec!["bench-mmap-write".into(), target_file_cache.clone()],
             target: 0.7,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
         TestCase {
             name: "bench-write",
+            program: "fro",
             args: vec!["bench-write".into(), target_file_cache.clone()],
             target: 0.5,
             cache_state: CacheState::None,
             files_to_prep: vec![],
+            bytes_hint: BytesHint::None,
+            kind: CommandKind::Fro,
         },
     ];
 
@@ -1324,8 +1541,8 @@ fn main() {
         let mut outputs = Vec::with_capacity(repeat_count);
 
         for _ in 0..repeat_count {
-            if t.args.first().map(String::as_str) == Some("copy")
-                && t.args.iter().any(|arg| arg == "--recursive")
+            if matches!(t.bytes_hint, BytesHint::RecursiveTree)
+                && t.args.last().map(String::as_str) == Some(recursive_copy_target.as_str())
             {
                 if let Some(target) = t.args.last() {
                     let target_path = std::path::Path::new(target);
@@ -1347,15 +1564,31 @@ fn main() {
                 CacheState::None => {}
             }
 
-            let output = Command::new(&fro_exe)
-                .args(&t.args)
-                .output()
+            let (output, elapsed) = run_test_command(&fro_exe, &t)
                 .unwrap_or_else(|e| panic!("Failed to execute process for {}: {}", t.name, e));
 
             let out_str = String::from_utf8_lossy(&output.stdout);
             let err_str = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{}\n{}", out_str, err_str);
-            let speed = parse_first_gbps(&combined).unwrap_or(0.0);
+            let bytes_for_effective_speed = match t.bytes_hint {
+                BytesHint::None => None,
+                BytesHint::SourceFile => Some(size),
+                BytesHint::RecursiveTree => Some(recursive_tree_effective_bytes(
+                    recursive_tree_fixture_bytes,
+                    recursive_tree_equiv_files,
+                    size,
+                )),
+            };
+            let speed = match t.kind {
+                CommandKind::Fro => parse_reported_gbps(&combined).unwrap_or_else(|| {
+                    bytes_for_effective_speed
+                        .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
+                        .unwrap_or(0.0)
+                }),
+                CommandKind::ExternalDiscardStdout => bytes_for_effective_speed
+                    .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
+                    .unwrap_or(0.0),
+            };
             min_speed = min_speed.min(speed);
             max_speed = max_speed.max(speed);
             outputs.push(combined);
@@ -1422,10 +1655,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_first_gbps_extracts_speed() {
+    fn parse_reported_gbps_extracts_speed() {
         let sample = "copy 1073741824 bytes in 0.1076 s, 10.0 GB/s, [1, 2, 3]";
-        assert_eq!(parse_first_gbps(sample), Some(10.0));
-        assert_eq!(parse_first_gbps("no throughput here"), None);
+        assert_eq!(parse_reported_gbps(sample), Some(10.0));
+        let sampled = "recursive-copy sample t=0.010s bytes=123 items=4 window=1.230 GB/s avg=1.230 GB/s items/s=400.0\ncopy 1073741824 bytes in 0.1076 s, 10.0 GB/s, [1, 2, 3]";
+        assert_eq!(parse_reported_gbps(sampled), Some(10.0));
+        assert_eq!(parse_reported_gbps("no throughput here"), None);
     }
 
     #[test]

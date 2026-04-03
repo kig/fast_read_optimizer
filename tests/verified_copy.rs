@@ -1,6 +1,7 @@
 use fro::block_hash::{default_hash_base, verify_file_with_replicas, BlockHashAlgorithm};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::symlink;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -379,6 +380,78 @@ fn copy_file_range_single_cli_copies_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn copy_recursive_cli_copies_tree_contents_and_symlinks() {
+    let tmp = unique_temp_dir("fro-copy-recursive-cli");
+    let source_root = tmp.join("src-tree");
+    let nested = source_root.join("nested/deeper");
+    let fro_dest_parent = tmp.join("fro-dest");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&fro_dest_parent).unwrap();
+
+    fs::write(source_root.join("small.txt"), b"alpha\nbeta\n").unwrap();
+    fs::write(
+        nested.join("large.bin"),
+        (0..(2 * 1024 * 1024 + 333))
+            .map(|i| ((i * 13) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    symlink("../small.txt", source_root.join("nested/link-small")).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--recursive",
+        "--no-direct",
+        "-n",
+        "1",
+        source_root.to_str().unwrap(),
+        fro_dest_parent.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let copied_root = fro_dest_parent.join("src-tree");
+    assert_eq!(
+        fs::read(copied_root.join("small.txt")).unwrap(),
+        b"alpha\nbeta\n"
+    );
+    assert_eq!(
+        fs::read(copied_root.join("nested/deeper/large.bin")).unwrap(),
+        fs::read(source_root.join("nested/deeper/large.bin")).unwrap()
+    );
+    assert_eq!(
+        fs::read_link(copied_root.join("nested/link-small")).unwrap(),
+        std::path::PathBuf::from("../small.txt")
+    );
+}
+
+#[test]
+fn copy_recursive_cli_rejects_target_inside_source() {
+    let tmp = unique_temp_dir("fro-copy-recursive-inside-source");
+    let source_root = tmp.join("src-tree");
+    let nested = source_root.join("subdir");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(source_root.join("small.txt"), b"alpha\n").unwrap();
+    let target = source_root.join("nested-copy");
+
+    let out = run_fro(&[
+        "copy",
+        "--recursive",
+        "--no-direct",
+        "-n",
+        "1",
+        source_root.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to copy directory"));
 }
 
 #[test]

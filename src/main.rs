@@ -73,6 +73,7 @@ const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
 const COPY_RANGE_PARAM_INDICES: [usize; 3] = [6, 7, 8];
 const RECURSIVE_COPY_LARGE_FILE_THRESHOLD: u64 = 8 << 20;
 const RECURSIVE_COPY_MAX_LARGE_WORKERS: usize = 2;
+const THROUGHPUT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Clone)]
 struct RecursiveCopyContext {
@@ -102,6 +103,14 @@ struct RecursiveFileTask {
     resolved_copy: ResolvedCopyExecution,
 }
 
+#[derive(Clone)]
+struct RecursiveSmallFileTask {
+    source_path: PathBuf,
+    target_path: PathBuf,
+    source_len: u64,
+    source_mode: u32,
+}
+
 #[derive(Default)]
 struct RecursiveDirectoryQueue {
     state: Mutex<RecursiveDirectoryQueueState>,
@@ -129,6 +138,7 @@ struct RecursiveCopyStats {
     dirs_created: AtomicU64,
     symlinks_created: AtomicU64,
     bytes_copied: AtomicU64,
+    items_completed: AtomicU64,
 }
 
 impl Default for RecursiveCopyStats {
@@ -138,7 +148,87 @@ impl Default for RecursiveCopyStats {
             dirs_created: AtomicU64::new(0),
             symlinks_created: AtomicU64::new(0),
             bytes_copied: AtomicU64::new(0),
+            items_completed: AtomicU64::new(0),
         }
+    }
+}
+
+struct ThroughputSampler {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+#[derive(Default)]
+struct ThroughputSampleCounters {
+    bytes: AtomicU64,
+    units: AtomicU64,
+}
+
+impl ThroughputSampler {
+    fn start(
+        label: &'static str,
+        unit_label: &'static str,
+        counters: Arc<ThroughputSampleCounters>,
+    ) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = done.clone();
+        let handle = std::thread::spawn(move || -> io::Result<()> {
+            let start = std::time::Instant::now();
+            let mut last = start;
+            let mut last_bytes = 0_u64;
+            let mut last_units = 0_u64;
+            loop {
+                std::thread::sleep(THROUGHPUT_SAMPLE_INTERVAL);
+                let now = std::time::Instant::now();
+                let bytes_now = counters.bytes.load(Ordering::Relaxed);
+                let units_now = counters.units.load(Ordering::Relaxed);
+                let window = now.duration_since(last);
+                let total = now.duration_since(start);
+                let delta_bytes = bytes_now.saturating_sub(last_bytes);
+                let delta_units = units_now.saturating_sub(last_units);
+                let should_stop = done_thread.load(Ordering::Relaxed);
+                if delta_bytes != 0 || delta_units != 0 || should_stop {
+                    let window_secs = window.as_secs_f64().max(1e-9);
+                    let total_secs = total.as_secs_f64().max(1e-9);
+                    let window_gbps = delta_bytes as f64 / window_secs / 1e9;
+                    let avg_gbps = bytes_now as f64 / total_secs / 1e9;
+                    let unit_rate = delta_units as f64 / window_secs;
+                    let mut stderr = std::io::stderr().lock();
+                    writeln!(
+                        stderr,
+                        "{label} sample t={:.3}s bytes={} {}={} window={:.3} GB/s avg={:.3} GB/s {unit_label}/s={:.1}",
+                        total_secs,
+                        bytes_now,
+                        unit_label,
+                        units_now,
+                        window_gbps,
+                        avg_gbps,
+                        unit_rate
+                    )?;
+                }
+                if should_stop {
+                    break;
+                }
+                last = now;
+                last_bytes = bytes_now;
+                last_units = units_now;
+            }
+            Ok(())
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("throughput sampler thread panicked"))??;
+        }
+        Ok(())
     }
 }
 
@@ -1080,6 +1170,7 @@ fn create_directory_like(
     source_mode: u32,
     target_dir: &Path,
     stats: &RecursiveCopyStats,
+    sample_counters: Option<&ThroughputSampleCounters>,
 ) -> io::Result<()> {
     match fs::symlink_metadata(target_dir) {
         Ok(metadata) => {
@@ -1096,6 +1187,10 @@ fn create_directory_like(
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             fs::create_dir(target_dir)?;
             stats.dirs_created.fetch_add(1, Ordering::Relaxed);
+            stats.items_completed.fetch_add(1, Ordering::Relaxed);
+            if let Some(counters) = sample_counters {
+                counters.units.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Err(err) => return Err(err),
     }
@@ -1112,6 +1207,7 @@ fn copy_symlink_entry(
     let link_target = fs::read_link(source_path)?;
     symlink(&link_target, target_path)?;
     stats.symlinks_created.fetch_add(1, Ordering::Relaxed);
+    stats.items_completed.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1119,6 +1215,7 @@ fn execute_recursive_file_copy(
     task: &RecursiveFileTask,
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
+    sample_counters: Option<&ThroughputSampleCounters>,
 ) -> io::Result<()> {
     let source_path = task.source_path.to_string_lossy();
     let target_path = task.target_path.to_string_lossy();
@@ -1163,6 +1260,11 @@ fn execute_recursive_file_copy(
     )?;
     stats.files_copied.fetch_add(1, Ordering::Relaxed);
     stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+    stats.items_completed.fetch_add(1, Ordering::Relaxed);
+    if let Some(counters) = sample_counters {
+        counters.bytes.fetch_add(copied, Ordering::Relaxed);
+        counters.units.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -1179,6 +1281,14 @@ fn recursive_copy_large_worker_count() -> usize {
         .map(usize::from)
         .unwrap_or(1)
         .min(RECURSIVE_COPY_MAX_LARGE_WORKERS)
+        .max(1)
+}
+
+fn recursive_copy_small_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_mul(2)
         .max(1)
 }
 
@@ -1224,39 +1334,44 @@ fn resolve_recursive_large_copy_execution(
 }
 
 fn execute_recursive_small_file_copy(
-    source_path: &Path,
-    target_path: &Path,
-    source_len: u64,
-    source_mode: u32,
+    task: &RecursiveSmallFileTask,
     use_lock: bool,
     stats: &RecursiveCopyStats,
+    sample_counters: Option<&ThroughputSampleCounters>,
 ) -> io::Result<()> {
-    let source_str = source_path.to_string_lossy();
-    let target_str = target_path.to_string_lossy();
+    let source_str = task.source_path.to_string_lossy();
+    let target_str = task.target_path.to_string_lossy();
     let guard = CopyOperationGuard::new(&source_str, &target_str, use_lock)?;
     let copied = copy_file_range_syscall(
         &source_str,
         &target_str,
         0,
         0,
-        source_len,
+        task.source_len,
         true,
         common::IOMode::PageCache,
         common::IOMode::PageCache,
     )?;
     guard.ensure_source_unchanged()?;
-    fs::set_permissions(target_path, fs::Permissions::from_mode(source_mode))?;
+    fs::set_permissions(&task.target_path, fs::Permissions::from_mode(task.source_mode))?;
     stats.files_copied.fetch_add(1, Ordering::Relaxed);
     stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+    stats.items_completed.fetch_add(1, Ordering::Relaxed);
+    if let Some(counters) = sample_counters {
+        counters.bytes.fetch_add(copied, Ordering::Relaxed);
+        counters.units.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
 fn walk_recursive_copy_subtree(
     start: RecursiveDirectoryTask,
     dir_queue: &RecursiveDirectoryQueue,
+    small_queue: &RecursiveTaskQueue<RecursiveSmallFileTask>,
     large_queue: &RecursiveTaskQueue<RecursiveFileTask>,
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
+    sample_counters: &ThroughputSampleCounters,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut stack = vec![start];
@@ -1273,7 +1388,7 @@ fn walk_recursive_copy_subtree(
             let file_type = metadata.file_type();
             if file_type.is_dir() {
                 let mode = metadata.permissions().mode();
-                create_directory_like(mode, &target_path, stats)?;
+                create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
                 child_dirs.push(RecursiveDirectoryTask {
                     source_dir: source_path,
                     target_dir: target_path,
@@ -1296,14 +1411,12 @@ fn walk_recursive_copy_subtree(
             let source_len = metadata.len();
             let source_mode = metadata.permissions().mode();
             if recursive_copy_uses_small_file_range(ctx, source_len) {
-                execute_recursive_small_file_copy(
-                    &source_path,
-                    &target_path,
+                small_queue.enqueue(RecursiveSmallFileTask {
+                    source_path,
+                    target_path,
                     source_len,
                     source_mode,
-                    ctx.use_lock,
-                    stats,
-                )?;
+                })?;
             } else {
                 let resolved_copy =
                     resolve_recursive_large_copy_execution(ctx, &source_path, &target_path)?;
@@ -1333,10 +1446,22 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     }
     ensure_recursive_target_not_inside_source(&ctx.source_root, &ctx.target_root)?;
     let stats = Arc::new(RecursiveCopyStats::default());
-    create_directory_like(source_meta.permissions().mode(), &ctx.target_root, &stats)?;
+    let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    create_directory_like(
+        source_meta.permissions().mode(),
+        &ctx.target_root,
+        &stats,
+        Some(sample_counters.as_ref()),
+    )?;
     let dir_queue = Arc::new(RecursiveDirectoryQueue::default());
+    let small_queue = Arc::new(RecursiveTaskQueue::default());
     let large_queue = Arc::new(RecursiveTaskQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let sampler = if verbose {
+        Some(ThroughputSampler::start("recursive-copy", "items", sample_counters.clone()))
+    } else {
+        None
+    };
 
     dir_queue.enqueue_one(RecursiveDirectoryTask {
         source_dir: ctx.source_root.clone(),
@@ -1344,29 +1469,63 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     });
 
     let worker_count = recursive_copy_dir_worker_count();
+    let small_worker_count = recursive_copy_small_worker_count();
     let large_worker_count = recursive_copy_large_worker_count();
 
     let mut walk_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let dir_queue = dir_queue.clone();
+        let small_queue = small_queue.clone();
         let large_queue = large_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
         let stop = stop.clone();
+        let sample_counters = sample_counters.clone();
         walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = dir_queue.claim(&stop) {
                 let result = walk_recursive_copy_subtree(
                     task,
                     &dir_queue,
+                    &small_queue,
                     &large_queue,
                     &ctx,
                     &stats,
+                    sample_counters.as_ref(),
                     &stop,
                 );
                 dir_queue.complete_claim();
                 if let Err(err) = result {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
+                    small_queue.wake_all();
+                    large_queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut small_threads = Vec::with_capacity(small_worker_count);
+    for _ in 0..small_worker_count {
+        let queue = small_queue.clone();
+        let dir_queue = dir_queue.clone();
+        let large_queue = large_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        let sample_counters = sample_counters.clone();
+        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = queue.claim(&stop) {
+                if let Err(err) = execute_recursive_small_file_copy(
+                    &task,
+                    ctx.use_lock,
+                    &stats,
+                    Some(sample_counters.as_ref()),
+                ) {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    queue.wake_all();
                     large_queue.wake_all();
                     return Err(err);
                 }
@@ -1379,14 +1538,19 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     for _ in 0..large_worker_count {
         let queue = large_queue.clone();
         let dir_queue = dir_queue.clone();
+        let small_queue = small_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
         let stop = stop.clone();
+        let sample_counters = sample_counters.clone();
         large_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = queue.claim(&stop) {
-                if let Err(err) = execute_recursive_file_copy(&task, &ctx, &stats) {
+                if let Err(err) =
+                    execute_recursive_file_copy(&task, &ctx, &stats, Some(sample_counters.as_ref()))
+                {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
+                    small_queue.wake_all();
                     queue.wake_all();
                     return Err(err);
                 }
@@ -1406,7 +1570,19 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
             Err(_) => {}
         }
     }
+    small_queue.close();
     large_queue.close();
+
+    for thread in small_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive copy small-file worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
 
     for thread in large_threads {
         match thread
@@ -1417,6 +1593,9 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
             Err(err) if first_error.is_none() => first_error = Some(err),
             Err(_) => {}
         }
+    }
+    if let Some(sampler) = sampler {
+        sampler.finish()?;
     }
 
     if let Some(err) = first_error {
@@ -1483,8 +1662,19 @@ fn bench_recursive_read(
     }
 
     let start = std::time::Instant::now();
+    let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    let sampler = if verbose {
+        Some(ThroughputSampler::start(
+            "recursive-read-bench",
+            "files",
+            sample_counters.clone(),
+        ))
+    } else {
+        None
+    };
     let mut total_bytes = 0_u64;
     for file in &files {
+        let sample_counters_for_file = sample_counters.clone();
         let file_str = file.to_str().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1500,9 +1690,15 @@ fn bench_recursive_read(
             block_size_d,
             qd_d,
             io_mode,
-            |_block| Ok(()),
+            move |block| {
+                sample_counters_for_file
+                    .bytes
+                    .fetch_add(block.data.len() as u64, Ordering::Relaxed);
+                Ok(())
+            },
         )?;
         total_bytes = total_bytes.saturating_add(bytes_read);
+        sample_counters.units.fetch_add(1, Ordering::Relaxed);
         if bytes_read == 0 && fs::metadata(file)?.len() != 0 {
             return Err(io::Error::other(format!(
                 "recursive-read-bench observed zero bytes for non-empty file {}",
@@ -1510,14 +1706,18 @@ fn bench_recursive_read(
             )));
         }
     }
+    if let Some(sampler) = sampler {
+        sampler.finish()?;
+    }
     let elapsed = start.elapsed().as_secs_f64();
     if verbose {
         eprintln!(
-            "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
+            "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s ({:.1} files/s)",
             total_bytes,
             files.len(),
             elapsed,
-            total_bytes as f64 / elapsed / 1e9
+            total_bytes as f64 / elapsed / 1e9,
+            files.len() as f64 / elapsed.max(1e-9)
         );
     } else {
         println!(
