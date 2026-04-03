@@ -18,6 +18,27 @@ Reference:
 - PR: https://github.com/kig/fast_read_optimizer/pull/4
 - Initial shipped commit: `797c6a8`
 
+## 2026-04-03
+
+### Archived from TODO: completed shipped work through `a7c297d`
+
+- `TODO.md` was cleaned up so it tracks open work instead of mixing backlog with release notes and already-completed checkboxes.
+- The following shipped items were moved out of the active TODO backlog because they are already done in the repo:
+  - benchmark/optimizer temp-file creation now only creates files needed by the selected modes
+  - checked arithmetic and checked `u64` to `usize` conversions landed for block/offset math, with explicit overflow-boundary coverage
+  - short `io_uring` read handling now treats partial CQE results as retry-or-error instead of silently accepting truncated logical blocks
+  - sparse offset write semantics were decided, documented, and tested
+  - verified write/copy mode now stages hash/copy/fsync/recover-or-repair/fsync/optional-verify with a documented contract
+  - dirwalk subtree processing by multi-tree parallel DFS landed as the current best-known `io_uring` scheduling fallback
+- Additional shipped coreutils/library progress archived from the old TODO "recent progress" section:
+  - `du` is a real multicall/subcommand and no longer uses the naive recursive metadata walk
+  - `find` keeps the coarse subtree-stealing traversal; `du` uses the wider split stat-worker scheduler
+  - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, `head`, `pv`, and read-to-memory flows are wired into the main tool surface
+  - `benchmark_page_cache_lift()` exists as a public API hook for direct-read-plus-page-cache-warm benchmarking
+  - `read` and `grep` expose `--auto-lift`
+  - base64 regained a working GNU-style `--help` path, large wrapped decode regression coverage, and submodule splits that satisfy janitor line-count limits
+  - `io_uring` `GETDENTS` remains blocked in this environment because the available headers/crates do not expose `IORING_OP_GETDENTS`
+
 ## Archived planning and previous TODO backlog
 
 The following planning notes and backlog were moved out of `TODO.md` so that `TODO.md`

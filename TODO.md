@@ -1,24 +1,5 @@
 # TODO
 
-## Recent progress
-
-- PR #4 is open with the sidecar/hash-architecture hardening work:
-  - sidecars now store `hash_type`
-  - both `xxh3` and `sha256` are supported
-  - recovery writes are durable
-  - grep finds matches across block boundaries
-  - malformed config files are preserved instead of being overwritten
-  - more io_uring failures propagate as regular CLI errors
-- Coretools progress is materially better than the earlier snapshot:
-  - `du` now exists as a real multicall/subcommand and no longer uses a naive recursive metadata walk
-  - `find` keeps the coarse subtree-stealing traversal that measures about `0.06-0.07 s` on `/data/repos/formalanswer`
-  - `du` now uses split scheduling: coarse `find`-style traversal plus a wider metadata-stat worker pool, measuring about `0.09-0.10 s` on the same tree
-  - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, and read-to-memory flows are all wired into the main tool surface
-  - `io_uring` `GETDENTS` remains blocked in this environment because the shipped kernel headers and current Rust crate surfaces do not expose `IORING_OP_GETDENTS`
-- The public API now exposes a first application-level benchmark hook for the "cold direct read to program memory while warming the page cache in the background" workflow via `benchmark_page_cache_lift()`, with ordered checkpoint reporting and a bounded Kani proof for the checkpoint helper.
-- `read` and `grep` now also have a user-facing `--auto-lift` mode that starts cold files on the direct path, warms the page cache in a background thread for later iterations in the same process, and measurably improves cold-start repeated scans on `checkpoints.tar.gz`.
-- `base64` now has a working GNU-style `--help` path again, a large wrapped decode regression test, and the base64/stream internals were split into submodules so janitor line-count checks pass without dropping the current fast paths.
-
 ## Current active items
 
 ### Config layering and selection
@@ -37,7 +18,6 @@
 ### Benchmark and optimizer safety
 
 - [ ] Add deterministic wear/space-based test sizing.
-- [x] Only create temp files needed by the selected benchmark/optimization modes.
 - [ ] Add CLI knobs for min/max test size and drive-write budget.
 - [ ] Optionally add probe-based time targeting after the deterministic sizing work lands.
 
@@ -49,13 +29,9 @@
 
 ### I/O correctness and verification
 
-- [x] Add checked arithmetic and checked `u64`→`usize` conversions for block/offset math in `reader`, `stream`, and writer offset paths, then test overflow boundaries explicitly.
-- [x] Treat short `io_uring` reads in the read/map/load paths as retry-or-error conditions instead of accepting partial CQE results as complete logical blocks.
-- [x] Decide and document the contract for sparse offset writes: either enforce completeness for fixed-size outputs or explicitly preserve "gaps are caller-defined" semantics and test that model.
 - [ ] Make direct-I/O fallback observable and testable so `--direct` users can tell when unsupported filesystems or unaligned tails silently took the page-cache path.
 - [ ] Define the durability contract for high-level write APIs (`flush` vs `sync`) and add explicit tests or APIs for the promised level.
 - [ ] Add explicit sync policies for library and CLI writes (for example `fsync` default with optional `nosync`), and test file plus parent-directory sync semantics for create/replace/rename flows.
-- [x] Design and implement a verified write/copy mode that stages `hash -> copy -> fsync -> recover/repair if needed -> fsync -> optional verify`, with a documented success/failure contract.
 - [ ] Add property-based model tests for read partitioning, indexed/offset writer ordering, copy equivalence, and hash/verify/recover invariants. Initial property coverage now includes read partitioning reconstruction and offset-writer reference-model checks.
 - [ ] Add fuzz targets for config/manifest parsing plus model-based fuzzing of read/write/copy/hash orchestration on small files.
 - [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani) for arithmetic and partition helpers. Targeted Miri-safe tests now cover `common::AlignedBuffer` page-backed storage and `reader` destination-slice construction; executing them still requires a nightly toolchain with the `miri` component installed. Current Kani slices prove `io_util::expected_read_len()` matches its `min(file_size - offset, block_size)` contract, rejects offsets past EOF, and is monotonic in offset, and also prove the `find`/`du` permission-classification and `du` node-completion helpers used by the dirwalk error-handling path.
@@ -80,7 +56,6 @@
 - [ ] Idea: sort files by block inode to get a more sequential access pattern. 
 - [ ] Idea: keep nearby-on-media files in the same thread, pin threads to cores (each core manages an area of memory -> higher cache hit rate).
 - [ ] Idea: small files bundled into processing bundles for efficient batching, large files dealt with separately (while large file data is streaming, small file inodes are streaming).
-- [x] Process subtrees with io_uring by doing multi-tree parallel DFS (threads start traversing at nearest-to-root non-claimed subtree, claim it, add found dirs to "to-process" stack.)
 
 ### More utils
 
