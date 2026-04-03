@@ -1,50 +1,5 @@
 use super::*;
-use libc::{splice, SPLICE_F_MOVE};
-use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
-
-fn count_bytes_splice(fd: RawFd) -> std::io::Result<i64> {
-    // Open /dev/null to act as the sink for the spliced data
-    let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
-    let null_fd = dev_null.as_raw_fd();
-
-    let mut total_bytes: i64 = 0;
-    // 1MB buffer size for the splice operations
-    let chunk_size = 1024 * 1024;
-
-    loop {
-        // splice(fd_in, off_in, fd_out, off_out, len, flags)
-        // This moves data from STDIN directly to /dev/null in kernel space.
-        let bytes_moved = unsafe {
-            splice(
-                fd,
-                std::ptr::null_mut(),
-                null_fd,
-                std::ptr::null_mut(),
-                chunk_size,
-                SPLICE_F_MOVE,
-            )
-        };
-
-        if bytes_moved < 0 {
-            let err = std::io::Error::last_os_error();
-            // Handle interrupted calls; exit on other errors
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-
-        if bytes_moved == 0 {
-            // End of stream (EOF) reached
-            break;
-        }
-
-        total_bytes += bytes_moved as i64;
-    }
-
-    Ok(total_bytes)
-}
 
 fn fast_count_fd<R: AsRawFd>(reader: &mut R) -> Option<u64> {
     let fd = reader.as_raw_fd();
@@ -59,7 +14,11 @@ fn fast_count_fd<R: AsRawFd>(reader: &mut R) -> Option<u64> {
             S_IFREG => Some(s.st_size as u64),
 
             // Path 2: Pipe (Zero-Copy)
-            S_IFIFO => Some(count_bytes_splice(fd).ok()? as u64),
+            S_IFIFO => {
+                let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null").ok()?;
+                let mut noop = |_bytes: u64| Ok(());
+                copy_fd_to_fd_splice_counted(fd, dev_null.as_raw_fd(), &mut noop).ok()?
+            }
 
             // Path 3: Fallback (Standard Read)
             _ => None,

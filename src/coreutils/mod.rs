@@ -27,6 +27,8 @@ mod du;
 mod fgrep;
 mod find;
 mod hash;
+mod head;
+mod pv;
 mod shred;
 mod tac;
 mod wc;
@@ -56,6 +58,8 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "sha256sum"
             | "sha384sum"
             | "sha512sum"
+            | "head"
+            | "pv"
             | "shred"
     )
 }
@@ -172,6 +176,14 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         "sha256sum" => hash::run_hash_sum(args, HashAlgorithm::Sha256)?,
         "sha384sum" => hash::run_hash_sum(args, HashAlgorithm::Sha384)?,
         "sha512sum" => hash::run_hash_sum(args, HashAlgorithm::Sha512)?,
+        "head" => {
+            head::run_head(args)?;
+            0
+        }
+        "pv" => {
+            pv::run_pv(args)?;
+            0
+        }
         "shred" => {
             shred::run_shred(args)?;
             0
@@ -434,44 +446,64 @@ fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn copy_regular_file_to_stdout_sendfile(path: &str) -> io::Result<bool> {
-    let file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
-    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
-    let mut offset = 0 as libc::off_t;
-    let max_chunk = 0x7fff_f000usize;
-    while (offset as u64) < file_len {
-        let remaining = (file_len - offset as u64).min(max_chunk as u64) as usize;
+const FAST_COPY_SPLICE_CHUNK_SIZE: usize = 1 << 20;
+const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
+
+fn copy_regular_fd_to_fd_sendfile_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if !fd_is_regular(src_fd)? {
+        return Ok(None);
+    }
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
+    loop {
         let copied = unsafe {
             libc::sendfile(
-                libc::STDOUT_FILENO,
-                file.as_raw_fd(),
-                &mut offset,
-                remaining,
+                dst_fd,
+                src_fd,
+                std::ptr::null_mut(),
+                FAST_COPY_SENDFILE_CHUNK_SIZE,
             )
         };
         if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("sendfile byte count overflow"))?;
+            progress(total)?;
             continue;
         }
         if copied == 0 {
-            break;
+            return Ok(Some(total));
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EINTR) => continue,
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(false),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
             _ => return Err(err),
         }
     }
-    Ok(offset as u64 == file_len)
 }
 
-fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
-    if !fd_is_fifo(libc::STDIN_FILENO)? && !fd_is_fifo(libc::STDOUT_FILENO)? {
-        return Ok(false);
+fn copy_fd_to_fd_splice_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if !fd_is_fifo(src_fd)? && !fd_is_fifo(dst_fd)? {
+        return Ok(None);
     }
-    grow_pipe_best_effort(libc::STDIN_FILENO)?;
-    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+    grow_pipe_best_effort(src_fd)?;
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
     if let Ok(mut ring) = IoUring::new(8) {
         loop {
             let mut sqe = ring
@@ -479,11 +511,11 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
                 .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
             unsafe {
                 sqe.prep_splice(
-                    libc::STDIN_FILENO,
+                    src_fd,
                     -1,
-                    libc::STDOUT_FILENO,
+                    dst_fd,
                     -1,
-                    1 << 20,
+                    FAST_COPY_SPLICE_CHUNK_SIZE.try_into().unwrap(),
                     SpliceFlags::empty(),
                 );
                 sqe.set_user_data(0x5350_4c49_4345);
@@ -491,16 +523,20 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
             ring.submit_sqes().map_err(io::Error::other)?;
             let cqe = ring.wait_for_cqe().map_err(io::Error::other)?;
             match cqe.result() {
-                Ok(copied) if copied > 0 => continue,
-                Ok(0) => return Ok(true),
+                Ok(copied) if copied > 0 => {
+                    total = total
+                        .checked_add(copied as u64)
+                        .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+                    progress(total)?;
+                    continue;
+                }
+                Ok(0) => return Ok(Some(total)),
                 Ok(_) => {}
                 Err(err) => match err.raw_os_error() {
                     Some(libc::EINTR) => continue,
                     Some(
                         libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV,
-                    ) => {
-                        break;
-                    }
+                    ) => break,
                     _ => return Err(err),
                 },
             }
@@ -509,147 +545,75 @@ fn copy_stdin_to_stdout_splice() -> io::Result<bool> {
     loop {
         let copied = unsafe {
             libc::splice(
-                libc::STDIN_FILENO,
+                src_fd,
                 std::ptr::null_mut(),
-                libc::STDOUT_FILENO,
+                dst_fd,
                 std::ptr::null_mut(),
-                1 << 20,
+                FAST_COPY_SPLICE_CHUNK_SIZE,
                 0,
             )
         };
         if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+            progress(total)?;
             continue;
         }
         if copied == 0 {
-            return Ok(true);
+            return Ok(Some(total));
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EINTR) => continue,
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(false),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
             _ => return Err(err),
         }
     }
 }
 
-fn copy_stdin_to_stdout_sendfile() -> io::Result<bool> {
-    if !fd_is_regular(libc::STDIN_FILENO)? {
-        return Ok(false);
-    }
-    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
-    let max_chunk = 0x7fff_f000usize;
-    loop {
-        let copied = unsafe {
-            libc::sendfile(
-                libc::STDOUT_FILENO,
-                libc::STDIN_FILENO,
-                std::ptr::null_mut(),
-                max_chunk,
-            )
-        };
-        if copied > 0 {
-            continue;
-        }
-        if copied == 0 {
-            return Ok(true);
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(false),
-            _ => return Err(err),
-        }
-    }
-}
-
-fn copy_stdin_to_stdout_fast() -> io::Result<bool> {
-    if copy_stdin_to_stdout_sendfile()? {
-        return Ok(true);
-    }
-    copy_stdin_to_stdout_splice()
-}
-
-fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
+fn try_fast_copy_to_stdout_counted<F>(
+    input: &StreamInput,
+    io_mode: IOMode,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
     if io_mode == IOMode::Direct {
-        return Ok(false);
+        return Ok(None);
     }
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
-            copy_regular_file_to_stdout_sendfile(path)
+            let file = std::fs::File::open(path)?;
+            copy_regular_fd_to_fd_sendfile_counted(file.as_raw_fd(), libc::STDOUT_FILENO, progress)
         }
-        StreamInput::Stdin { .. } => copy_stdin_to_stdout_fast(),
+        StreamInput::Stdin { .. } => {
+            if let Some(bytes) =
+                copy_regular_fd_to_fd_sendfile_counted(libc::STDIN_FILENO, libc::STDOUT_FILENO, progress)?
+            {
+                return Ok(Some(bytes));
+            }
+            copy_fd_to_fd_splice_counted(libc::STDIN_FILENO, libc::STDOUT_FILENO, progress)
+        }
         StreamInput::File(path) => {
             let file_type = fs::metadata(path)?.file_type();
             if file_type.is_fifo() {
                 let file = std::fs::File::open(path)?;
-                grow_pipe_best_effort(file.as_raw_fd())?;
-                grow_pipe_best_effort(libc::STDOUT_FILENO)?;
-                if let Ok(mut ring) = IoUring::new(8) {
-                    loop {
-                        let mut sqe = ring
-                            .prepare_sqe()
-                            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-                        unsafe {
-                            sqe.prep_splice(
-                                file.as_raw_fd(),
-                                -1,
-                                libc::STDOUT_FILENO,
-                                -1,
-                                1 << 20,
-                                SpliceFlags::empty(),
-                            );
-                            sqe.set_user_data(0x5350_4c49_4345);
-                        }
-                        ring.submit_sqes().map_err(io::Error::other)?;
-                        let cqe = ring.wait_for_cqe().map_err(io::Error::other)?;
-                        match cqe.result() {
-                            Ok(copied) if copied > 0 => continue,
-                            Ok(0) => return Ok(true),
-                            Ok(_) => {}
-                            Err(err) => match err.raw_os_error() {
-                                Some(libc::EINTR) => continue,
-                                Some(
-                                    libc::EBADF
-                                    | libc::EINVAL
-                                    | libc::ENOSYS
-                                    | libc::EOPNOTSUPP
-                                    | libc::EXDEV,
-                                ) => break,
-                                _ => return Err(err),
-                            },
-                        }
-                    }
-                }
-                loop {
-                    let copied = unsafe {
-                        libc::splice(
-                            file.as_raw_fd(),
-                            std::ptr::null_mut(),
-                            libc::STDOUT_FILENO,
-                            std::ptr::null_mut(),
-                            1 << 20,
-                            0,
-                        )
-                    };
-                    if copied > 0 {
-                        continue;
-                    }
-                    if copied == 0 {
-                        return Ok(true);
-                    }
-                    let err = io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EINTR) => continue,
-                        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
-                            return Ok(false);
-                        }
-                        _ => return Err(err),
-                    }
-                }
+                return copy_fd_to_fd_splice_counted(
+                    file.as_raw_fd(),
+                    libc::STDOUT_FILENO,
+                    progress,
+                );
             }
-            Ok(false)
+            Ok(None)
         }
     }
+}
+
+fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
+    let mut noop = |_bytes: u64| Ok(());
+    Ok(try_fast_copy_to_stdout_counted(input, io_mode, &mut noop)?.is_some())
 }
 
 fn visit_ordered_blocks<F>(path: &str, io_mode: IOMode, mut on_block: F) -> io::Result<()>

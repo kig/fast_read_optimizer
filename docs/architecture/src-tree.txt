@@ -18,7 +18,9 @@ src/
     fgrep.rs
     find.rs
     hash.rs
+    head.rs
     mod.rs
+    pv.rs
     shred.rs
     tac.rs
     wc.rs

@@ -32,6 +32,24 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
                 run_system("tac", &[file]),
                 &format!("tac path {:?}", args),
             );
+            for head_args in [
+                vec![],
+                vec!["-n", "2"],
+                vec!["-c", "5"],
+                vec!["-c", "1KiB"],
+                vec!["-c", "1MiB"],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(head_args.iter().copied());
+                fro_args.push(file);
+                let mut sys_args = head_args;
+                sys_args.push(file);
+                assert_same_result(
+                    run_fro("head", &fro_args),
+                    run_system("head", &sys_args),
+                    &format!("head path {:?}", fro_args),
+                );
+            }
             for wc_flags in wc_flag_sets() {
                 let mut fro_args = flags.clone();
                 fro_args.extend(wc_flags.iter().copied());
@@ -94,6 +112,26 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
         run_system_with_stdin("tac", &["-"], &text),
         "tac dash",
     );
+    for head_args in [
+        vec![],
+        vec!["-n", "2"],
+        vec!["-c", "5"],
+        vec!["-c", "1KiB"],
+        vec!["-c", "1MiB"],
+    ] {
+        assert_same_result(
+            run_fro_with_stdin("head", &head_args, &text),
+            run_system_with_stdin("head", &head_args, &text),
+            &format!("head stdin {:?}", head_args),
+        );
+        let mut dash_args = head_args.clone();
+        dash_args.push("-");
+        assert_same_result(
+            run_fro_with_stdin("head", &dash_args, &text),
+            run_system_with_stdin("head", &dash_args, &text),
+            &format!("head dash {:?}", dash_args),
+        );
+    }
 
     for wc_flags in wc_flag_sets() {
         assert_same_wc(

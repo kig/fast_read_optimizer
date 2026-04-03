@@ -203,6 +203,17 @@ fn multicall_cat_and_wc_accept_stdin_and_dash() {
 }
 
 #[test]
+fn multicall_pv_passes_through_stdin_and_reports_progress() {
+    let bytes = b"one two\nthree\n";
+    let out = assert_success(run_fro_with_stdin("pv", &[], bytes));
+    assert_eq!(out.stdout, bytes);
+    assert!(
+        !out.stderr.is_empty(),
+        "expected progress output on stderr, got none"
+    );
+}
+
+#[test]
 fn multicall_fgrep_prints_matching_line_once() {
     let tmp = unique_temp_dir("fro-coreutils-fgrep");
     let path = tmp.join("grep.txt");

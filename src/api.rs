@@ -1,14 +1,15 @@
 use crate::common::CopyStrategy;
 use crate::config::load_config;
 use crate::io_util::CopyOperationGuard;
-use crate::reader::{evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache};
+use crate::reader::{evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache, BufReader};
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
     self, copy_file_range_with_strategy as copy_range_internal, resolve_writer_params_for_mode,
     SequentialWriter,
 };
 use crate::IOMode;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -21,6 +22,195 @@ fn path_str(path: &Path) -> io::Result<&str> {
             format!("path is not valid UTF-8: {}", path.display()),
         )
     })
+}
+
+const ORDERED_SCAN_BLOCK_SIZE: usize = 8 << 20;
+const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ByteRange {
+    pub start_offset: u64,
+    pub end_offset: Option<u64>,
+}
+
+impl ByteRange {
+    pub const fn starting_at(start_offset: u64) -> Self {
+        Self {
+            start_offset,
+            end_offset: None,
+        }
+    }
+
+    pub const fn up_to(end_offset: u64) -> Self {
+        Self {
+            start_offset: 0,
+            end_offset: Some(end_offset),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedVisitDecision {
+    Continue,
+    Stop,
+}
+
+fn validate_byte_range(range: ByteRange) -> io::Result<()> {
+    if let Some(end_offset) = range.end_offset {
+        if end_offset < range.start_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "end_offset {} must be >= start_offset {}",
+                    end_offset, range.start_offset
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fd_is_regular(fd: RawFd) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+fn fd_is_fifo(fd: RawFd) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFIFO)
+}
+
+fn grow_pipe_best_effort(fd: RawFd) -> io::Result<()> {
+    if !fd_is_fifo(fd)? {
+        return Ok(());
+    }
+    let target_size = 1 << 20;
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, target_size) };
+    if rc >= 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EPERM | libc::EINVAL | libc::EBUSY) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+pub fn copy_path_range_to_fd_with_progress<P, F>(
+    path: P,
+    dst_fd: RawFd,
+    range: ByteRange,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    P: AsRef<Path>,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    validate_byte_range(range)?;
+    let file = std::fs::File::open(path)?;
+    copy_fd_range_to_fd_with_progress(file.as_raw_fd(), dst_fd, range, progress)
+}
+
+pub fn copy_fd_range_to_fd_with_progress<F>(
+    src_fd: RawFd,
+    dst_fd: RawFd,
+    range: ByteRange,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    validate_byte_range(range)?;
+    if !fd_is_regular(src_fd)? {
+        return Ok(None);
+    }
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
+    let mut offset = i64::try_from(range.start_offset)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "start_offset overflowed off_t"))?;
+    loop {
+        let count = match range.end_offset {
+            Some(end_offset) => {
+                if offset as u64 >= end_offset {
+                    return Ok(Some(total));
+                }
+                (end_offset - offset as u64).min(FAST_COPY_SENDFILE_CHUNK_SIZE as u64) as usize
+            }
+            None => FAST_COPY_SENDFILE_CHUNK_SIZE,
+        };
+        let copied = unsafe { libc::sendfile(dst_fd, src_fd, &mut offset, count) };
+        if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("sendfile byte count overflow"))?;
+            progress(total)?;
+            continue;
+        }
+        if copied == 0 {
+            return Ok(Some(total));
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
+            _ => return Err(err),
+        }
+    }
+}
+
+pub fn visit_path_range_ordered<P, F>(
+    path: P,
+    range: ByteRange,
+    mut visit: F,
+) -> io::Result<u64>
+where
+    P: AsRef<Path>,
+    F: FnMut(u64, &[u8]) -> io::Result<OrderedVisitDecision>,
+{
+    validate_byte_range(range)?;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start_offset))?;
+    let mut reader = BufReader::with_capacity(ORDERED_SCAN_BLOCK_SIZE, file);
+    let mut buffer = vec![0u8; ORDERED_SCAN_BLOCK_SIZE];
+    let mut offset = range.start_offset;
+    loop {
+        let read_cap = match range.end_offset {
+            Some(end_offset) => {
+                if offset >= end_offset {
+                    return Ok(offset.saturating_sub(range.start_offset));
+                }
+                (end_offset - offset).min(buffer.len() as u64) as usize
+            }
+            None => buffer.len(),
+        };
+        let read = reader.read(&mut buffer[..read_cap])?;
+        if read == 0 {
+            return Ok(offset.saturating_sub(range.start_offset));
+        }
+        match visit(offset, &buffer[..read])? {
+            OrderedVisitDecision::Continue => {
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("ordered scan offset overflow"))?;
+            }
+            OrderedVisitDecision::Stop => {
+                return Ok(offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("ordered scan offset overflow"))?
+                    .saturating_sub(range.start_offset));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
