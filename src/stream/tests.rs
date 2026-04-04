@@ -98,7 +98,11 @@
     #[test]
     fn foreach_block_uses_stable_logical_block_size_across_io_modes() {
         let path = unique_temp_file("fro-parallel-file-block-size");
-        fs::write(&path, (0..200).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+        fs::write(
+            &path,
+            (0..8192).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+        )
+        .unwrap();
 
         let mut app = AppConfig::default();
         app.read.page_cache.block_size = 64 * 1024;

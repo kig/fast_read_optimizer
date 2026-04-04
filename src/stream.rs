@@ -157,7 +157,12 @@ impl ParallelFile {
     {
         let path = self.path.clone();
         let config = self.config.clone();
-        let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
+        let effective_block_size = if self.io_mode == IOMode::Direct && block_size % 4096 != 0 {
+            block_size.next_multiple_of(4096)
+        } else {
+            block_size
+        };
+        let io_mode = effective_io_mode_for_block_size(self.io_mode, effective_block_size);
         let visit = Arc::new(visit);
         let mut local_config = config.clone();
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
@@ -168,7 +173,7 @@ impl ParallelFile {
             &path,
             crate::config::IOParams {
                 num_threads: page_cache.num_threads,
-                block_size,
+                block_size: effective_block_size,
                 qd: page_cache.qd,
             },
         );
@@ -178,17 +183,32 @@ impl ParallelFile {
             &path,
             crate::config::IOParams {
                 num_threads: direct.num_threads,
-                block_size,
+                block_size: effective_block_size,
                 qd: direct.qd,
             },
         );
-        let (bytes_read, file_size, params) =
-            crate::reader::visit_file_blocks_for_mode(&local_config, &self.mode, &path, io_mode, move |block| {
-                visit(block.block_index, block.data)
-            })?;
+        let params = crate::reader::resolve_reader_params(
+            &path,
+            &crate::config::IOParams {
+                num_threads: page_cache.num_threads,
+                block_size: effective_block_size,
+                qd: page_cache.qd,
+            },
+            &crate::config::IOParams {
+                num_threads: direct.num_threads,
+                block_size: effective_block_size,
+                qd: direct.qd,
+            },
+            io_mode,
+        )?;
+        let metrics = crate::reader::visit_file_blocks_with_resolved_params(
+            &path,
+            params,
+            move |block| visit(block.block_index, block.data),
+        )?;
         Ok(ParallelReadReport {
-            bytes_read,
-            file_size,
+            bytes_read: metrics.bytes_read,
+            file_size: metrics.file_size,
             params,
         })
     }
@@ -221,7 +241,12 @@ impl ParallelFile {
     {
         let path = self.path.clone();
         let config = self.config.clone();
-        let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
+        let effective_block_size = if self.io_mode == IOMode::Direct && block_size % 4096 != 0 {
+            block_size.next_multiple_of(4096)
+        } else {
+            block_size
+        };
+        let io_mode = effective_io_mode_for_block_size(self.io_mode, effective_block_size);
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
         let direct = config.get_params_for_path(&self.mode, true, &path);
         let mut local_config = config.clone();
@@ -231,7 +256,7 @@ impl ParallelFile {
             &path,
             crate::config::IOParams {
                 num_threads: page_cache.num_threads,
-                block_size,
+                block_size: effective_block_size,
                 qd: page_cache.qd,
             },
         );
@@ -241,11 +266,24 @@ impl ParallelFile {
             &path,
             crate::config::IOParams {
                 num_threads: direct.num_threads,
-                block_size,
+                block_size: effective_block_size,
                 qd: direct.qd,
             },
         );
-        let params = resolve_reader_params_for_mode(&local_config, &self.mode, &path, io_mode)?;
+        let params = crate::reader::resolve_reader_params(
+            &path,
+            &crate::config::IOParams {
+                num_threads: page_cache.num_threads,
+                block_size: effective_block_size,
+                qd: page_cache.qd,
+            },
+            &crate::config::IOParams {
+                num_threads: direct.num_threads,
+                block_size: effective_block_size,
+                qd: direct.qd,
+            },
+            io_mode,
+        )?;
         self.map_reduce_blocks_with_params(params, map, reduce)
     }
 

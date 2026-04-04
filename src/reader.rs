@@ -722,7 +722,7 @@ fn validate_read_params(params: ResolvedReadParams) -> std::io::Result<()> {
             "qd must be greater than zero",
         ));
     }
-    if params.use_direct && params.block_size % 4096 != 0 {
+    if params.use_direct && params.num_threads > 1 && params.block_size % 4096 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -2819,7 +2819,8 @@ mod tests {
     #[test]
     fn resolve_reader_params_for_mode_uses_config_mode() {
         let path = unique_temp_file("fro-load-config");
-        fs::write(&path, b"hello world").unwrap();
+        let data = vec![0x5A; 300 * 1024 * 1024];
+        fs::write(&path, &data).unwrap();
 
         let mut cfg = AppConfig::default();
         cfg.hash.page_cache = IOParams {
