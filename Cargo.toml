@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+read-phase-timing = []
+
 [dependencies]
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
 io-uring = "0.7.11"

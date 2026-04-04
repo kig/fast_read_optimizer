@@ -1,4 +1,4 @@
-use crate::common::CopyAutoMode;
+use crate::common::{CopyAutoMode, ReadAutoStrategy, ReadPathKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -31,6 +31,8 @@ pub struct AppConfig {
     pub copy_range: IOParams,
     #[serde(default = "default_copy_auto_mode")]
     pub copy_auto_mode: CopyAutoMode,
+    #[serde(default = "default_read_auto_strategy")]
+    pub read_auto_strategy: ReadAutoStrategy,
     pub grep: ModeConfig,
     pub diff: ModeConfig,
     pub dual_read_bench: ModeConfig,
@@ -71,6 +73,7 @@ pub struct AppConfigPatch {
     pub copy: Option<ModeConfigPatch>,
     pub copy_range: Option<IOParams>,
     pub copy_auto_mode: Option<CopyAutoMode>,
+    pub read_auto_strategy: Option<ReadAutoStrategy>,
     pub grep: Option<ModeConfigPatch>,
     pub diff: Option<ModeConfigPatch>,
     pub dual_read_bench: Option<ModeConfigPatch>,
@@ -107,6 +110,35 @@ pub enum LoadedConfig {
 }
 
 impl LoadedConfig {
+    fn defaults_ref(&self) -> &AppConfig {
+        match self {
+            LoadedConfig::Legacy { config, .. } => config,
+            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
+        }
+    }
+
+    fn mount_patch_for_path(&self, path: &str) -> Option<&AppConfigPatch> {
+        let LoadedConfig::BundleV1 { bundle, .. } = self else {
+            return None;
+        };
+        let mp = mountpoint_for_path(path)?;
+        bundle.mount_overrides.by_mountpoint.get(&mp)
+    }
+
+    fn mount_patch_for_path_mut(&mut self, path: &str) -> Option<&mut AppConfigPatch> {
+        let LoadedConfig::BundleV1 { bundle, .. } = self else {
+            return None;
+        };
+        let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
+        Some(
+            bundle
+                .mount_overrides
+                .by_mountpoint
+                .entry(mp)
+                .or_insert_with(AppConfigPatch::default),
+        )
+    }
+
     #[allow(dead_code)]
     pub fn defaults_mut(&mut self) -> &mut AppConfig {
         match self {
@@ -116,49 +148,25 @@ impl LoadedConfig {
     }
 
     pub fn get_params(&self, mode: &str, direct: bool) -> IOParams {
-        let cfg = match self {
-            LoadedConfig::Legacy { config, .. } => config,
-            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
-        };
-        cfg.get_params(mode, direct)
+        self.defaults_ref().get_params(mode, direct)
     }
 
     pub fn get_copy_range_params(&self) -> IOParams {
-        let cfg = match self {
-            LoadedConfig::Legacy { config, .. } => config,
-            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
-        };
-        cfg.copy_range.clone()
+        self.defaults_ref().copy_range.clone()
     }
 
     pub fn get_copy_auto_mode(&self) -> CopyAutoMode {
-        let cfg = match self {
-            LoadedConfig::Legacy { config, .. } => config,
-            LoadedConfig::BundleV1 { bundle, .. } => &bundle.defaults,
-        };
-        cfg.copy_auto_mode
+        self.defaults_ref().copy_auto_mode
+    }
+
+    pub fn get_read_auto_strategy(&self) -> ReadAutoStrategy {
+        self.defaults_ref().read_auto_strategy
     }
 
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
         let base = self.get_params(mode, direct);
-
-        let (bundle, mountpoint) = match self {
-            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
-            _ => return base,
-        };
-
-        let mp = match mountpoint {
-            Some(mp) => mp,
-            None => return base,
-        };
-
-        let patch = match bundle.mount_overrides.by_mountpoint.get(&mp) {
-            Some(p) => p,
-            None => return base,
-        };
-
-        patch
-            .get_mode_patch(mode)
+        self.mount_patch_for_path(path)
+            .and_then(|patch| patch.get_mode_patch(mode))
             .and_then(|m| {
                 if direct {
                     m.direct.clone()
@@ -170,45 +178,21 @@ impl LoadedConfig {
     }
 
     pub fn get_copy_range_params_for_path(&self, path: &str) -> IOParams {
-        let base = self.get_copy_range_params();
-
-        let (bundle, mountpoint) = match self {
-            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
-            _ => return base,
-        };
-
-        let mp = match mountpoint {
-            Some(mp) => mp,
-            None => return base,
-        };
-
-        bundle
-            .mount_overrides
-            .by_mountpoint
-            .get(&mp)
+        self.mount_patch_for_path(path)
             .and_then(|patch| patch.copy_range.clone())
-            .unwrap_or(base)
+            .unwrap_or_else(|| self.get_copy_range_params())
     }
 
     pub fn get_copy_auto_mode_for_path(&self, path: &str) -> CopyAutoMode {
-        let base = self.get_copy_auto_mode();
-
-        let (bundle, mountpoint) = match self {
-            LoadedConfig::BundleV1 { bundle, .. } => (bundle, mountpoint_for_path(path)),
-            _ => return base,
-        };
-
-        let mp = match mountpoint {
-            Some(mp) => mp,
-            None => return base,
-        };
-
-        bundle
-            .mount_overrides
-            .by_mountpoint
-            .get(&mp)
+        self.mount_patch_for_path(path)
             .and_then(|patch| patch.copy_auto_mode)
-            .unwrap_or(base)
+            .unwrap_or_else(|| self.get_copy_auto_mode())
+    }
+
+    pub fn get_read_auto_strategy_for_path(&self, path: &str) -> ReadAutoStrategy {
+        self.mount_patch_for_path(path)
+            .and_then(|patch| patch.read_auto_strategy)
+            .unwrap_or_else(|| self.get_read_auto_strategy())
     }
 
     #[allow(dead_code)]
@@ -226,6 +210,11 @@ impl LoadedConfig {
         self.defaults_mut().copy_auto_mode = mode;
     }
 
+    #[allow(dead_code)]
+    pub fn update_read_auto_strategy(&mut self, strategy: ReadAutoStrategy) {
+        self.defaults_mut().read_auto_strategy = strategy;
+    }
+
     pub fn update_params_for_path(
         &mut self,
         mode: &str,
@@ -233,54 +222,35 @@ impl LoadedConfig {
         path: &str,
         params: IOParams,
     ) {
-        match self {
-            LoadedConfig::BundleV1 { bundle, .. } => {
-                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
-                let entry = bundle
-                    .mount_overrides
-                    .by_mountpoint
-                    .entry(mp)
-                    .or_insert_with(AppConfigPatch::default);
-                entry.set_mode_params(mode, direct, params);
-            }
-            LoadedConfig::Legacy { config, .. } => {
-                config.update_params(mode, direct, params);
-            }
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.set_mode_params(mode, direct, params);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.update_params(mode, direct, params);
         }
     }
 
     pub fn update_copy_range_params_for_path(&mut self, path: &str, params: IOParams) {
-        match self {
-            LoadedConfig::BundleV1 { bundle, .. } => {
-                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
-                let entry = bundle
-                    .mount_overrides
-                    .by_mountpoint
-                    .entry(mp)
-                    .or_insert_with(AppConfigPatch::default);
-                entry.copy_range = Some(params);
-            }
-            LoadedConfig::Legacy { config, .. } => {
-                config.copy_range = params;
-            }
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.copy_range = Some(params);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.copy_range = params;
         }
     }
 
     #[allow(dead_code)]
     pub fn update_copy_auto_mode_for_path(&mut self, path: &str, mode: CopyAutoMode) {
-        match self {
-            LoadedConfig::BundleV1 { bundle, .. } => {
-                let mp = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
-                let entry = bundle
-                    .mount_overrides
-                    .by_mountpoint
-                    .entry(mp)
-                    .or_insert_with(AppConfigPatch::default);
-                entry.copy_auto_mode = Some(mode);
-            }
-            LoadedConfig::Legacy { config, .. } => {
-                config.copy_auto_mode = mode;
-            }
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.copy_auto_mode = Some(mode);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.copy_auto_mode = mode;
+        }
+    }
+
+    pub fn update_read_auto_strategy_for_path(&mut self, path: &str, strategy: ReadAutoStrategy) {
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.read_auto_strategy = Some(strategy);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.read_auto_strategy = strategy;
         }
     }
 
@@ -575,6 +545,7 @@ impl Default for AppConfig {
             copy: default_write_mode.clone(),
             copy_range: default_copy_range,
             copy_auto_mode: CopyAutoMode::Heuristic,
+            read_auto_strategy: default_read_auto_strategy(),
             grep: default_mode.clone(),
             diff: ModeConfig {
                 direct: default_direct.clone(),
@@ -653,6 +624,17 @@ impl AppConfig {
         } else {
             mode_config.page_cache = params;
         }
+    }
+}
+
+fn default_read_auto_strategy() -> ReadAutoStrategy {
+    ReadAutoStrategy {
+        hot_large_min_bytes: 256 * 1024 * 1024,
+        cold_large_min_bytes: 256 * 1024 * 1024,
+        hot_small_path: ReadPathKind::SimplePageCache,
+        hot_large_path: ReadPathKind::ThreadedPageCache,
+        cold_small_path: ReadPathKind::SimpleDirect,
+        cold_large_path: ReadPathKind::ThreadedDirect,
     }
 }
 
@@ -964,5 +946,26 @@ mod tests {
             reloaded.get_copy_auto_mode_for_path(tmp.to_str().unwrap()),
             CopyAutoMode::CopyFileRange
         );
+    }
+
+    #[test]
+    fn bundle_mount_overrides_roundtrip_read_auto_strategy() {
+        let tmp = unique_temp_dir("fro-read-auto-config");
+        let cfg_path = tmp.join("fro.json");
+        let mut loaded = load_config(Some(cfg_path.to_str().unwrap()));
+
+        let strategy = ReadAutoStrategy {
+            hot_large_min_bytes: 64 * 1024 * 1024,
+            cold_large_min_bytes: 128 * 1024 * 1024,
+            hot_small_path: ReadPathKind::SimplePageCache,
+            hot_large_path: ReadPathKind::ThreadedPageCache,
+            cold_small_path: ReadPathKind::SimpleDirect,
+            cold_large_path: ReadPathKind::ThreadedDirect,
+        };
+        loaded.update_read_auto_strategy_for_path(tmp.to_str().unwrap(), strategy);
+        loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        assert_eq!(reloaded.get_read_auto_strategy_for_path(tmp.to_str().unwrap()), strategy);
     }
 }

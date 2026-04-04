@@ -19,15 +19,16 @@ use block_hash::{
     verify_file_with_replicas, BlockHashAlgorithm, RecoverMode,
 };
 use common::{CopyAutoMode, CopyStrategy};
+use common::{ReadAutoStrategy, ReadPathKind};
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use io_util::{direct_writer_supported, sync_path, CopyOperationGuard};
 use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
 use reader::visit_file_blocks;
 use reader::{
-    load_file_to_memory, measure_file_load_to_memory, prepare_file_load_to_memory, read_file,
-    read_file_auto_lift, resolve_to_memory_mode, HugepageAdvice, ReadToMemoryMode,
-    ReadToMemoryOptions,
+    benchmark_read_variant, load_file_to_memory, measure_file_load_to_memory,
+    prepare_file_load_to_memory, read_file, read_file_auto_with_strategy, resolve_to_memory_mode,
+    HugepageAdvice, ReadBenchmarkCacheState, ReadBenchmarkVariant, ReadToMemoryMode, ReadToMemoryOptions,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -66,6 +67,367 @@ fn parse_size(s: &str) -> Option<u64> {
         _ => return None,
     };
     num.checked_mul(mult)
+}
+
+fn unique_temp_file(prefix: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{}-{}-{}.bin", prefix, pid, nanos))
+}
+
+fn format_phase_duration(duration: Option<std::time::Duration>) -> String {
+    duration
+        .map(|d| format!("{:.3} ms", d.as_secs_f64() * 1e3))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn write_sweep_fixture(path: &Path, size: usize) -> io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    let mut remaining = size;
+    let mut seed = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while remaining > 0 {
+        for byte in &mut buffer {
+            *byte = ((seed.wrapping_mul(17).wrapping_add(23)) % 251) as u8;
+            seed = seed.wrapping_add(1);
+        }
+        let chunk = remaining.min(buffer.len());
+        file.write_all(&buffer[..chunk])?;
+        remaining -= chunk;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadSweepCacheState {
+    Cold,
+    Hot,
+}
+
+impl ReadSweepCacheState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Hot => "hot",
+        }
+    }
+}
+
+fn prepare_read_sweep_cache(path: &Path, variant: ReadBenchmarkVariant, cache: ReadSweepCacheState) {
+    let path_str = path.to_str().unwrap();
+    match (variant, cache) {
+        (ReadBenchmarkVariant::SingleThreadDirect, _) => {
+            let _ = reader::evict_file_cache(path_str);
+        }
+        (_, ReadSweepCacheState::Cold) => {
+            let _ = reader::evict_file_cache(path_str);
+        }
+        (_, ReadSweepCacheState::Hot) => {
+            let _ = reader::warm_file_page_cache(path_str);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReadSweepRow {
+    cache_state: ReadSweepCacheState,
+    size: u64,
+    variant: ReadBenchmarkVariant,
+    gbps: f64,
+    elapsed: f64,
+    params: reader::ResolvedReadParams,
+    phase_timings: reader::ReadPhaseTimings,
+}
+
+fn variant_to_path_kind(
+    cache_state: ReadSweepCacheState,
+    variant: ReadBenchmarkVariant,
+) -> ReadPathKind {
+    match (cache_state, variant) {
+        (_, ReadBenchmarkVariant::SingleThreadPageCache) => ReadPathKind::SimplePageCache,
+        (_, ReadBenchmarkVariant::SingleThreadDirect) => ReadPathKind::SimpleDirect,
+        (_, ReadBenchmarkVariant::SingleThreadIoUring) => ReadPathKind::IoUringPageCache,
+        (ReadSweepCacheState::Hot, ReadBenchmarkVariant::MultiThreadCurrent) => {
+            ReadPathKind::ThreadedPageCache
+        }
+        (ReadSweepCacheState::Cold, ReadBenchmarkVariant::MultiThreadCurrent) => {
+            ReadPathKind::ThreadedDirect
+        }
+    }
+}
+
+fn path_kind_label(path: ReadPathKind) -> &'static str {
+    match path {
+        ReadPathKind::SimplePageCache => "simple-page-cache",
+        ReadPathKind::SimpleDirect => "simple-direct",
+        ReadPathKind::IoUringPageCache => "io-uring-page-cache",
+        ReadPathKind::ThreadedPageCache => "threaded-page-cache",
+        ReadPathKind::ThreadedDirect => "threaded-direct",
+    }
+}
+
+fn infer_cache_strategy(rows: &[ReadSweepRow], cache_state: ReadSweepCacheState) -> (u64, ReadPathKind, ReadPathKind) {
+    let mut by_size = std::collections::BTreeMap::<u64, Vec<&ReadSweepRow>>::new();
+    for row in rows.iter().filter(|row| row.cache_state == cache_state) {
+        by_size.entry(row.size).or_default().push(row);
+    }
+    let sizes = by_size.keys().copied().collect::<Vec<_>>();
+    if sizes.is_empty() {
+        return (
+            0,
+            ReadPathKind::SimplePageCache,
+            ReadPathKind::SimplePageCache,
+        );
+    }
+
+    let variants = [
+        ReadPathKind::SimplePageCache,
+        ReadPathKind::SimpleDirect,
+        ReadPathKind::IoUringPageCache,
+        match cache_state {
+            ReadSweepCacheState::Hot => ReadPathKind::ThreadedPageCache,
+            ReadSweepCacheState::Cold => ReadPathKind::ThreadedDirect,
+        },
+    ];
+
+    let avg_for = |segment: &[u64], path_kind: ReadPathKind| -> f64 {
+        if segment.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        let mut total = 0.0;
+        for size in segment {
+            let row = by_size[size]
+                .iter()
+                .find(|row| variant_to_path_kind(cache_state, row.variant) == path_kind)
+                .expect("path kind row should exist for each sweep size");
+            total += row.gbps;
+        }
+        total / segment.len() as f64
+    };
+
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best = (
+        sizes[0],
+        variant_to_path_kind(cache_state, by_size[&sizes[0]][0].variant),
+        variant_to_path_kind(
+            cache_state,
+            by_size[sizes.last().expect("sizes non-empty")][0].variant,
+        ),
+    );
+
+    for split in 0..=sizes.len() {
+        let small_sizes = &sizes[..split];
+        let large_sizes = &sizes[split..];
+        let small_path = variants
+            .iter()
+            .copied()
+            .max_by(|a, b| avg_for(small_sizes, *a).partial_cmp(&avg_for(small_sizes, *b)).unwrap())
+            .unwrap_or(variants[0]);
+        let large_path = variants
+            .iter()
+            .copied()
+            .max_by(|a, b| avg_for(large_sizes, *a).partial_cmp(&avg_for(large_sizes, *b)).unwrap())
+            .unwrap_or(variants[0]);
+        let mut score = 0.0;
+        for size in small_sizes {
+            score += avg_for(&[*size], small_path);
+        }
+        for size in large_sizes {
+            score += avg_for(&[*size], large_path);
+        }
+        if score > best_score {
+            let cutoff = if split >= sizes.len() {
+                *sizes.last().unwrap()
+            } else {
+                sizes[split]
+            };
+            best_score = score;
+            best = (cutoff, small_path, large_path);
+        }
+    }
+
+    best
+}
+
+fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
+    println!();
+    println!("summary\tcache\tsize\tfastest-path\tgbps");
+    for cache_state in [ReadSweepCacheState::Cold, ReadSweepCacheState::Hot] {
+        let mut sizes = rows
+            .iter()
+            .filter(|row| row.cache_state == cache_state)
+            .map(|row| row.size)
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+        sizes.dedup();
+        for size in sizes {
+            if let Some(best) = rows
+                .iter()
+                .filter(|row| row.cache_state == cache_state && row.size == size)
+                .max_by(|a, b| a.gbps.partial_cmp(&b.gbps).unwrap())
+            {
+                println!(
+                    "summary\t{}\t{}\t{}\t{:.6}",
+                    cache_state.label(),
+                    size,
+                    path_kind_label(variant_to_path_kind(cache_state, best.variant)),
+                    best.gbps
+                );
+            }
+        }
+    }
+}
+
+fn print_read_sweep_strategy(strategy: ReadAutoStrategy) {
+    println!();
+    println!("strategy\tstate\tsmall-path\tlarge-path\tcutoff-bytes");
+    println!(
+        "strategy\thot\t{}\t{}\t{}",
+        path_kind_label(strategy.hot_small_path),
+        path_kind_label(strategy.hot_large_path),
+        strategy.hot_large_min_bytes
+    );
+    println!(
+        "strategy\tcold\t{}\t{}\t{}",
+        path_kind_label(strategy.cold_small_path),
+        path_kind_label(strategy.cold_large_path),
+        strategy.cold_large_min_bytes
+    );
+}
+
+fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
+    let sizes = [
+        4 * 1024_u64,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+        512 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    ];
+    let variants = [
+        ReadBenchmarkVariant::SingleThreadPageCache,
+        ReadBenchmarkVariant::SingleThreadDirect,
+        ReadBenchmarkVariant::SingleThreadIoUring,
+        ReadBenchmarkVariant::MultiThreadCurrent,
+    ];
+    let cache_states = [ReadSweepCacheState::Cold, ReadSweepCacheState::Hot];
+    let page_cache = config.get_params("read", false);
+    let direct = config.get_params("read", true);
+
+    let path = unique_temp_file("fro-read-sweep");
+    let strategy_path = std::env::temp_dir().to_string_lossy().to_string();
+    let mut created = false;
+    let mut previous_size = 0_u64;
+    let mut rows = Vec::new();
+    let result = (|| -> io::Result<()> {
+        for size in sizes {
+            if !created || size != previous_size {
+                write_sweep_fixture(&path, size as usize)?;
+                created = true;
+                previous_size = size;
+            }
+            for cache_state in cache_states {
+                for variant in variants {
+                    prepare_read_sweep_cache(&path, variant, cache_state);
+                    let result = benchmark_read_variant(
+                        path.to_str().unwrap(),
+                        variant,
+                        match cache_state {
+                            ReadSweepCacheState::Cold => ReadBenchmarkCacheState::Cold,
+                            ReadSweepCacheState::Hot => ReadBenchmarkCacheState::Hot,
+                        },
+                        page_cache.clone(),
+                        direct.clone(),
+                    )?;
+                    let elapsed = result.elapsed.as_secs_f64();
+                    let gbps = if elapsed > 0.0 {
+                        result.bytes_read as f64 / elapsed / 1e9
+                    } else {
+                        0.0
+                    };
+                    rows.push(ReadSweepRow {
+                        cache_state,
+                        size,
+                        variant,
+                        gbps,
+                        elapsed,
+                        params: result.params,
+                        phase_timings: result.phase_timings,
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.cache_state
+                .label()
+                .cmp(b.cache_state.label())
+                .then(a.size.cmp(&b.size))
+                .then(a.variant.label().cmp(b.variant.label()))
+        });
+        println!("cache\tsize\tvariant\tbytes\telapsed_s\tgbps\tthreads\tblock\tqd\tdirect");
+        for row in &rows {
+            println!(
+                "{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}",
+                row.cache_state.label(),
+                row.size,
+                row.variant.label(),
+                ((row.elapsed * row.gbps * 1e9).round() as u64),
+                row.elapsed,
+                row.gbps,
+                row.params.num_threads,
+                row.params.block_size,
+                row.params.qd,
+                row.params.use_direct
+            );
+        }
+        if rows.iter().any(|row| row.phase_timings.enabled()) {
+            println!();
+            println!(
+                "phases\tcache\tsize\tvariant\tthreads-created\tfirst-submit\tfirst-completion\twrapup-start\tjoin-done"
+            );
+            for row in rows.iter().filter(|row| row.phase_timings.enabled()) {
+                let timings = row.phase_timings;
+                println!(
+                    "phases\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    row.cache_state.label(),
+                    row.size,
+                    row.variant.label(),
+                    format_phase_duration(timings.call_to_threads_created),
+                    format_phase_duration(timings.call_to_first_submit),
+                    format_phase_duration(timings.call_to_first_completion),
+                    format_phase_duration(timings.call_to_wrapup_start),
+                    format_phase_duration(timings.call_to_join_done),
+                );
+            }
+        }
+        print_read_sweep_summary(&rows);
+        let (hot_cutoff, hot_small, hot_large) = infer_cache_strategy(&rows, ReadSweepCacheState::Hot);
+        let (cold_cutoff, cold_small, cold_large) =
+            infer_cache_strategy(&rows, ReadSweepCacheState::Cold);
+        let strategy = ReadAutoStrategy {
+            hot_large_min_bytes: hot_cutoff,
+            cold_large_min_bytes: cold_cutoff,
+            hot_small_path: hot_small,
+            hot_large_path: hot_large,
+            cold_small_path: cold_small,
+            cold_large_path: cold_large,
+        };
+        print_read_sweep_strategy(strategy);
+        config.update_read_auto_strategy_for_path(&strategy_path, strategy);
+        config.save();
+        Ok(())
+    })();
+    let _ = fs::remove_file(&path);
+    result
 }
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
@@ -2109,6 +2471,19 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "recursive-read-bench --no-direct /data/tree",
             )],
         }),
+        "bench-read-sweep" => Some(CommandHelp {
+            name: "bench-read-sweep",
+            usage: "bench-read-sweep",
+            summary: "Sweep single-file read performance across size buckets for simple ST, ST io_uring, and current MT readers.",
+            notes: &[
+                "Uses temporary files sized 4 KiB through 256 MiB.",
+                "Reports effective GB/s and, when built with the read-phase-timing feature, MT phase timestamps.",
+            ],
+            examples: &[(
+                "Run the reader crossover sweep",
+                "bench-read-sweep",
+            )],
+        }),
         "hash" => Some(CommandHelp {
             name: "hash",
             usage: "hash [--auto|--no-direct|--direct] [--xxh3|--sha256] [--hash-only] [-v] [-n iterations] [-s] [-c config.json] [--hash-base path] <filename>",
@@ -2354,6 +2729,7 @@ fn print_general_help(program: &str) {
     println!("  read               measure striped file read throughput");
     println!("  dual-read-bench    benchmark the read pressure of diff");
     println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
+    println!("  bench-read-sweep  sweep read variants across file sizes");
     println!("  fro-optimize       tune configs for one or more commands / mounts");
     println!("  fro-benchmark      run the regression benchmark suite");
     println!("  bench-diff         in-memory diff microbenchmark");
@@ -2712,6 +3088,11 @@ fn try_main() -> io::Result<i32> {
         bench_diff_memory(16, 1024 * 1024);
         return Ok(0);
     }
+    if mode == "bench-read-sweep" {
+        let mut config = config::load_config(config_path);
+        run_bench_read_sweep(&mut config)?;
+        return Ok(0);
+    }
     if mode == "bench-memcpy" {
         let total_size = bench_size.unwrap_or(4 * 1024 * 1024 * 1024);
         let num_threads = bench_threads.unwrap_or(32);
@@ -3055,6 +3436,9 @@ fn try_main() -> io::Result<i32> {
     let mut exit_code = 0;
     let hash_base_owned = hash_base.map(|s| s.to_string());
     let extra_paths_owned = extra_paths;
+    let read_auto_strategy = config.get_read_auto_strategy_for_path(context_path);
+    let params_page_cache_for_path = config.get_params_for_path(config_mode, false, context_path);
+    let params_direct_for_path = config.get_params_for_path(config_mode, true, context_path);
 
     let mode_callback = |p: &[u64]| {
         if mode == "read" && to_memory {
@@ -3072,15 +3456,12 @@ fn try_main() -> io::Result<i32> {
             )
         } else if mode == "read" || mode == "grep" {
             if auto_lift {
-                read_file_auto_lift(
+                read_file_auto_with_strategy(
                     pattern,
                     filename,
-                    p[0],
-                    p[1],
-                    p[2] as usize,
-                    p[3],
-                    p[4],
-                    p[5] as usize,
+                    read_auto_strategy,
+                    params_page_cache_for_path.clone(),
+                    params_direct_for_path.clone(),
                 )
             } else {
                 read_file(

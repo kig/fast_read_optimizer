@@ -140,6 +140,26 @@ pub enum CopyAutoMode {
     CopyFileRange,
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadPathKind {
+    SimplePageCache,
+    SimpleDirect,
+    IoUringPageCache,
+    ThreadedPageCache,
+    ThreadedDirect,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+pub struct ReadAutoStrategy {
+    pub hot_large_min_bytes: u64,
+    pub cold_large_min_bytes: u64,
+    pub hot_small_path: ReadPathKind,
+    pub hot_large_path: ReadPathKind,
+    pub cold_small_path: ReadPathKind,
+    pub cold_large_path: ReadPathKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::AlignedBuffer;

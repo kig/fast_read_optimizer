@@ -1,4 +1,4 @@
-use crate::common::{AlignedBuffer, IOMode};
+use crate::common::{AlignedBuffer, IOMode, ReadAutoStrategy, ReadPathKind};
 use crate::config::{IOParams, LoadedConfig};
 use crate::io_util::{
     expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
@@ -6,14 +6,14 @@ use crate::io_util::{
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
-use std::collections::HashMap;
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::ops::Deref;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub struct BufReader<R> {
     inner: std::io::BufReader<R>,
@@ -41,24 +41,12 @@ impl<R: Read> BufReader<R> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AutoLiftWarmState {
-    InProgress,
-    Complete,
-    Failed(String),
-}
-
 fn auto_lift_mode_for_residency(first_page_resident: bool) -> IOMode {
     if first_page_resident {
         IOMode::PageCache
     } else {
         IOMode::Direct
     }
-}
-
-fn auto_lift_warmers() -> &'static Mutex<HashMap<String, AutoLiftWarmState>> {
-    static AUTO_LIFT_WARMERS: OnceLock<Mutex<HashMap<String, AutoLiftWarmState>>> = OnceLock::new();
-    AUTO_LIFT_WARMERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[allow(dead_code)]
@@ -88,51 +76,33 @@ pub(crate) fn warm_file_page_cache(filename: &str) -> io::Result<u64> {
     }
 }
 
-fn resolve_auto_lift_io_mode(filename: &str) -> io::Result<IOMode> {
-    {
-        let warmers = auto_lift_warmers().lock().unwrap();
-        match warmers.get(filename) {
-            Some(AutoLiftWarmState::Complete) => return Ok(IOMode::PageCache),
-            Some(AutoLiftWarmState::InProgress) => return Ok(IOMode::Direct),
-            Some(AutoLiftWarmState::Failed(message)) => {
-                return Err(io::Error::other(format!(
-                    "background page-cache warm failed for {}: {}",
-                    filename, message
-                )));
+
+fn auto_read_cache_state(filename: &str) -> ReadBenchmarkCacheState {
+    match auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false)) {
+        IOMode::PageCache => ReadBenchmarkCacheState::Hot,
+        IOMode::Direct | IOMode::Auto => ReadBenchmarkCacheState::Cold,
+    }
+}
+
+fn choose_path_kind_for_state(
+    strategy: ReadAutoStrategy,
+    cache_state: ReadBenchmarkCacheState,
+    file_size: u64,
+) -> ReadPathKind {
+    match cache_state {
+        ReadBenchmarkCacheState::Hot => {
+            if file_size >= strategy.hot_large_min_bytes {
+                strategy.hot_large_path
+            } else {
+                strategy.hot_small_path
             }
-            None => {}
         }
-    }
-
-    if auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false))
-        == IOMode::PageCache
-    {
-        return Ok(IOMode::PageCache);
-    }
-
-    let mut warmers = auto_lift_warmers().lock().unwrap();
-    match warmers.get(filename) {
-        Some(AutoLiftWarmState::Complete) => Ok(IOMode::PageCache),
-        Some(AutoLiftWarmState::InProgress) => Ok(IOMode::Direct),
-        Some(AutoLiftWarmState::Failed(message)) => Err(io::Error::other(format!(
-            "background page-cache warm failed for {}: {}",
-            filename, message
-        ))),
-        None => {
-            warmers.insert(filename.to_string(), AutoLiftWarmState::InProgress);
-            let filename_owned = filename.to_string();
-            std::thread::spawn(move || {
-                let result = warm_file_page_cache(&filename_owned);
-                let next_state = match result {
-                    Ok(_) => AutoLiftWarmState::Complete,
-                    Err(err) => AutoLiftWarmState::Failed(err.to_string()),
-                };
-                auto_lift_warmers()
-                    .lock()
-                    .unwrap()
-                    .insert(filename_owned, next_state);
-            });
-            Ok(IOMode::Direct)
+        ReadBenchmarkCacheState::Cold => {
+            if file_size >= strategy.cold_large_min_bytes {
+                strategy.cold_large_path
+            } else {
+                strategy.cold_small_path
+            }
         }
     }
 }
@@ -170,6 +140,171 @@ pub struct ResolvedReadParams {
     pub num_threads: u64,
     pub block_size: u64,
     pub qd: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBenchmarkVariant {
+    SingleThreadPageCache,
+    SingleThreadDirect,
+    SingleThreadIoUring,
+    MultiThreadCurrent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBenchmarkCacheState {
+    Cold,
+    Hot,
+}
+
+impl ReadBenchmarkVariant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SingleThreadPageCache => "st-page-cache",
+            Self::SingleThreadDirect => "st-direct",
+            Self::SingleThreadIoUring => "st-io-uring",
+            Self::MultiThreadCurrent => "mt-current",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReadPhaseTimings {
+    pub call_to_threads_created: Option<std::time::Duration>,
+    pub call_to_first_submit: Option<std::time::Duration>,
+    pub call_to_first_completion: Option<std::time::Duration>,
+    pub call_to_wrapup_start: Option<std::time::Duration>,
+    pub call_to_join_done: Option<std::time::Duration>,
+}
+
+impl ReadPhaseTimings {
+    pub fn enabled(self) -> bool {
+        self.call_to_threads_created.is_some()
+            || self.call_to_first_submit.is_some()
+            || self.call_to_first_completion.is_some()
+            || self.call_to_wrapup_start.is_some()
+            || self.call_to_join_done.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBenchmarkResult {
+    pub bytes_read: u64,
+    pub file_size: u64,
+    pub elapsed: std::time::Duration,
+    pub params: ResolvedReadParams,
+    pub phase_timings: ReadPhaseTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisitFileMetrics {
+    pub bytes_read: u64,
+    pub file_size: u64,
+    pub phase_timings: ReadPhaseTimings,
+}
+
+#[cfg(feature = "read-phase-timing")]
+const READ_PHASE_UNSET: u64 = u64::MAX;
+
+struct ReadPhaseTimingProbe {
+    #[cfg(feature = "read-phase-timing")]
+    start: std::time::Instant,
+    #[cfg(feature = "read-phase-timing")]
+    threads_created_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    first_submit_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    first_completion_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    wrapup_start_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    join_done_ns: AtomicU64,
+}
+
+impl ReadPhaseTimingProbe {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "read-phase-timing")]
+            start: std::time::Instant::now(),
+            #[cfg(feature = "read-phase-timing")]
+            threads_created_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            first_submit_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            first_completion_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            wrapup_start_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            join_done_ns: AtomicU64::new(READ_PHASE_UNSET),
+        }
+    }
+
+    #[cfg(feature = "read-phase-timing")]
+    fn elapsed_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(feature = "read-phase-timing")]
+    fn store_min(slot: &AtomicU64, value: u64) {
+        let mut current = slot.load(Ordering::Relaxed);
+        while value < current {
+            match slot.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn note_threads_created(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.threads_created_ns, self.elapsed_ns());
+    }
+
+    fn note_first_submit(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.first_submit_ns, self.elapsed_ns());
+    }
+
+    fn note_first_completion(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.first_completion_ns, self.elapsed_ns());
+    }
+
+    fn note_wrapup_start(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.wrapup_start_ns, self.elapsed_ns());
+    }
+
+    fn note_join_done(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.join_done_ns, self.elapsed_ns());
+    }
+
+    fn snapshot(&self) -> ReadPhaseTimings {
+        #[cfg(feature = "read-phase-timing")]
+        {
+            fn load_duration(slot: &AtomicU64) -> Option<std::time::Duration> {
+                let nanos = slot.load(Ordering::Relaxed);
+                if nanos == READ_PHASE_UNSET {
+                    None
+                } else {
+                    Some(std::time::Duration::from_nanos(nanos))
+                }
+            }
+
+            return ReadPhaseTimings {
+                call_to_threads_created: load_duration(&self.threads_created_ns),
+                call_to_first_submit: load_duration(&self.first_submit_ns),
+                call_to_first_completion: load_duration(&self.first_completion_ns),
+                call_to_wrapup_start: load_duration(&self.wrapup_start_ns),
+                call_to_join_done: load_duration(&self.join_done_ns),
+            };
+        }
+
+        #[cfg(not(feature = "read-phase-timing"))]
+        {
+            ReadPhaseTimings::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +806,33 @@ fn submit_read(
     Ok(())
 }
 
+fn submit_read_with_probe(
+    io_uring: &mut IoUring,
+    file: &File,
+    file_direct: &File,
+    buffer: &mut AlignedBuffer,
+    offset: u64,
+    block_id: u64,
+    use_direct: bool,
+    file_size: u64,
+    timing_probe: Option<&ReadPhaseTimingProbe>,
+) -> std::io::Result<()> {
+    submit_read(
+        io_uring,
+        file,
+        file_direct,
+        buffer,
+        offset,
+        block_id,
+        use_direct,
+        file_size,
+    )?;
+    if let Some(probe) = timing_probe {
+        probe.note_first_submit();
+    }
+    Ok(())
+}
+
 fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
     let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
     let mut ready = vec![(cq.user_data(), cq.result()?)];
@@ -683,6 +845,51 @@ fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
     }
 
     Ok(ready)
+}
+
+fn read_file_single_thread_blocking(
+    filename: &str,
+    use_direct: bool,
+    block_size: usize,
+) -> io::Result<u64> {
+    let (file, file_direct) = open_reader_files(filename, use_direct)?;
+    let metadata = file.metadata()?;
+    let file_size = metadata.len();
+    if file_size == 0 {
+        return Ok(0);
+    }
+
+    let mut bytes_read = 0_u64;
+    let mut offset = 0_u64;
+    let mut buffer = AlignedBuffer::new(block_size);
+    loop {
+        let remaining = file_size.saturating_sub(offset);
+        if remaining == 0 {
+            return Ok(bytes_read);
+        }
+        let want = remaining.min(block_size as u64) as usize;
+        let target = if should_use_direct_io(use_direct, offset, want, file_size) {
+            &file_direct
+        } else {
+            &file
+        };
+        let read = target.read_at(&mut buffer.as_mut_slice()[..want], offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blocking single-thread read reached EOF early at offset {} of {}",
+                    offset, file_size
+                ),
+            ));
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("single-thread byte count overflowed"))?;
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("single-thread offset overflowed"))?;
+    }
 }
 
 #[allow(dead_code)]
@@ -1266,6 +1473,7 @@ fn thread_visit_blocks<F>(
     read_count: Arc<AtomicU64>,
     visitor: Arc<F>,
     use_direct: bool,
+    timing_probe: Option<Arc<ReadPhaseTimingProbe>>,
 ) -> std::io::Result<()>
 where
     F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<()> + Send + Sync + 'static,
@@ -1286,7 +1494,7 @@ where
             break;
         }
         pending.reserve(slot, block_num as u64)?;
-        submit_read(
+        submit_read_with_probe(
             io_uring,
             file,
             file_direct,
@@ -1295,6 +1503,7 @@ where
             slot as u64,
             use_direct,
             file_size,
+            timing_probe.as_deref(),
         )?;
         block_num += 1;
         inflight += 1;
@@ -1307,6 +1516,9 @@ where
 
     loop {
         for (slot_id, result) in wait_for_ready(io_uring)? {
+            if let Some(probe) = timing_probe.as_deref() {
+                probe.note_first_completion();
+            }
             let slot = usize::try_from(slot_id).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "read slot id overflowed")
             })?;
@@ -1331,7 +1543,7 @@ where
             let next_offset = block_offset(offset, block_num as u64, num_threads, block_size)?;
             if next_offset < file_size {
                 pending.reserve(slot, block_num as u64)?;
-                submit_read(
+                submit_read_with_probe(
                     io_uring,
                     file,
                     file_direct,
@@ -1340,9 +1552,15 @@ where
                     slot as u64,
                     use_direct,
                     file_size,
+                    timing_probe.as_deref(),
                 )?;
                 block_num += 1;
                 inflight += 1;
+            }
+        }
+        if inflight == 0 {
+            if let Some(probe) = timing_probe.as_deref() {
+                probe.note_wrapup_start();
             }
         }
         io_uring.submit_sqes().map_err(std::io::Error::other)?;
@@ -1755,16 +1973,15 @@ where
         io_mode,
     )?;
 
-    let (bytes_read, file_size) =
-        visit_file_blocks_with_resolved_params(filename, params, visitor)?;
-    Ok((bytes_read, file_size, params))
+    let metrics = visit_file_blocks_with_resolved_params(filename, params, visitor)?;
+    Ok((metrics.bytes_read, metrics.file_size, params))
 }
 
 pub fn visit_file_blocks_with_resolved_params<F>(
     filename: &str,
     params: ResolvedReadParams,
     visitor: F,
-) -> std::io::Result<(u64, u64)>
+) -> std::io::Result<VisitFileMetrics>
 where
     F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<()> + Send + Sync + 'static,
 {
@@ -1772,16 +1989,22 @@ where
 
     let file_size = std::fs::metadata(filename)?.len();
     if file_size == 0 {
-        return Ok((0, 0));
+        return Ok(VisitFileMetrics {
+            bytes_read: 0,
+            file_size: 0,
+            phase_timings: ReadPhaseTimings::default(),
+        });
     }
     let read_count = Arc::new(AtomicU64::new(0));
     let visitor = Arc::new(visitor);
+    let timing_probe = Arc::new(ReadPhaseTimingProbe::new());
 
     let mut threads = vec![];
     for thread_id in 0..params.num_threads {
         let filename = filename.to_string();
         let read_count = read_count.clone();
         let visitor = visitor.clone();
+        let timing_probe = timing_probe.clone();
         threads.push(std::thread::spawn(move || -> std::io::Result<()> {
             let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
             let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
@@ -1796,17 +2019,24 @@ where
                 read_count,
                 visitor,
                 params.use_direct,
+                Some(timing_probe),
             )
         }));
     }
+    timing_probe.note_threads_created();
 
     for thread in threads {
         thread
             .join()
             .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
     }
+    timing_probe.note_join_done();
 
-    Ok((read_count.load(Ordering::SeqCst), file_size))
+    Ok(VisitFileMetrics {
+        bytes_read: read_count.load(Ordering::SeqCst),
+        file_size,
+        phase_timings: timing_probe.snapshot(),
+    })
 }
 
 #[allow(dead_code)]
@@ -1877,28 +2107,130 @@ pub fn read_file(
     Ok(bytes_read)
 }
 
-pub fn read_file_auto_lift(
+
+pub fn read_file_auto_with_strategy(
     pattern: &str,
     filename: &str,
-    num_threads_p: u64,
-    block_size_p: u64,
-    qd_p: usize,
-    num_threads_d: u64,
-    block_size_d: u64,
-    qd_d: usize,
+    strategy: ReadAutoStrategy,
+    page_cache: IOParams,
+    direct: IOParams,
 ) -> std::io::Result<u64> {
-    let io_mode = resolve_auto_lift_io_mode(filename)?;
-    read_file(
-        pattern,
-        filename,
-        num_threads_p,
-        block_size_p,
-        qd_p,
-        num_threads_d,
-        block_size_d,
-        qd_d,
-        io_mode,
-    )
+    let file_size = std::fs::metadata(filename)?.len();
+    let cache_state = auto_read_cache_state(filename);
+    let path_kind = choose_path_kind_for_state(strategy, cache_state, file_size);
+    match path_kind {
+        ReadPathKind::SimplePageCache => {
+            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::PageCache)
+        }
+        ReadPathKind::SimpleDirect => {
+            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::Direct)
+        }
+        ReadPathKind::IoUringPageCache => read_file(
+            pattern,
+            filename,
+            1,
+            1024 * 1024,
+            32,
+            1,
+            1024 * 1024,
+            32,
+            IOMode::PageCache,
+        ),
+        ReadPathKind::ThreadedPageCache => read_file(
+            pattern,
+            filename,
+            page_cache.num_threads,
+            page_cache.block_size,
+            page_cache.qd,
+            direct.num_threads,
+            direct.block_size,
+            direct.qd,
+            IOMode::PageCache,
+        ),
+        ReadPathKind::ThreadedDirect => read_file(
+            pattern,
+            filename,
+            page_cache.num_threads,
+            page_cache.block_size,
+            page_cache.qd,
+            direct.num_threads,
+            direct.block_size,
+            direct.qd,
+            IOMode::Direct,
+        ),
+    }
+}
+
+pub fn benchmark_read_variant(
+    filename: &str,
+    variant: ReadBenchmarkVariant,
+    cache_state: ReadBenchmarkCacheState,
+    page_cache: IOParams,
+    direct: IOParams,
+) -> io::Result<ReadBenchmarkResult> {
+    let start = std::time::Instant::now();
+    let (bytes_read, file_size, params, phase_timings) = match variant {
+        ReadBenchmarkVariant::SingleThreadPageCache => {
+            let block_size = 1024 * 1024;
+            let bytes_read = read_file_single_thread_blocking(filename, false, block_size)?;
+            let file_size = std::fs::metadata(filename)?.len();
+            let params = ResolvedReadParams {
+                use_direct: false,
+                num_threads: 1,
+                block_size: 1024 * 1024,
+                qd: 1,
+            };
+            (bytes_read, file_size, params, ReadPhaseTimings::default())
+        }
+        ReadBenchmarkVariant::SingleThreadDirect => {
+            let block_size = 1024 * 1024;
+            let bytes_read = read_file_single_thread_blocking(filename, true, block_size)?;
+            let file_size = std::fs::metadata(filename)?.len();
+            let params = ResolvedReadParams {
+                use_direct: true,
+                num_threads: 1,
+                block_size: 1024 * 1024,
+                qd: 1,
+            };
+            (bytes_read, file_size, params, ReadPhaseTimings::default())
+        }
+        ReadBenchmarkVariant::SingleThreadIoUring => {
+            let params = resolve_reader_params(
+                filename,
+                &IOParams {
+                    num_threads: 1,
+                    block_size: 1024 * 1024,
+                    qd: 32,
+                },
+                &IOParams {
+                    num_threads: 1,
+                    block_size: 1024 * 1024,
+                    qd: 32,
+                },
+                IOMode::PageCache,
+            )?;
+            let metrics =
+                visit_file_blocks_with_resolved_params(filename, params, |_| Ok::<_, io::Error>(()))?;
+            (metrics.bytes_read, metrics.file_size, params, metrics.phase_timings)
+        }
+        ReadBenchmarkVariant::MultiThreadCurrent => {
+            let io_mode = match cache_state {
+                ReadBenchmarkCacheState::Cold => IOMode::Direct,
+                ReadBenchmarkCacheState::Hot => IOMode::PageCache,
+            };
+            let params = resolve_reader_params(filename, &page_cache, &direct, io_mode)?;
+            let metrics =
+                visit_file_blocks_with_resolved_params(filename, params, |_| Ok::<_, io::Error>(()))?;
+            (metrics.bytes_read, metrics.file_size, params, metrics.phase_timings)
+        }
+    };
+    Ok(ReadBenchmarkResult {
+        bytes_read,
+        file_size,
+        elapsed: start.elapsed(),
+        params,
+        phase_timings,
+    })
 }
 
 #[cfg(test)]
@@ -2061,31 +2393,6 @@ mod tests {
     fn auto_lift_mode_prefers_page_cache_for_resident_file() {
         assert!(auto_lift_mode_for_residency(false) == IOMode::Direct);
         assert!(auto_lift_mode_for_residency(true) == IOMode::PageCache);
-    }
-
-    #[test]
-    fn auto_lift_background_warm_promotes_future_reads() {
-        let path = unique_temp_file("fro-auto-lift");
-        fs::write(&path, vec![7_u8; 2 * 1024 * 1024]).unwrap();
-        let filename = path.to_str().unwrap();
-
-        evict_file_cache(filename).unwrap();
-        let first_mode = resolve_auto_lift_io_mode(filename).unwrap();
-        assert!(first_mode == IOMode::Direct);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match resolve_auto_lift_io_mode(filename).unwrap() {
-                IOMode::PageCache => break,
-                IOMode::Direct => {
-                    assert!(std::time::Instant::now() < deadline);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                IOMode::Auto => panic!("auto-lift should resolve to a concrete mode"),
-            }
-        }
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -254,12 +254,11 @@ impl ParallelFile {
         let mapped_slots = Arc::clone(&mapped);
         let path = self.path.clone();
 
-        let (bytes_read, file_size) =
-            visit_file_blocks_with_resolved_params(&path, params, move |block| {
-                let value = map(block.block_index, block.data)?;
-                mapped_slots.lock().unwrap()[block.block_index] = Some(value);
-                Ok(())
-            })?;
+        let metrics = visit_file_blocks_with_resolved_params(&path, params, move |block| {
+            let value = map(block.block_index, block.data)?;
+            mapped_slots.lock().unwrap()[block.block_index] = Some(value);
+            Ok(())
+        })?;
 
         let mapped = Arc::into_inner(mapped)
             .ok_or_else(|| std::io::Error::other("mapped block storage still shared"))?
@@ -276,8 +275,8 @@ impl ParallelFile {
         reduce(
             values,
             ParallelReadReport {
-                bytes_read,
-                file_size,
+                bytes_read: metrics.bytes_read,
+                file_size: metrics.file_size,
                 params,
             },
         )
