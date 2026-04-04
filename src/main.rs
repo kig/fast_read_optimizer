@@ -19,24 +19,30 @@ use block_hash::{
     verify_file_with_replicas, BlockHashAlgorithm, RecoverMode,
 };
 use common::{CopyAutoMode, CopyStrategy};
-use common::{ReadAutoStrategy, ReadPathKind};
+use common::{AlignedBuffer, ReadAutoStrategy, ReadPathKind};
 use differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
-use io_util::{direct_writer_supported, sync_path, CopyOperationGuard};
+use io_util::{
+    direct_writer_supported, open_reader_files, sync_path, validate_read_result, CopyOperationGuard,
+};
+use iou::IoUring;
 use mincore::is_first_page_resident;
 use optimizer::run_optimizer;
-use reader::visit_file_blocks;
 use reader::{
     benchmark_read_variant, load_file_to_memory, measure_file_load_to_memory,
     prepare_file_load_to_memory, read_file, read_file_auto_with_strategy, resolve_to_memory_mode,
-    HugepageAdvice, ReadBenchmarkCacheState, ReadBenchmarkVariant, ReadToMemoryMode, ReadToMemoryOptions,
+    visit_file_blocks_for_mode, HugepageAdvice, ReadBenchmarkCacheState, ReadBenchmarkVariant,
+    ReadToMemoryMode, ReadToMemoryOptions,
 };
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use verified_copy::copy_file_verified_with_options_and_lock;
 use writer::{
@@ -102,6 +108,21 @@ fn write_sweep_fixture(path: &Path, size: usize) -> io::Result<()> {
     Ok(())
 }
 
+fn format_bytes_compact(size: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+        ("B", 1),
+    ];
+    for (suffix, unit) in UNITS {
+        if size >= unit && size % unit == 0 {
+            return format!("{}{}", size / unit, suffix);
+        }
+    }
+    format!("{}B", size)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadSweepCacheState {
     Cold,
@@ -143,6 +164,12 @@ struct ReadSweepRow {
     phase_timings: reader::ReadPhaseTimings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmallFileThreadCacheState {
+    Hot,
+    Cold,
+}
+
 fn variant_to_path_kind(
     cache_state: ReadSweepCacheState,
     variant: ReadBenchmarkVariant,
@@ -151,6 +178,7 @@ fn variant_to_path_kind(
         (_, ReadBenchmarkVariant::SingleThreadPageCache) => ReadPathKind::SimplePageCache,
         (_, ReadBenchmarkVariant::SingleThreadDirect) => ReadPathKind::SimpleDirect,
         (_, ReadBenchmarkVariant::SingleThreadIoUring) => ReadPathKind::IoUringPageCache,
+        (_, ReadBenchmarkVariant::QuickProbePageCache) => ReadPathKind::SimplePageCache,
         (ReadSweepCacheState::Hot, ReadBenchmarkVariant::MultiThreadCurrent) => {
             ReadPathKind::ThreadedPageCache
         }
@@ -255,7 +283,7 @@ fn infer_cache_strategy(rows: &[ReadSweepRow], cache_state: ReadSweepCacheState)
 
 fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
     println!();
-    println!("summary\tcache\tsize\tfastest-path\tgbps");
+    println!("summary\tcache\tsize\tfastest-variant\tfastest-path\tgbps");
     for cache_state in [ReadSweepCacheState::Cold, ReadSweepCacheState::Hot] {
         let mut sizes = rows
             .iter()
@@ -271,9 +299,10 @@ fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
                 .max_by(|a, b| a.gbps.partial_cmp(&b.gbps).unwrap())
             {
                 println!(
-                    "summary\t{}\t{}\t{}\t{:.6}",
+                    "summary\t{}\t{}\t{}\t{}\t{:.6}",
                     cache_state.label(),
                     size,
+                    best.variant.label(),
                     path_kind_label(variant_to_path_kind(cache_state, best.variant)),
                     best.gbps
                 );
@@ -299,6 +328,59 @@ fn print_read_sweep_strategy(strategy: ReadAutoStrategy) {
     );
 }
 
+fn zfs_direct_read_strategy() -> ReadAutoStrategy {
+    ReadAutoStrategy {
+        hot_large_min_bytes: 1,
+        cold_large_min_bytes: 1,
+        hot_small_path: ReadPathKind::SimpleDirect,
+        hot_large_path: ReadPathKind::SimpleDirect,
+        cold_small_path: ReadPathKind::SimpleDirect,
+        cold_large_path: ReadPathKind::SimpleDirect,
+    }
+}
+
+fn print_read_sweep_table(rows: &[ReadSweepRow]) {
+    let mut rendered = vec![vec![
+        "cache".to_string(),
+        "size".to_string(),
+        "variant".to_string(),
+        "bytes".to_string(),
+        "elapsed_s".to_string(),
+        "gbps".to_string(),
+        "threads".to_string(),
+        "block".to_string(),
+        "qd".to_string(),
+        "direct".to_string(),
+    ]];
+    for row in rows {
+        rendered.push(vec![
+            row.cache_state.label().to_string(),
+            format_bytes_compact(row.size),
+            row.variant.label().to_string(),
+            row.size.to_string(),
+            format!("{:.6}", row.elapsed),
+            format!("{:.6}", row.gbps),
+            row.params.num_threads.to_string(),
+            format_bytes_compact(row.params.block_size),
+            row.params.qd.to_string(),
+            row.params.use_direct.to_string(),
+        ]);
+    }
+    let widths = (0..rendered[0].len())
+        .map(|col| rendered.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    for row in rendered {
+        println!(
+            "{}",
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+}
+
 fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
     let sizes = [
         4 * 1024_u64,
@@ -308,23 +390,30 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
         1024 * 1024,
         4 * 1024 * 1024,
         16 * 1024 * 1024,
+        32 * 1024 * 1024,
         64 * 1024 * 1024,
+        80 * 1024 * 1024,
         256 * 1024 * 1024,
-        512 * 1024 * 1024,
-        1024 * 1024 * 1024,
     ];
     let variants = [
         ReadBenchmarkVariant::SingleThreadPageCache,
         ReadBenchmarkVariant::SingleThreadDirect,
         ReadBenchmarkVariant::SingleThreadIoUring,
+        ReadBenchmarkVariant::QuickProbePageCache,
         ReadBenchmarkVariant::MultiThreadCurrent,
     ];
     let cache_states = [ReadSweepCacheState::Cold, ReadSweepCacheState::Hot];
     let page_cache = config.get_params("read", false);
     let direct = config.get_params("read", true);
+    let strategy_path = std::env::temp_dir().to_string_lossy().to_string();
+    let mount_info = config.mount_info_for_path(&strategy_path);
+    let strategy = if mount_info.as_ref().is_some_and(|info| info.fstype == "zfs") {
+        zfs_direct_read_strategy()
+    } else {
+        config.get_read_auto_strategy()
+    };
 
     let path = unique_temp_file("fro-read-sweep");
-    let strategy_path = std::env::temp_dir().to_string_lossy().to_string();
     let mut created = false;
     let mut previous_size = 0_u64;
     let mut rows = Vec::new();
@@ -345,6 +434,8 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
                             ReadSweepCacheState::Cold => ReadBenchmarkCacheState::Cold,
                             ReadSweepCacheState::Hot => ReadBenchmarkCacheState::Hot,
                         },
+                        strategy,
+                        mount_info.as_ref(),
                         page_cache.clone(),
                         direct.clone(),
                     )?;
@@ -363,6 +454,18 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
                         params: result.params,
                         phase_timings: result.phase_timings,
                     });
+                    println!(
+                        "result\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}",
+                        cache_state.label(),
+                        size,
+                        variant.label(),
+                        elapsed,
+                        gbps,
+                        result.params.num_threads,
+                        result.params.block_size,
+                        result.params.qd,
+                        result.params.use_direct
+                    );
                 }
             }
         }
@@ -373,22 +476,8 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
                 .then(a.size.cmp(&b.size))
                 .then(a.variant.label().cmp(b.variant.label()))
         });
-        println!("cache\tsize\tvariant\tbytes\telapsed_s\tgbps\tthreads\tblock\tqd\tdirect");
-        for row in &rows {
-            println!(
-                "{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}",
-                row.cache_state.label(),
-                row.size,
-                row.variant.label(),
-                ((row.elapsed * row.gbps * 1e9).round() as u64),
-                row.elapsed,
-                row.gbps,
-                row.params.num_threads,
-                row.params.block_size,
-                row.params.qd,
-                row.params.use_direct
-            );
-        }
+        println!();
+        print_read_sweep_table(&rows);
         if rows.iter().any(|row| row.phase_timings.enabled()) {
             println!();
             println!(
@@ -421,6 +510,11 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
             cold_small_path: cold_small,
             cold_large_path: cold_large,
         };
+        let strategy = if mount_info.as_ref().is_some_and(|info| info.fstype == "zfs") {
+            zfs_direct_read_strategy()
+        } else {
+            strategy
+        };
         print_read_sweep_strategy(strategy);
         config.update_read_auto_strategy_for_path(&strategy_path, strategy);
         config.save();
@@ -433,8 +527,10 @@ fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Result<()> {
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
 const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
 const COPY_RANGE_PARAM_INDICES: [usize; 3] = [6, 7, 8];
-const RECURSIVE_COPY_LARGE_FILE_THRESHOLD: u64 = 8 << 20;
-const RECURSIVE_COPY_MAX_LARGE_WORKERS: usize = 2;
+const RECURSIVE_COPY_SMALL_FILE_THRESHOLD: u64 = 16 << 20;
+const RECURSIVE_COPY_THREADED_LANE_THRESHOLD: u64 = 80 << 20;
+const RECURSIVE_COPY_MAX_LARGE_WORKERS: usize = 4;
+const RECURSIVE_COPY_SMALL_WORKERS: usize = 32;
 const THROUGHPUT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Clone)]
@@ -449,6 +545,7 @@ struct RecursiveCopyContext {
     io_mode_write: common::IOMode,
     keep_target_size: bool,
     use_lock: bool,
+    relative_copy_method: RelativeCopyMethod,
 }
 
 #[derive(Clone)]
@@ -473,15 +570,29 @@ struct RecursiveSmallFileTask {
     source_mode: u32,
 }
 
-#[derive(Default)]
-struct RecursiveDirectoryQueue {
-    state: Mutex<RecursiveDirectoryQueueState>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelativeCopyMethod {
+    CopyFileRange,
+    Sendfile,
+}
+
+#[derive(Clone)]
+struct RecursiveReadDirectoryTask {
+    source_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct RecursiveReadFileTask {
+    source_path: PathBuf,
+}
+
+struct RecursiveDirectoryQueue<T> {
+    state: Mutex<RecursiveDirectoryQueueState<T>>,
     ready: Condvar,
 }
 
-#[derive(Default)]
-struct RecursiveDirectoryQueueState {
-    queue: VecDeque<RecursiveDirectoryTask>,
+struct RecursiveDirectoryQueueState<T> {
+    queue: VecDeque<T>,
     active_workers: usize,
 }
 
@@ -515,6 +626,434 @@ impl Default for RecursiveCopyStats {
     }
 }
 
+#[derive(Default)]
+struct RecursiveReadStats {
+    files_read: AtomicU64,
+    bytes_read: AtomicU64,
+}
+
+struct FileListUringInflightRead {
+    file: fs::File,
+    file_direct: fs::File,
+    slot_buffer_index: usize,
+}
+
+struct FileListUringSweepResult {
+    inflight_per_thread: usize,
+    total_bytes: u64,
+    total_files: usize,
+    elapsed_secs: f64,
+}
+
+#[derive(Clone, Copy)]
+enum ManifestReadVariant {
+    SingleThreadBlocking,
+    MultiThreadBlocking { threads: usize },
+    SingleThreadUring { qd: usize },
+    MultiThreadUring { threads: usize, qd: usize },
+}
+
+impl ManifestReadVariant {
+    fn label(self) -> String {
+        match self {
+            ManifestReadVariant::SingleThreadBlocking => "st-blocking".to_string(),
+            ManifestReadVariant::MultiThreadBlocking { threads } => format!("mt-blocking-{threads}t"),
+            ManifestReadVariant::SingleThreadUring { qd } => format!("st-uring-qd{qd}"),
+            ManifestReadVariant::MultiThreadUring { threads, qd } => {
+                format!("mt-uring-{threads}t-qd{qd}")
+            }
+        }
+    }
+}
+
+struct ManifestReadSweepResult {
+    prefix_files: usize,
+    variant: ManifestReadVariant,
+    total_bytes: u64,
+    total_files: usize,
+    elapsed_secs: f64,
+}
+
+#[derive(Clone)]
+struct ManifestCopyEntry {
+    relative_path: PathBuf,
+    size: u64,
+    mode: u32,
+}
+
+struct ManifestCopyBenchmarkResult {
+    entries: usize,
+    bytes: u64,
+    dirs_created: usize,
+    dir_phase_secs: f64,
+    file_phase_secs: f64,
+    total_secs: f64,
+    overlap_secs: Option<f64>,
+    overlap_large_file_bytes: Option<u64>,
+}
+
+fn collect_recursive_copy_manifest(
+    ctx: &RecursiveCopyContext,
+    stats: &RecursiveCopyStats,
+    sample_counters: &ThroughputSampleCounters,
+) -> io::Result<(Vec<RecursiveSmallFileTask>, Vec<RecursiveFileTask>)> {
+    let mut stack = vec![RecursiveDirectoryTask {
+        source_dir: ctx.source_root.clone(),
+        target_dir: ctx.target_root.clone(),
+    }];
+    let mut small_tasks = Vec::new();
+    let mut large_tasks = Vec::new();
+    while let Some(task) = stack.pop() {
+        let mut child_dirs = Vec::new();
+        for entry in fs::read_dir(&task.source_dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let source_path = entry.path();
+            let target_path = task.target_dir.join(entry.file_name());
+            if file_type.is_dir() {
+                let metadata = entry.metadata()?;
+                let mode = metadata.permissions().mode();
+                create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
+                child_dirs.push(RecursiveDirectoryTask {
+                    source_dir: source_path,
+                    target_dir: target_path,
+                });
+                continue;
+            }
+            if file_type.is_symlink() {
+                copy_symlink_entry(&source_path, &target_path, stats)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "recursive copy only supports regular files, directories, and symlinks (saw {})",
+                        source_path.display()
+                    ),
+                ));
+            }
+            let metadata = entry.metadata()?;
+            let source_len = metadata.len();
+            let source_mode = metadata.permissions().mode();
+            if recursive_copy_uses_small_file_range(ctx, source_len) {
+                small_tasks.push(RecursiveSmallFileTask {
+                    source_path,
+                    target_path,
+                    source_len,
+                    source_mode,
+                });
+            } else {
+                let resolved_copy =
+                    resolve_recursive_large_copy_execution(ctx, &source_path, &target_path)?;
+                large_tasks.push(RecursiveFileTask {
+                    source_path,
+                    target_path,
+                    source_mode,
+                    resolved_copy,
+                });
+            }
+        }
+        child_dirs.reverse();
+        stack.extend(child_dirs);
+    }
+    Ok((small_tasks, large_tasks))
+}
+
+fn load_paths_from_manifest(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let file = fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut paths = Vec::new();
+    loop {
+        line.clear();
+        let read = std::io::BufRead::read_line(&mut reader, &mut line)?;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        paths.push(PathBuf::from(trimmed));
+    }
+    Ok(paths)
+}
+
+fn load_manifest_copy_entries(manifest: &Path, source_root: &Path) -> io::Result<Vec<ManifestCopyEntry>> {
+    let paths = load_paths_from_manifest(manifest)?;
+    let mut entries = Vec::with_capacity(paths.len());
+    for source_path in paths {
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let relative_path = source_path.strip_prefix(source_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "manifest path {} is not under source root {}",
+                    source_path.display(),
+                    source_root.display()
+                ),
+            )
+        })?;
+        let relative_path = relative_path.to_path_buf();
+        entries.push(ManifestCopyEntry {
+            relative_path,
+            size: metadata.len(),
+            mode: metadata.permissions().mode(),
+        });
+    }
+    Ok(entries)
+}
+
+fn create_manifest_target_dirs(
+    entries: &[ManifestCopyEntry],
+    target_root: &Path,
+) -> io::Result<(usize, std::time::Duration)> {
+    let start = std::time::Instant::now();
+    let mut dirs = std::collections::BTreeSet::<PathBuf>::new();
+    for entry in entries {
+        let mut current = PathBuf::new();
+        if let Some(parent) = entry.relative_path.parent() {
+            for component in parent.components() {
+                current.push(component.as_os_str());
+                dirs.insert(current.clone());
+            }
+        }
+    }
+    for dir in &dirs {
+        fs::create_dir_all(target_root.join(dir))?;
+    }
+    Ok((dirs.len(), start.elapsed()))
+}
+
+fn open_dir_fd(path: &Path) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL: {}", path.display()),
+        )
+    })?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn open_relative_fd(dir: &fs::File, relative: &Path, flags: i32, mode: libc::mode_t) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_rel = CString::new(relative.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL: {}", relative.display()),
+        )
+    })?;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c_rel.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn open_relative_target_for_copy(
+    dir: &fs::File,
+    relative: &Path,
+    mode: libc::mode_t,
+) -> io::Result<(fs::File, bool)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_rel = CString::new(relative.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL: {}", relative.display()),
+        )
+    })?;
+    let create_flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c_rel.as_ptr(), create_flags, mode) };
+    if fd >= 0 {
+        return Ok((unsafe { fs::File::from_raw_fd(fd) }, true));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() != io::ErrorKind::AlreadyExists {
+        return Err(err);
+    }
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_rel.as_ptr(),
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((unsafe { fs::File::from_raw_fd(fd) }, false))
+}
+
+const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
+
+fn copy_openat_via_sendfile(
+    relative_path: &Path,
+    source_len: u64,
+    source: &fs::File,
+    target: &fs::File,
+) -> io::Result<u64> {
+    let mut copied_total = 0_u64;
+    let mut source_pos: libc::off_t = 0;
+    while copied_total < source_len {
+        let remaining = source_len - copied_total;
+        let chunk = remaining.min(FAST_COPY_SENDFILE_CHUNK_SIZE as u64) as usize;
+        let copied = unsafe {
+            libc::sendfile(
+                target.as_raw_fd(),
+                source.as_raw_fd(),
+                &mut source_pos,
+                chunk,
+            )
+        };
+        if copied > 0 {
+            copied_total = copied_total.saturating_add(copied as u64);
+            continue;
+        }
+        if copied == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "sendfile/openat stopped early after {} of {} bytes for {}",
+                    copied_total,
+                    source_len,
+                    relative_path.display()
+                ),
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(io::Error::new(
+            err.kind(),
+            format!("sendfile/openat failed for {}: {}", relative_path.display(), err),
+        ));
+    }
+    Ok(copied_total)
+}
+
+fn copy_openat_via_copy_file_range(
+    relative_path: &Path,
+    source_len: u64,
+    source: &fs::File,
+    target: &fs::File,
+) -> io::Result<u64> {
+    let mut source_pos: libc::loff_t = 0;
+    let mut target_pos: libc::loff_t = 0;
+    let mut copied_total = 0_u64;
+    while copied_total < source_len {
+        let remaining = source_len - copied_total;
+        let chunk = remaining.min(usize::MAX as u64) as usize;
+        let copied = unsafe {
+            libc::copy_file_range(
+                source.as_raw_fd(),
+                &mut source_pos,
+                target.as_raw_fd(),
+                &mut target_pos,
+                chunk,
+                0,
+            )
+        };
+        if copied < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "copy_file_range/openat failed for {}: {}",
+                    relative_path.display(),
+                    err
+                ),
+            ));
+        }
+        if copied == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "copy_file_range/openat stopped early after {} of {} bytes for {}",
+                    copied_total,
+                    source_len,
+                    relative_path.display()
+                ),
+            ));
+        }
+        copied_total = copied_total.saturating_add(copied as u64);
+    }
+    Ok(copied_total)
+}
+
+fn copy_small_file_openat(
+    entry: &ManifestCopyEntry,
+    source_root_fd: &fs::File,
+    target_root_fd: &fs::File,
+    method: RelativeCopyMethod,
+) -> io::Result<u64> {
+    let source = open_relative_fd(source_root_fd, &entry.relative_path, libc::O_RDONLY, 0)?;
+    let (target, created) =
+        open_relative_target_for_copy(target_root_fd, &entry.relative_path, entry.mode as libc::mode_t)?;
+    let copied_total = match method {
+        RelativeCopyMethod::CopyFileRange => {
+            copy_openat_via_copy_file_range(&entry.relative_path, entry.size, &source, &target)?
+        }
+        RelativeCopyMethod::Sendfile => {
+            copy_openat_via_sendfile(&entry.relative_path, entry.size, &source, &target)?
+        }
+    };
+    if !created {
+        let rc = unsafe { libc::fchmod(target.as_raw_fd(), entry.mode as libc::mode_t) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(copied_total)
+}
+
+fn copy_relative_file_openat(
+    relative_path: &Path,
+    source_len: u64,
+    source_mode: u32,
+    source_root_fd: &fs::File,
+    target_root_fd: &fs::File,
+    method: RelativeCopyMethod,
+) -> io::Result<u64> {
+    let source = open_relative_fd(source_root_fd, relative_path, libc::O_RDONLY, 0)?;
+    let (target, created) =
+        open_relative_target_for_copy(target_root_fd, relative_path, source_mode as libc::mode_t)?;
+    let copied_total = match method {
+        RelativeCopyMethod::CopyFileRange => {
+            copy_openat_via_copy_file_range(relative_path, source_len, &source, &target)?
+        }
+        RelativeCopyMethod::Sendfile => {
+            copy_openat_via_sendfile(relative_path, source_len, &source, &target)?
+        }
+    };
+    if !created {
+        let rc = unsafe { libc::fchmod(target.as_raw_fd(), source_mode as libc::mode_t) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(copied_total)
+}
+
 struct ThroughputSampler {
     done: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<io::Result<()>>>,
@@ -524,6 +1063,62 @@ struct ThroughputSampler {
 struct ThroughputSampleCounters {
     bytes: AtomicU64,
     units: AtomicU64,
+}
+
+#[cfg(feature = "read-phase-timing")]
+#[derive(Default)]
+struct RecursiveCopyLaneCounters {
+    small_queued: AtomicU64,
+    medium_queued: AtomicU64,
+    large_queued: AtomicU64,
+    small_done: AtomicU64,
+    medium_done: AtomicU64,
+    large_done: AtomicU64,
+}
+
+#[cfg(feature = "read-phase-timing")]
+impl RecursiveCopyLaneCounters {
+    fn note_queued(&self, lane: &'static str) {
+        match lane {
+            "small" => {
+                self.small_queued.fetch_add(1, Ordering::Relaxed);
+            }
+            "medium" => {
+                self.medium_queued.fetch_add(1, Ordering::Relaxed);
+            }
+            "large" => {
+                self.large_queued.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn note_done(&self, lane: &'static str) {
+        match lane {
+            "small" => {
+                self.small_done.fetch_add(1, Ordering::Relaxed);
+            }
+            "medium" => {
+                self.medium_done.fetch_add(1, Ordering::Relaxed);
+            }
+            "large" => {
+                self.large_done.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot_line(&self) -> String {
+        format!(
+            "lane-occupancy small={}/{} medium={}/{} large={}/{}",
+            self.small_done.load(Ordering::Relaxed),
+            self.small_queued.load(Ordering::Relaxed),
+            self.medium_done.load(Ordering::Relaxed),
+            self.medium_queued.load(Ordering::Relaxed),
+            self.large_done.load(Ordering::Relaxed),
+            self.large_queued.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl ThroughputSampler {
@@ -636,7 +1231,10 @@ fn active_optimizer_param_mask(
 ) -> Vec<bool> {
     let mut mask = [false; 9];
     match mode {
-        "read" | "grep" | "hash" | "diff" | "dual-read-bench" | "recursive-read-bench" => {
+        "read" | "grep" | "hash" | "diff" | "dual-read-bench" | "recursive-read-bench"
+        | "file-list-read-bench" | "file-list-read-uring-bench"
+        | "file-list-read-open-read-close-sweep"
+        | "bench-recursive-small-file-threads" => {
             match io_mode {
                 common::IOMode::Direct => {
                     mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
@@ -1370,8 +1968,20 @@ fn describe_copy_path(
     format!("copy path: {}", details.join(", "))
 }
 
-impl RecursiveDirectoryQueue {
-    fn enqueue(&self, tasks: impl IntoIterator<Item = RecursiveDirectoryTask>) {
+impl<T> Default for RecursiveDirectoryQueue<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RecursiveDirectoryQueueState {
+                queue: VecDeque::new(),
+                active_workers: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+impl<T> RecursiveDirectoryQueue<T> {
+    fn enqueue(&self, tasks: impl IntoIterator<Item = T>) {
         let mut state = self.state.lock().unwrap();
         let mut added = false;
         for task in tasks {
@@ -1383,13 +1993,13 @@ impl RecursiveDirectoryQueue {
         }
     }
 
-    fn enqueue_one(&self, task: RecursiveDirectoryTask) {
+    fn enqueue_one(&self, task: T) {
         let mut state = self.state.lock().unwrap();
         state.queue.push_back(task);
         self.ready.notify_one();
     }
 
-    fn claim(&self, stop: &AtomicBool) -> Option<RecursiveDirectoryTask> {
+    fn claim(&self, stop: &AtomicBool) -> Option<T> {
         let mut state = self.state.lock().unwrap();
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -1453,6 +2063,593 @@ impl<T> RecursiveTaskQueue<T> {
     fn wake_all(&self) {
         self.ready.notify_all();
     }
+}
+
+const FILE_LIST_URING_THREAD_COUNT: usize = 32;
+const FILE_LIST_URING_INFLIGHT_SWEEP: [usize; 5] = [32, 64, 128, 256, 512];
+const FILE_LIST_URING_SLOT_BUFFER_SIZE: usize = 4096;
+const MANIFEST_READ_PREFIX_SWEEP: [usize; 5] = [512, 2048, 8192, 16384, 32768];
+const MANIFEST_MT_BLOCKING_THREADS: [usize; 3] = [4, 16, 32];
+const MANIFEST_ST_URING_QDS: [usize; 4] = [32, 64, 128, 256];
+const MANIFEST_MT_URING_CONFIGS: [(usize, usize); 4] = [(4, 32), (8, 32), (16, 64), (32, 64)];
+
+fn file_list_uring_should_use_direct(
+    config: &config::LoadedConfig,
+    manifest_path: &str,
+    io_mode: common::IOMode,
+) -> bool {
+    match io_mode {
+        common::IOMode::Direct => true,
+        common::IOMode::PageCache => false,
+        common::IOMode::Auto => {
+            if config
+                .mount_info_for_path(manifest_path)
+                .as_ref()
+                .is_some_and(|info| info.fstype == "zfs")
+            {
+                return true;
+            }
+            let strategy = config.get_read_auto_strategy_for_path(manifest_path);
+            matches!(
+                strategy.hot_small_path,
+                ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect
+            ) || matches!(
+                strategy.cold_small_path,
+                ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect
+            )
+        }
+    }
+}
+
+fn raise_nofile_soft_limit(verbose: bool) {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let get_result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
+    if get_result != 0 {
+        if verbose {
+            let err = io::Error::last_os_error();
+            eprintln!("warning: failed to read RLIMIT_NOFILE: {err}");
+        }
+        return;
+    }
+    if limits.rlim_cur >= limits.rlim_max {
+        return;
+    }
+    let updated = libc::rlimit {
+        rlim_cur: limits.rlim_max,
+        rlim_max: limits.rlim_max,
+    };
+    let set_result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) };
+    if set_result != 0 && verbose {
+        let err = io::Error::last_os_error();
+        eprintln!(
+            "warning: failed to raise RLIMIT_NOFILE from {} to {}: {err}",
+            limits.rlim_cur, limits.rlim_max
+        );
+    }
+}
+
+fn file_list_uring_claim_path(
+    files: &[PathBuf],
+    next_index: &AtomicUsize,
+) -> Option<PathBuf> {
+    let index = next_index.fetch_add(1, Ordering::Relaxed);
+    files.get(index).cloned()
+}
+
+fn prepare_file_list_uring_read(path: PathBuf, use_direct: bool, slot_buffer_index: usize) -> io::Result<Option<FileListUringInflightRead>> {
+    let path_str = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    let (file, file_direct) = open_reader_files(path_str, use_direct)?;
+    Ok(Some(FileListUringInflightRead { file, file_direct, slot_buffer_index }))
+}
+
+fn submit_file_list_uring_read(
+    io_uring: &mut IoUring,
+    slot: usize,
+    read: &mut FileListUringInflightRead,
+    slot_buffers: &mut [AlignedBuffer],
+    use_direct: bool,
+) -> io::Result<()> {
+    let buffer = slot_buffers
+        .get_mut(read.slot_buffer_index)
+        .ok_or_else(|| io::Error::other("missing slot buffer for file-list io_uring read"))?;
+    unsafe {
+        let mut sqe = io_uring
+            .prepare_sqe()
+            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
+        if use_direct {
+            sqe.prep_read(read.file_direct.as_raw_fd(), buffer.as_mut_slice(), 0);
+        } else {
+            sqe.prep_read(read.file.as_raw_fd(), buffer.as_mut_slice(), 0);
+        }
+        sqe.set_user_data(slot as u64);
+    }
+    Ok(())
+}
+
+fn file_list_uring_fill_slots(
+    io_uring: &mut IoUring,
+    slots: &mut [Option<FileListUringInflightRead>],
+    slot_buffers: &mut [AlignedBuffer],
+    files: &[PathBuf],
+    next_index: &AtomicUsize,
+    use_direct: bool,
+    _stats: &RecursiveReadStats,
+    _sample_counters: &ThroughputSampleCounters,
+) -> io::Result<usize> {
+    let mut queued = 0usize;
+    for (slot_index, slot) in slots.iter_mut().enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        loop {
+            let Some(path) = file_list_uring_claim_path(files, next_index) else {
+                break;
+            };
+            match prepare_file_list_uring_read(path, use_direct, slot_index)? {
+                Some(mut read) => {
+                    submit_file_list_uring_read(io_uring, slot_index, &mut read, slot_buffers, use_direct)?;
+                    *slot = Some(read);
+                    queued += 1;
+                    break;
+                }
+                None => unreachable!("prepare_file_list_uring_read always returns Some"),
+            }
+        }
+    }
+    Ok(queued)
+}
+
+fn wait_for_ready_slots(io_uring: &mut IoUring) -> io::Result<Vec<(usize, u32)>> {
+    let first = io_uring.wait_for_cqe().map_err(io::Error::other)?;
+    let mut ready = vec![(
+        usize::try_from(first.user_data())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slot id overflowed"))?,
+        first.result()?,
+    )];
+    while io_uring.cq_ready() > 0 {
+        let cq = io_uring
+            .peek_for_cqe()
+            .ok_or_else(|| io::Error::other("completion queue reported ready but no CQE was available"))?;
+        ready.push((
+            usize::try_from(cq.user_data())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slot id overflowed"))?,
+            cq.result()?,
+        ));
+    }
+    Ok(ready)
+}
+
+fn file_list_uring_worker(
+    files: Arc<Vec<PathBuf>>,
+    next_index: Arc<AtomicUsize>,
+    inflight_per_thread: usize,
+    use_direct: bool,
+    stats: Arc<RecursiveReadStats>,
+    sample_counters: Arc<ThroughputSampleCounters>,
+) -> io::Result<()> {
+    let mut io_uring = IoUring::new(1024).map_err(io::Error::other)?;
+    let mut slot_buffers = std::iter::repeat_with(|| AlignedBuffer::new(FILE_LIST_URING_SLOT_BUFFER_SIZE))
+        .take(inflight_per_thread)
+        .collect::<Vec<_>>();
+    let mut slots = std::iter::repeat_with(|| None)
+        .take(inflight_per_thread)
+        .collect::<Vec<Option<FileListUringInflightRead>>>();
+    let mut inflight = file_list_uring_fill_slots(
+        &mut io_uring,
+        &mut slots,
+        &mut slot_buffers,
+        &files,
+        &next_index,
+        use_direct,
+        &stats,
+        &sample_counters,
+    )?;
+    if inflight == 0 {
+        return Ok(());
+    }
+    io_uring.submit_sqes().map_err(io::Error::other)?;
+    loop {
+        for (slot_index, result) in wait_for_ready_slots(&mut io_uring)? {
+            let _read = slots
+                .get_mut(slot_index)
+                .and_then(Option::take)
+                .ok_or_else(|| io::Error::other("completed slot had no active file read"))?;
+            let actual_len = validate_read_result(
+                "file-list-uring-read",
+                0,
+                FILE_LIST_URING_SLOT_BUFFER_SIZE,
+                result,
+            )?;
+            if actual_len > 0 {
+                sample_counters
+                    .bytes
+                    .fetch_add(actual_len as u64, Ordering::Relaxed);
+                stats
+                    .bytes_read
+                    .fetch_add(actual_len as u64, Ordering::Relaxed);
+            }
+            stats.files_read.fetch_add(1, Ordering::Relaxed);
+            sample_counters.units.fetch_add(1, Ordering::Relaxed);
+            inflight = inflight.saturating_sub(1);
+        }
+        inflight += file_list_uring_fill_slots(
+            &mut io_uring,
+            &mut slots,
+            &mut slot_buffers,
+            &files,
+            &next_index,
+            use_direct,
+            &stats,
+            &sample_counters,
+        )?;
+        if inflight == 0 {
+            return Ok(());
+        }
+        io_uring.submit_sqes().map_err(io::Error::other)?;
+    }
+}
+
+fn run_file_list_uring_bench_once(
+    files: Arc<Vec<PathBuf>>,
+    inflight_per_thread: usize,
+    use_direct: bool,
+    verbose: bool,
+) -> io::Result<FileListUringSweepResult> {
+    let start = std::time::Instant::now();
+    let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    if verbose {
+        eprintln!(
+            "file-list-read-uring-bench run threads={} inflight/thread={} direct={}",
+            FILE_LIST_URING_THREAD_COUNT, inflight_per_thread, use_direct
+        );
+    }
+    let sampler = if verbose {
+        Some(ThroughputSampler::start(
+            "file-list-read-uring-bench",
+            "files",
+            sample_counters.clone(),
+        ))
+    } else {
+        None
+    };
+    let stats = Arc::new(RecursiveReadStats::default());
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::with_capacity(FILE_LIST_URING_THREAD_COUNT);
+    for _ in 0..FILE_LIST_URING_THREAD_COUNT {
+        let files = files.clone();
+        let next_index = next_index.clone();
+        let stats = stats.clone();
+        let sample_counters = sample_counters.clone();
+        threads.push(std::thread::spawn(move || {
+            file_list_uring_worker(
+                files,
+                next_index,
+                inflight_per_thread,
+                use_direct,
+                stats,
+                sample_counters,
+            )
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("file-list io_uring read worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    if let Some(sampler) = sampler {
+        sampler.finish()?;
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(FileListUringSweepResult {
+        inflight_per_thread,
+        total_bytes: stats.bytes_read.load(Ordering::Relaxed),
+        total_files: stats.files_read.load(Ordering::Relaxed) as usize,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn print_file_list_uring_sweep_results(results: &[FileListUringSweepResult]) {
+    let mut rows = vec![vec![
+        "inflight/thread".to_string(),
+        "time(s)".to_string(),
+        "GB/s".to_string(),
+        "files/s".to_string(),
+        "bytes".to_string(),
+        "files".to_string(),
+    ]];
+    for result in results {
+        rows.push(vec![
+            result.inflight_per_thread.to_string(),
+            format!("{:.4}", result.elapsed_secs),
+            format!("{:.3}", result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9),
+            format!("{:.1}", result.total_files as f64 / result.elapsed_secs.max(1e-9)),
+            result.total_bytes.to_string(),
+            result.total_files.to_string(),
+        ]);
+    }
+    let column_count = rows[0].len();
+    let widths = (0..column_count)
+        .map(|index| rows.iter().map(|row| row[index].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    for row in rows {
+        println!(
+            "{}",
+            row.iter()
+                .enumerate()
+                .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+}
+
+fn load_manifest_prefix(files: &[PathBuf], prefix_files: usize) -> Arc<Vec<PathBuf>> {
+    Arc::new(files.iter().take(prefix_files.min(files.len())).cloned().collect())
+}
+
+
+fn run_manifest_blocking_worker(
+    files: Arc<Vec<PathBuf>>,
+    next_index: Arc<AtomicUsize>,
+    use_direct: bool,
+    stats: Arc<RecursiveReadStats>,
+) -> io::Result<()> {
+    let mut buffer = AlignedBuffer::new(FILE_LIST_URING_SLOT_BUFFER_SIZE);
+    loop {
+        let index = next_index.fetch_add(1, Ordering::Relaxed);
+        let Some(path) = files.get(index) else {
+            return Ok(());
+        };
+        let path_str = path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path is not valid UTF-8: {}", path.display()),
+            )
+        })?;
+        let (file, file_direct) = open_reader_files(path_str, use_direct)?;
+        let target = if use_direct { &file_direct } else { &file };
+        let read = target.read_at(buffer.as_mut_slice(), 0)?;
+        stats.files_read.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+    }
+}
+
+fn read_small_file_probe_then_fallback(
+    config: &config::LoadedConfig,
+    path: &Path,
+    io_mode: common::IOMode,
+) -> io::Result<u64> {
+    let path_str = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    let mut file = fs::File::open(path)?;
+    let mut probe = vec![0_u8; 64 * 1024];
+    let read = file.read(&mut probe)?;
+    if read < probe.len() {
+        return Ok(read as u64);
+    }
+    let (bytes_read, _file_size, _params) =
+        visit_file_blocks_for_mode(config, "read", path_str, io_mode, |_| Ok(()))?;
+    Ok(bytes_read)
+}
+
+fn run_manifest_blocking_once(
+    files: Arc<Vec<PathBuf>>,
+    threads: usize,
+    use_direct: bool,
+) -> io::Result<ManifestReadSweepResult> {
+    let start = std::time::Instant::now();
+    let stats = Arc::new(RecursiveReadStats::default());
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(threads.max(1));
+    for _ in 0..threads.max(1) {
+        let files = files.clone();
+        let next_index = next_index.clone();
+        let stats = stats.clone();
+        handles.push(std::thread::spawn(move || {
+            run_manifest_blocking_worker(files, next_index, use_direct, stats)
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| io::Error::other("manifest blocking worker panicked"))??;
+    }
+    Ok(ManifestReadSweepResult {
+        prefix_files: files.len(),
+        variant: if threads <= 1 {
+            ManifestReadVariant::SingleThreadBlocking
+        } else {
+            ManifestReadVariant::MultiThreadBlocking { threads }
+        },
+        total_bytes: stats.bytes_read.load(Ordering::Relaxed),
+        total_files: stats.files_read.load(Ordering::Relaxed) as usize,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn run_manifest_uring_once(
+    files: Arc<Vec<PathBuf>>,
+    threads: usize,
+    qd: usize,
+    use_direct: bool,
+) -> io::Result<ManifestReadSweepResult> {
+    let start = std::time::Instant::now();
+    let stats = Arc::new(RecursiveReadStats::default());
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(threads.max(1));
+    for _ in 0..threads.max(1) {
+        let files = files.clone();
+        let next_index = next_index.clone();
+        let stats = stats.clone();
+        handles.push(std::thread::spawn(move || {
+            file_list_uring_worker(
+                files,
+                next_index,
+                qd,
+                use_direct,
+                stats,
+                Arc::new(ThroughputSampleCounters::default()),
+            )
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| io::Error::other("manifest io_uring worker panicked"))??;
+    }
+    Ok(ManifestReadSweepResult {
+        prefix_files: files.len(),
+        variant: if threads <= 1 {
+            ManifestReadVariant::SingleThreadUring { qd }
+        } else {
+            ManifestReadVariant::MultiThreadUring { threads, qd }
+        },
+        total_bytes: stats.bytes_read.load(Ordering::Relaxed),
+        total_files: stats.files_read.load(Ordering::Relaxed) as usize,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn print_manifest_read_sweep_results(results: &[ManifestReadSweepResult]) {
+    let mut rows = vec![vec![
+        "prefix_files".to_string(),
+        "variant".to_string(),
+        "time(s)".to_string(),
+        "GB/s".to_string(),
+        "files/s".to_string(),
+        "bytes".to_string(),
+    ]];
+    for result in results {
+        rows.push(vec![
+            result.prefix_files.to_string(),
+            result.variant.label(),
+            format!("{:.4}", result.elapsed_secs),
+            format!("{:.3}", result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9),
+            format!("{:.1}", result.total_files as f64 / result.elapsed_secs.max(1e-9)),
+            result.total_bytes.to_string(),
+        ]);
+    }
+    let column_count = rows[0].len();
+    let widths = (0..column_count)
+        .map(|index| rows.iter().map(|row| row[index].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    for row in rows {
+        println!(
+            "{}",
+            row.iter()
+                .enumerate()
+                .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+}
+
+fn bench_recursive_small_file_threads(
+    config: &mut config::LoadedConfig,
+    path: &str,
+    io_mode: common::IOMode,
+    verbose: bool,
+    save_config: bool,
+    cache_state_override: Option<SmallFileThreadCacheState>,
+) -> io::Result<u64> {
+    let root = Path::new(path);
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bench-recursive-small-file-threads requires a directory root, got {}", root.display()),
+        ));
+    }
+    let mount_path = path;
+    let is_hot = cache_state_override
+        .map(|state| state == SmallFileThreadCacheState::Hot)
+        .unwrap_or_else(|| is_first_page_resident(path).unwrap_or(false));
+    match cache_state_override {
+        Some(SmallFileThreadCacheState::Hot) => {
+            let _ = reader::warm_file_page_cache(path);
+        }
+        Some(SmallFileThreadCacheState::Cold) => {
+            let _ = reader::evict_file_cache(path);
+        }
+        None => {}
+    }
+    let sweep = [8_u64, 13, 16, 24, 32, 55, 64, 96, 128];
+    let page_cache = config.get_params_for_path("read", false, path);
+    let direct = config.get_params_for_path("read", true, path);
+    let mut rows = Vec::new();
+    for threads in sweep {
+        let start = std::time::Instant::now();
+        let bytes = bench_recursive_read(
+            config,
+            path,
+            page_cache.num_threads,
+            page_cache.block_size,
+            page_cache.qd,
+            direct.num_threads,
+            direct.block_size,
+            direct.qd,
+            io_mode,
+            verbose,
+            Some(threads),
+        )?;
+        let elapsed = start.elapsed().as_secs_f64();
+        rows.push((threads, bytes, elapsed));
+        println!(
+            "result\tcache={}\tthreads={}\ttime={:.4}s\tgbps={:.3}",
+            if is_hot { "hot" } else { "cold" },
+            threads,
+            elapsed,
+            bytes as f64 / elapsed.max(1e-9) / 1e9
+        );
+    }
+    let best = rows
+        .iter()
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .ok_or_else(|| io::Error::other("recursive small-file thread sweep produced no results"))?;
+    println!(
+        "bench-recursive-small-file-threads best cache={} threads={} {:.4}s {:.3} GB/s",
+        if is_hot { "hot" } else { "cold" },
+        best.0,
+        best.2,
+        best.1 as f64 / best.2.max(1e-9) / 1e9
+    );
+    if save_config {
+        let mut tuned = config.get_recursive_small_file_threads_for_path(mount_path);
+        if is_hot {
+            tuned.hot = best.0;
+        } else {
+            tuned.cold = best.0;
+        }
+        config.update_recursive_small_file_threads_for_path(mount_path, tuned);
+        config.save();
+        println!(
+            "saved recursive_small_file_threads for {}: hot={}, cold={}",
+            mount_path, tuned.hot, tuned.cold
+        );
+    }
+    Ok(best.1)
 }
 
 fn current_absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -1639,6 +2836,13 @@ fn recursive_copy_dir_worker_count() -> usize {
 }
 
 fn recursive_copy_large_worker_count() -> usize {
+    if let Ok(value) = std::env::var("FRO_RECURSIVE_COPY_LARGE_WORKERS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -1647,6 +2851,17 @@ fn recursive_copy_large_worker_count() -> usize {
 }
 
 fn recursive_copy_small_worker_count() -> usize {
+    if let Ok(value) = std::env::var("FRO_RECURSIVE_COPY_SMALL_WORKERS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    RECURSIVE_COPY_SMALL_WORKERS
+}
+
+fn recursive_read_dir_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -1654,8 +2869,44 @@ fn recursive_copy_small_worker_count() -> usize {
         .max(1)
 }
 
+fn recursive_read_file_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .max(1)
+}
+
+fn recursive_read_file_worker_count_with_override(override_threads: Option<u64>) -> usize {
+    override_threads
+        .and_then(|threads| usize::try_from(threads).ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(recursive_read_file_worker_count)
+}
+
+fn recursive_small_file_worker_count_for_path(
+    config: &config::LoadedConfig,
+    path: &str,
+    override_threads: Option<u64>,
+) -> usize {
+    if let Some(threads) = override_threads {
+        return recursive_read_file_worker_count_with_override(Some(threads));
+    }
+    let tuned = config.get_recursive_small_file_threads_for_path(path);
+    let cache_state = if is_first_page_resident(path).unwrap_or(false) {
+        tuned.hot
+    } else {
+        tuned.cold
+    };
+    recursive_read_file_worker_count_with_override(Some(cache_state))
+}
+
 fn recursive_copy_uses_small_file_range(ctx: &RecursiveCopyContext, source_len: u64) -> bool {
-    source_len < RECURSIVE_COPY_LARGE_FILE_THRESHOLD
+    let cutoff = std::env::var("FRO_RECURSIVE_COPY_SMALL_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(RECURSIVE_COPY_SMALL_FILE_THRESHOLD);
+    source_len < cutoff
         && ctx.rewrite_mode == CopyRewriteMode::Auto
         && !ctx.keep_target_size
         && !matches!(
@@ -1664,6 +2915,16 @@ fn recursive_copy_uses_small_file_range(ctx: &RecursiveCopyContext, source_len: 
         )
         && ctx.io_mode_read != common::IOMode::Direct
         && ctx.io_mode_write != common::IOMode::Direct
+}
+
+fn recursive_copy_uses_threaded_large_lane(ctx: &RecursiveCopyContext, source_len: u64) -> bool {
+    let cutoff = std::env::var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(RECURSIVE_COPY_THREADED_LANE_THRESHOLD);
+    source_len >= cutoff
+        || ctx.requested_strategy == CopyStrategy::Threaded
+        || ctx.requested_strategy == CopyStrategy::Reflink
 }
 
 fn resolve_recursive_large_copy_execution(
@@ -1728,15 +2989,17 @@ fn execute_recursive_small_file_copy(
 
 fn walk_recursive_copy_subtree(
     start: RecursiveDirectoryTask,
-    dir_queue: &RecursiveDirectoryQueue,
-    small_queue: &RecursiveTaskQueue<RecursiveSmallFileTask>,
+    dir_queue: &RecursiveDirectoryQueue<RecursiveDirectoryTask>,
     large_queue: &RecursiveTaskQueue<RecursiveFileTask>,
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
     sample_counters: &ThroughputSampleCounters,
+    #[cfg(feature = "read-phase-timing")] lane_counters: &RecursiveCopyLaneCounters,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut stack = vec![start];
+    let source_root_fd = open_dir_fd(&ctx.source_root)?;
+    let target_root_fd = open_dir_fd(&ctx.target_root)?;
     while let Some(task) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -1744,11 +3007,11 @@ fn walk_recursive_copy_subtree(
         let mut child_dirs = Vec::new();
         for entry in fs::read_dir(&task.source_dir)? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
             let source_path = entry.path();
             let target_path = task.target_dir.join(entry.file_name());
-            let metadata = fs::symlink_metadata(&source_path)?;
-            let file_type = metadata.file_type();
             if file_type.is_dir() {
+                let metadata = entry.metadata()?;
                 let mode = metadata.permissions().mode();
                 create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
                 child_dirs.push(RecursiveDirectoryTask {
@@ -1770,16 +3033,33 @@ fn walk_recursive_copy_subtree(
                     ),
                 ));
             }
+            let metadata = entry.metadata()?;
             let source_len = metadata.len();
             let source_mode = metadata.permissions().mode();
+            let relative_path = source_path
+                .strip_prefix(&ctx.source_root)
+                .map_err(|_| io::Error::other("recursive copy path escaped source root"))?
+                .to_path_buf();
             if recursive_copy_uses_small_file_range(ctx, source_len) {
-                small_queue.enqueue(RecursiveSmallFileTask {
-                    source_path,
-                    target_path,
+                let copied = copy_relative_file_openat(
+                    &relative_path,
                     source_len,
                     source_mode,
-                })?;
-            } else {
+                    &source_root_fd,
+                    &target_root_fd,
+                    ctx.relative_copy_method,
+                )?;
+                stats.files_copied.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+                stats.items_completed.fetch_add(1, Ordering::Relaxed);
+                sample_counters.bytes.fetch_add(copied, Ordering::Relaxed);
+                sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "read-phase-timing")]
+                {
+                    lane_counters.note_queued("small");
+                    lane_counters.note_done("small");
+                }
+            } else if recursive_copy_uses_threaded_large_lane(ctx, source_len) {
                 let resolved_copy =
                     resolve_recursive_large_copy_execution(ctx, &source_path, &target_path)?;
                 large_queue.enqueue(RecursiveFileTask {
@@ -1788,10 +3068,63 @@ fn walk_recursive_copy_subtree(
                     source_mode,
                     resolved_copy,
                 })?;
+                #[cfg(feature = "read-phase-timing")]
+                lane_counters.note_queued("large");
+            } else {
+                let copied = copy_relative_file_openat(
+                    &relative_path,
+                    source_len,
+                    source_mode,
+                    &source_root_fd,
+                    &target_root_fd,
+                    ctx.relative_copy_method,
+                )?;
+                stats.files_copied.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+                stats.items_completed.fetch_add(1, Ordering::Relaxed);
+                sample_counters.bytes.fetch_add(copied, Ordering::Relaxed);
+                sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "read-phase-timing")]
+                {
+                    lane_counters.note_queued("medium");
+                    lane_counters.note_done("medium");
+                }
             }
         }
         if let Some(local_dir) = child_dirs.pop() {
             dir_queue.enqueue(child_dirs);
+            stack.push(local_dir);
+        }
+    }
+    Ok(())
+}
+
+fn walk_recursive_read_subtree(
+    start: RecursiveReadDirectoryTask,
+    dir_queue: &RecursiveDirectoryQueue<RecursiveReadDirectoryTask>,
+    file_queue: &RecursiveTaskQueue<RecursiveReadFileTask>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let mut stack = vec![start];
+    while let Some(task) = stack.pop() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut child_dirs = Vec::new();
+        for entry in fs::read_dir(&task.source_dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                child_dirs.push(RecursiveReadDirectoryTask { source_dir: path });
+            } else if file_type.is_file() {
+                file_queue.enqueue(RecursiveReadFileTask { source_path: path })?;
+            }
+        }
+        if let Some(local_dir) = child_dirs.pop() {
+            for task in child_dirs {
+                dir_queue.enqueue_one(task);
+            }
             stack.push(local_dir);
         }
     }
@@ -1815,10 +3148,25 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
         &stats,
         Some(sample_counters.as_ref()),
     )?;
-    let dir_queue = Arc::new(RecursiveDirectoryQueue::default());
-    let small_queue = Arc::new(RecursiveTaskQueue::default());
+    let source_mount = mount_info_for_path(&ctx.source_root);
+    let target_mount = mount_info_for_path(&ctx.target_root);
+    let relative_copy_method = match (source_mount.as_ref(), target_mount.as_ref()) {
+        (Some(source), Some(target))
+            if source.mount_point == target.mount_point
+                && source.fstype == target.fstype
+                && source.mount_source == target.mount_source =>
+        {
+            RelativeCopyMethod::CopyFileRange
+        }
+        _ => RelativeCopyMethod::Sendfile,
+    };
+    let mut ctx = ctx;
+    ctx.relative_copy_method = relative_copy_method;
+    let dir_queue = Arc::new(RecursiveDirectoryQueue::<RecursiveDirectoryTask>::default());
     let large_queue = Arc::new(RecursiveTaskQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "read-phase-timing")]
+    let lane_counters = Arc::new(RecursiveCopyLaneCounters::default());
     let sampler = if verbose {
         Some(ThroughputSampler::start("recursive-copy", "items", sample_counters.clone()))
     } else {
@@ -1831,63 +3179,35 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     });
 
     let worker_count = recursive_copy_dir_worker_count();
-    let small_worker_count = recursive_copy_small_worker_count();
     let large_worker_count = recursive_copy_large_worker_count();
 
     let mut walk_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let dir_queue = dir_queue.clone();
-        let small_queue = small_queue.clone();
         let large_queue = large_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
         let stop = stop.clone();
         let sample_counters = sample_counters.clone();
+        #[cfg(feature = "read-phase-timing")]
+        let lane_counters = lane_counters.clone();
         walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = dir_queue.claim(&stop) {
                 let result = walk_recursive_copy_subtree(
                     task,
                     &dir_queue,
-                    &small_queue,
                     &large_queue,
                     &ctx,
                     &stats,
                     sample_counters.as_ref(),
+                    #[cfg(feature = "read-phase-timing")]
+                    lane_counters.as_ref(),
                     &stop,
                 );
                 dir_queue.complete_claim();
                 if let Err(err) = result {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
-                    small_queue.wake_all();
-                    large_queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut small_threads = Vec::with_capacity(small_worker_count);
-    for _ in 0..small_worker_count {
-        let queue = small_queue.clone();
-        let dir_queue = dir_queue.clone();
-        let large_queue = large_queue.clone();
-        let ctx = ctx.clone();
-        let stats = stats.clone();
-        let stop = stop.clone();
-        let sample_counters = sample_counters.clone();
-        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(task) = queue.claim(&stop) {
-                if let Err(err) = execute_recursive_small_file_copy(
-                    &task,
-                    ctx.use_lock,
-                    &stats,
-                    Some(sample_counters.as_ref()),
-                ) {
-                    stop.store(true, Ordering::SeqCst);
-                    dir_queue.wake_all();
-                    queue.wake_all();
                     large_queue.wake_all();
                     return Err(err);
                 }
@@ -1900,11 +3220,12 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
     for _ in 0..large_worker_count {
         let queue = large_queue.clone();
         let dir_queue = dir_queue.clone();
-        let small_queue = small_queue.clone();
         let ctx = ctx.clone();
         let stats = stats.clone();
         let stop = stop.clone();
         let sample_counters = sample_counters.clone();
+        #[cfg(feature = "read-phase-timing")]
+        let lane_counters = lane_counters.clone();
         large_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = queue.claim(&stop) {
                 if let Err(err) =
@@ -1912,10 +3233,11 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
                 {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
-                    small_queue.wake_all();
                     queue.wake_all();
                     return Err(err);
                 }
+                #[cfg(feature = "read-phase-timing")]
+                lane_counters.note_done("large");
             }
             Ok(())
         }));
@@ -1932,19 +3254,7 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
             Err(_) => {}
         }
     }
-    small_queue.close();
     large_queue.close();
-
-    for thread in small_threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("recursive copy small-file worker panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
 
     for thread in large_threads {
         match thread
@@ -1972,37 +3282,149 @@ fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u6
             stats.symlinks_created.load(Ordering::Relaxed),
             bytes_copied
         );
+        #[cfg(feature = "read-phase-timing")]
+        eprintln!("{}", lane_counters.snapshot_line());
     }
     Ok(bytes_copied)
 }
 
-fn collect_regular_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(root)?;
-    if metadata.file_type().is_file() {
-        out.push(root.to_path_buf());
-        return Ok(());
+fn run_split_manifest_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
+    let source_meta = fs::symlink_metadata(&ctx.source_root)?;
+    if !source_meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recursive copy requires a directory source",
+        ));
     }
-    if !metadata.file_type().is_dir() {
-        return Ok(());
+    ensure_recursive_target_not_inside_source(&ctx.source_root, &ctx.target_root)?;
+    let stats = Arc::new(RecursiveCopyStats::default());
+    let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    create_directory_like(
+        source_meta.permissions().mode(),
+        &ctx.target_root,
+        &stats,
+        Some(sample_counters.as_ref()),
+    )?;
+    let sampler = if verbose {
+        Some(ThroughputSampler::start(
+            "split-manifest-recursive-copy",
+            "items",
+            sample_counters.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let (small_tasks, large_tasks) =
+        collect_recursive_copy_manifest(&ctx, stats.as_ref(), sample_counters.as_ref())?;
+
+    let small_queue = Arc::new(RecursiveTaskQueue::default());
+    let large_queue = Arc::new(RecursiveTaskQueue::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    for task in small_tasks {
+        small_queue.enqueue(task)?;
+    }
+    for task in large_tasks {
+        large_queue.enqueue(task)?;
+    }
+    small_queue.close();
+    large_queue.close();
+
+    let small_worker_count = recursive_copy_small_worker_count();
+    let large_worker_count = recursive_copy_large_worker_count();
+
+    let mut small_threads = Vec::with_capacity(small_worker_count);
+    for _ in 0..small_worker_count {
+        let queue = small_queue.clone();
+        let large_queue = large_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        let sample_counters = sample_counters.clone();
+        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = queue.claim(&stop) {
+                if let Err(err) = execute_recursive_small_file_copy(
+                    &task,
+                    ctx.use_lock,
+                    &stats,
+                    Some(sample_counters.as_ref()),
+                ) {
+                    stop.store(true, Ordering::SeqCst);
+                    queue.wake_all();
+                    large_queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
     }
 
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_dir() {
-                stack.push(path);
-            } else if metadata.file_type().is_file() {
-                out.push(path);
+    let mut large_threads = Vec::with_capacity(large_worker_count);
+    for _ in 0..large_worker_count {
+        let queue = large_queue.clone();
+        let small_queue = small_queue.clone();
+        let ctx = ctx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        let sample_counters = sample_counters.clone();
+        large_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = queue.claim(&stop) {
+                if let Err(err) =
+                    execute_recursive_file_copy(&task, &ctx, &stats, Some(sample_counters.as_ref()))
+                {
+                    stop.store(true, Ordering::SeqCst);
+                    small_queue.wake_all();
+                    queue.wake_all();
+                    return Err(err);
+                }
             }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in small_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("split-manifest recursive copy small worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
         }
     }
-    Ok(())
+    for thread in large_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("split-manifest recursive copy large worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+
+    if let Some(sampler) = sampler {
+        sampler.finish()?;
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
+    if verbose {
+        eprintln!(
+            "split-manifest recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, bytes_copied={}",
+            stats.dirs_created.load(Ordering::Relaxed),
+            stats.files_copied.load(Ordering::Relaxed),
+            stats.symlinks_created.load(Ordering::Relaxed),
+            bytes_copied
+        );
+    }
+    Ok(bytes_copied)
 }
 
 fn bench_recursive_read(
+    config: &config::LoadedConfig,
     path: &str,
     num_threads_p: u64,
     block_size_p: u64,
@@ -2012,11 +3434,17 @@ fn bench_recursive_read(
     qd_d: usize,
     io_mode: common::IOMode,
     verbose: bool,
+    file_worker_override: Option<u64>,
 ) -> io::Result<u64> {
     let root = Path::new(path);
-    let mut files = Vec::new();
-    collect_regular_files_recursive(root, &mut files)?;
-    if files.is_empty() {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("recursive-read-bench requires a directory root, got {}", root.display()),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("no regular files found under {}", root.display()),
@@ -2034,63 +3462,550 @@ fn bench_recursive_read(
     } else {
         None
     };
-    let mut total_bytes = 0_u64;
-    for file in &files {
-        let sample_counters_for_file = sample_counters.clone();
-        let file_str = file.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("path is not valid UTF-8: {}", file.display()),
-            )
-        })?;
-        let (bytes_read, _file_size, _params) = visit_file_blocks(
-            file_str,
-            num_threads_p,
-            block_size_p,
-            qd_p,
-            num_threads_d,
-            block_size_d,
-            qd_d,
-            io_mode,
-            move |block| {
-                sample_counters_for_file
-                    .bytes
-                    .fetch_add(block.data.len() as u64, Ordering::Relaxed);
-                Ok(())
-            },
-        )?;
-        total_bytes = total_bytes.saturating_add(bytes_read);
-        sample_counters.units.fetch_add(1, Ordering::Relaxed);
-        if bytes_read == 0 && fs::metadata(file)?.len() != 0 {
-            return Err(io::Error::other(format!(
-                "recursive-read-bench observed zero bytes for non-empty file {}",
-                file.display()
-            )));
+    let mut read_config = config.clone();
+    read_config.update_params_for_path(
+        "read",
+        false,
+        path,
+        config::IOParams {
+            num_threads: num_threads_p,
+            block_size: block_size_p,
+            qd: qd_p,
+        },
+    );
+    read_config.update_params_for_path(
+        "read",
+        true,
+        path,
+        config::IOParams {
+            num_threads: num_threads_d,
+            block_size: block_size_d,
+            qd: qd_d,
+        },
+    );
+    let stats = Arc::new(RecursiveReadStats::default());
+    let dir_queue = Arc::new(RecursiveDirectoryQueue::<RecursiveReadDirectoryTask>::default());
+    let file_queue = Arc::new(RecursiveTaskQueue::<RecursiveReadFileTask>::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    dir_queue.enqueue_one(RecursiveReadDirectoryTask {
+        source_dir: root.to_path_buf(),
+    });
+
+    let dir_worker_count = recursive_read_dir_worker_count();
+    let file_worker_count =
+        recursive_small_file_worker_count_for_path(&read_config, path, file_worker_override);
+
+    let mut walk_threads = Vec::with_capacity(dir_worker_count);
+    for _ in 0..dir_worker_count {
+        let dir_queue = dir_queue.clone();
+        let file_queue = file_queue.clone();
+        let stop = stop.clone();
+        walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = dir_queue.claim(&stop) {
+                let result = walk_recursive_read_subtree(task, &dir_queue, &file_queue, &stop);
+                dir_queue.complete_claim();
+                if let Err(err) = result {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    file_queue.wake_all();
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut file_threads = Vec::with_capacity(file_worker_count);
+    for _ in 0..file_worker_count {
+        let file_queue = file_queue.clone();
+        let dir_queue = dir_queue.clone();
+        let stop = stop.clone();
+        let stats = stats.clone();
+        let sample_counters = sample_counters.clone();
+        let read_config = read_config.clone();
+        let file_io_mode = io_mode;
+        file_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = file_queue.claim(&stop) {
+                let bytes_read =
+                    read_small_file_probe_then_fallback(&read_config, &task.source_path, file_io_mode)?;
+                sample_counters.bytes.fetch_add(bytes_read, Ordering::Relaxed);
+                stats.files_read.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
+                sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                if bytes_read == 0 {
+                    stop.store(true, Ordering::SeqCst);
+                    dir_queue.wake_all();
+                    file_queue.wake_all();
+                    return Err(io::Error::other(format!(
+                        "recursive-read-bench observed zero bytes for file {}",
+                        task.source_path.display()
+                    )));
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in walk_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive read walk worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    file_queue.close();
+    for thread in file_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("recursive read file worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
         }
     }
     if let Some(sampler) = sampler {
         sampler.finish()?;
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    let total_bytes = stats.bytes_read.load(Ordering::Relaxed);
+    let total_files = stats.files_read.load(Ordering::Relaxed) as usize;
+    if total_files == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no regular files found under {}", root.display()),
+        ));
     }
     let elapsed = start.elapsed().as_secs_f64();
     if verbose {
         eprintln!(
             "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s ({:.1} files/s)",
             total_bytes,
-            files.len(),
+            total_files,
             elapsed,
             total_bytes as f64 / elapsed / 1e9,
-            files.len() as f64 / elapsed.max(1e-9)
+            total_files as f64 / elapsed.max(1e-9)
         );
     } else {
         println!(
             "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
             total_bytes,
-            files.len(),
+            total_files,
             elapsed,
             total_bytes as f64 / elapsed / 1e9
         );
     }
     Ok(total_bytes)
+}
+
+fn bench_file_list_read(
+    config: &config::LoadedConfig,
+    manifest_path: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: common::IOMode,
+    verbose: bool,
+) -> io::Result<u64> {
+    let files = load_paths_from_manifest(Path::new(manifest_path))?;
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no file paths found in manifest {}", manifest_path),
+        ));
+    }
+
+    let start = std::time::Instant::now();
+    let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    let sampler = if verbose {
+        Some(ThroughputSampler::start(
+            "file-list-read-bench",
+            "files",
+            sample_counters.clone(),
+        ))
+    } else {
+        None
+    };
+    let mut read_config = config.clone();
+    read_config.update_params_for_path(
+        "read",
+        false,
+        manifest_path,
+        config::IOParams {
+            num_threads: num_threads_p,
+            block_size: block_size_p,
+            qd: qd_p,
+        },
+    );
+    read_config.update_params_for_path(
+        "read",
+        true,
+        manifest_path,
+        config::IOParams {
+            num_threads: num_threads_d,
+            block_size: block_size_d,
+            qd: qd_d,
+        },
+    );
+    let stats = Arc::new(RecursiveReadStats::default());
+    let file_queue = Arc::new(RecursiveTaskQueue::<RecursiveReadFileTask>::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    for source_path in files {
+        file_queue.enqueue(RecursiveReadFileTask { source_path })?;
+    }
+    file_queue.close();
+
+    let file_worker_count = recursive_read_file_worker_count();
+    let mut file_threads = Vec::with_capacity(file_worker_count);
+    for _ in 0..file_worker_count {
+        let file_queue = file_queue.clone();
+        let stop = stop.clone();
+        let stats = stats.clone();
+        let sample_counters = sample_counters.clone();
+        let read_config = read_config.clone();
+        file_threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while let Some(task) = file_queue.claim(&stop) {
+                let sample_counters_for_file = sample_counters.clone();
+                let file_str = task.source_path.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path is not valid UTF-8: {}", task.source_path.display()),
+                    )
+                })?;
+                let (bytes_read, _file_size, _params) = visit_file_blocks_for_mode(
+                    &read_config,
+                    "read",
+                    file_str,
+                    io_mode,
+                    move |block| {
+                        sample_counters_for_file
+                            .bytes
+                            .fetch_add(block.data.len() as u64, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )?;
+                stats.files_read.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
+                sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                if bytes_read == 0 && fs::metadata(&task.source_path)?.len() != 0 {
+                    stop.store(true, Ordering::SeqCst);
+                    file_queue.wake_all();
+                    return Err(io::Error::other(format!(
+                        "file-list-read-bench observed zero bytes for non-empty file {}",
+                        task.source_path.display()
+                    )));
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in file_threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("file-list read worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+    }
+    if let Some(sampler) = sampler {
+        sampler.finish()?;
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    let total_bytes = stats.bytes_read.load(Ordering::Relaxed);
+    let total_files = stats.files_read.load(Ordering::Relaxed) as usize;
+    let elapsed = start.elapsed().as_secs_f64();
+    if verbose {
+        eprintln!(
+            "file-list-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s ({:.1} files/s)",
+            total_bytes,
+            total_files,
+            elapsed,
+            total_bytes as f64 / elapsed / 1e9,
+            total_files as f64 / elapsed.max(1e-9)
+        );
+    } else {
+        println!(
+            "file-list-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
+            total_bytes,
+            total_files,
+            elapsed,
+            total_bytes as f64 / elapsed / 1e9
+        );
+    }
+    Ok(total_bytes)
+}
+
+fn bench_file_list_read_uring(
+    config: &config::LoadedConfig,
+    manifest_path: &str,
+    io_mode: common::IOMode,
+    verbose: bool,
+) -> io::Result<u64> {
+    let files = Arc::new(load_paths_from_manifest(Path::new(manifest_path))?);
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no file paths found in manifest {}", manifest_path),
+        ));
+    }
+    raise_nofile_soft_limit(verbose);
+    let use_direct = file_list_uring_should_use_direct(config, manifest_path, io_mode);
+    let mut results = Vec::with_capacity(FILE_LIST_URING_INFLIGHT_SWEEP.len());
+    for inflight_per_thread in FILE_LIST_URING_INFLIGHT_SWEEP {
+        let result = run_file_list_uring_bench_once(
+            files.clone(),
+            inflight_per_thread,
+            use_direct,
+            verbose,
+        )?;
+        eprintln!(
+            "result\tinflight/thread={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
+            result.inflight_per_thread,
+            result.elapsed_secs,
+            result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9,
+            result.total_files as f64 / result.elapsed_secs.max(1e-9)
+        );
+        results.push(result);
+    }
+    print_file_list_uring_sweep_results(&results);
+    let best = results
+        .iter()
+        .min_by(|a, b| a.elapsed_secs.total_cmp(&b.elapsed_secs))
+        .ok_or_else(|| io::Error::other("file-list io_uring sweep produced no results"))?;
+    println!(
+        "file-list-read-uring-bench best inflight/thread={} {} bytes across {} files in {:.4} s, {:.3} GB/s ({:.1} files/s)",
+        best.inflight_per_thread,
+        best.total_bytes,
+        best.total_files,
+        best.elapsed_secs,
+        best.total_bytes as f64 / best.elapsed_secs.max(1e-9) / 1e9,
+        best.total_files as f64 / best.elapsed_secs.max(1e-9)
+    );
+    Ok(best.total_bytes)
+}
+
+fn bench_file_list_read_open_read_close_sweep(
+    config: &config::LoadedConfig,
+    manifest_path: &str,
+    io_mode: common::IOMode,
+    verbose: bool,
+) -> io::Result<u64> {
+    let files = load_paths_from_manifest(Path::new(manifest_path))?;
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no file paths found in manifest {}", manifest_path),
+        ));
+    }
+    raise_nofile_soft_limit(verbose);
+    let use_direct = file_list_uring_should_use_direct(config, manifest_path, io_mode);
+    let mut results = Vec::new();
+    let prefix_sweep = MANIFEST_READ_PREFIX_SWEEP
+        .iter()
+        .copied()
+        .filter(|count| *count <= files.len())
+        .chain(std::iter::once(files.len()))
+        .collect::<Vec<_>>();
+    for prefix_files in prefix_sweep {
+        let prefix = load_manifest_prefix(&files, prefix_files);
+        let st = run_manifest_blocking_once(prefix.clone(), 1, use_direct)?;
+        eprintln!(
+            "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
+            st.prefix_files,
+            st.variant.label(),
+            st.elapsed_secs,
+            st.total_bytes as f64 / st.elapsed_secs.max(1e-9) / 1e9,
+            st.total_files as f64 / st.elapsed_secs.max(1e-9)
+        );
+        results.push(st);
+
+        for threads in MANIFEST_MT_BLOCKING_THREADS {
+            let result = run_manifest_blocking_once(prefix.clone(), threads, use_direct)?;
+            eprintln!(
+                "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
+                result.prefix_files,
+                result.variant.label(),
+                result.elapsed_secs,
+                result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9,
+                result.total_files as f64 / result.elapsed_secs.max(1e-9)
+            );
+            results.push(result);
+        }
+
+        for qd in MANIFEST_ST_URING_QDS {
+            let result = run_manifest_uring_once(prefix.clone(), 1, qd, use_direct)?;
+            eprintln!(
+                "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
+                result.prefix_files,
+                result.variant.label(),
+                result.elapsed_secs,
+                result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9,
+                result.total_files as f64 / result.elapsed_secs.max(1e-9)
+            );
+            results.push(result);
+        }
+
+        for (threads, qd) in MANIFEST_MT_URING_CONFIGS {
+            let result = run_manifest_uring_once(prefix.clone(), threads, qd, use_direct)?;
+            eprintln!(
+                "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
+                result.prefix_files,
+                result.variant.label(),
+                result.elapsed_secs,
+                result.total_bytes as f64 / result.elapsed_secs.max(1e-9) / 1e9,
+                result.total_files as f64 / result.elapsed_secs.max(1e-9)
+            );
+            results.push(result);
+        }
+    }
+
+    print_manifest_read_sweep_results(&results);
+    let best = results
+        .iter()
+        .filter(|result| result.prefix_files == files.len())
+        .min_by(|a, b| a.elapsed_secs.total_cmp(&b.elapsed_secs))
+        .ok_or_else(|| io::Error::other("manifest open-read-close sweep produced no results"))?;
+    println!(
+        "file-list-read-open-read-close-sweep best prefix_files={} variant={} {} bytes across {} files in {:.4} s, {:.3} GB/s ({:.1} files/s)",
+        best.prefix_files,
+        best.variant.label(),
+        best.total_bytes,
+        best.total_files,
+        best.elapsed_secs,
+        best.total_bytes as f64 / best.elapsed_secs.max(1e-9) / 1e9,
+        best.total_files as f64 / best.elapsed_secs.max(1e-9)
+    );
+    Ok(best.total_bytes)
+}
+
+fn bench_manifest_recursive_copy(
+    manifest_path: &str,
+    source_root: &str,
+    target_root: &str,
+    overlap_large_file: Option<&str>,
+    verbose: bool,
+) -> io::Result<u64> {
+    let manifest = Path::new(manifest_path);
+    let source_root = Path::new(source_root);
+    let target_root = Path::new(target_root);
+    if target_root.exists() {
+        fs::remove_dir_all(target_root)?;
+    }
+    fs::create_dir_all(target_root)?;
+
+    let entries = load_manifest_copy_entries(manifest, source_root)?;
+    if entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no regular files found in manifest {}", manifest.display()),
+        ));
+    }
+    let total_bytes = entries.iter().map(|entry| entry.size).sum::<u64>();
+
+    let overall_start = std::time::Instant::now();
+    let (dirs_created, dir_elapsed) = create_manifest_target_dirs(&entries, target_root)?;
+
+    let source_root_fd = open_dir_fd(source_root)?;
+    let target_root_fd = open_dir_fd(target_root)?;
+    let file_start = std::time::Instant::now();
+
+    let overlap_handle = overlap_large_file.map(|large_src| {
+        let large_src = large_src.to_string();
+        let large_dst = target_root.join(".fro_manifest_overlap_large_copy.bin");
+        std::thread::spawn(move || {
+            let large_src_str = large_src;
+            let large_dst_str = large_dst.display().to_string();
+            let start = std::time::Instant::now();
+            let status = Command::new(env::current_exe()?)
+                .arg("copy")
+                .arg("-n")
+                .arg("1")
+                .arg(&large_src_str)
+                .arg(&large_dst_str)
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "overlap fro copy failed with status {status}"
+                )));
+            }
+            let copied = fs::metadata(&large_dst)?.len();
+            Ok::<(u64, std::time::Duration), io::Error>((copied, start.elapsed()))
+        })
+    });
+
+    for entry in &entries {
+        copy_small_file_openat(
+            entry,
+            &source_root_fd,
+            &target_root_fd,
+            RelativeCopyMethod::CopyFileRange,
+        )?;
+    }
+    let file_elapsed = file_start.elapsed();
+
+    let (overlap_bytes, overlap_elapsed) = match overlap_handle {
+        Some(handle) => {
+            let (bytes, elapsed) = handle
+                .join()
+                .map_err(|_| io::Error::other("overlap large-file copy worker panicked"))??;
+            (Some(bytes), Some(elapsed))
+        }
+        None => (None, None),
+    };
+
+    let result = ManifestCopyBenchmarkResult {
+        entries: entries.len(),
+        bytes: total_bytes,
+        dirs_created,
+        dir_phase_secs: dir_elapsed.as_secs_f64(),
+        file_phase_secs: file_elapsed.as_secs_f64(),
+        total_secs: overall_start.elapsed().as_secs_f64(),
+        overlap_secs: overlap_elapsed.map(|d| d.as_secs_f64()),
+        overlap_large_file_bytes: overlap_bytes,
+    };
+
+    println!(
+        "manifest-recursive-copy {} bytes across {} files: dirs={} dir_phase={:.4}s file_phase={:.4}s total={:.4}s file_gbps={:.3}",
+        result.bytes,
+        result.entries,
+        result.dirs_created,
+        result.dir_phase_secs,
+        result.file_phase_secs,
+        result.total_secs,
+        result.bytes as f64 / result.file_phase_secs.max(1e-9) / 1e9
+    );
+    if let (Some(bytes), Some(secs)) = (result.overlap_large_file_bytes, result.overlap_secs) {
+        println!(
+            "manifest-recursive-copy overlap-large-file {} bytes in {:.4}s {:.3} GB/s",
+            bytes,
+            secs,
+            bytes as f64 / secs.max(1e-9) / 1e9
+        );
+    }
+    if verbose {
+        eprintln!(
+            "manifest-recursive-copy details: source_root={} target_root={} manifest={}",
+            source_root.display(),
+            target_root.display(),
+            manifest.display()
+        );
+    }
+    Ok(result.bytes)
 }
 
 fn print_verify_report(report: &block_hash::VerifyReport) {
@@ -2471,6 +4386,85 @@ fn command_help(name: &str) -> Option<CommandHelp> {
                 "recursive-read-bench --no-direct /data/tree",
             )],
         }),
+        "file-list-read-bench" => Some(CommandHelp {
+            name: "file-list-read-bench",
+            usage: "file-list-read-bench [--auto|--no-direct|--direct] [-v] <manifest>",
+            summary: "Read every file named in a newline-delimited manifest and report aggregate throughput without tree-walk cost.",
+            notes: &[
+                "Use this to separate traversal cost from pure many-small-file read throughput.",
+                "Each non-empty line in the manifest is treated as one path.",
+            ],
+            examples: &[(
+                "Benchmark reading files listed by a prior find pass",
+                "find /data/tree -type f > files.txt && file-list-read-bench --no-direct files.txt",
+            )],
+        }),
+        "file-list-read-uring-bench" => Some(CommandHelp {
+            name: "file-list-read-uring-bench",
+            usage: "file-list-read-uring-bench [--auto|--no-direct|--direct] [-v] <manifest>",
+            summary: "Sweep many-small-file io_uring reads from a manifest using 32 worker threads and varying in-flight file counts.",
+            notes: &[
+                "Each worker issues separate whole-file reads via its own io_uring.",
+                "Sweeps in-flight files per thread over 32, 64, 128, 256, and 512.",
+            ],
+            examples: &[(
+                "Benchmark a many-open-files io_uring approach against a prior find manifest",
+                "find /data/tree -type f > files.txt && file-list-read-uring-bench --auto files.txt",
+            )],
+        }),
+        "file-list-read-open-read-close-sweep" => Some(CommandHelp {
+            name: "file-list-read-open-read-close-sweep",
+            usage: "file-list-read-open-read-close-sweep [--auto|--no-direct|--direct] [-v] <manifest>",
+            summary: "Compare open-read-close manifest readers across blocking and io_uring variants over file-count prefixes.",
+            notes: &[
+                "Runs single-thread, multi-thread, single-thread io_uring, and multi-thread io_uring variants.",
+                "Useful for finding the file-count inflection points between reader designs.",
+            ],
+            examples: &[(
+                "Sweep manifest reader variants over small-file prefixes",
+                "find /data/tree -type f > files.txt && file-list-read-open-read-close-sweep --auto files.txt",
+            )],
+        }),
+        "manifest-recursive-copy-bench" => Some(CommandHelp {
+            name: "manifest-recursive-copy-bench",
+            usage: "manifest-recursive-copy-bench [--overlap-large-file PATH] [-v] <manifest> <source_root> <target_root>",
+            summary: "Benchmark manifest-driven recursive copy with separate directory-build and file-copy phase timing.",
+            notes: &[
+                "The manifest must list regular files under <source_root>.",
+                "Keep source and target on the same mount when benchmarking the openat+copy_file_range small-file phase.",
+                "--overlap-large-file runs one additional large-file copy in parallel with the file-copy phase.",
+            ],
+            examples: &[(
+                "Time recursive copy phases and overlap one large file",
+                "manifest-recursive-copy-bench --overlap-large-file /data/ilmari_cache/fro-test/coreutils-1g.bin files.txt /data/tree /data/out",
+            )],
+        }),
+        "split-manifest-recursive-copy-bench" => Some(CommandHelp {
+            name: "split-manifest-recursive-copy-bench",
+            usage: "split-manifest-recursive-copy-bench [-v] <source_dir> <target_dir>",
+            summary: "Benchmark a recursive copy design that first builds the full manifest, then dispatches copy work.",
+            notes: &[
+                "Uses the same recursive copy lanes as copy --recursive, but delays file-copy dispatch until the full manifest is built.",
+                "This exists to compare walk-as-you-go scheduling against a split manifest-build -> dispatch design.",
+            ],
+            examples: &[(
+                "Benchmark split-manifest recursive copy on one tree",
+                "split-manifest-recursive-copy-bench /data/tree /data/out",
+            )],
+        }),
+        "bench-recursive-small-file-threads" => Some(CommandHelp {
+            name: "bench-recursive-small-file-threads",
+            usage: "bench-recursive-small-file-threads [--auto|--no-direct|--direct] [--hot|--cold] [-v] [-s] <directory>",
+            summary: "Sweep recursive small-file worker counts for the current cache state and optionally save the per-mount winner.",
+            notes: &[
+                "The current cache state is inferred from the directory path's first-page residency.",
+                "When used with --save, only the hot or cold slot for the current mount is updated.",
+            ],
+            examples: &[(
+                "Tune recursive small-file worker count for the current mount/cache state",
+                "bench-recursive-small-file-threads --auto -s /data/tree",
+            )],
+        }),
         "bench-read-sweep" => Some(CommandHelp {
             name: "bench-read-sweep",
             usage: "bench-read-sweep",
@@ -2715,6 +4709,30 @@ fn print_general_help(program: &str) {
             "recursive-read-bench",
             "read every byte of every file in a tree",
         ),
+        (
+            "file-list-read-bench",
+            "read every file named in a manifest",
+        ),
+        (
+            "file-list-read-uring-bench",
+            "sweep many-small-file io_uring manifest reads",
+        ),
+        (
+            "file-list-read-open-read-close-sweep",
+            "compare manifest open-read-close reader variants",
+        ),
+        (
+            "manifest-recursive-copy-bench",
+            "benchmark manifest-driven recursive copy phases",
+        ),
+        (
+            "split-manifest-recursive-copy-bench",
+            "benchmark split manifest-build recursive copy",
+        ),
+        (
+            "bench-recursive-small-file-threads",
+            "sweep recursive small-file worker counts",
+        ),
         ("hash", "write 1 MiB block-hash sidecars"),
         ("verify", "scrub a file against its block-hash sidecars"),
         (
@@ -2729,6 +4747,12 @@ fn print_general_help(program: &str) {
     println!("  read               measure striped file read throughput");
     println!("  dual-read-bench    benchmark the read pressure of diff");
     println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
+    println!("  file-list-read-bench benchmark aggregate read throughput from a file manifest");
+    println!("  file-list-read-uring-bench sweep io_uring aggregate throughput from a file manifest");
+    println!("  file-list-read-open-read-close-sweep compare manifest reader variants across file-count prefixes");
+    println!("  manifest-recursive-copy-bench benchmark manifest-driven recursive copy phase timing");
+    println!("  split-manifest-recursive-copy-bench benchmark split manifest-build recursive copy timing");
+    println!("  bench-recursive-small-file-threads sweep recursive small-file worker counts and save hot/cold per mount");
     println!("  bench-read-sweep  sweep read variants across file sizes");
     println!("  fro-optimize       tune configs for one or more commands / mounts");
     println!("  fro-benchmark      run the regression benchmark suite");
@@ -2855,6 +4879,8 @@ fn try_main() -> io::Result<i32> {
     let mut base64_decode_kernel = coreutils::Base64DecodeKernel::Auto;
     let mut base64_wrap_cols: usize = 76;
     let mut base64_ignore_garbage = false;
+    let mut small_file_thread_cache_state: Option<SmallFileThreadCacheState> = None;
+    let mut overlap_large_file: Option<&str> = None;
 
     let mut i = 2;
     let mut end_flags = false;
@@ -2881,6 +4907,11 @@ fn try_main() -> io::Result<i32> {
                 i += 1;
                 if i < args.len() {
                     hash_base = Some(args[i].as_str());
+                }
+            } else if args[i] == "--overlap-large-file" {
+                i += 1;
+                if i < args.len() {
+                    overlap_large_file = Some(args[i].as_str());
                 }
             } else if args[i] == "--size" {
                 i += 1;
@@ -2920,6 +4951,10 @@ fn try_main() -> io::Result<i32> {
                 }
             } else if args[i] == "--ignore-garbage" {
                 base64_ignore_garbage = true;
+            } else if args[i] == "--hot" {
+                small_file_thread_cache_state = Some(SmallFileThreadCacheState::Hot);
+            } else if args[i] == "--cold" {
+                small_file_thread_cache_state = Some(SmallFileThreadCacheState::Cold);
             } else if args[i] == "--threads" {
                 i += 1;
                 if i < args.len() {
@@ -3061,11 +5096,21 @@ fn try_main() -> io::Result<i32> {
                 }
                 return Ok(0);
             }
-        } else if mode == "copy" || mode == "diff" || mode == "dual-read-bench" {
+        } else if mode == "copy"
+            || mode == "diff"
+            || mode == "dual-read-bench"
+            || mode == "split-manifest-recursive-copy-bench"
+        {
             if source.is_none() {
                 source = Some(args[i].as_str());
             } else if filename == "" {
                 filename = args[i].as_str();
+            }
+        } else if mode == "manifest-recursive-copy-bench" {
+            if filename == "" {
+                filename = args[i].as_str();
+            } else {
+                extra_paths.push(args[i].clone());
             }
         } else if mode == "recover" {
             if filename == "" {
@@ -3190,8 +5235,15 @@ fn try_main() -> io::Result<i32> {
         println!("--mmap and --mmap-read-pages are not supported with --direct");
         return Ok(1);
     }
-    if manual_read_overrides.any() && mode != "read" {
-        println!("--threads, --qd, and --blocksize overrides are only supported for read");
+    if manual_read_overrides.any()
+        && mode != "read"
+        && mode != "recursive-read-bench"
+        && mode != "file-list-read-bench"
+        && mode != "file-list-read-uring-bench"
+        && mode != "file-list-read-open-read-close-sweep"
+        && mode != "manifest-recursive-copy-bench"
+    {
+        println!("--threads, --qd, and --blocksize overrides are only supported for read-style benchmarks");
         return Ok(1);
     }
     if via_memory && mode != "copy" {
@@ -3351,6 +5403,10 @@ fn try_main() -> io::Result<i32> {
         println!("At least one recovery copy is required");
         return Ok(1);
     }
+    if mode == "manifest-recursive-copy-bench" && extra_paths.len() != 2 {
+        println!("manifest-recursive-copy-bench requires <manifest> <source_root> <target_root>");
+        return Ok(1);
+    }
     if mode != "write" && create_size.is_some() {
         println!("--create is only supported for write");
         return Ok(1);
@@ -3363,7 +5419,12 @@ fn try_main() -> io::Result<i32> {
     let mut config = config::load_config(config_path);
     let config_mode = match mode {
         "read" if to_memory => "read_to_memory",
-        "recursive-read-bench" => "read",
+        "recursive-read-bench"
+        | "file-list-read-bench"
+        | "file-list-read-uring-bench"
+        | "file-list-read-open-read-close-sweep"
+        | "manifest-recursive-copy-bench"
+        | "bench-recursive-small-file-threads" => "read",
         "recover" => "verify",
         "hash" | "verify" => mode,
         _ => mode,
@@ -3420,7 +5481,14 @@ fn try_main() -> io::Result<i32> {
     };
     let mut optimizer_mask =
         active_optimizer_param_mask(mode, io_mode, io_mode_write, via_memory, copy_strategy);
-    if mode == "read" || mode == "recursive-read-bench" {
+    if mode == "read"
+        || mode == "recursive-read-bench"
+        || mode == "file-list-read-bench"
+        || mode == "file-list-read-uring-bench"
+        || mode == "file-list-read-open-read-close-sweep"
+        || mode == "manifest-recursive-copy-bench"
+        || mode == "bench-recursive-small-file-threads"
+    {
         apply_manual_read_overrides(
             &mut start_params,
             &mut params_steps,
@@ -3437,6 +5505,7 @@ fn try_main() -> io::Result<i32> {
     let hash_base_owned = hash_base.map(|s| s.to_string());
     let extra_paths_owned = extra_paths;
     let read_auto_strategy = config.get_read_auto_strategy_for_path(context_path);
+    let read_mount_info = config.mount_info_for_path(context_path);
     let params_page_cache_for_path = config.get_params_for_path(config_mode, false, context_path);
     let params_direct_for_path = config.get_params_for_path(config_mode, true, context_path);
 
@@ -3460,6 +5529,7 @@ fn try_main() -> io::Result<i32> {
                     pattern,
                     filename,
                     read_auto_strategy,
+                    read_mount_info.as_ref(),
                     params_page_cache_for_path.clone(),
                     params_direct_for_path.clone(),
                 )
@@ -3478,6 +5548,7 @@ fn try_main() -> io::Result<i32> {
             }
         } else if mode == "recursive-read-bench" {
             bench_recursive_read(
+                &config,
                 filename,
                 p[0],
                 p[1],
@@ -3487,6 +5558,41 @@ fn try_main() -> io::Result<i32> {
                 p[5] as usize,
                 io_mode,
                 verbose,
+                manual_read_overrides.threads,
+            )
+        } else if mode == "file-list-read-bench" {
+            bench_file_list_read(
+                &config,
+                filename,
+                p[0],
+                p[1],
+                p[2] as usize,
+                p[3],
+                p[4],
+                p[5] as usize,
+                io_mode,
+                verbose,
+            )
+        } else if mode == "file-list-read-uring-bench" {
+            bench_file_list_read_uring(&config, filename, io_mode, verbose)
+        } else if mode == "file-list-read-open-read-close-sweep" {
+            bench_file_list_read_open_read_close_sweep(&config, filename, io_mode, verbose)
+        } else if mode == "manifest-recursive-copy-bench" {
+            bench_manifest_recursive_copy(
+                filename,
+                extra_paths_owned[0].as_str(),
+                extra_paths_owned[1].as_str(),
+                overlap_large_file,
+                verbose,
+            )
+        } else if mode == "bench-recursive-small-file-threads" {
+            bench_recursive_small_file_threads(
+                &mut config,
+                filename,
+                io_mode,
+                verbose,
+                save_config,
+                small_file_thread_cache_state,
             )
         } else if mode == "hash" {
             if hash_only || iterations > 1 {
@@ -3602,15 +5708,19 @@ fn try_main() -> io::Result<i32> {
                 p[5] as usize,
                 io_mode_write,
             )
-        } else if mode == "copy" {
+        } else if mode == "copy" || mode == "split-manifest-recursive-copy-bench" {
             if let Some(src) = source {
-                if recursive_copy {
+                if recursive_copy || mode == "split-manifest-recursive-copy-bench" {
                     let source_root = PathBuf::from(src);
                     let source_metadata = fs::symlink_metadata(&source_root)?;
                     if !source_metadata.file_type().is_dir() {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            "copy --recursive requires a directory source",
+                            if mode == "copy" {
+                                "copy --recursive requires a directory source"
+                            } else {
+                                "split-manifest-recursive-copy-bench requires a directory source"
+                            },
                         ));
                     }
                     let target_root =
@@ -3627,8 +5737,13 @@ fn try_main() -> io::Result<i32> {
                         io_mode_write,
                         keep_target_size,
                         use_lock: !no_lock,
+                        relative_copy_method: RelativeCopyMethod::CopyFileRange,
                     };
-                    run_recursive_copy(recursive_ctx, verbose)
+                    if mode == "split-manifest-recursive-copy-bench" {
+                        run_split_manifest_recursive_copy(recursive_ctx, verbose)
+                    } else {
+                        run_recursive_copy(recursive_ctx, verbose)
+                    }
                 } else {
                     let resolved_copy = resolve_copy_execution(
                         &config,

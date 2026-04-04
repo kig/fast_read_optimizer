@@ -1304,6 +1304,8 @@ fn main() {
         let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
         let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
         let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
+        let recursive_tree = test_path.join("fro_optimize_recursive_small_tree");
+        let recursive_tree_str = recursive_tree.display().to_string();
 
         let mut configs: Vec<Vec<String>> = vec![
             argsv!("read", "-s", "--direct", "-n", &read_iters, &source_file),
@@ -1425,6 +1427,20 @@ fn main() {
                 &source_file,
                 &target_file_cache
             ),
+            argsv!(
+                "bench-recursive-small-file-threads",
+                "--no-direct",
+                "--cold",
+                "-s",
+                &recursive_tree_str
+            ),
+            argsv!(
+                "bench-recursive-small-file-threads",
+                "--no-direct",
+                "--hot",
+                "-s",
+                &recursive_tree_str
+            ),
         ];
 
         if let Some(cfg) = config_path {
@@ -1467,6 +1483,7 @@ fn main() {
         let mut need_target_cache = false;
         let mut need_target_dir_matching = false;
         let mut need_target_cache_matching = false;
+        let mut need_recursive_tree = false;
 
         let mut num_full_writes: u64 = 0;
         for cfg in &selected {
@@ -1480,6 +1497,9 @@ fn main() {
             }
             if cfg.iter().any(|s| s == &target_file_cache) {
                 need_target_cache = true;
+            }
+            if cfg.iter().any(|s| s == &recursive_tree_str) {
+                need_recursive_tree = true;
             }
 
             if (op == "diff" || op == "dual-read-bench")
@@ -1511,8 +1531,10 @@ fn main() {
             need_source = true;
         }
 
-        let file_count =
-            (need_source as u64) + (need_target_dir as u64) + (need_target_cache as u64);
+        let file_count = (need_source as u64)
+            + (need_target_dir as u64)
+            + (need_target_cache as u64)
+            + (need_recursive_tree as u64);
         let setup_writes = (need_source as u64)
             + (need_target_dir_matching as u64)
             + (need_target_cache_matching as u64);
@@ -1625,6 +1647,17 @@ fn main() {
                     .expect("Failed to prepare fro_bench_tmp_cache");
             }
         }
+        if need_recursive_tree {
+            let _ = fs::remove_dir_all(&recursive_tree);
+            fs::create_dir_all(&recursive_tree).expect("Failed to create recursive tuning tree");
+            for i in 0..16384_u64 {
+                let shard = format!("{:03}", i / 64);
+                let dir = recursive_tree.join(shard);
+                let _ = fs::create_dir_all(&dir);
+                let path = dir.join(format!("file_{:06}.bin", i));
+                fs::write(&path, vec![0x5a_u8; 4096]).expect("Failed to create recursive tuning file");
+            }
+        }
 
         println!("Running optimizer for all modes... (This may take a while)");
 
@@ -1653,6 +1686,7 @@ fn main() {
         let _ = fs::remove_file(source_file);
         let _ = fs::remove_file(target_file_dir);
         let _ = fs::remove_file(target_file_cache);
+        let _ = fs::remove_dir_all(recursive_tree);
 
         let saved_to = config_path.map(|p| p.to_string()).unwrap_or_else(|| {
             fro::config::resolve_default_config_path()

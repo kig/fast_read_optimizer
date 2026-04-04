@@ -7,6 +7,12 @@ use std::sync::Once;
 
 static MOUNTINFO_WARNING: Once = Once::new();
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountInfo {
+    pub mount_point: String,
+    pub fstype: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IOParams {
     pub num_threads: u64,
@@ -33,6 +39,8 @@ pub struct AppConfig {
     pub copy_auto_mode: CopyAutoMode,
     #[serde(default = "default_read_auto_strategy")]
     pub read_auto_strategy: ReadAutoStrategy,
+    #[serde(default = "default_recursive_small_file_threads")]
+    pub recursive_small_file_threads: RecursiveSmallFileThreads,
     pub grep: ModeConfig,
     pub diff: ModeConfig,
     pub dual_read_bench: ModeConfig,
@@ -74,6 +82,7 @@ pub struct AppConfigPatch {
     pub copy_range: Option<IOParams>,
     pub copy_auto_mode: Option<CopyAutoMode>,
     pub read_auto_strategy: Option<ReadAutoStrategy>,
+    pub recursive_small_file_threads: Option<RecursiveSmallFileThreads>,
     pub grep: Option<ModeConfigPatch>,
     pub diff: Option<ModeConfigPatch>,
     pub dual_read_bench: Option<ModeConfigPatch>,
@@ -97,6 +106,12 @@ pub struct DeviceDbConfig {
     pub allow_online_update: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecursiveSmallFileThreads {
+    pub hot: u64,
+    pub cold: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum LoadedConfig {
     Legacy {
@@ -110,6 +125,23 @@ pub enum LoadedConfig {
 }
 
 impl LoadedConfig {
+    fn promote_legacy_to_bundle(&mut self) {
+        let LoadedConfig::Legacy { path, config } = self else {
+            return;
+        };
+        let path = path.clone();
+        let config = config.clone();
+        *self = LoadedConfig::BundleV1 {
+            path,
+            bundle: ConfigBundleV1 {
+                version: 1,
+                defaults: config,
+                mount_overrides: MountOverrides::default(),
+                device_db: default_bundle_v1().device_db,
+            },
+        };
+    }
+
     fn defaults_ref(&self) -> &AppConfig {
         match self {
             LoadedConfig::Legacy { config, .. } => config,
@@ -163,6 +195,10 @@ impl LoadedConfig {
         self.defaults_ref().read_auto_strategy
     }
 
+    pub fn get_recursive_small_file_threads(&self) -> RecursiveSmallFileThreads {
+        self.defaults_ref().recursive_small_file_threads
+    }
+
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
         let base = self.get_params(mode, direct);
         self.mount_patch_for_path(path)
@@ -195,6 +231,16 @@ impl LoadedConfig {
             .unwrap_or_else(|| self.get_read_auto_strategy())
     }
 
+    pub fn get_recursive_small_file_threads_for_path(&self, path: &str) -> RecursiveSmallFileThreads {
+        self.mount_patch_for_path(path)
+            .and_then(|patch| patch.recursive_small_file_threads)
+            .unwrap_or_else(|| self.get_recursive_small_file_threads())
+    }
+
+    pub fn mount_info_for_path(&self, path: &str) -> Option<MountInfo> {
+        mount_info_for_path(path)
+    }
+
     #[allow(dead_code)]
     pub fn update_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         self.defaults_mut().update_params(mode, direct, params)
@@ -215,6 +261,11 @@ impl LoadedConfig {
         self.defaults_mut().read_auto_strategy = strategy;
     }
 
+    #[allow(dead_code)]
+    pub fn update_recursive_small_file_threads(&mut self, threads: RecursiveSmallFileThreads) {
+        self.defaults_mut().recursive_small_file_threads = threads;
+    }
+
     pub fn update_params_for_path(
         &mut self,
         mode: &str,
@@ -222,6 +273,9 @@ impl LoadedConfig {
         path: &str,
         params: IOParams,
     ) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
         if let Some(entry) = self.mount_patch_for_path_mut(path) {
             entry.set_mode_params(mode, direct, params);
         } else if let LoadedConfig::Legacy { config, .. } = self {
@@ -230,6 +284,9 @@ impl LoadedConfig {
     }
 
     pub fn update_copy_range_params_for_path(&mut self, path: &str, params: IOParams) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
         if let Some(entry) = self.mount_patch_for_path_mut(path) {
             entry.copy_range = Some(params);
         } else if let LoadedConfig::Legacy { config, .. } = self {
@@ -239,6 +296,9 @@ impl LoadedConfig {
 
     #[allow(dead_code)]
     pub fn update_copy_auto_mode_for_path(&mut self, path: &str, mode: CopyAutoMode) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
         if let Some(entry) = self.mount_patch_for_path_mut(path) {
             entry.copy_auto_mode = Some(mode);
         } else if let LoadedConfig::Legacy { config, .. } = self {
@@ -247,10 +307,28 @@ impl LoadedConfig {
     }
 
     pub fn update_read_auto_strategy_for_path(&mut self, path: &str, strategy: ReadAutoStrategy) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
         if let Some(entry) = self.mount_patch_for_path_mut(path) {
             entry.read_auto_strategy = Some(strategy);
         } else if let LoadedConfig::Legacy { config, .. } = self {
             config.read_auto_strategy = strategy;
+        }
+    }
+
+    pub fn update_recursive_small_file_threads_for_path(
+        &mut self,
+        path: &str,
+        threads: RecursiveSmallFileThreads,
+    ) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.recursive_small_file_threads = Some(threads);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.recursive_small_file_threads = threads;
         }
     }
 
@@ -310,6 +388,10 @@ impl AppConfigPatch {
 }
 
 fn mountpoint_for_path(path: &str) -> Option<String> {
+    mount_info_for_path(path).map(|info| info.mount_point)
+}
+
+fn mount_info_for_path(path: &str) -> Option<MountInfo> {
     let p = std::path::Path::new(path);
     let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let path = canonical.to_string_lossy();
@@ -327,11 +409,11 @@ fn mountpoint_for_path(path: &str) -> Option<String> {
         }
     };
 
-    let mut best: Option<String> = None;
+    let mut best: Option<MountInfo> = None;
     let mut best_len = 0usize;
 
     for line in data.lines() {
-        let (lhs, _) = match line.split_once(" - ") {
+        let (lhs, rhs) = match line.split_once(" - ") {
             Some(v) => v,
             None => continue,
         };
@@ -340,13 +422,20 @@ fn mountpoint_for_path(path: &str) -> Option<String> {
             continue;
         }
 
+        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
+        if right_fields.is_empty() {
+            continue;
+        }
         let mp = left_fields[4];
         if !path_starts_with_mount(&path, mp) {
             continue;
         }
         if mp.len() > best_len {
             best_len = mp.len();
-            best = Some(mp.to_string());
+            best = Some(MountInfo {
+                mount_point: mp.to_string(),
+                fstype: right_fields[0].to_string(),
+            });
         }
     }
 
@@ -546,6 +635,7 @@ impl Default for AppConfig {
             copy_range: default_copy_range,
             copy_auto_mode: CopyAutoMode::Heuristic,
             read_auto_strategy: default_read_auto_strategy(),
+            recursive_small_file_threads: default_recursive_small_file_threads(),
             grep: default_mode.clone(),
             diff: ModeConfig {
                 direct: default_direct.clone(),
@@ -636,6 +726,10 @@ fn default_read_auto_strategy() -> ReadAutoStrategy {
         cold_small_path: ReadPathKind::SimpleDirect,
         cold_large_path: ReadPathKind::ThreadedDirect,
     }
+}
+
+fn default_recursive_small_file_threads() -> RecursiveSmallFileThreads {
+    RecursiveSmallFileThreads { hot: 32, cold: 32 }
 }
 
 fn default_hash_mode_config() -> ModeConfig {
@@ -964,6 +1058,50 @@ mod tests {
         };
         loaded.update_read_auto_strategy_for_path(tmp.to_str().unwrap(), strategy);
         loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        assert_eq!(reloaded.get_read_auto_strategy_for_path(tmp.to_str().unwrap()), strategy);
+    }
+
+    #[test]
+    fn bundle_mount_overrides_roundtrip_recursive_small_file_threads() {
+        let tmp = unique_temp_dir("fro-recursive-small-file-threads");
+        let cfg_path = tmp.join("fro.json");
+        let mut loaded = load_config(Some(cfg_path.to_str().unwrap()));
+
+        let threads = RecursiveSmallFileThreads { hot: 13, cold: 55 };
+        loaded.update_recursive_small_file_threads_for_path(tmp.to_str().unwrap(), threads);
+        loaded.save();
+
+        let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
+        assert_eq!(
+            reloaded.get_recursive_small_file_threads_for_path(tmp.to_str().unwrap()),
+            threads
+        );
+    }
+
+    #[test]
+    fn legacy_config_promotes_to_bundle_for_mount_override() {
+        let tmp = unique_temp_dir("fro-legacy-promote");
+        let cfg_path = tmp.join("fro.json");
+        let legacy = AppConfig::default();
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let mut loaded = load_config(Some(cfg_path.to_str().unwrap()));
+        let strategy = ReadAutoStrategy {
+            hot_large_min_bytes: 1,
+            cold_large_min_bytes: 1,
+            hot_small_path: ReadPathKind::SimpleDirect,
+            hot_large_path: ReadPathKind::SimpleDirect,
+            cold_small_path: ReadPathKind::SimpleDirect,
+            cold_large_path: ReadPathKind::SimpleDirect,
+        };
+        loaded.update_read_auto_strategy_for_path(tmp.to_str().unwrap(), strategy);
+        loaded.save();
+
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(text.contains("\"version\": 1"));
+        assert!(text.contains("\"mount_overrides\""));
 
         let reloaded = load_config(Some(cfg_path.to_str().unwrap()));
         assert_eq!(reloaded.get_read_auto_strategy_for_path(tmp.to_str().unwrap()), strategy);

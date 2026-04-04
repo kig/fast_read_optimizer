@@ -4,7 +4,7 @@ use crate::io_util::{
     expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
 };
 use crate::reader::{
-    resolve_reader_params, resolve_reader_params_for_mode, visit_file_blocks,
+    resolve_reader_params, resolve_reader_params_for_mode,
     visit_file_blocks_with_resolved_params, ResolvedReadParams,
 };
 use crate::writer::{
@@ -159,19 +159,33 @@ impl ParallelFile {
         let config = self.config.clone();
         let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
         let visit = Arc::new(visit);
+        let mut local_config = config.clone();
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
         let direct = config.get_params_for_path(&self.mode, true, &path);
-        let (bytes_read, file_size, params) = visit_file_blocks(
+        local_config.update_params_for_path(
+            &self.mode,
+            false,
             &path,
-            page_cache.num_threads,
-            block_size,
-            page_cache.qd,
-            direct.num_threads,
-            block_size,
-            direct.qd,
-            io_mode,
-            move |block| visit(block.block_index, block.data),
-        )?;
+            crate::config::IOParams {
+                num_threads: page_cache.num_threads,
+                block_size,
+                qd: page_cache.qd,
+            },
+        );
+        local_config.update_params_for_path(
+            &self.mode,
+            true,
+            &path,
+            crate::config::IOParams {
+                num_threads: direct.num_threads,
+                block_size,
+                qd: direct.qd,
+            },
+        );
+        let (bytes_read, file_size, params) =
+            crate::reader::visit_file_blocks_for_mode(&local_config, &self.mode, &path, io_mode, move |block| {
+                visit(block.block_index, block.data)
+            })?;
         Ok(ParallelReadReport {
             bytes_read,
             file_size,
@@ -210,20 +224,28 @@ impl ParallelFile {
         let io_mode = effective_io_mode_for_block_size(self.io_mode, block_size);
         let page_cache = config.get_params_for_path(&self.mode, false, &path);
         let direct = config.get_params_for_path(&self.mode, true, &path);
-        let params = resolve_reader_params(
+        let mut local_config = config.clone();
+        local_config.update_params_for_path(
+            &self.mode,
+            false,
             &path,
-            &crate::config::IOParams {
+            crate::config::IOParams {
                 num_threads: page_cache.num_threads,
                 block_size,
                 qd: page_cache.qd,
             },
-            &crate::config::IOParams {
+        );
+        local_config.update_params_for_path(
+            &self.mode,
+            true,
+            &path,
+            crate::config::IOParams {
                 num_threads: direct.num_threads,
                 block_size,
                 qd: direct.qd,
             },
-            io_mode,
-        )?;
+        );
+        let params = resolve_reader_params_for_mode(&local_config, &self.mode, &path, io_mode)?;
         self.map_reduce_blocks_with_params(params, map, reduce)
     }
 

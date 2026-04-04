@@ -1,5 +1,5 @@
 use crate::common::{AlignedBuffer, IOMode, ReadAutoStrategy, ReadPathKind};
-use crate::config::{IOParams, LoadedConfig};
+use crate::config::{IOParams, LoadedConfig, MountInfo};
 use crate::io_util::{
     expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
 };
@@ -147,6 +147,7 @@ pub enum ReadBenchmarkVariant {
     SingleThreadPageCache,
     SingleThreadDirect,
     SingleThreadIoUring,
+    QuickProbePageCache,
     MultiThreadCurrent,
 }
 
@@ -162,6 +163,7 @@ impl ReadBenchmarkVariant {
             Self::SingleThreadPageCache => "st-page-cache",
             Self::SingleThreadDirect => "st-direct",
             Self::SingleThreadIoUring => "st-io-uring",
+            Self::QuickProbePageCache => "quick-probe-page-cache",
             Self::MultiThreadCurrent => "mt-current",
         }
     }
@@ -200,6 +202,12 @@ pub struct VisitFileMetrics {
     pub bytes_read: u64,
     pub file_size: u64,
     pub phase_timings: ReadPhaseTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedReadExecution {
+    Simple(ResolvedReadParams),
+    Threaded(ResolvedReadParams),
 }
 
 #[cfg(feature = "read-phase-timing")]
@@ -765,9 +773,9 @@ pub fn resolve_reader_params_for_mode(
     filename: &str,
     io_mode: IOMode,
 ) -> std::io::Result<ResolvedReadParams> {
-    let page_cache = config.get_params_for_path(mode, false, filename);
-    let direct = config.get_params_for_path(mode, true, filename);
-    resolve_reader_params(filename, &page_cache, &direct, io_mode)
+    match resolve_reader_execution_for_mode(config, mode, filename, io_mode)? {
+        ResolvedReadExecution::Simple(params) | ResolvedReadExecution::Threaded(params) => Ok(params),
+    }
 }
 
 fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
@@ -890,6 +898,339 @@ fn read_file_single_thread_blocking(
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("single-thread offset overflowed"))?;
     }
+}
+
+fn benchmark_block_size(file_size: u64) -> usize {
+    file_size.clamp(1, 1024 * 1024) as usize
+}
+
+fn benchmark_uring_qd(file_size: u64) -> usize {
+    file_size.div_ceil(1024 * 1024).clamp(1, 4) as usize
+}
+
+fn read_file_simple_page_cache_from_probe(file: &mut File, file_size: u64) -> io::Result<u64> {
+    let mut bytes_read = 64 * 1024_u64;
+    let mut buffer = vec![0_u8; benchmark_block_size(file_size)];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(bytes_read);
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("quick-probe byte count overflowed"))?;
+    }
+}
+
+fn visit_file_blocks_simple<F>(
+    filename: &str,
+    params: ResolvedReadParams,
+    visitor: F,
+) -> io::Result<VisitFileMetrics>
+where
+    F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<()>,
+{
+    validate_read_params(params)?;
+    let (file, file_direct) = open_reader_files(filename, params.use_direct)?;
+    let file_size = file.metadata()?.len();
+    if file_size == 0 {
+        return Ok(VisitFileMetrics {
+            bytes_read: 0,
+            file_size: 0,
+            phase_timings: ReadPhaseTimings::default(),
+        });
+    }
+
+    let mut bytes_read = 0_u64;
+    let mut block_index = 0usize;
+    let mut offset = 0_u64;
+    let mut buffer = AlignedBuffer::new(params.block_size as usize);
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let want = remaining.min(params.block_size) as usize;
+        let target = if should_use_direct_io(params.use_direct, offset, want, file_size) {
+            &file_direct
+        } else {
+            &file
+        };
+        let read = target.read_at(&mut buffer.as_mut_slice()[..want], offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("simple read reached EOF early at offset {} of {}", offset, file_size),
+            ));
+        }
+        visitor(ReaderBlock {
+            block_index,
+            offset,
+            file_size,
+            data: &buffer.as_slice()[..read],
+        })?;
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("simple visitor byte count overflowed"))?;
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("simple visitor offset overflowed"))?;
+        block_index += 1;
+    }
+
+    Ok(VisitFileMetrics {
+        bytes_read,
+        file_size,
+        phase_timings: ReadPhaseTimings::default(),
+    })
+}
+
+fn choose_forced_path_kind(
+    forced_simple: ReadPathKind,
+    forced_threaded: ReadPathKind,
+    small_candidate: ReadPathKind,
+    large_candidate: ReadPathKind,
+    file_size: u64,
+    large_min_bytes: u64,
+) -> ReadPathKind {
+    if file_size >= large_min_bytes {
+        match large_candidate {
+            ReadPathKind::ThreadedPageCache | ReadPathKind::ThreadedDirect => forced_threaded,
+            ReadPathKind::IoUringPageCache => ReadPathKind::IoUringPageCache,
+            _ => forced_simple,
+        }
+    } else {
+        match small_candidate {
+            ReadPathKind::ThreadedPageCache | ReadPathKind::ThreadedDirect => forced_threaded,
+            ReadPathKind::IoUringPageCache => ReadPathKind::IoUringPageCache,
+            _ => forced_simple,
+        }
+    }
+}
+
+fn resolve_execution_for_path_kind(
+    filename: &str,
+    path_kind: ReadPathKind,
+    file_size: u64,
+    page_cache: &IOParams,
+    direct: &IOParams,
+) -> io::Result<ResolvedReadExecution> {
+    let params = match path_kind {
+        ReadPathKind::SimplePageCache => ResolvedReadParams {
+            use_direct: false,
+            num_threads: 1,
+            block_size: benchmark_block_size(file_size) as u64,
+            qd: 1,
+        },
+        ReadPathKind::SimpleDirect => ResolvedReadParams {
+            use_direct: true,
+            num_threads: 1,
+            block_size: benchmark_block_size(file_size) as u64,
+            qd: 1,
+        },
+        ReadPathKind::IoUringPageCache => ResolvedReadParams {
+            use_direct: false,
+            num_threads: 1,
+            block_size: benchmark_block_size(file_size) as u64,
+            qd: benchmark_uring_qd(file_size),
+        },
+        ReadPathKind::ThreadedPageCache => {
+            resolve_reader_params(filename, page_cache, direct, IOMode::PageCache)?
+        }
+        ReadPathKind::ThreadedDirect => {
+            resolve_reader_params(filename, page_cache, direct, IOMode::Direct)?
+        }
+    };
+    Ok(match path_kind {
+        ReadPathKind::SimplePageCache | ReadPathKind::SimpleDirect => {
+            ResolvedReadExecution::Simple(params)
+        }
+        ReadPathKind::IoUringPageCache
+        | ReadPathKind::ThreadedPageCache
+        | ReadPathKind::ThreadedDirect => ResolvedReadExecution::Threaded(params),
+    })
+}
+
+fn resolve_reader_execution_for_mode(
+    config: &LoadedConfig,
+    mode: &str,
+    filename: &str,
+    io_mode: IOMode,
+) -> io::Result<ResolvedReadExecution> {
+    let page_cache = config.get_params_for_path(mode, false, filename);
+    let direct = config.get_params_for_path(mode, true, filename);
+    let strategy = config.get_read_auto_strategy_for_path(filename);
+    let mount_info = config.mount_info_for_path(filename);
+    let file_size = std::fs::metadata(filename)?.len();
+    let path_kind = match io_mode {
+        IOMode::Direct => choose_forced_path_kind(
+            ReadPathKind::SimpleDirect,
+            ReadPathKind::ThreadedDirect,
+            strategy.cold_small_path,
+            strategy.cold_large_path,
+            file_size,
+            strategy.cold_large_min_bytes,
+        ),
+        IOMode::PageCache => choose_forced_path_kind(
+            ReadPathKind::SimplePageCache,
+            ReadPathKind::ThreadedPageCache,
+            strategy.hot_small_path,
+            strategy.hot_large_path,
+            file_size,
+            strategy.hot_large_min_bytes,
+        ),
+        IOMode::Auto => {
+            if mount_info.as_ref().is_some_and(|info| info.fstype == "zfs") {
+                ReadPathKind::SimpleDirect
+            } else if file_size >= strategy.hot_large_min_bytes {
+                match strategy.hot_large_path {
+                    ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => {
+                        ReadPathKind::SimpleDirect
+                    }
+                    other => other,
+                }
+            } else {
+                match strategy.hot_small_path {
+                    ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => {
+                        ReadPathKind::SimpleDirect
+                    }
+                    other => other,
+                }
+            }
+        }
+    };
+    resolve_execution_for_path_kind(filename, path_kind, file_size, &page_cache, &direct)
+}
+
+fn read_file_path_kind(
+    pattern: &str,
+    filename: &str,
+    path_kind: ReadPathKind,
+    page_cache: &IOParams,
+    direct: &IOParams,
+) -> io::Result<u64> {
+    match path_kind {
+        ReadPathKind::SimplePageCache => {
+            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::PageCache)
+        }
+        ReadPathKind::SimpleDirect => {
+            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::Direct)
+        }
+        ReadPathKind::IoUringPageCache => read_file(
+            pattern,
+            filename,
+            1,
+            1024 * 1024,
+            32,
+            1,
+            1024 * 1024,
+            32,
+            IOMode::PageCache,
+        ),
+        ReadPathKind::ThreadedPageCache => read_file(
+            pattern,
+            filename,
+            page_cache.num_threads,
+            page_cache.block_size,
+            page_cache.qd,
+            direct.num_threads,
+            direct.block_size,
+            direct.qd,
+            IOMode::PageCache,
+        ),
+        ReadPathKind::ThreadedDirect => read_file(
+            pattern,
+            filename,
+            page_cache.num_threads,
+            page_cache.block_size,
+            page_cache.qd,
+            direct.num_threads,
+            direct.block_size,
+            direct.qd,
+            IOMode::Direct,
+        ),
+    }
+}
+
+fn benchmark_quick_probe_page_cache(
+    filename: &str,
+    strategy: ReadAutoStrategy,
+    mount_info: Option<&MountInfo>,
+    page_cache: &IOParams,
+    direct: &IOParams,
+) -> io::Result<(u64, u64, ResolvedReadParams)> {
+    if mount_info.is_some_and(|info| info.fstype == "zfs") {
+        let file_size = File::open(filename)?.metadata()?.len();
+        let bytes_read = read_file_path_kind("", filename, ReadPathKind::SimpleDirect, page_cache, direct)?;
+        return Ok((
+            bytes_read,
+            file_size,
+            ResolvedReadParams {
+                use_direct: true,
+                num_threads: 1,
+                block_size: benchmark_block_size(file_size) as u64,
+                qd: 1,
+            },
+        ));
+    }
+
+    let mut file = File::open(filename)?;
+    let mut probe = vec![0_u8; 64 * 1024];
+    let mut filled = 0usize;
+    while filled < probe.len() {
+        let read = file.read(&mut probe[filled..])?;
+        if read == 0 {
+            let bytes_read = filled as u64;
+            return Ok((
+                bytes_read,
+                bytes_read,
+                ResolvedReadParams {
+                    use_direct: false,
+                    num_threads: 1,
+                    block_size: benchmark_block_size(bytes_read) as u64,
+                    qd: 1,
+                },
+            ));
+        }
+        filled += read;
+    }
+
+    let file_size = file.metadata()?.len();
+    if file_size < strategy.hot_large_min_bytes {
+        let bytes_read = read_file_simple_page_cache_from_probe(&mut file, file_size)?;
+        return Ok((
+            bytes_read,
+            file_size,
+            ResolvedReadParams {
+                use_direct: false,
+                num_threads: 1,
+                block_size: benchmark_block_size(file_size) as u64,
+                qd: 1,
+            },
+        ));
+    }
+
+    let selected_kind = match strategy.hot_large_path {
+        ReadPathKind::SimplePageCache
+        | ReadPathKind::IoUringPageCache
+        | ReadPathKind::ThreadedPageCache => strategy.hot_large_path,
+        ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => ReadPathKind::ThreadedPageCache,
+    };
+    let bytes_read = read_file_path_kind("", filename, selected_kind, page_cache, direct)?;
+    let params = match selected_kind {
+        ReadPathKind::SimplePageCache => ResolvedReadParams {
+            use_direct: false,
+            num_threads: 1,
+            block_size: benchmark_block_size(file_size) as u64,
+            qd: 1,
+        },
+        ReadPathKind::IoUringPageCache => ResolvedReadParams {
+            use_direct: false,
+            num_threads: 1,
+            block_size: benchmark_block_size(file_size) as u64,
+            qd: benchmark_uring_qd(file_size),
+        },
+        ReadPathKind::ThreadedPageCache => resolve_reader_params(filename, page_cache, direct, IOMode::PageCache)?,
+        ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => unreachable!(),
+    };
+    Ok((bytes_read, file_size, params))
 }
 
 #[allow(dead_code)]
@@ -1929,19 +2270,116 @@ where
     T: Send + 'static,
     F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<T> + Send + Sync + 'static,
 {
-    let page_cache = config.get_params_for_path(mode, false, filename);
-    let direct = config.get_params_for_path(mode, true, filename);
-    map_file_blocks(
-        filename,
-        page_cache.num_threads,
-        page_cache.block_size,
-        page_cache.qd,
-        direct.num_threads,
-        direct.block_size,
-        direct.qd,
-        io_mode,
-        mapper,
-    )
+    match resolve_reader_execution_for_mode(config, mode, filename, io_mode)? {
+        ResolvedReadExecution::Simple(params) => {
+            let file_size = std::fs::metadata(filename)?.len();
+            if file_size == 0 {
+                return Ok(MappedBlocks {
+                    blocks: Vec::new(),
+                    bytes_read: 0,
+                    file_size,
+                    params,
+                });
+            }
+            let block_count = file_size.div_ceil(params.block_size) as usize;
+            let mapper = Arc::new(mapper);
+            let results = Arc::new(
+                (0..block_count)
+                    .map(|_| Mutex::new(None))
+                    .collect::<Vec<_>>(),
+            );
+            let result_slots = Arc::clone(&results);
+            let metrics = visit_file_blocks_simple(filename, params, move |block| {
+                let value = mapper(block)?;
+                *result_slots[block.block_index].lock().unwrap() = Some(value);
+                Ok(())
+            })?;
+            let mut blocks = Vec::with_capacity(block_count);
+            for (block_index, slot) in results.iter().enumerate() {
+                let value = slot.lock().unwrap().take().ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "missing mapped result for block {}",
+                        block_index
+                    ))
+                })?;
+                blocks.push(value);
+            }
+            Ok(MappedBlocks {
+                blocks,
+                bytes_read: metrics.bytes_read,
+                file_size: metrics.file_size,
+                params,
+            })
+        }
+        ResolvedReadExecution::Threaded(params) => {
+            let file_size = std::fs::metadata(filename)?.len();
+            let block_count = if file_size == 0 {
+                0
+            } else {
+                file_size.div_ceil(params.block_size) as usize
+            };
+            if block_count == 0 {
+                return Ok(MappedBlocks {
+                    blocks: Vec::new(),
+                    bytes_read: 0,
+                    file_size,
+                    params,
+                });
+            }
+            let read_count = Arc::new(AtomicU64::new(0));
+            let results = Arc::new(
+                (0..block_count)
+                    .map(|_| Mutex::new(None))
+                    .collect::<Vec<_>>(),
+            );
+            let mapper = Arc::new(mapper);
+            let mut threads = vec![];
+            for thread_id in 0..params.num_threads {
+                let filename = filename.to_string();
+                let read_count = read_count.clone();
+                let results = results.clone();
+                let mapper = mapper.clone();
+                threads.push(std::thread::spawn(move || -> std::io::Result<()> {
+                    let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+                    let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
+                    thread_map_blocks(
+                        thread_id,
+                        params.num_threads,
+                        params.block_size,
+                        params.qd,
+                        &mut file,
+                        &mut file_direct,
+                        &mut io_uring,
+                        read_count,
+                        results,
+                        mapper,
+                        params.use_direct,
+                    )
+                }));
+            }
+            for thread in threads {
+                thread
+                    .join()
+                    .map_err(|_| std::io::Error::other("read worker thread panicked"))??;
+            }
+            let mut blocks = Vec::with_capacity(block_count);
+            for (block_index, slot) in results.iter().enumerate() {
+                let value = slot.lock().unwrap().take().ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "missing mapped result for block {}",
+                        block_index
+                    ))
+                })?;
+                blocks.push(value);
+            }
+            Ok(MappedBlocks {
+                blocks,
+                bytes_read: read_count.load(Ordering::SeqCst),
+                file_size,
+                params,
+            })
+        }
+    }
 }
 
 pub fn visit_file_blocks<F>(
@@ -2050,19 +2488,16 @@ pub fn visit_file_blocks_for_mode<F>(
 where
     F: for<'a> Fn(ReaderBlock<'a>) -> std::io::Result<()> + Send + Sync + 'static,
 {
-    let page_cache = config.get_params_for_path(mode, false, filename);
-    let direct = config.get_params_for_path(mode, true, filename);
-    visit_file_blocks(
-        filename,
-        page_cache.num_threads,
-        page_cache.block_size,
-        page_cache.qd,
-        direct.num_threads,
-        direct.block_size,
-        direct.qd,
-        io_mode,
-        visitor,
-    )
+    match resolve_reader_execution_for_mode(config, mode, filename, io_mode)? {
+        ResolvedReadExecution::Simple(params) => {
+            let metrics = visit_file_blocks_simple(filename, params, visitor)?;
+            Ok((metrics.bytes_read, metrics.file_size, params))
+        }
+        ResolvedReadExecution::Threaded(params) => {
+            let metrics = visit_file_blocks_with_resolved_params(filename, params, visitor)?;
+            Ok((metrics.bytes_read, metrics.file_size, params))
+        }
+    }
 }
 
 pub fn read_file(
@@ -2112,106 +2547,78 @@ pub fn read_file_auto_with_strategy(
     pattern: &str,
     filename: &str,
     strategy: ReadAutoStrategy,
+    mount_info: Option<&MountInfo>,
     page_cache: IOParams,
     direct: IOParams,
 ) -> std::io::Result<u64> {
+    if mount_info.is_some_and(|info| info.fstype == "zfs") {
+        return read_file_path_kind(pattern, filename, ReadPathKind::SimpleDirect, &page_cache, &direct);
+    }
     let file_size = std::fs::metadata(filename)?.len();
     let cache_state = auto_read_cache_state(filename);
     let path_kind = choose_path_kind_for_state(strategy, cache_state, file_size);
-    match path_kind {
-        ReadPathKind::SimplePageCache => {
-            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::PageCache)
-        }
-        ReadPathKind::SimpleDirect => {
-            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::Direct)
-        }
-        ReadPathKind::IoUringPageCache => read_file(
-            pattern,
-            filename,
-            1,
-            1024 * 1024,
-            32,
-            1,
-            1024 * 1024,
-            32,
-            IOMode::PageCache,
-        ),
-        ReadPathKind::ThreadedPageCache => read_file(
-            pattern,
-            filename,
-            page_cache.num_threads,
-            page_cache.block_size,
-            page_cache.qd,
-            direct.num_threads,
-            direct.block_size,
-            direct.qd,
-            IOMode::PageCache,
-        ),
-        ReadPathKind::ThreadedDirect => read_file(
-            pattern,
-            filename,
-            page_cache.num_threads,
-            page_cache.block_size,
-            page_cache.qd,
-            direct.num_threads,
-            direct.block_size,
-            direct.qd,
-            IOMode::Direct,
-        ),
-    }
+    read_file_path_kind(pattern, filename, path_kind, &page_cache, &direct)
 }
 
 pub fn benchmark_read_variant(
     filename: &str,
     variant: ReadBenchmarkVariant,
     cache_state: ReadBenchmarkCacheState,
+    strategy: ReadAutoStrategy,
+    mount_info: Option<&MountInfo>,
     page_cache: IOParams,
     direct: IOParams,
 ) -> io::Result<ReadBenchmarkResult> {
     let start = std::time::Instant::now();
+    let file_size = std::fs::metadata(filename)?.len();
     let (bytes_read, file_size, params, phase_timings) = match variant {
         ReadBenchmarkVariant::SingleThreadPageCache => {
-            let block_size = 1024 * 1024;
+            let block_size = benchmark_block_size(file_size);
             let bytes_read = read_file_single_thread_blocking(filename, false, block_size)?;
-            let file_size = std::fs::metadata(filename)?.len();
             let params = ResolvedReadParams {
                 use_direct: false,
                 num_threads: 1,
-                block_size: 1024 * 1024,
+                block_size: block_size as u64,
                 qd: 1,
             };
             (bytes_read, file_size, params, ReadPhaseTimings::default())
         }
         ReadBenchmarkVariant::SingleThreadDirect => {
-            let block_size = 1024 * 1024;
+            let block_size = benchmark_block_size(file_size);
             let bytes_read = read_file_single_thread_blocking(filename, true, block_size)?;
-            let file_size = std::fs::metadata(filename)?.len();
             let params = ResolvedReadParams {
                 use_direct: true,
                 num_threads: 1,
-                block_size: 1024 * 1024,
+                block_size: block_size as u64,
                 qd: 1,
             };
             (bytes_read, file_size, params, ReadPhaseTimings::default())
         }
         ReadBenchmarkVariant::SingleThreadIoUring => {
+            let block_size = benchmark_block_size(file_size) as u64;
+            let qd = benchmark_uring_qd(file_size);
             let params = resolve_reader_params(
                 filename,
                 &IOParams {
                     num_threads: 1,
-                    block_size: 1024 * 1024,
-                    qd: 32,
+                    block_size,
+                    qd,
                 },
                 &IOParams {
                     num_threads: 1,
-                    block_size: 1024 * 1024,
-                    qd: 32,
+                    block_size,
+                    qd,
                 },
                 IOMode::PageCache,
             )?;
             let metrics =
                 visit_file_blocks_with_resolved_params(filename, params, |_| Ok::<_, io::Error>(()))?;
             (metrics.bytes_read, metrics.file_size, params, metrics.phase_timings)
+        }
+        ReadBenchmarkVariant::QuickProbePageCache => {
+            let (bytes_read, file_size, params) =
+                benchmark_quick_probe_page_cache(filename, strategy, mount_info, &page_cache, &direct)?;
+            (bytes_read, file_size, params, ReadPhaseTimings::default())
         }
         ReadBenchmarkVariant::MultiThreadCurrent => {
             let io_mode = match cache_state {
@@ -2393,6 +2800,20 @@ mod tests {
     fn auto_lift_mode_prefers_page_cache_for_resident_file() {
         assert!(auto_lift_mode_for_residency(false) == IOMode::Direct);
         assert!(auto_lift_mode_for_residency(true) == IOMode::PageCache);
+    }
+
+    #[test]
+    fn benchmark_block_size_caps_at_one_megabyte() {
+        assert_eq!(benchmark_block_size(4096), 4096);
+        assert_eq!(benchmark_block_size(80 * 1024 * 1024), 1024 * 1024);
+    }
+
+    #[test]
+    fn benchmark_uring_qd_scales_up_to_four() {
+        assert_eq!(benchmark_uring_qd(4 * 1024), 1);
+        assert_eq!(benchmark_uring_qd(1024 * 1024), 1);
+        assert_eq!(benchmark_uring_qd(3 * 1024 * 1024), 3);
+        assert_eq!(benchmark_uring_qd(80 * 1024 * 1024), 4);
     }
 
     #[test]
