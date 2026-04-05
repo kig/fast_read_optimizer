@@ -1,0 +1,832 @@
+use crate::common::{AlignedBuffer, IOMode, ReadAutoStrategy, ReadPathKind};
+use crate::config::{IOParams, LoadedConfig, MountInfo};
+use crate::io_util::{
+    expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
+};
+use crate::mincore::is_first_page_resident;
+use iou::IoUring;
+use memchr::memmem::Finder;
+use std::fs::File;
+use std::hint::black_box;
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
+use std::ops::Deref;
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+pub struct BufReader<R> {
+    inner: std::io::BufReader<R>,
+}
+
+impl<R: Read> BufReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self::with_capacity(1 << 20, inner)
+    }
+
+    pub fn with_capacity(capacity: usize, inner: R) -> Self {
+        Self {
+            inner: std::io::BufReader::with_capacity(capacity, inner),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_ref(&self) -> &R {
+        self.inner.get_ref()
+    }
+
+    #[allow(dead_code)]
+    pub fn into_inner(self) -> R {
+        self.inner.into_inner()
+    }
+}
+
+fn auto_lift_mode_for_residency(first_page_resident: bool) -> IOMode {
+    if first_page_resident {
+        IOMode::PageCache
+    } else {
+        IOMode::Direct
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn evict_file_cache(filename: &str) -> io::Result<()> {
+    let file = File::open(filename)?;
+    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+pub(crate) fn warm_file_page_cache(filename: &str) -> io::Result<u64> {
+    let file = File::open(filename)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("page-cache warm byte count overflowed"))?;
+    }
+}
+
+
+fn auto_read_cache_state(filename: &str) -> ReadBenchmarkCacheState {
+    match auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false)) {
+        IOMode::PageCache => ReadBenchmarkCacheState::Hot,
+        IOMode::Direct | IOMode::Auto => ReadBenchmarkCacheState::Cold,
+    }
+}
+
+fn choose_path_kind_for_state(
+    strategy: ReadAutoStrategy,
+    cache_state: ReadBenchmarkCacheState,
+    file_size: u64,
+) -> ReadPathKind {
+    match cache_state {
+        ReadBenchmarkCacheState::Hot => {
+            if file_size >= strategy.hot_large_min_bytes {
+                strategy.hot_large_path
+            } else {
+                strategy.hot_small_path
+            }
+        }
+        ReadBenchmarkCacheState::Cold => {
+            if file_size >= strategy.cold_large_min_bytes {
+                strategy.cold_large_path
+            } else {
+                strategy.cold_small_path
+            }
+        }
+    }
+}
+
+impl BufReader<File> {
+    pub fn stdin() -> io::Result<Self> {
+        let stdin_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+        if stdin_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self::new(unsafe { File::from_raw_fd(stdin_fd) }))
+    }
+}
+
+impl<R: Read> Read for BufReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read> BufRead for BufReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedReadParams {
+    pub use_direct: bool,
+    pub num_threads: u64,
+    pub block_size: u64,
+    pub qd: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBenchmarkVariant {
+    SingleThreadPageCache,
+    SingleThreadDirect,
+    SingleThreadIoUring,
+    QuickProbePageCache,
+    MultiThreadCurrent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBenchmarkCacheState {
+    Cold,
+    Hot,
+}
+
+impl ReadBenchmarkVariant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SingleThreadPageCache => "st-page-cache",
+            Self::SingleThreadDirect => "st-direct",
+            Self::SingleThreadIoUring => "st-io-uring",
+            Self::QuickProbePageCache => "quick-probe-page-cache",
+            Self::MultiThreadCurrent => "mt-current",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReadPhaseTimings {
+    pub call_to_threads_created: Option<std::time::Duration>,
+    pub call_to_first_submit: Option<std::time::Duration>,
+    pub call_to_first_completion: Option<std::time::Duration>,
+    pub call_to_wrapup_start: Option<std::time::Duration>,
+    pub call_to_join_done: Option<std::time::Duration>,
+}
+
+impl ReadPhaseTimings {
+    pub fn enabled(self) -> bool {
+        self.call_to_threads_created.is_some()
+            || self.call_to_first_submit.is_some()
+            || self.call_to_first_completion.is_some()
+            || self.call_to_wrapup_start.is_some()
+            || self.call_to_join_done.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBenchmarkResult {
+    pub bytes_read: u64,
+    pub file_size: u64,
+    pub elapsed: std::time::Duration,
+    pub params: ResolvedReadParams,
+    pub phase_timings: ReadPhaseTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisitFileMetrics {
+    pub bytes_read: u64,
+    pub file_size: u64,
+    pub phase_timings: ReadPhaseTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedReadExecution {
+    Simple(ResolvedReadParams),
+    Threaded(ResolvedReadParams),
+}
+
+#[cfg(feature = "read-phase-timing")]
+const READ_PHASE_UNSET: u64 = u64::MAX;
+
+struct ReadPhaseTimingProbe {
+    #[cfg(feature = "read-phase-timing")]
+    start: std::time::Instant,
+    #[cfg(feature = "read-phase-timing")]
+    threads_created_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    first_submit_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    first_completion_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    wrapup_start_ns: AtomicU64,
+    #[cfg(feature = "read-phase-timing")]
+    join_done_ns: AtomicU64,
+}
+
+impl ReadPhaseTimingProbe {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "read-phase-timing")]
+            start: std::time::Instant::now(),
+            #[cfg(feature = "read-phase-timing")]
+            threads_created_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            first_submit_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            first_completion_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            wrapup_start_ns: AtomicU64::new(READ_PHASE_UNSET),
+            #[cfg(feature = "read-phase-timing")]
+            join_done_ns: AtomicU64::new(READ_PHASE_UNSET),
+        }
+    }
+
+    #[cfg(feature = "read-phase-timing")]
+    fn elapsed_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(feature = "read-phase-timing")]
+    fn store_min(slot: &AtomicU64, value: u64) {
+        let mut current = slot.load(Ordering::Relaxed);
+        while value < current {
+            match slot.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn note_threads_created(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.threads_created_ns, self.elapsed_ns());
+    }
+
+    fn note_first_submit(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.first_submit_ns, self.elapsed_ns());
+    }
+
+    fn note_first_completion(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.first_completion_ns, self.elapsed_ns());
+    }
+
+    fn note_wrapup_start(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.wrapup_start_ns, self.elapsed_ns());
+    }
+
+    fn note_join_done(&self) {
+        #[cfg(feature = "read-phase-timing")]
+        Self::store_min(&self.join_done_ns, self.elapsed_ns());
+    }
+
+    fn snapshot(&self) -> ReadPhaseTimings {
+        #[cfg(feature = "read-phase-timing")]
+        {
+            fn load_duration(slot: &AtomicU64) -> Option<std::time::Duration> {
+                let nanos = slot.load(Ordering::Relaxed);
+                if nanos == READ_PHASE_UNSET {
+                    None
+                } else {
+                    Some(std::time::Duration::from_nanos(nanos))
+                }
+            }
+
+            return ReadPhaseTimings {
+                call_to_threads_created: load_duration(&self.threads_created_ns),
+                call_to_first_submit: load_duration(&self.first_submit_ns),
+                call_to_first_completion: load_duration(&self.first_completion_ns),
+                call_to_wrapup_start: load_duration(&self.wrapup_start_ns),
+                call_to_join_done: load_duration(&self.join_done_ns),
+            };
+        }
+
+        #[cfg(not(feature = "read-phase-timing"))]
+        {
+            ReadPhaseTimings::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadToMemoryMode {
+    Auto,
+    PagedSharedBuffer,
+    Mmap,
+    MmapReadPages,
+    MultipleTargetBuffers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HugepageAdvice {
+    Auto,
+    Disabled,
+}
+
+const HUGEPAGE_MIN_FILE_LEN: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadToMemoryOptions {
+    pub hugepages: HugepageAdvice,
+    pub measure_unmap_time: bool,
+}
+
+impl Default for ReadToMemoryOptions {
+    fn default() -> Self {
+        Self {
+            hugepages: HugepageAdvice::Auto,
+            measure_unmap_time: false,
+        }
+    }
+}
+
+impl ReadToMemoryOptions {
+    fn use_hugepages_for_len(self, len: usize) -> bool {
+        match self.hugepages {
+            HugepageAdvice::Auto => len >= HUGEPAGE_MIN_FILE_LEN,
+            HugepageAdvice::Disabled => false,
+        }
+    }
+}
+
+pub fn resolve_to_memory_mode(
+    filename: &str,
+    io_mode: IOMode,
+    requested_mode: ReadToMemoryMode,
+) -> ReadToMemoryMode {
+    match requested_mode {
+        ReadToMemoryMode::Auto => match io_mode {
+            IOMode::Direct => ReadToMemoryMode::PagedSharedBuffer,
+            IOMode::PageCache => ReadToMemoryMode::Mmap,
+            IOMode::Auto => {
+                if is_first_page_resident(filename).unwrap_or(false) {
+                    ReadToMemoryMode::Mmap
+                } else {
+                    ReadToMemoryMode::PagedSharedBuffer
+                }
+            }
+        },
+        other => other,
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LoadedFile {
+    pub data: LoadedData,
+    pub bytes_read: u64,
+    pub params: ResolvedReadParams,
+}
+
+#[derive(Debug)]
+pub enum LoadedData {
+    Aligned(AlignedBuffer),
+    Mapped(MappedReadBuffer),
+}
+
+impl LoadedData {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            LoadedData::Aligned(buffer) => buffer.as_slice(),
+            LoadedData::Mapped(buffer) => buffer.as_slice(),
+        }
+    }
+}
+
+impl Deref for LoadedData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+#[derive(Debug)]
+pub struct MappedReadBuffer {
+    ptr: *const u8,
+    len: usize,
+    map_ptr: *mut libc::c_void,
+    map_len: usize,
+}
+
+impl MappedReadBuffer {
+    fn map(file: &File, len: usize, options: ReadToMemoryOptions) -> std::io::Result<Self> {
+        let map_len = len.max(1);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Err(err) = advise_mapped_read_region(ptr, map_len, options) {
+            unsafe {
+                let _ = libc::munmap(ptr, map_len);
+            }
+            return Err(err);
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+            map_ptr: ptr,
+            map_len,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    #[allow(unused)]
+    pub fn mapped_len(&self) -> usize {
+        self.map_len
+    }
+
+    #[allow(unused)]
+    pub fn unmap_prefix(&mut self, bytes: usize) -> std::io::Result<usize> {
+        if bytes == 0 || self.map_len == 0 {
+            return Ok(0);
+        }
+        let page_size = 4096usize;
+        let unmap_len = (bytes / page_size) * page_size;
+        if unmap_len == 0 {
+            return Ok(0);
+        }
+        let unmap_len = unmap_len.min(self.map_len);
+        let rc = unsafe { libc::munmap(self.map_ptr, unmap_len) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.map_ptr = unsafe { self.map_ptr.add(unmap_len) };
+        self.ptr = self.map_ptr.cast();
+        self.map_len -= unmap_len;
+        self.len = self.len.saturating_sub(unmap_len);
+        Ok(unmap_len)
+    }
+}
+
+impl Drop for MappedReadBuffer {
+    fn drop(&mut self) {
+        if self.map_len == 0 {
+            return;
+        }
+        unsafe {
+            let _ = libc::munmap(self.map_ptr, self.map_len);
+        }
+    }
+}
+
+fn madvise_best_effort(ptr: *mut libc::c_void, len: usize, advice: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::madvise(ptr, len, advice) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+fn advise_mapped_read_region(
+    ptr: *mut libc::c_void,
+    len: usize,
+    options: ReadToMemoryOptions,
+) -> io::Result<()> {
+    madvise_best_effort(ptr, len, libc::MADV_RANDOM)?;
+    if options.use_hugepages_for_len(len) {
+        madvise_best_effort(ptr, len, libc::MADV_HUGEPAGE)?;
+    }
+    Ok(())
+}
+
+unsafe impl Send for MappedReadBuffer {}
+unsafe impl Sync for MappedReadBuffer {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockSpan {
+    start_offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderBlock<'a> {
+    pub block_index: usize,
+    pub offset: u64,
+    pub file_size: u64,
+    pub data: &'a [u8],
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct MappedBlocks<T> {
+    pub blocks: Vec<T>,
+    pub bytes_read: u64,
+    pub file_size: u64,
+    pub params: ResolvedReadParams,
+}
+
+#[allow(dead_code)]
+struct SharedOutput {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for SharedOutput {}
+unsafe impl Sync for SharedOutput {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepScanBlock {
+    offset: u64,
+    len: usize,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    matches: Vec<u64>,
+}
+
+fn block_offset(
+    thread_base: u64,
+    block_id: u64,
+    num_threads: u64,
+    block_size: u64,
+) -> std::io::Result<u64> {
+    let stride = block_id
+        .checked_mul(num_threads)
+        .and_then(|value| value.checked_mul(block_size))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read offset calculation overflowed",
+            )
+        })?;
+    thread_base.checked_add(stride).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read offset calculation overflowed",
+        )
+    })
+}
+
+fn checked_output_offset(offset: u64, len: usize, output_len: usize) -> std::io::Result<usize> {
+    let start = usize::try_from(offset).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination offset does not fit in usize",
+        )
+    })?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination offset calculation overflowed",
+        )
+    })?;
+    if end > output_len {
+        return Err(std::io::Error::other(
+            "read wrote beyond destination buffer",
+        ));
+    }
+    Ok(start)
+}
+
+fn collect_grep_scan_block(block: ReaderBlock<'_>, pattern: &[u8]) -> GrepScanBlock {
+    let overlap = pattern.len().saturating_sub(1);
+    let finder = Finder::new(pattern);
+    GrepScanBlock {
+        offset: block.offset,
+        len: block.data.len(),
+        prefix: block.data[..block.data.len().min(overlap)].to_vec(),
+        suffix: block.data[block.data.len().saturating_sub(overlap)..].to_vec(),
+        matches: finder
+            .find_iter(block.data)
+            .map(|idx| {
+                block
+                    .offset
+                    .checked_add(idx as u64)
+                    .expect("match offset should not overflow")
+            })
+            .collect(),
+    }
+}
+
+fn find_boundary_matches(prev: &GrepScanBlock, next: &GrepScanBlock, pattern: &[u8]) -> Vec<u64> {
+    if pattern.len() <= 1 || prev.suffix.is_empty() || next.prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut joined = Vec::with_capacity(prev.suffix.len() + next.prefix.len());
+    joined.extend_from_slice(&prev.suffix);
+    joined.extend_from_slice(&next.prefix);
+    let boundary = prev.suffix.len();
+    let start_offset = prev.offset + prev.len as u64 - prev.suffix.len() as u64;
+    let finder = Finder::new(pattern);
+
+    finder
+        .find_iter(&joined)
+        .filter(|idx| *idx < boundary && idx + pattern.len() > boundary)
+        .map(|idx| start_offset + idx as u64)
+        .collect()
+}
+
+fn grep_match_offsets(
+    filename: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+    pattern: &[u8],
+) -> std::io::Result<(Vec<u64>, u64)> {
+    let blocks = map_file_blocks(
+        filename,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+        {
+            let pattern = pattern.to_vec();
+            move |block| Ok::<_, std::io::Error>(collect_grep_scan_block(block, &pattern))
+        },
+    )?;
+
+    let mut all_matches = Vec::new();
+    for block in &blocks.blocks {
+        all_matches.extend(block.matches.iter().copied());
+    }
+    for pair in blocks.blocks.windows(2) {
+        all_matches.extend(find_boundary_matches(&pair[0], &pair[1], pattern));
+    }
+    all_matches.sort_unstable();
+    all_matches.dedup();
+    Ok((all_matches, blocks.bytes_read))
+}
+
+pub fn grep_match_offsets_for_mode(
+    config: &LoadedConfig,
+    mode: &str,
+    filename: &str,
+    io_mode: IOMode,
+    pattern: &[u8],
+) -> std::io::Result<(Vec<u64>, u64)> {
+    let page_cache = config.get_params_for_path(mode, false, filename);
+    let direct = config.get_params_for_path(mode, true, filename);
+    grep_match_offsets(
+        filename,
+        page_cache.num_threads,
+        page_cache.block_size,
+        page_cache.qd,
+        direct.num_threads,
+        direct.block_size,
+        direct.qd,
+        io_mode,
+        pattern,
+    )
+}
+
+#[allow(dead_code)]
+fn validate_read_params(params: ResolvedReadParams) -> std::io::Result<()> {
+    if params.num_threads == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "num_threads must be greater than zero",
+        ));
+    }
+    if params.block_size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "block_size must be greater than zero",
+        ));
+    }
+    if params.qd == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "qd must be greater than zero",
+        ));
+    }
+    if params.use_direct && params.num_threads > 1 && params.block_size % 4096 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "direct IO requires a 4096-byte-aligned block size, got {}",
+                params.block_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn resolve_reader_params(
+    filename: &str,
+    page_cache: &IOParams,
+    direct: &IOParams,
+    io_mode: IOMode,
+) -> std::io::Result<ResolvedReadParams> {
+    let file_cached = match is_first_page_resident(filename) {
+        Ok(true) => io_mode != IOMode::Direct,
+        _ => io_mode == IOMode::PageCache,
+    };
+    let use_direct = (!file_cached) || io_mode == IOMode::Direct;
+
+    let params = if use_direct {
+        ResolvedReadParams {
+            use_direct,
+            num_threads: direct.num_threads,
+            block_size: direct.block_size,
+            qd: direct.qd,
+        }
+    } else {
+        ResolvedReadParams {
+            use_direct,
+            num_threads: page_cache.num_threads,
+            block_size: page_cache.block_size,
+            qd: page_cache.qd,
+        }
+    };
+    validate_read_params(params)?;
+    Ok(params)
+}
+
+#[allow(dead_code)]
+pub fn resolve_reader_params_for_mode(
+    config: &LoadedConfig,
+    mode: &str,
+    filename: &str,
+    io_mode: IOMode,
+) -> std::io::Result<ResolvedReadParams> {
+    match execution::resolve_reader_execution_for_mode(config, mode, filename, io_mode)? {
+        ResolvedReadExecution::Simple(params) | ResolvedReadExecution::Threaded(params) => Ok(params),
+    }
+}
+
+
+mod execution;
+mod workers;
+mod api;
+#[cfg(test)]
+mod tests;
+#[cfg(kani)]
+mod kani_proofs;
+
+pub use api::*;
+
+unsafe fn output_slice_mut(output: &SharedOutput, offset: usize, len: usize) -> &mut [u8] {
+    std::slice::from_raw_parts_mut(output.ptr.add(offset), len)
+}
+
+fn read_all_bytes(data: &[u8], num_threads: u64) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let checksum = Arc::new(AtomicU64::new(0));
+    let thread_count = num_threads.max(1) as usize;
+    let shared = Arc::new(SharedOutput {
+        ptr: data.as_ptr() as *mut u8,
+        len: data.len(),
+    });
+    let mut threads = Vec::new();
+    let chunk_size = data.len().div_ceil(thread_count);
+
+    for thread_id in 0..thread_count {
+        let checksum = Arc::clone(&checksum);
+        let shared = Arc::clone(&shared);
+        threads.push(std::thread::spawn(move || {
+            let start = thread_id * chunk_size;
+            let end = shared.len.min(start + chunk_size);
+            let mut local = 0u64;
+            for offset in start..end {
+                let value = unsafe { *shared.ptr.add(offset) as u64 };
+                local = local.wrapping_add(value);
+            }
+            checksum.fetch_add(local, Ordering::Relaxed);
+        }));
+    }
+
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("page-touch worker thread panicked"))?;
+    }
+    black_box(checksum.load(Ordering::Relaxed));
+    Ok(())
+}

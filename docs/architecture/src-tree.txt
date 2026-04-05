@@ -1,7 +1,25 @@
 src/
   bin/
+    fro_benchmark_impl/
+      mod.rs
+      run.rs
+      test_matrix.rs
+      tests.rs
+    fro_optimize_impl/
+      cli_utils.rs
+      inspect.rs
+      mod.rs
+      run.rs
+      tests.rs
     fro-benchmark.rs
     fro-optimize.rs
+  block_hash/
+    mod.rs
+    ops.rs
+    tests.rs
+  config/
+    mod.rs
+    tests.rs
   coreutils/
     base64/
       process/
@@ -24,16 +42,45 @@ src/
     shred.rs
     tac.rs
     wc.rs
+  main_app/
+    cli/
+      args.rs
+      execute.rs
+      mod.rs
+    recursive/
+      bench.rs
+      openat.rs
+      paths.rs
+    copy_plan.rs
+    file_list.rs
+    help.rs
+    mod.rs
+    read_sweep.rs
+    recursive.rs
+    tests.rs
+    tuning.rs
+    util.rs
+  reader/
+    api.rs
+    execution.rs
+    kani_proofs.rs
+    mod.rs
+    tests.rs
+    workers.rs
   stream/
     parallel_stream.rs
     parallel_stream_to_file.rs
     tests.rs
     transform.rs
+  writer/
+    api.rs
+    copy_ops.rs
+    kani_proofs.rs
+    mod.rs
+    tests.rs
   api.rs
   blake3_hash.rs
-  block_hash.rs
   common.rs
-  config.rs
   dd_tool.rs
   differ.rs
   file_hash.rs
@@ -42,7 +89,5 @@ src/
   main.rs
   mincore.rs
   optimizer.rs
-  reader.rs
   stream.rs
   verified_copy.rs
-  writer.rs

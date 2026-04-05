@@ -1,13 +1,6 @@
 pub const MAX_FILE_LINES: usize = 1000;
 
-pub const MAX_FILE_LINES_ALLOWLIST: &[&str] = &[
-    "src/block_hash.rs",
-    "src/bin/fro-benchmark.rs",
-    "src/bin/fro-optimize.rs",
-    "src/main.rs",
-    "src/reader.rs",
-    "src/writer.rs",
-];
+pub const MAX_FILE_LINES_ALLOWLIST: &[&str] = &[];
 
 pub const FILE_SIZE_ROOTS: &[&str] = &["src", "tests", "examples", "janitor/src"];
 
