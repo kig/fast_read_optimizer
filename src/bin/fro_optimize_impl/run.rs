@@ -312,10 +312,14 @@ pub(super) fn main_impl() {
             let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
             for p in patterns.iter() {
                 let pattern = p.as_str();
-                if cfg[0].starts_with(pattern)
-                    || ((pattern == "read-to-memory" || pattern == "read_to_memory")
-                        && is_to_memory)
-                {
+                let matches_plain_read = cfg[0] == "read"
+                    && !is_to_memory
+                    && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
+                let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
+                    && is_to_memory;
+                let matches_other = cfg[0].starts_with(pattern)
+                    && !(cfg[0] == "read" && is_to_memory && pattern == "read");
+                if matches_plain_read || matches_read_to_memory || matches_other {
                     ok = true;
                     break;
                 }

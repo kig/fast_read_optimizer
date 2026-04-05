@@ -42,17 +42,29 @@ const RECURSIVE_TREE_MIN_FILE_SIZE: u64 = 4 * 1024;
 const RECURSIVE_TREE_FILES_PER_DIR: usize = 100;
 const RECURSIVE_TREE_POWER_ALPHA: f64 = 1.15;
 
-fn parse_reported_gbps(text: &str) -> Option<f64> {
+#[derive(Debug, Clone, PartialEq)]
+struct FroRunSummary {
+    gbps: f64,
+    params: Option<Vec<u64>>,
+}
+
+fn parse_reported_summary(text: &str) -> Option<FroRunSummary> {
     for line in text.lines().rev() {
         if !(line.contains(" bytes in ") || line.contains(" bytes across ")) {
             continue;
         }
-        if let Some(idx) = line.rfind(" GB/s") {
-            let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
-            if let Ok(num) = line[start..idx].trim().parse::<f64>() {
-                return Some(num);
-            }
-        }
+        let idx = line.rfind(" GB/s")?;
+        let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let gbps = line[start..idx].trim().parse::<f64>().ok()?;
+        let params = line.rfind('[').and_then(|open| {
+            line[open..].split_once(']').map(|(body, _)| {
+                body.trim_start_matches('[')
+                    .split(',')
+                    .filter_map(|part| part.trim().parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            })
+        }).filter(|vals| !vals.is_empty());
+        return Some(FroRunSummary { gbps, params });
     }
     None
 }

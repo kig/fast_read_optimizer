@@ -176,6 +176,18 @@ pub(super) fn main_impl() {
         return;
     }
 
+    let wants_large_hot_source = selected_tests.iter().any(|t| {
+        matches!(t.cache_state, CacheState::Hot)
+            && matches!(t.bytes_hint, BytesHint::SourceFile)
+            && (t.args.first().map(String::as_str) == Some("read")
+                || t.args.first().map(String::as_str) == Some("grep"))
+    });
+    if test_size.is_none() && wants_large_hot_source {
+        let recommended_hot_source_size = 4 * 1024 * 1024 * 1024;
+        min_test_size = min_test_size.max(recommended_hot_source_size);
+        max_test_size = max_test_size.max(recommended_hot_source_size);
+    }
+
     if iters != 1 {
         for t in &mut selected_tests {
             let mut j = 0;
@@ -329,6 +341,7 @@ pub(super) fn main_impl() {
         );
         println!("  est_user_writes: {}", format_bytes(est_user_writes));
         println!("  max_drive_writes: {}", max_drive_writes);
+        println!("  large_hot_source: {}", wants_large_hot_source);
         println!("  repeat_count: {}", repeat_count);
         println!("  selected_benchmarks:");
         for t in &selected_tests {
@@ -402,6 +415,7 @@ pub(super) fn main_impl() {
         let mut min_speed = f64::INFINITY;
         let mut max_speed = 0.0_f64;
         let mut outputs = Vec::with_capacity(repeat_count);
+        let mut run_summaries: Vec<Option<FroRunSummary>> = Vec::with_capacity(repeat_count);
 
         for _ in 0..repeat_count {
             if matches!(t.bytes_hint, BytesHint::RecursiveTree)
@@ -442,8 +456,12 @@ pub(super) fn main_impl() {
                     size,
                 )),
             };
+            let summary = match t.kind {
+                CommandKind::Fro => parse_reported_summary(&combined),
+                CommandKind::ExternalDiscardStdout => None,
+            };
             let speed = match t.kind {
-                CommandKind::Fro => parse_reported_gbps(&combined).unwrap_or_else(|| {
+                CommandKind::Fro => summary.as_ref().map(|s| s.gbps).unwrap_or_else(|| {
                     bytes_for_effective_speed
                         .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
                         .unwrap_or(0.0)
@@ -455,6 +473,7 @@ pub(super) fn main_impl() {
             min_speed = min_speed.min(speed);
             max_speed = max_speed.max(speed);
             outputs.push(combined);
+            run_summaries.push(summary);
         }
 
         let best_speed = max_speed;
@@ -475,9 +494,17 @@ pub(super) fn main_impl() {
             "PASS"
         };
 
+        let best_params = run_summaries
+            .iter()
+            .filter_map(|summary| summary.as_ref())
+            .find(|summary| (summary.gbps - best_speed).abs() < 1e-9)
+            .and_then(|summary| summary.params.as_ref())
+            .map(|params| format!(" {:?}", params))
+            .unwrap_or_default();
+
         println!(
-            "{:<35} | {:<12.2} | {:<12.2} | {:<12.2} | {:<12.2} | {}",
-            t.name, best_speed, min_speed, max_speed, t.target, status
+            "{:<35} | {:<12.2} | {:<12.2} | {:<12.2} | {:<12.2} | {}{}",
+            t.name, best_speed, min_speed, max_speed, t.target, status, best_params
         );
 
         if best_speed == 0.0 {

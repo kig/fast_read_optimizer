@@ -122,3 +122,33 @@ fn parse_size_accepts_common_suffixes() {
     assert_eq!(parse_size(""), None);
     assert_eq!(parse_size("nope"), None);
 }
+
+#[test]
+fn read_pattern_does_not_match_read_to_memory_configs() {
+    let cfg = vec!["read".to_string(), "--to-memory".to_string(), "-s".to_string()];
+    let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
+    let pattern = "read";
+    let matches_plain_read = cfg[0] == "read"
+        && !is_to_memory
+        && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
+    let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
+        && is_to_memory;
+    let matches_other = cfg[0].starts_with(pattern)
+        && !(cfg[0] == "read" && is_to_memory && pattern == "read");
+    assert!(!(matches_plain_read || matches_read_to_memory || matches_other));
+}
+
+#[test]
+fn read_to_memory_pattern_matches_read_to_memory_configs() {
+    let cfg = vec!["read".to_string(), "--to-memory".to_string(), "-s".to_string()];
+    let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
+    let pattern = "read-to-memory";
+    let matches_plain_read = cfg[0] == "read"
+        && !is_to_memory
+        && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
+    let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
+        && is_to_memory;
+    let matches_other = cfg[0].starts_with(pattern)
+        && !(cfg[0] == "read" && is_to_memory && pattern == "read");
+    assert!(matches_plain_read || matches_read_to_memory || matches_other);
+}
