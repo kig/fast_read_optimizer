@@ -370,6 +370,72 @@ impl<T> Default for RecursiveTaskQueue<T> {
     }
 }
 
+pub(crate) fn resolve_recursive_move_target(source_root: &Path, target: &Path) -> io::Result<PathBuf> {
+    recursive::paths::resolve_recursive_copy_root(source_root, target)
+}
+
+pub(crate) fn copy_directory_recursively(
+    source_root: &Path,
+    target_root: &Path,
+    io_mode_read: common::IOMode,
+    io_mode_write: common::IOMode,
+    verbose: bool,
+) -> io::Result<u64> {
+    let config = config::load_config(None);
+    let target_str = target_root.to_string_lossy();
+    let params_page_cache = config.get_params_for_path("copy", false, target_str.as_ref());
+    let params_direct = config.get_params_for_path("copy", true, target_str.as_ref());
+    let params_copy_range = config.get_copy_range_params_for_path(target_str.as_ref());
+    let recursive_ctx = RecursiveCopyContext {
+        config,
+        source_root: source_root.to_path_buf(),
+        target_root: target_root.to_path_buf(),
+        optimizer_params: [
+            params_page_cache.num_threads,
+            params_page_cache.block_size,
+            params_page_cache.qd as u64,
+            params_direct.num_threads,
+            params_direct.block_size,
+            params_direct.qd as u64,
+            params_copy_range.num_threads,
+            params_copy_range.block_size,
+            params_copy_range.qd as u64,
+        ],
+        requested_strategy: CopyStrategy::Auto,
+        rewrite_mode: CopyRewriteMode::Auto,
+        io_mode_read,
+        io_mode_write,
+        keep_target_size: false,
+        use_lock: true,
+        relative_copy_method: RelativeCopyMethod::CopyFileRange,
+    };
+    recursive::run_recursive_copy(recursive_ctx, verbose)
+}
+
+pub(crate) fn remove_path_recursively(path: &Path, verbose: bool) -> io::Result<u64> {
+    recursive::delete::run_recursive_delete(path, verbose)
+}
+
+pub(crate) fn create_tar_archive(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
+    recursive::archive::create_uncompressed_tar(source, output, verbose)
+}
+
+pub(crate) fn bench_tar_archive(
+    variant: &str,
+    source: &Path,
+    target: Option<&Path>,
+    io_mode_read: common::IOMode,
+    io_mode_write: common::IOMode,
+) -> io::Result<u64> {
+    recursive::archive::bench_tar_archive_variant(
+        variant,
+        source,
+        target,
+        io_mode_read,
+        io_mode_write,
+    )
+}
+
 pub(super) fn main() {
     cli::main();
 }

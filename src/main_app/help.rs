@@ -210,6 +210,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[],
             examples: &[("Hash one file with SHA-512", "sha512sum bigfile.dat")],
         }),
+        "tar" => Some(CommandHelp {
+            name: "tar",
+            usage: "tar -cf <archive.tar> [-v] <source>",
+            summary: "Create an uncompressed ustar archive from a file or directory tree.",
+            notes: &["Only create mode is currently implemented; extraction stays delegated to system tar."],
+            examples: &[("Archive one directory", "tar -cf tree.tar mytree")],
+        }),
         "shred" => Some(CommandHelp {
             name: "shred",
             usage: "shred [-n passes] [-z] [-u] [--auto|--no-direct|--direct] <file> [file ...]",
@@ -510,6 +517,30 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "bench-memcpy --size 4GiB --threads 32",
             )],
         }),
+        "bench-tar-archive" => Some(CommandHelp {
+            name: "bench-tar-archive",
+            usage: "bench-tar-archive <ram|ram-write|mmap-file> <source-dir> [target-file]",
+            summary: "Benchmark tar archive assembly into RAM, RAM+write, or an mmap-backed target file.",
+            notes: &[
+                "ram: precompute tar offsets, write headers, and copy payload blocks into a preallocated RAM archive buffer.",
+                "ram-write: build the tar archive in RAM, then flush it with the existing parallel file-write helpers.",
+                "mmap-file: map the output file and write the archive directly into the mapping before msync.",
+            ],
+            examples: &[
+                (
+                    "Benchmark tar archive construction into RAM only",
+                    "bench-tar-archive ram /data/ilmari_cache/fro-test/tar-mixedbench",
+                ),
+                (
+                    "Benchmark tar archive construction in RAM plus parallel file write",
+                    "bench-tar-archive ram-write /data/ilmari_cache/fro-test/tar-mixedbench /data/ilmari_cache/fro-test/tar-mixedbench.tar",
+                ),
+                (
+                    "Benchmark writing the archive directly into an mmap-backed target file",
+                    "bench-tar-archive mmap-file /data/ilmari_cache/fro-test/tar-mixedbench /data/ilmari_cache/fro-test/tar-mixedbench.tar",
+                ),
+            ],
+        }),
         "bench-base64-encode" => Some(CommandHelp {
             name: "bench-base64-encode",
             usage: "bench-base64-encode [-n iterations] [--variant auto|scalar|spmd|shuffle]",
@@ -716,6 +747,7 @@ pub(super) fn print_general_help(program: &str) {
     println!("  fro-benchmark      run the regression benchmark suite");
     println!("  bench-diff         in-memory diff microbenchmark");
     println!("  bench-memcpy       in-memory memcpy microbenchmark");
+    println!("  bench-tar-archive  benchmark tar assembly into RAM / RAM+write / mmap file");
     println!("  bench-base64-encode base64 encode kernel microbenchmark");
     println!("  bench-base64-decode base64 decode kernel microbenchmark");
     println!("  bench-base64-wrapped-encode wrapped base64 encode path microbenchmark");
@@ -733,7 +765,7 @@ pub(super) fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp dd fgrep find du cat base64 tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp dd fgrep find du rm mv tar cat base64 tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

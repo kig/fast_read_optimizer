@@ -91,3 +91,117 @@ This repo’s main automated verification is the benchmark runner binary:
 - Auto-write expectations:
   - for cold write benchmarking, `auto` should land on the direct-write path when that is the faster mode for the target
   - if `write (auto, cold)` behaves like cached writes, verify the code path before re-tuning config
+
+## Performance review protocol for agentic turns
+
+When a user asks about performance, throughput, or regressions, follow this protocol before making claims or proposing fixes:
+
+- **State the proposition precisely before reasoning from numbers.**
+  - Example: distinguish `archive build throughput`, `write engine throughput`, `msync/fsync durability cost`, and `end-to-end wall time`.
+  - Do not compare `bytes / (build + write + sync)` against a claim that was about raw write throughput.
+
+- **Decompose end-to-end timings into named phases.**
+  - For any benchmark path that contains multiple substantial stages, print and analyze at least:
+    - setup/allocation time
+    - payload/build/copy time
+    - write submission/completion time
+    - durability barriers such as `msync`, `fsync`, `sync_all`, directory sync
+  - Do not attribute a slow total to one subsystem until the phase split shows that subsystem dominates.
+
+- **Check for hidden O(n) work before blaming the fast path.**
+  - Inspect the benchmark/helper code for:
+    - cloning large buffers
+    - extra `Vec` materialization
+    - repeated allocation/zeroing
+    - avoidable `mmap`/`munmap`
+    - extra format conversion or manifest rebuilding inside the timed region
+  - If a benchmark reports unexpectedly low throughput, audit for accidental pre-copy or pre-processing overhead before speculating about IO limits.
+
+- **Validate warm vs cold explicitly.**
+  - If the first run differs sharply from reruns, record both and label them.
+  - Do not present a cold first-run result as the canonical steady-state number for RAM or hot-cache paths.
+  - For hot-path claims, require at least one warm rerun before drawing conclusions.
+
+- **Compare against an in-repo baseline on the same mount and size.**
+  - When a result seems wrong, run the closest existing benchmark or command on the same target path, same data size, and same IO mode.
+  - Prefer comparisons like:
+    - `bench-tar-archive ram-write` vs `fro write --create ...`
+    - `tar` large-file path vs `fro cp -r`
+    - mmap-file path vs existing write/mmap benches
+  - Do not compare across different mounts, cache states, or durability semantics unless that difference is the point of the experiment.
+
+- **Use stdlib or ad hoc programs only as controls, never as the primary proof for `fro`.**
+  - A standalone `std::io::BufReader` / `BufWriter` test program does not exercise the tuned `fro` path and therefore cannot prove a `fro` regression or optimization.
+  - External microprograms may be used as sanity checks or controls, but label them explicitly as external baselines.
+  - Do not infer anything about `fro` performance from an external control until the same claim is reproduced on the real in-tree `fro` path with matching mount, size, cache state, and sync semantics.
+
+- **Verify that the intended optimized API is actually the one being exercised.**
+  - Before concluding that an optimized path is slow, inspect the call chain and confirm:
+    - the benchmark reaches the intended helper
+    - the helper is configured with the mount-specific tuned params
+    - the IO mode (`direct`/`page-cache`/`auto`) is the one being claimed
+    - direct-IO alignment rules are not silently forcing fallback behavior
+
+- **Treat helper semantics as part of the benchmark contract.**
+  - If a public helper is used as a benchmarked primitive, audit whether it performs extra work beyond the name's apparent promise.
+  - Example: `write_buffer_range(...)` must not clone the entire source slice when the benchmark claim is about RAM-to-file write throughput.
+
+- **Treat `/dev/null` and in-memory targets as upper bounds, not substitutes for real-target claims.**
+  - `/dev/null` can show payload-generation or read-side ceiling behavior, but it does not measure archive-file destination behavior.
+  - RAM-only assembly can show what the copy/build path can do without destination writeback, but it does not prove real-file tar performance.
+  - Use these as diagnostic ceilings and explicitly label them as such.
+
+- **Prefer first-class in-tree commands over temporary harnesses when presenting final numbers.**
+  - Temporary benchmark crates or one-off binaries are acceptable for fast exploration.
+  - But before presenting a result as the current project behavior, reproduce it through the closest committed command or helper in the repository.
+  - If the temporary harness and the in-tree command disagree, investigate the semantic difference before drawing conclusions.
+
+- **Re-state the exact benchmark intent when the user is distinguishing between similar paths.**
+  - In this repo, “serialize a tar archive in userspace” and “use the cp-r style read path into precomputed tar offsets in RAM” are different propositions.
+  - If the user is asking for the latter, do not substitute the former just because both produce tar bytes.
+  - When there are multiple plausible benchmark meanings, explicitly name the one being implemented before measuring.
+
+- **Do not delay the compile-and-run proof for new benchmark surfaces.**
+  - If a new command or benchmark mode is being added, compile it and run it early rather than stacking more reasoning on unvalidated code.
+  - Late validation increases the chance of reasoning from a path that does not yet build or whose CLI semantics are still wrong.
+
+- **Keep measurement semantics aligned across comparisons.**
+  - Match at least the following before comparing throughput numbers:
+    - source payload size
+    - target mount/device
+    - cache temperature
+    - direct/page-cache mode
+    - whether durability work (`msync`/`fsync`/directory sync) is included
+    - whether data is copied, generated, or reused in memory
+  - If one of these differs, name that mismatch explicitly instead of presenting the numbers as directly comparable.
+
+- **Use formal contradiction checks before accepting a surprising result.**
+  - If measured throughput contradicts a validated baseline or known-good path, explicitly test the alternatives:
+    - either the code path differs,
+    - or the timed region includes extra work,
+    - or cache/durability conditions differ.
+  - Resolve which proposition is false before proposing an optimization.
+
+- **Only write performance conclusions that survive cross-checks.**
+  - A conclusion is not ready to present until it is consistent with:
+    - the phase timing split,
+    - the helper/code inspection,
+    - the same-mount baseline,
+    - and the warm/cold labeling.
+
+### Critique of this protocol
+
+- This protocol adds overhead and can slow down agent turns.
+  - Response: use the cheapest checks that falsify the bad explanation first: inspect the timed helper, split phases, and run one same-mount baseline before escalating to `perf`/`strace`.
+
+- It can still miss errors caused by benchmark code that mutates across turns.
+  - Response: after each benchmark-path edit, rerun the nearest baseline immediately so any semantic drift is caught while context is fresh.
+
+- It may overfocus on throughput and miss correctness or semantics differences.
+  - Response: always pair performance comparisons with semantic checks: same payload size, same target semantics, same sync/durability behavior, same cache mode.
+
+- It can become a long checklist that agents cargo-cult without prioritizing.
+  - Response: apply the protocol in falsification order: first verify path identity and timing semantics, then same-mount baseline, then warm/cold state, and only then escalate to heavier tracing.
+
+- It may bias agents toward excessive benchmarking of controls rather than the product path.
+  - Response: require that every external control or temporary harness be paired with a reproduction on the real `fro` path before using it in a final conclusion.

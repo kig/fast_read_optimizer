@@ -364,7 +364,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
             } else if filename.is_empty() {
                 filename = args[i].clone();
             }
-        } else if mode == "manifest-recursive-copy-bench" {
+        } else if mode == "manifest-recursive-copy-bench" || mode == "bench-tar-archive" {
             if filename.is_empty() {
                 filename = args[i].clone();
             } else {
@@ -449,6 +449,16 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         }
         writer::bench_write(&filename);
         return Ok(ParseOutcome::Early(0));
+    }
+    if mode == "bench-tar-archive" {
+        if filename.is_empty() {
+            println!("Variant missing");
+            return Ok(ParseOutcome::Early(1));
+        }
+        if extra_paths.is_empty() {
+            println!("Source path missing");
+            return Ok(ParseOutcome::Early(1));
+        }
     }
 
     if filename.is_empty() {

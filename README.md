@@ -41,7 +41,7 @@ cargo build --release --examples
 cargo install --path .
 ```
 
-`fro` also supports a small BusyBox-style multicall surface via `argv[0]`. If you symlink the `fro` binary to names such as `cp`, `cmp`, `fgrep`, `cat`, `tac`, `wc`, `find`, `cksum`, `b3sum`, `b2sum`, `md5sum`, `sha256sum`, or `shred`, it dispatches to the corresponding `fro`-backed implementation.
+`fro` also supports a small BusyBox-style multicall surface via `argv[0]`. If you symlink the `fro` binary to names such as `cp`, `cmp`, `fgrep`, `cat`, `tac`, `wc`, `find`, `rm`, `mv`, `tar`, `cksum`, `b3sum`, `b2sum`, `md5sum`, `sha256sum`, or `shred`, it dispatches to the corresponding `fro`-backed implementation.
 
 Current coreutils snapshot on `/data/ilmari_cache/fro-test/coreutils-1g.bin` (1 GiB, best of 3, hot page cache for non-direct runs):
 

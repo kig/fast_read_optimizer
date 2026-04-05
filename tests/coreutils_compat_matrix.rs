@@ -252,7 +252,11 @@ mod du;
 mod fifo;
 #[path = "coreutils_compat_matrix/hash.rs"]
 mod hash;
+#[path = "coreutils_compat_matrix/rm_mv.rs"]
+mod rm_mv;
 #[path = "coreutils_compat_matrix/stream_coreutils.rs"]
 mod stream_coreutils;
+#[path = "coreutils_compat_matrix/tar.rs"]
+mod tar;
 #[path = "coreutils_compat_matrix/wc.rs"]
 mod wc;

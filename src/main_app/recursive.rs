@@ -2,7 +2,9 @@ use super::*;
 use crate::config;
 use crate::main_app::copy_plan::{resolve_copy_execution, CopyRewriteMode, ResolvedCopyExecution};
 
+pub(crate) mod archive;
 pub(super) mod bench;
+pub(crate) mod delete;
 pub(super) mod openat;
 pub(super) mod paths;
 

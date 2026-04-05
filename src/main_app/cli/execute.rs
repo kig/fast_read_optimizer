@@ -1,5 +1,6 @@
 use super::*;
 use super::args::ParsedArgs;
+use crate::main_app::bench_tar_archive;
 use crate::main_app::copy_plan::{describe_copy_path, resolve_copy_execution};
 use crate::main_app::recursive::bench::{bench_recursive_read, bench_recursive_small_file_threads};
 use crate::main_app::recursive::paths::resolve_recursive_copy_root;
@@ -217,6 +218,9 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 save_config,
                 small_file_thread_cache_state,
             )
+        } else if mode == "bench-tar-archive" {
+            let target = extra_paths_owned.get(1).map(Path::new);
+            bench_tar_archive(&filename, Path::new(extra_paths_owned[0].as_str()), target, io_mode, io_mode_write)
         } else if mode == "hash" {
             if hash_only || iterations > 1 {
                 let manifest = hash_file_blocks(

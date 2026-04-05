@@ -35,6 +35,13 @@ fn run_fro(command: &str, args: &[&str]) -> Output {
         .expect("failed to run fro coreutils command")
 }
 
+fn run_system(program: &str, args: &[&str]) -> Output {
+    Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+}
+
 fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fro"))
         .arg(command)
@@ -123,11 +130,33 @@ fn multicall_aliases_cover_existing_copy_diff_and_grep_modes() {
         &[source.to_str().unwrap(), target.to_str().unwrap()],
     ));
 
+    let moved = tmp.join("moved.bin");
+    assert_success(run_fro(
+        "mv",
+        &[target.to_str().unwrap(), moved.to_str().unwrap()],
+    ));
+    assert_eq!(fs::read(&moved).unwrap(), bytes);
+    assert!(!target.exists());
+
     let grep = assert_success(run_fro(
         "fgrep",
         &["-n", "needle", grep_target.to_str().unwrap()],
     ));
     assert_eq!(String::from_utf8_lossy(&grep.stdout), "2:needle beta\n");
+
+    assert_success(run_fro("rm", &[moved.to_str().unwrap()]));
+    assert!(!moved.exists());
+
+    let archive = tmp.join("bundle.tar");
+    assert_success(run_fro(
+        "tar",
+        &["-cf", archive.to_str().unwrap(), source.to_str().unwrap()],
+    ));
+    let listing = assert_success(run_system("tar", &["-tf", archive.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&listing.stdout).trim(),
+        source.file_name().unwrap().to_string_lossy()
+    );
 }
 
 #[test]

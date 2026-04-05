@@ -1,5 +1,27 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct SharedWriteBuffer {
+    ptr: *const u8,
+    len: usize,
+}
+
+unsafe impl Send for SharedWriteBuffer {}
+unsafe impl Sync for SharedWriteBuffer {}
+
+impl SharedWriteBuffer {
+    fn new(data: &[u8]) -> Self {
+        Self {
+            ptr: data.as_ptr(),
+            len: data.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 pub fn write_file(
     filename: &str,
     create_size: Option<u64>,
@@ -241,7 +263,7 @@ pub fn write_buffer_range(
     };
     let qd = if direct_write { qd_d } else { qd_p };
     let total_size = slice.len() as u64;
-    let source_buffer: Arc<[u8]> = Arc::from(slice);
+    let source_buffer = SharedWriteBuffer::new(slice);
 
     {
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
@@ -256,7 +278,7 @@ pub fn write_buffer_range(
     for thread_id in 0..num_threads {
         let write_count = write_count.clone();
         let filename = filename.to_string();
-        let source_buffer = Arc::clone(&source_buffer);
+        let source_buffer = source_buffer;
         threads.push(std::thread::spawn(move || -> io::Result<()> {
             let dest_file_nodir = OpenOptions::new().write(true).open(&filename)?;
             let dest_file_dir = open_direct_writer_or_fallback(&filename, &dest_file_nodir)?;
@@ -264,7 +286,7 @@ pub fn write_buffer_range(
             thread_writer(
                 thread_id,
                 None,
-                Some(source_buffer.as_ref()),
+                Some(source_buffer.as_slice()),
                 (&dest_file_dir, &dest_file_nodir),
                 0,
                 0,
@@ -494,4 +516,3 @@ pub fn bench_write(filename: &str) {
     let dur = start.elapsed().as_secs_f64();
     println!("Standard write 1 GB in {:.4} s, {:.1} GB/s", dur, 1.0 / dur);
 }
-

@@ -38,9 +38,12 @@ src/
     hash.rs
     head.rs
     mod.rs
+    mv.rs
     pv.rs
+    rm.rs
     shred.rs
     tac.rs
+    tar.rs
     wc.rs
   main_app/
     cli/
@@ -48,7 +51,11 @@ src/
       execute.rs
       mod.rs
     recursive/
+      archive/
+        bench.rs
+      archive.rs
       bench.rs
+      delete.rs
       openat.rs
       paths.rs
     copy_plan.rs

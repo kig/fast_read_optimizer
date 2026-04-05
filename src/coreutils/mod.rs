@@ -29,8 +29,11 @@ mod find;
 mod hash;
 mod head;
 mod pv;
+mod rm;
 mod shred;
 mod tac;
+mod tar;
+mod mv;
 mod wc;
 
 pub(crate) use base64::{
@@ -59,6 +62,9 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "sha384sum"
             | "sha512sum"
             | "head"
+            | "rm"
+            | "mv"
+            | "tar"
             | "pv"
             | "shred"
     )
@@ -184,6 +190,9 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             pv::run_pv(args)?;
             0
         }
+        "rm" => rm::run_rm(args)?,
+        "mv" => mv::run_mv(args)?,
+        "tar" => tar::run_tar(args)?,
         "shred" => {
             shred::run_shred(args)?;
             0
