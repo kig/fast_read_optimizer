@@ -10,14 +10,24 @@ pub(in crate::main_app) fn open_dir_fd(path: &Path) -> io::Result<fs::File> {
             format!("path contains interior NUL: {}", path.display()),
         )
     })?;
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
-pub(super) fn open_relative_fd(dir: &fs::File, relative: &Path, flags: i32, mode: libc::mode_t) -> io::Result<fs::File> {
+pub(super) fn open_relative_fd(
+    dir: &fs::File,
+    relative: &Path,
+    flags: i32,
+    mode: libc::mode_t,
+) -> io::Result<fs::File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -27,7 +37,14 @@ pub(super) fn open_relative_fd(dir: &fs::File, relative: &Path, flags: i32, mode
             format!("path contains interior NUL: {}", relative.display()),
         )
     })?;
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c_rel.as_ptr(), flags | libc::O_CLOEXEC, mode) };
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_rel.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -113,7 +130,11 @@ pub(super) fn copy_openat_via_sendfile(
         }
         return Err(io::Error::new(
             err.kind(),
-            format!("sendfile/openat failed for {}: {}", relative_path.display(), err),
+            format!(
+                "sendfile/openat failed for {}: {}",
+                relative_path.display(),
+                err
+            ),
         ));
     }
     Ok(copied_total)
@@ -178,8 +199,11 @@ pub(in crate::main_app) fn copy_small_file_openat(
     method: RelativeCopyMethod,
 ) -> io::Result<u64> {
     let source = open_relative_fd(source_root_fd, &entry.relative_path, libc::O_RDONLY, 0)?;
-    let (target, created) =
-        open_relative_target_for_copy(target_root_fd, &entry.relative_path, entry.mode as libc::mode_t)?;
+    let (target, created) = open_relative_target_for_copy(
+        target_root_fd,
+        &entry.relative_path,
+        entry.mode as libc::mode_t,
+    )?;
     let copied_total = match method {
         RelativeCopyMethod::CopyFileRange => {
             copy_openat_via_copy_file_range(&entry.relative_path, entry.size, &source, &target)?

@@ -69,12 +69,7 @@ fn fallback_copy_with_progress(input: &StreamInput, io_mode: IOMode) -> io::Resu
         total = total
             .checked_add(block.len() as u64)
             .ok_or_else(|| io::Error::other("pv byte count overflow"))?;
-        report_progress(
-            total,
-            start,
-            &mut last_report,
-            &mut last_reported_bytes,
-        )
+        report_progress(total, start, &mut last_report, &mut last_reported_bytes)
     };
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
@@ -116,12 +111,7 @@ pub(super) fn run_pv(args: &[String]) -> io::Result<()> {
         let mut last_report = start;
         let mut last_reported_bytes = 0u64;
         if let Some(total) = try_fast_copy_to_stdout_counted(&input, io_mode, &mut |bytes| {
-            report_progress(
-                bytes,
-                start,
-                &mut last_report,
-                &mut last_reported_bytes,
-            )
+            report_progress(bytes, start, &mut last_report, &mut last_reported_bytes)
         })? {
             finish_progress(total, start)?;
             continue;

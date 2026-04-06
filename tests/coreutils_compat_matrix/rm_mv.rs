@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn rm_force_matches_system_for_missing_operands_and_missing_files() {
+    let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-force");
+
+    let fro_missing = run_fro("rm", &["-f"]);
+    let sys_missing = run_system("rm", &["-f"]);
+    assert_same_result(fro_missing, sys_missing, "rm -f with no operands");
+
+    let fro_root = tmp.join("fro");
+    let sys_root = tmp.join("sys");
+    fs::create_dir_all(&fro_root).unwrap();
+    fs::create_dir_all(&sys_root).unwrap();
+
+    let missing_name = "ghost.txt";
+    let fro_existing = fro_root.join("keep.txt");
+    let sys_existing = sys_root.join("keep.txt");
+    fs::write(&fro_existing, b"keep\n").unwrap();
+    fs::write(&sys_existing, b"keep\n").unwrap();
+
+    let fro_out = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .current_dir(&fro_root)
+        .arg("rm")
+        .args(["-fv", missing_name, "keep.txt"])
+        .output()
+        .expect("failed to run fro rm in fixture dir");
+    let sys_out = Command::new("rm")
+        .current_dir(&sys_root)
+        .args(["-fv", missing_name, "keep.txt"])
+        .output()
+        .expect("failed to run system rm in fixture dir");
+    assert_same_result(fro_out, sys_out, "rm -fv missing and existing");
+    assert!(!fro_existing.exists());
+    assert!(!sys_existing.exists());
+    assert_eq!(
+        fro_root.join(missing_name).exists(),
+        sys_root.join(missing_name).exists()
+    );
+}
+
+#[test]
 fn cartesian_rm_recursive_matches_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-matrix");
 
@@ -35,7 +74,11 @@ fn cartesian_mv_file_and_recursive_directory_match_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-rm-mv-mv-matrix");
 
     for verbose_flags in [Vec::<&str>::new(), vec!["-v"]] {
-        let tag = if verbose_flags.is_empty() { "plain" } else { "verbose" };
+        let tag = if verbose_flags.is_empty() {
+            "plain"
+        } else {
+            "verbose"
+        };
 
         let fro_src_file = tmp.join(format!("mv-file-fro-src-{tag}.bin"));
         let fro_dst_file = tmp.join(format!("mv-file-fro-dst-{tag}.bin"));
@@ -65,7 +108,10 @@ fn cartesian_mv_file_and_recursive_directory_match_system_side_effects() {
             String::from_utf8_lossy(&sys_file_out.stderr),
         );
         assert_eq!(fro_file_out.stderr, sys_file_out.stderr);
-        assert_eq!(fs::read(&fro_dst_file).unwrap(), fs::read(&sys_dst_file).unwrap());
+        assert_eq!(
+            fs::read(&fro_dst_file).unwrap(),
+            fs::read(&sys_dst_file).unwrap()
+        );
         assert_eq!(fro_src_file.exists(), sys_src_file.exists());
         if !verbose_flags.is_empty() {
             assert!(
@@ -140,5 +186,213 @@ fn cartesian_mv_file_and_recursive_directory_match_system_side_effects() {
         let sys_tree = snapshot_tree(&sys_dest_parent.join(sys_moved_name));
         assert_eq!(fro_tree, sys_tree, "recursive move tree mismatch for {tag}");
         assert_eq!(fro_source_root.exists(), sys_source_root.exists());
+    }
+}
+
+#[test]
+fn mv_target_directory_matches_system_for_files_and_directories() {
+    let tmp = unique_temp_dir("fro-coreutils-rm-mv-target-directory");
+
+    for flags in [Vec::<&str>::new(), vec!["-v"]] {
+        let suffix = if flags.is_empty() { "plain" } else { "verbose" };
+
+        let fro_src_root = tmp.join(format!("mv-target-dir-fro-src-root-{suffix}"));
+        let sys_src_root = tmp.join(format!("mv-target-dir-sys-src-root-{suffix}"));
+        fs::create_dir_all(&fro_src_root).unwrap();
+        fs::create_dir_all(&sys_src_root).unwrap();
+        let src_a = fro_src_root.join("mv-source-a.txt");
+        let src_b = fro_src_root.join("mv-source-b.txt");
+        let sys_src_a = sys_src_root.join("mv-source-a.txt");
+        let sys_src_b = sys_src_root.join("mv-source-b.txt");
+        let fro_dest = tmp.join(format!("mv-dest-fro-{suffix}"));
+        let sys_dest = tmp.join(format!("mv-dest-sys-{suffix}"));
+        fs::write(&src_a, b"alpha-target-dir").unwrap();
+        fs::write(&src_b, b"beta-target-dir").unwrap();
+        fs::write(&sys_src_a, b"alpha-target-dir").unwrap();
+        fs::write(&sys_src_b, b"beta-target-dir").unwrap();
+        fs::create_dir_all(&fro_dest).unwrap();
+        fs::create_dir_all(&sys_dest).unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "-t",
+            fro_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+            src_b.to_str().unwrap(),
+        ]);
+        let mut sys_args = flags.clone();
+        sys_args.extend([
+            "-t",
+            sys_dest.to_str().unwrap(),
+            sys_src_a.to_str().unwrap(),
+            sys_src_b.to_str().unwrap(),
+        ]);
+        let fro_out = run_fro("mv", &fro_args);
+        let sys_out = run_system("mv", &sys_args);
+        assert_eq!(
+            fro_out.status.code(),
+            sys_out.status.code(),
+            "mv -t multi-source status mismatch for {:?}\nfro stdout:\n{}\nfro stderr:\n{}\nsys stdout:\n{}\nsys stderr:\n{}",
+            fro_args,
+            String::from_utf8_lossy(&fro_out.stdout),
+            String::from_utf8_lossy(&fro_out.stderr),
+            String::from_utf8_lossy(&sys_out.stdout),
+            String::from_utf8_lossy(&sys_out.stderr),
+        );
+        assert_eq!(fro_out.stderr, sys_out.stderr);
+        if flags.is_empty() {
+            assert_eq!(fro_out.stdout, sys_out.stdout);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&fro_out.stdout).contains("renamed"),
+                "expected mv -t -v to mention rename in fro stdout"
+            );
+            assert!(
+                String::from_utf8_lossy(&sys_out.stdout).contains("renamed"),
+                "expected mv -t -v to mention rename in system stdout"
+            );
+        }
+        assert_eq!(snapshot_tree(&fro_dest), snapshot_tree(&sys_dest));
+
+        let long_src = fro_src_root.join("mv-source-long.txt");
+        let long_sys_src = sys_src_root.join("mv-source-long.txt");
+        fs::write(&long_src, b"gamma-target-dir").unwrap();
+        fs::write(&long_sys_src, b"gamma-target-dir").unwrap();
+        let long_fro_dest = tmp.join(format!("mv-long-dest-fro-{suffix}"));
+        let long_sys_dest = tmp.join(format!("mv-long-dest-sys-{suffix}"));
+        fs::create_dir_all(&long_fro_dest).unwrap();
+        fs::create_dir_all(&long_sys_dest).unwrap();
+        let fro_long_target = format!("--target-directory={}", long_fro_dest.display());
+        let sys_long_target = format!("--target-directory={}", long_sys_dest.display());
+        let mut fro_long_args = flags.clone();
+        fro_long_args.extend([fro_long_target.as_str(), long_src.to_str().unwrap()]);
+        let mut sys_long_args = flags.clone();
+        sys_long_args.extend([sys_long_target.as_str(), long_sys_src.to_str().unwrap()]);
+        let fro_long_out = run_fro("mv", &fro_long_args);
+        let sys_long_out = run_system("mv", &sys_long_args);
+        assert_eq!(
+            fro_long_out.status.code(),
+            sys_long_out.status.code(),
+            "mv --target-directory status mismatch for {:?}\nfro stdout:\n{}\nfro stderr:\n{}\nsys stdout:\n{}\nsys stderr:\n{}",
+            fro_long_args,
+            String::from_utf8_lossy(&fro_long_out.stdout),
+            String::from_utf8_lossy(&fro_long_out.stderr),
+            String::from_utf8_lossy(&sys_long_out.stdout),
+            String::from_utf8_lossy(&sys_long_out.stderr),
+        );
+        assert_eq!(fro_long_out.stderr, sys_long_out.stderr);
+        if flags.is_empty() {
+            assert_eq!(fro_long_out.stdout, sys_long_out.stdout);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&fro_long_out.stdout).contains("renamed"),
+                "expected mv --target-directory -v to mention rename in fro stdout"
+            );
+            assert!(
+                String::from_utf8_lossy(&sys_long_out.stdout).contains("renamed"),
+                "expected mv --target-directory -v to mention rename in system stdout"
+            );
+        }
+        assert_eq!(snapshot_tree(&long_fro_dest), snapshot_tree(&long_sys_dest));
+
+        let sep_src = fro_src_root.join("mv-source-sep.txt");
+        let sep_sys_src = sys_src_root.join("mv-source-sep.txt");
+        fs::write(&sep_src, b"delta-target-dir").unwrap();
+        fs::write(&sep_sys_src, b"delta-target-dir").unwrap();
+        let sep_fro_dest = tmp.join(format!("mv-sep-dest-fro-{suffix}"));
+        let sep_sys_dest = tmp.join(format!("mv-sep-dest-sys-{suffix}"));
+        fs::create_dir_all(&sep_fro_dest).unwrap();
+        fs::create_dir_all(&sep_sys_dest).unwrap();
+        let mut fro_sep_args = flags.clone();
+        fro_sep_args.extend([
+            "--target-directory",
+            sep_fro_dest.to_str().unwrap(),
+            sep_src.to_str().unwrap(),
+        ]);
+        let mut sys_sep_args = flags.clone();
+        sys_sep_args.extend([
+            "--target-directory",
+            sep_sys_dest.to_str().unwrap(),
+            sep_sys_src.to_str().unwrap(),
+        ]);
+        let fro_sep_out = run_fro("mv", &fro_sep_args);
+        let sys_sep_out = run_system("mv", &sys_sep_args);
+        assert_eq!(
+            fro_sep_out.status.code(),
+            sys_sep_out.status.code(),
+            "mv --target-directory separated status mismatch for {:?}\nfro stdout:\n{}\nfro stderr:\n{}\nsys stdout:\n{}\nsys stderr:\n{}",
+            fro_sep_args,
+            String::from_utf8_lossy(&fro_sep_out.stdout),
+            String::from_utf8_lossy(&fro_sep_out.stderr),
+            String::from_utf8_lossy(&sys_sep_out.stdout),
+            String::from_utf8_lossy(&sys_sep_out.stderr),
+        );
+        assert_eq!(fro_sep_out.stderr, sys_sep_out.stderr);
+        if flags.is_empty() {
+            assert_eq!(fro_sep_out.stdout, sys_sep_out.stdout);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&fro_sep_out.stdout).contains("renamed"),
+                "expected mv --target-directory separated -v to mention rename in fro stdout"
+            );
+            assert!(
+                String::from_utf8_lossy(&sys_sep_out.stdout).contains("renamed"),
+                "expected mv --target-directory separated -v to mention rename in system stdout"
+            );
+        }
+        assert_eq!(snapshot_tree(&sep_fro_dest), snapshot_tree(&sep_sys_dest));
+
+        let fro_dir_src = fro_src_root.join("mv-tree-src");
+        let sys_dir_src = sys_src_root.join("mv-tree-src");
+        fs::create_dir_all(fro_dir_src.join("nested")).unwrap();
+        fs::create_dir_all(sys_dir_src.join("nested")).unwrap();
+        fs::write(fro_dir_src.join("nested/file.txt"), b"recursive-target-dir").unwrap();
+        fs::write(sys_dir_src.join("nested/file.txt"), b"recursive-target-dir").unwrap();
+        let fro_recursive_dest = tmp.join(format!("mv-tree-dest-fro-{suffix}"));
+        let sys_recursive_dest = tmp.join(format!("mv-tree-dest-sys-{suffix}"));
+        fs::create_dir_all(&fro_recursive_dest).unwrap();
+        fs::create_dir_all(&sys_recursive_dest).unwrap();
+
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-t",
+            fro_recursive_dest.to_str().unwrap(),
+            fro_dir_src.to_str().unwrap(),
+        ]);
+        let mut sys_recursive_args = flags.clone();
+        sys_recursive_args.extend([
+            "-t",
+            sys_recursive_dest.to_str().unwrap(),
+            sys_dir_src.to_str().unwrap(),
+        ]);
+        let fro_recursive_out = run_fro("mv", &fro_recursive_args);
+        let sys_recursive_out = run_system("mv", &sys_recursive_args);
+        assert_eq!(
+            fro_recursive_out.status.code(),
+            sys_recursive_out.status.code(),
+            "mv -t recursive status mismatch for {:?}\nfro stdout:\n{}\nfro stderr:\n{}\nsys stdout:\n{}\nsys stderr:\n{}",
+            fro_recursive_args,
+            String::from_utf8_lossy(&fro_recursive_out.stdout),
+            String::from_utf8_lossy(&fro_recursive_out.stderr),
+            String::from_utf8_lossy(&sys_recursive_out.stdout),
+            String::from_utf8_lossy(&sys_recursive_out.stderr),
+        );
+        assert_eq!(fro_recursive_out.stderr, sys_recursive_out.stderr);
+        if flags.is_empty() {
+            assert_eq!(fro_recursive_out.stdout, sys_recursive_out.stdout);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&fro_recursive_out.stdout).contains("renamed"),
+                "expected mv -t recursive -v to mention rename in fro stdout"
+            );
+            assert!(
+                String::from_utf8_lossy(&sys_recursive_out.stdout).contains("renamed"),
+                "expected mv -t recursive -v to mention rename in system stdout"
+            );
+        }
+        assert_eq!(
+            snapshot_tree(&fro_recursive_dest),
+            snapshot_tree(&sys_recursive_dest)
+        );
     }
 }

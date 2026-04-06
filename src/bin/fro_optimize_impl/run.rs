@@ -1,19 +1,84 @@
-use super::*;
 use super::cli_utils::{align_down, fmt_gib, fs_stats_for_path, parse_size};
 use super::inspect::{
     collect_home_targets, device_db_match, fill_device_info, find_writable_dir_for_mount,
     is_disk_backed_mount, load_device_db, read_mountinfo,
 };
+use super::*;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TargetSelection {
+    pub benchmark_dir: String,
+    pub target_path: Option<String>,
+    pub target_mount: Option<String>,
+}
+
+fn derive_benchmark_dir_from_target(target: &Path) -> Result<PathBuf, String> {
+    if target.is_dir() {
+        return Ok(target.to_path_buf());
+    }
+    target.parent().map(Path::to_path_buf).ok_or_else(|| {
+        format!(
+            "--for target {} has no parent directory; pass --test-dir explicitly",
+            target.display()
+        )
+    })
+}
+
+pub(super) fn resolve_target_selection(
+    explicit_test_dir: Option<&str>,
+    target_path: Option<&str>,
+) -> Result<TargetSelection, String> {
+    let benchmark_dir = match (explicit_test_dir, target_path) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(target)) => derive_benchmark_dir_from_target(Path::new(target))?,
+        (None, None) => PathBuf::from("."),
+    };
+    let benchmark_dir_string = benchmark_dir.display().to_string();
+
+    let Some(target_path) = target_path else {
+        return Ok(TargetSelection {
+            benchmark_dir: benchmark_dir_string,
+            target_path: None,
+            target_mount: None,
+        });
+    };
+
+    let target_mount = fro::config::mount_info_for_path(target_path)
+        .map(|info| info.mount_point)
+        .ok_or_else(|| format!("Failed to resolve mount info for --for target {target_path}"))?;
+    let benchmark_mount = fro::config::mount_info_for_path(&benchmark_dir_string)
+        .map(|info| info.mount_point)
+        .ok_or_else(|| {
+            format!(
+                "Failed to resolve mount info for benchmark dir {}",
+                benchmark_dir.display()
+            )
+        })?;
+
+    if benchmark_mount != target_mount {
+        return Err(format!(
+            "--for target {target_path} resolves to mount {target_mount}, but benchmark dir {} resolves to mount {benchmark_mount}; pass --test-dir on the same mount or omit --test-dir",
+            benchmark_dir.display()
+        ));
+    }
+
+    Ok(TargetSelection {
+        benchmark_dir: benchmark_dir_string,
+        target_path: Some(target_path.to_string()),
+        target_mount: Some(target_mount),
+    })
+}
 
 pub(super) fn main_impl() {
     let args: Vec<String> = env::args().collect();
     let mut patterns = vec![];
 
-    let mut test_dir = ".";
+    let mut explicit_test_dir: Option<String> = None;
+    let mut target_path: Option<String> = None;
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         println!(
-            "USAGE: {} [--list-devices | --list-devices-all] [--all] [-c config.json] [--plan] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
+            "USAGE: {} [--list-devices | --list-devices-all] [--all] [-c config.json] [--plan] [--for path] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
             args[0]
         );
         println!(
@@ -26,6 +91,9 @@ pub(super) fn main_impl() {
         println!("--list-devices-all prints all mountpoints from /proc/self/mountinfo as JSON and exits.");
         println!("--all runs the optimizer for each discovered disk-backed mount (best-effort writable_dir discovery).");
         println!("--all-dir <path> can be repeated to provide an explicit list of directories to optimize.");
+        println!("--for <path> selects which mount should receive tuned mount_overrides.");
+        println!("               If --test-dir is omitted, benchmarks run in <path> (or its parent if <path> is a file).");
+        println!("               If both are provided, they must resolve to the same mount.");
         println!("--iters <n> overrides the internal -n used for each optimized mode (useful for quick runs/tests).");
         std::process::exit(0);
     }
@@ -51,7 +119,10 @@ pub(super) fn main_impl() {
         } else if arg == "--list-devices-all" {
             list_devices_all = true;
         } else if arg == "--test-dir" {
-            test_dir = &args[i];
+            explicit_test_dir = Some(args[i].clone());
+            i += 1;
+        } else if arg == "--for" {
+            target_path = Some(args[i].clone());
             i += 1;
         } else if arg == "-c" || arg == "--config" {
             config_path = Some(args[i].as_str());
@@ -138,6 +209,20 @@ pub(super) fn main_impl() {
         return;
     }
 
+    if target_path.is_some() && all {
+        eprintln!("--for cannot be combined with --all/--all-dir");
+        std::process::exit(2);
+    }
+
+    let target_selection =
+        match resolve_target_selection(explicit_test_dir.as_deref(), target_path.as_deref()) {
+            Ok(selection) => selection,
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        };
+
     let mut fro_exe = env::current_exe().expect("Failed to get current executable path");
     fro_exe.set_file_name("fro");
 
@@ -150,7 +235,7 @@ pub(super) fn main_impl() {
     let read_iters = iters_override.unwrap_or(100).to_string();
     let write_iters = iters_override.unwrap_or(20).to_string();
 
-    let run_for_dir = |test_dir: &str| {
+    let run_for_dir = |test_dir: &str, target_path: Option<&str>, target_mount: Option<&str>| {
         let test_path = std::path::Path::new(test_dir);
 
         let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
@@ -314,9 +399,11 @@ pub(super) fn main_impl() {
                 let pattern = p.as_str();
                 let matches_plain_read = cfg[0] == "read"
                     && !is_to_memory
-                    && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
-                let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
-                    && is_to_memory;
+                    && (pattern == "read"
+                        || pattern == "read-page-cache"
+                        || pattern == "read-direct");
+                let matches_read_to_memory =
+                    (pattern == "read-to-memory" || pattern == "read_to_memory") && is_to_memory;
                 let matches_other = cfg[0].starts_with(pattern)
                     && !(cfg[0] == "read" && is_to_memory && pattern == "read");
                 if matches_plain_read || matches_read_to_memory || matches_other {
@@ -439,6 +526,12 @@ pub(super) fn main_impl() {
 
         if plan {
             println!("fro-optimize plan");
+            if let Some(target_path) = target_path {
+                println!("  target_path: {}", target_path);
+            }
+            if let Some(target_mount) = target_mount {
+                println!("  target_mount: {}", target_mount);
+            }
             println!("  test_dir: {}", test_dir);
             println!("  test_size: {}", fmt_gib(size));
             println!(
@@ -511,7 +604,8 @@ pub(super) fn main_impl() {
                 let dir = recursive_tree.join(shard);
                 let _ = fs::create_dir_all(&dir);
                 let path = dir.join(format!("file_{:06}.bin", i));
-                fs::write(&path, vec![0x5a_u8; 4096]).expect("Failed to create recursive tuning file");
+                fs::write(&path, vec![0x5a_u8; 4096])
+                    .expect("Failed to create recursive tuning file");
             }
         }
 
@@ -534,7 +628,10 @@ pub(super) fn main_impl() {
             .any(|cfg| cfg.first().is_some_and(|op| op == "copy"))
         {
             let mut cfg = fro::config::load_config(config_path);
-            cfg.update_copy_auto_mode_for_path(&target_file_cache, fro::CopyAutoMode::Heuristic);
+            cfg.update_copy_auto_mode_for_path(
+                target_path.unwrap_or(&target_file_cache),
+                fro::CopyAutoMode::Heuristic,
+            );
             cfg.save();
             println!("Saved copy auto mode: {:?}", fro::CopyAutoMode::Heuristic);
         }
@@ -578,10 +675,13 @@ pub(super) fn main_impl() {
 
         for d in dirs {
             println!("=== Optimizing for {} ===", d);
-            run_for_dir(&d);
+            run_for_dir(&d, None, None);
         }
     } else {
-        run_for_dir(test_dir);
+        run_for_dir(
+            &target_selection.benchmark_dir,
+            target_selection.target_path.as_deref(),
+            target_selection.target_mount.as_deref(),
+        );
     }
-
 }

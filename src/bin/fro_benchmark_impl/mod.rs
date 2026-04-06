@@ -56,14 +56,17 @@ fn parse_reported_summary(text: &str) -> Option<FroRunSummary> {
         let idx = line.rfind(" GB/s")?;
         let start = line[..idx].rfind(' ').map(|i| i + 1).unwrap_or(0);
         let gbps = line[start..idx].trim().parse::<f64>().ok()?;
-        let params = line.rfind('[').and_then(|open| {
-            line[open..].split_once(']').map(|(body, _)| {
-                body.trim_start_matches('[')
-                    .split(',')
-                    .filter_map(|part| part.trim().parse::<u64>().ok())
-                    .collect::<Vec<_>>()
+        let params = line
+            .rfind('[')
+            .and_then(|open| {
+                line[open..].split_once(']').map(|(body, _)| {
+                    body.trim_start_matches('[')
+                        .split(',')
+                        .filter_map(|part| part.trim().parse::<u64>().ok())
+                        .collect::<Vec<_>>()
+                })
             })
-        }).filter(|vals| !vals.is_empty());
+            .filter(|vals| !vals.is_empty());
         return Some(FroRunSummary { gbps, params });
     }
     None
@@ -394,9 +397,8 @@ fn choose_test_size(
     size
 }
 
-
-mod test_matrix;
 mod run;
+mod test_matrix;
 #[cfg(test)]
 mod tests;
 

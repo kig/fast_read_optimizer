@@ -28,7 +28,10 @@ fn hash_stream_input(
             visit_ordered_input(input, io_mode, |block| {
                 hasher.update(block).map_err(io::Error::other)
             })?;
-            hasher.finish().map_err(io::Error::other).map(|d| d.to_vec())
+            hasher
+                .finish()
+                .map_err(io::Error::other)
+                .map(|d| d.to_vec())
         }
         HashAlgorithm::Blake3 => {
             let mut hasher = blake3::Hasher::new();
@@ -598,10 +601,14 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
         let stream_input = StreamInput::File(path.to_string_lossy().into_owned());
-        let streamed = hash_stream_input(&stream_input, HashAlgorithm::Sha256, IOMode::PageCache)
-            .unwrap();
-        let file = hash_file(path.to_str().unwrap(), HashAlgorithm::Sha256, IOMode::PageCache)
-            .unwrap();
+        let streamed =
+            hash_stream_input(&stream_input, HashAlgorithm::Sha256, IOMode::PageCache).unwrap();
+        let file = hash_file(
+            path.to_str().unwrap(),
+            HashAlgorithm::Sha256,
+            IOMode::PageCache,
+        )
+        .unwrap();
         assert_eq!(streamed, file);
         let _ = std::fs::remove_file(path);
     }

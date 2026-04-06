@@ -8,27 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 static FIFO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp");
-    fs::create_dir_all(&base).unwrap();
-    let path = base.join(format!(
-        "{}-{}-{}",
-        prefix,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&path).unwrap();
-    path
-}
+#[path = "helpers/coreutils_parity.rs"]
+mod helpers;
+use helpers::{stream_surfaces, unique_temp_dir, CoreutilsParityFixture};
 
 fn run_fro(command: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fro"))
@@ -228,18 +213,67 @@ fn io_flag_sets() -> Vec<Vec<&'static str>> {
     vec![vec![], vec!["--no-direct"], vec!["--direct"]]
 }
 
+fn set_file_mtime(path: &Path, secs: i64) {
+    let times = [
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+    ];
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(
+        rc,
+        0,
+        "utimensat failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn wc_flag_sets() -> Vec<Vec<&'static str>> {
     vec![
         vec![],
         vec!["-l"],
         vec!["-w"],
+        vec!["-m"],
         vec!["-c"],
+        vec!["-L"],
+        vec!["-m", "-c"],
+        vec!["-m", "-L"],
         vec!["-l", "-w", "-c"],
+        vec!["-l", "-m"],
+        vec!["-l", "-L"],
+        vec!["-l", "-m", "-c"],
+        vec!["-l", "-m", "-L"],
     ]
+}
+
+fn assert_same_wc_exact(fro: Output, system: Output, label: &str) {
+    assert_eq!(
+        fro.status.code(),
+        system.status.code(),
+        "{label}: wc status mismatch"
+    );
+    let fro_tokens = String::from_utf8_lossy(&fro.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let sys_tokens = String::from_utf8_lossy(&system.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(fro_tokens, sys_tokens, "{label}: wc stdout token mismatch");
+    assert_eq!(fro.stderr, system.stderr, "{label}: wc stderr mismatch");
 }
 
 #[path = "coreutils_compat_matrix/base64.rs"]
 mod base64;
+#[path = "coreutils_compat_matrix/cat_flags.rs"]
+mod cat_flags;
 #[path = "coreutils_compat_matrix/cat_tac.rs"]
 mod cat_tac;
 #[path = "coreutils_compat_matrix/cmp_fgrep.rs"]

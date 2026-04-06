@@ -15,7 +15,10 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("bench-recursive-small-file-threads requires a directory root, got {}", root.display()),
+            format!(
+                "bench-recursive-small-file-threads requires a directory root, got {}",
+                root.display()
+            ),
         ));
     }
     let mount_path = path;
@@ -106,7 +109,10 @@ pub(in crate::main_app) fn bench_recursive_read(
     if metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("recursive-read-bench requires a directory root, got {}", root.display()),
+            format!(
+                "recursive-read-bench requires a directory root, got {}",
+                root.display()
+            ),
         ));
     }
     if !metadata.file_type().is_dir() {
@@ -191,9 +197,14 @@ pub(in crate::main_app) fn bench_recursive_read(
         let file_io_mode = io_mode;
         file_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = file_queue.claim(&stop) {
-                let bytes_read =
-                    read_small_file_probe_then_fallback(&read_config, &task.source_path, file_io_mode)?;
-                sample_counters.bytes.fetch_add(bytes_read, Ordering::Relaxed);
+                let bytes_read = read_small_file_probe_then_fallback(
+                    &read_config,
+                    &task.source_path,
+                    file_io_mode,
+                )?;
+                sample_counters
+                    .bytes
+                    .fetch_add(bytes_read, Ordering::Relaxed);
                 stats.files_read.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
                 sample_counters.units.fetch_add(1, Ordering::Relaxed);

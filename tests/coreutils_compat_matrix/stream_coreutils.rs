@@ -1,36 +1,33 @@
+use super::helpers::StreamSurface;
 use super::*;
+
+fn wc_stream_flag_sets() -> Vec<Vec<&'static str>> {
+    wc_flag_sets()
+        .into_iter()
+        .filter(|flags| !flags.iter().any(|flag| *flag == "-L"))
+        .collect()
+}
 
 #[test]
 fn cartesian_stream_coreutils_match_system_for_input_kinds() {
-    let tmp = unique_temp_dir("fro-coreutils-stream-matrix");
-    let text = b"alpha\nneedle beta\nomega\n".to_vec();
-    let binary = (0..65557)
-        .map(|i| ((i * 17) % 251) as u8)
-        .collect::<Vec<_>>();
-
-    let text_path = tmp.join("text.txt");
-    let text_symlink = tmp.join("text-link.txt");
-    let binary_path = tmp.join("binary.bin");
-    let binary_symlink = tmp.join("binary-link.bin");
-    fs::write(&text_path, &text).unwrap();
-    fs::write(&binary_path, &binary).unwrap();
-    symlink(&text_path, &text_symlink).unwrap();
-    symlink(&binary_path, &binary_symlink).unwrap();
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-stream-matrix");
+    let text = fixture.text_bytes.clone();
+    let binary = fixture.binary_bytes.clone();
 
     for flags in io_flag_sets() {
-        for path in [&text_path, &text_symlink] {
+        for (kind, path) in fixture.text_path_inputs() {
             let file = path.to_str().unwrap();
             let mut args = flags.clone();
             args.push(file);
             assert_same_result(
                 run_fro("cat", &args),
                 run_system("cat", &[file]),
-                &format!("cat path {:?}", args),
+                &format!("cat {kind} path {:?}", args),
             );
             assert_same_result(
                 run_fro("tac", &args),
                 run_system("tac", &[file]),
-                &format!("tac path {:?}", args),
+                &format!("tac {kind} path {:?}", args),
             );
             for head_args in [
                 vec![],
@@ -47,10 +44,28 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
                 assert_same_result(
                     run_fro("head", &fro_args),
                     run_system("head", &sys_args),
-                    &format!("head path {:?}", fro_args),
+                    &format!("head {kind} path {:?}", fro_args),
                 );
             }
-            for wc_flags in wc_flag_sets() {
+            for tail_args in [
+                vec![],
+                vec!["-n", "2"],
+                vec!["-c", "5"],
+                vec!["-c", "1KiB"],
+                vec!["-c", "1MiB"],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(tail_args.iter().copied());
+                fro_args.push(file);
+                let mut sys_args = tail_args;
+                sys_args.push(file);
+                assert_same_result(
+                    run_fro("tail", &fro_args),
+                    run_system("tail", &sys_args),
+                    &format!("tail {kind} path {:?}", fro_args),
+                );
+            }
+            for wc_flags in wc_stream_flag_sets() {
                 let mut fro_args = flags.clone();
                 fro_args.extend(wc_flags.iter().copied());
                 fro_args.push(file);
@@ -59,7 +74,7 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
                 assert_same_wc(
                     run_fro("wc", &fro_args),
                     run_system("wc", &sys_args),
-                    &format!("wc path {:?}", fro_args),
+                    &format!("wc {kind} path {:?}", fro_args),
                 );
             }
             for grep_args in [vec!["needle", file], vec!["-n", "needle", file]] {
@@ -70,48 +85,41 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
                 assert_same_result(
                     run_fro("fgrep", &fro_args),
                     run_system("grep", &sys_args),
-                    &format!("fgrep path {:?}", fro_args),
+                    &format!("fgrep {kind} path {:?}", fro_args),
                 );
             }
         }
 
-        for path in [&binary_path, &binary_symlink] {
+        for (kind, path) in fixture.binary_path_inputs() {
             let file = path.to_str().unwrap();
             let mut args = flags.clone();
             args.push(file);
             assert_same_result(
                 run_fro("cksum", &args),
                 run_system("cksum", &[file]),
-                &format!("cksum path {:?}", args),
+                &format!("cksum {kind} path {:?}", args),
             );
             assert_same_result(
                 run_fro("sha256sum", &args),
                 run_system("sha256sum", &[file]),
-                &format!("sha256sum path {:?}", args),
+                &format!("sha256sum {kind} path {:?}", args),
             );
         }
     }
 
-    assert_same_result(
-        run_fro_with_stdin("cat", &[], &text),
-        run_system_with_stdin("cat", &[], &text),
-        "cat stdin []",
-    );
-    assert_same_result(
-        run_fro_with_stdin("cat", &["-"], &text),
-        run_system_with_stdin("cat", &["-"], &text),
-        "cat dash",
-    );
-    assert_same_result(
-        run_fro_with_stdin("tac", &[], &text),
-        run_system_with_stdin("tac", &[], &text),
-        "tac stdin []",
-    );
-    assert_same_result(
-        run_fro_with_stdin("tac", &["-"], &text),
-        run_system_with_stdin("tac", &["-"], &text),
-        "tac dash",
-    );
+    for surface in stream_surfaces() {
+        let args = surface.args(&[]);
+        assert_same_result(
+            run_fro_with_stdin("cat", &args, &text),
+            run_system_with_stdin("cat", &args, &text),
+            &format!("cat {}", surface.label()),
+        );
+        assert_same_result(
+            run_fro_with_stdin("tac", &args, &text),
+            run_system_with_stdin("tac", &args, &text),
+            &format!("tac {}", surface.label()),
+        );
+    }
     for head_args in [
         vec![],
         vec!["-n", "2"],
@@ -119,74 +127,203 @@ fn cartesian_stream_coreutils_match_system_for_input_kinds() {
         vec!["-c", "1KiB"],
         vec!["-c", "1MiB"],
     ] {
-        assert_same_result(
-            run_fro_with_stdin("head", &head_args, &text),
-            run_system_with_stdin("head", &head_args, &text),
-            &format!("head stdin {:?}", head_args),
-        );
-        let mut dash_args = head_args.clone();
-        dash_args.push("-");
-        assert_same_result(
-            run_fro_with_stdin("head", &dash_args, &text),
-            run_system_with_stdin("head", &dash_args, &text),
-            &format!("head dash {:?}", dash_args),
-        );
+        for surface in stream_surfaces() {
+            let args = surface.args(&head_args);
+            assert_same_result(
+                run_fro_with_stdin("head", &args, &text),
+                run_system_with_stdin("head", &args, &text),
+                &format!("head {} {:?}", surface.label(), args),
+            );
+        }
+    }
+    for tail_args in [
+        vec![],
+        vec!["-n", "2"],
+        vec!["-c", "5"],
+        vec!["-c", "1KiB"],
+        vec!["-c", "1MiB"],
+    ] {
+        for surface in stream_surfaces() {
+            let args = surface.args(&tail_args);
+            assert_same_result(
+                run_fro_with_stdin("tail", &args, &text),
+                run_system_with_stdin("tail", &args, &text),
+                &format!("tail {} {:?}", surface.label(), args),
+            );
+        }
     }
 
-    for wc_flags in wc_flag_sets() {
-        assert_same_wc(
-            run_fro_with_stdin("wc", &wc_flags, &text),
-            run_system_with_stdin("wc", &wc_flags, &text),
-            &format!("wc stdin {:?}", wc_flags),
-        );
-        let mut dash_args = wc_flags.clone();
-        dash_args.push("-");
-        assert_same_wc(
-            run_fro_with_stdin("wc", &dash_args, &text),
-            run_system_with_stdin("wc", &dash_args, &text),
-            &format!("wc dash {:?}", dash_args),
-        );
+    for wc_flags in wc_stream_flag_sets() {
+        for surface in stream_surfaces() {
+            let args = surface.args(&wc_flags);
+            assert_same_wc(
+                run_fro_with_stdin("wc", &args, &text),
+                run_system_with_stdin("wc", &args, &text),
+                &format!("wc {} {:?}", surface.label(), args),
+            );
+        }
     }
 
     for grep_args in [vec!["needle"], vec!["-n", "needle"]] {
-        let mut sys_args = vec!["-F"];
-        sys_args.extend(grep_args.iter().copied());
-        assert_same_result(
-            run_fro_with_stdin("fgrep", &grep_args, &text),
-            run_system_with_stdin("grep", &sys_args, &text),
-            &format!("fgrep stdin {:?}", grep_args),
-        );
+        for surface in stream_surfaces() {
+            let fro_args = surface.args(&grep_args);
+            let mut sys_args = vec!["-F"];
+            sys_args.extend(grep_args.iter().copied());
+            if matches!(surface, StreamSurface::Dash) {
+                sys_args.push("-");
+            }
+            assert_same_result(
+                run_fro_with_stdin("fgrep", &fro_args, &text),
+                run_system_with_stdin("grep", &sys_args, &text),
+                &format!("fgrep {} {:?}", surface.label(), fro_args),
+            );
+        }
+    }
 
-        let mut dash_args = grep_args.clone();
-        dash_args.push("-");
-        let mut sys_dash_args = vec!["-F"];
-        sys_dash_args.extend(grep_args.iter().copied());
-        sys_dash_args.push("-");
+    for surface in stream_surfaces() {
+        let args = surface.args(&[]);
         assert_same_result(
-            run_fro_with_stdin("fgrep", &dash_args, &text),
-            run_system_with_stdin("grep", &sys_dash_args, &text),
-            &format!("fgrep dash {:?}", dash_args),
+            run_fro_with_stdin("cksum", &args, &binary),
+            run_system_with_stdin("cksum", &args, &binary),
+            &format!("cksum {}", surface.label()),
+        );
+        assert_same_result(
+            run_fro_with_stdin("sha256sum", &args, &binary),
+            run_system_with_stdin("sha256sum", &args, &binary),
+            &format!("sha256sum {}", surface.label()),
+        );
+    }
+}
+
+#[test]
+fn head_matches_system_for_negative_counts_and_header_controls() {
+    let tmp = unique_temp_dir("fro-head-gnu-slice");
+    let file_a = tmp.join("a.txt");
+    let file_b = tmp.join("b.txt");
+    fs::write(&file_a, b"zero\none\ntwo\nthree\n").unwrap();
+    fs::write(&file_b, b"apple\nbanana\ncarrot\n").unwrap();
+
+    let a = file_a.to_str().unwrap();
+    let b = file_b.to_str().unwrap();
+
+    for args in [
+        vec!["-n", "-1", a],
+        vec!["-n", "-2", a],
+        vec!["-n-2", a],
+        vec!["-c", "-1", a],
+        vec!["-c", "-4", a],
+        vec!["-c-2", a],
+        vec!["-v", a],
+        vec!["-q", a],
+        vec!["--verbose", a, b],
+        vec!["--quiet", a, b],
+        vec!["--silent", a, b],
+        vec!["-q", a, b],
+        vec!["-v", a, b],
+        vec!["-qv", a, b],
+        vec!["-vq", a, b],
+        vec!["-q", "-v", a],
+        vec!["-v", "-q", a],
+    ] {
+        assert_same_result(
+            run_fro("head", &args),
+            run_system("head", &args),
+            &format!("head parity {:?}", args),
         );
     }
 
-    assert_same_result(
-        run_fro_with_stdin("cksum", &[], &binary),
-        run_system_with_stdin("cksum", &[], &binary),
-        "cksum stdin []",
-    );
-    assert_same_result(
-        run_fro_with_stdin("cksum", &["-"], &binary),
-        run_system_with_stdin("cksum", &["-"], &binary),
-        "cksum dash",
-    );
-    assert_same_result(
-        run_fro_with_stdin("sha256sum", &[], &binary),
-        run_system_with_stdin("sha256sum", &[], &binary),
-        "sha256sum stdin []",
-    );
-    assert_same_result(
-        run_fro_with_stdin("sha256sum", &["-"], &binary),
-        run_system_with_stdin("sha256sum", &["-"], &binary),
-        "sha256sum dash",
-    );
+    let stdin_text = b"alpha\nbeta\ngamma\ndelta\n";
+    for args in [
+        vec!["-n", "-1"],
+        vec!["-n", "-2"],
+        vec!["-n-2"],
+        vec!["-c", "-1"],
+        vec!["-c", "-5"],
+        vec!["-c-2"],
+        vec!["-v"],
+        vec!["-q"],
+        vec!["--verbose"],
+        vec!["--quiet"],
+        vec!["-v", "-"],
+        vec!["-q", "-"],
+    ] {
+        assert_same_result(
+            run_fro_with_stdin("head", &args, stdin_text),
+            run_system_with_stdin("head", &args, stdin_text),
+            &format!("head stdin parity {:?}", args),
+        );
+    }
+}
+
+#[test]
+fn tail_matches_system_for_positive_counts_and_header_controls() {
+    let tmp = unique_temp_dir("fro-tail-gnu-slice");
+    let file_a = tmp.join("a.txt");
+    let file_b = tmp.join("b.txt");
+    fs::write(&file_a, b"zero\none\ntwo\nthree\n").unwrap();
+    fs::write(&file_b, b"apple\nbanana\ncarrot\n").unwrap();
+
+    let a = file_a.to_str().unwrap();
+    let b = file_b.to_str().unwrap();
+
+    for args in [
+        vec!["-n", "+1", a],
+        vec!["-n", "+3", a],
+        vec!["-n+2", a],
+        vec!["-c", "+1", a],
+        vec!["-c", "+4", a],
+        vec!["-c+2", a],
+        vec!["-v", a],
+        vec!["-q", a],
+        vec!["-q", a, b],
+        vec!["-v", a, b],
+        vec!["-qv", a, b],
+        vec!["-vq", a, b],
+        vec!["-q", "-v", a],
+        vec!["-v", "-q", a],
+    ] {
+        assert_same_result(
+            run_fro("tail", &args),
+            run_system("tail", &args),
+            &format!("tail parity {:?}", args),
+        );
+    }
+
+    let stdin_text = b"alpha\nbeta\ngamma\ndelta\n";
+    for args in [
+        vec!["-n", "+1"],
+        vec!["-n", "+3"],
+        vec!["-n+2"],
+        vec!["-c", "+1"],
+        vec!["-c", "+5"],
+        vec!["-c+2"],
+        vec!["-v"],
+        vec!["-q"],
+        vec!["-v", "-"],
+        vec!["-q", "-"],
+    ] {
+        assert_same_result(
+            run_fro_with_stdin("tail", &args, stdin_text),
+            run_system_with_stdin("tail", &args, stdin_text),
+            &format!("tail stdin parity {:?}", args),
+        );
+    }
+}
+
+#[test]
+fn tail_matches_system_for_large_stream_windows() {
+    let line = "0123456789abcdef".repeat(256);
+    let mut text = String::new();
+    for idx in 0..8192 {
+        text.push_str(&line);
+        text.push_str(&format!("-{idx:04}\n"));
+    }
+
+    for args in [vec!["-n", "4096"], vec!["-c", "65536"]] {
+        assert_same_result(
+            run_fro_with_stdin("tail", &args, text.as_bytes()),
+            run_system_with_stdin("tail", &args, text.as_bytes()),
+            &format!("tail large stdin parity {:?}", args),
+        );
+    }
 }

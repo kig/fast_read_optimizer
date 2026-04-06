@@ -1,4 +1,15 @@
 use super::*;
+use std::os::unix::fs::FileExt;
+
+const SINGLE_DIRECT_WRITE_LIMIT: u64 = 512 * 1024;
+const ZFS_SERIAL_DIRECT_WRITE_LIMIT: u64 = 16 << 20;
+const EXT4_SERIAL_DIRECT_WRITE_LIMIT: u64 = 80 << 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GeneratedWriteStrategy {
+    SingleDirect,
+    SerialDirect,
+}
 
 #[derive(Clone, Copy)]
 struct SharedWriteBuffer {
@@ -20,6 +31,189 @@ impl SharedWriteBuffer {
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+}
+
+fn align_up_4096(value: u64) -> io::Result<u64> {
+    value
+        .checked_add(4095)
+        .map(|v| v / 4096 * 4096)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "aligned write size overflowed"))
+}
+
+fn write_all_at(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < data.len() {
+        let count = file.write_at(&data[written..], offset + written as u64)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short direct write",
+            ));
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+fn fill_generated_pattern(buffer: &mut [u8], pattern: GeneratedWritePattern) {
+    match pattern {
+        GeneratedWritePattern::Random => rand::rng().fill(buffer),
+        GeneratedWritePattern::Zero => buffer.fill(0),
+    }
+}
+
+pub(super) fn generated_write_strategy_for_fstype(
+    total_size: u64,
+    io_mode_write: IOMode,
+    fstype: Option<&str>,
+) -> Option<GeneratedWriteStrategy> {
+    if io_mode_write == IOMode::PageCache || total_size == 0 {
+        return None;
+    }
+    if total_size < SINGLE_DIRECT_WRITE_LIMIT {
+        return Some(GeneratedWriteStrategy::SingleDirect);
+    }
+    let serial_limit = match fstype {
+        Some("zfs") => ZFS_SERIAL_DIRECT_WRITE_LIMIT,
+        Some("ext4") => EXT4_SERIAL_DIRECT_WRITE_LIMIT,
+        _ => return None,
+    };
+    if total_size < serial_limit {
+        Some(GeneratedWriteStrategy::SerialDirect)
+    } else {
+        None
+    }
+}
+
+fn generated_write_strategy_for_path(
+    filename: &str,
+    total_size: u64,
+    io_mode_write: IOMode,
+) -> Option<GeneratedWriteStrategy> {
+    let mount_info = crate::config::mount_info_for_path(filename);
+    generated_write_strategy_for_fstype(
+        total_size,
+        io_mode_write,
+        mount_info.as_ref().map(|info| info.fstype.as_str()),
+    )
+}
+
+fn write_generated_single_direct(
+    filename: &str,
+    total_size: u64,
+    pattern: GeneratedWritePattern,
+) -> io::Result<u64> {
+    if total_size == 0 {
+        let _ = open_writer_files(filename, true, Some(0))?;
+        return Ok(0);
+    }
+    let padded_size = align_up_4096(total_size)?;
+    let padded_len = usize::try_from(padded_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "single direct write size does not fit in usize",
+        )
+    })?;
+    let (file_page_cache, file_direct, _) = open_writer_files(filename, true, Some(padded_size))?;
+    let mut buffer = AlignedBuffer::new(padded_len);
+    fill_generated_pattern(buffer.as_mut_slice(), pattern);
+    write_all_at(&file_direct, 0, buffer.as_slice())?;
+    if padded_size != total_size {
+        file_page_cache.set_len(total_size)?;
+    }
+    Ok(total_size)
+}
+
+fn write_generated_serial_direct(
+    filename: &str,
+    total_size: u64,
+    direct_block_size: u64,
+    pattern: GeneratedWritePattern,
+) -> io::Result<u64> {
+    if total_size == 0 {
+        let _ = open_writer_files(filename, true, Some(0))?;
+        return Ok(0);
+    }
+    let padded_total = align_up_4096(total_size)?;
+    let (file_page_cache, file_direct, _) = open_writer_files(filename, true, Some(padded_total))?;
+    let chunk_size = aligned_block_size(direct_block_size as usize).max(4096) as u64;
+    let mut written_data = 0u64;
+    let mut file_offset = 0u64;
+    while written_data < total_size {
+        let data_len = (total_size - written_data).min(chunk_size);
+        let write_len = align_up_4096(data_len)?;
+        let write_len_usize = usize::try_from(write_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serial direct write chunk does not fit in usize",
+            )
+        })?;
+        let mut buffer = AlignedBuffer::new(write_len_usize);
+        fill_generated_pattern(buffer.as_mut_slice(), pattern);
+        write_all_at(&file_direct, file_offset, buffer.as_slice())?;
+        written_data += data_len;
+        file_offset += write_len;
+    }
+    if padded_total != total_size {
+        file_page_cache.set_len(total_size)?;
+    }
+    Ok(total_size)
+}
+
+fn write_borrowed_buffer_single_direct(filename: &str, data: &[u8]) -> io::Result<u64> {
+    if data.is_empty() {
+        let _ = open_writer_files(filename, true, Some(0))?;
+        return Ok(0);
+    }
+    let padded_size = align_up_4096(data.len() as u64)?;
+    let padded_len = usize::try_from(padded_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "single direct buffered write size does not fit in usize",
+        )
+    })?;
+    let (file_page_cache, file_direct, _) = open_writer_files(filename, true, Some(padded_size))?;
+    let mut buffer = AlignedBuffer::new(padded_len);
+    buffer.as_mut_slice()[..data.len()].copy_from_slice(data);
+    write_all_at(&file_direct, 0, buffer.as_slice())?;
+    if padded_size != data.len() as u64 {
+        file_page_cache.set_len(data.len() as u64)?;
+    }
+    Ok(data.len() as u64)
+}
+
+fn write_borrowed_buffer_serial_direct(
+    filename: &str,
+    data: &[u8],
+    direct_block_size: u64,
+) -> io::Result<u64> {
+    if data.is_empty() {
+        let _ = open_writer_files(filename, true, Some(0))?;
+        return Ok(0);
+    }
+    let total_size = data.len() as u64;
+    let padded_total = align_up_4096(total_size)?;
+    let (file_page_cache, file_direct, _) = open_writer_files(filename, true, Some(padded_total))?;
+    let chunk_size = aligned_block_size(direct_block_size as usize).max(4096);
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let data_len = (data.len() - offset).min(chunk_size);
+        let write_len = align_up_4096(data_len as u64)?;
+        let write_len_usize = usize::try_from(write_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serial direct buffered write chunk does not fit in usize",
+            )
+        })?;
+        let mut buffer = AlignedBuffer::new(write_len_usize);
+        buffer.as_mut_slice()[..data_len].copy_from_slice(&data[offset..offset + data_len]);
+        write_all_at(&file_direct, offset as u64, buffer.as_slice())?;
+        offset += data_len;
+    }
+    if padded_total != total_size {
+        file_page_cache.set_len(total_size)?;
+    }
+    Ok(total_size)
 }
 
 pub fn write_file(
@@ -265,6 +459,17 @@ pub fn write_buffer_range(
     let total_size = slice.len() as u64;
     let source_buffer = SharedWriteBuffer::new(slice);
 
+    if let Some(strategy) = generated_write_strategy_for_path(filename, total_size, io_mode_write) {
+        return match strategy {
+            GeneratedWriteStrategy::SingleDirect => {
+                write_borrowed_buffer_single_direct(filename, slice)
+            }
+            GeneratedWriteStrategy::SerialDirect => {
+                write_borrowed_buffer_serial_direct(filename, slice, block_size_d)
+            }
+        };
+    }
+
     {
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
@@ -355,6 +560,24 @@ fn _write_file_internal(
     let qd = if direct_write { qd_d } else { qd_p };
 
     // println!("direct-read: {} | direct-write: {} | t={} bs={} qd={}", direct_read, direct_write, num_threads, block_size / 1024, qd);
+
+    if source.is_none() {
+        if let Some(strategy) =
+            generated_write_strategy_for_path(filename, total_size, io_mode_write)
+        {
+            return match strategy {
+                GeneratedWriteStrategy::SingleDirect => {
+                    write_generated_single_direct(filename, total_size, generated_pattern)
+                }
+                GeneratedWriteStrategy::SerialDirect => write_generated_serial_direct(
+                    filename,
+                    total_size,
+                    block_size_d,
+                    generated_pattern,
+                ),
+            };
+        }
+    }
 
     let random_block = if source.is_none() {
         let mut block = vec![0u8; block_size as usize];

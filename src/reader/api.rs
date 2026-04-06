@@ -1,6 +1,13 @@
+use super::execution::{
+    benchmark_block_size, benchmark_quick_probe_page_cache, benchmark_uring_qd,
+    read_file_path_kind, read_file_single_thread_blocking, resolve_reader_execution_for_mode,
+    visit_file_blocks_simple,
+};
+use super::workers::{
+    load_file_to_shared_buffer, measure_file_load_multiple_targets, resolve_load_file_request,
+    thread_map_blocks, thread_visit_blocks,
+};
 use super::*;
-use super::execution::{benchmark_block_size, benchmark_quick_probe_page_cache, benchmark_uring_qd, read_file_path_kind, read_file_single_thread_blocking, resolve_reader_execution_for_mode, visit_file_blocks_simple};
-use super::workers::{load_file_to_shared_buffer, measure_file_load_multiple_targets, resolve_load_file_request, thread_map_blocks, thread_visit_blocks};
 
 #[allow(dead_code)]
 pub fn load_file_to_memory(
@@ -431,7 +438,8 @@ where
                 let results = results.clone();
                 let mapper = mapper.clone();
                 threads.push(std::thread::spawn(move || -> std::io::Result<()> {
-                    let (mut file, mut file_direct) = open_reader_files(&filename, params.use_direct)?;
+                    let (mut file, mut file_direct) =
+                        open_reader_files(&filename, params.use_direct)?;
                     let mut io_uring = IoUring::new(1024).map_err(std::io::Error::other)?;
                     thread_map_blocks(
                         thread_id,
@@ -633,7 +641,6 @@ pub fn read_file(
     Ok(bytes_read)
 }
 
-
 pub fn read_file_auto_with_strategy(
     pattern: &str,
     filename: &str,
@@ -643,7 +650,13 @@ pub fn read_file_auto_with_strategy(
     direct: IOParams,
 ) -> std::io::Result<u64> {
     if mount_info.is_some_and(|info| info.fstype == "zfs") {
-        return read_file_path_kind(pattern, filename, ReadPathKind::SimpleDirect, &page_cache, &direct);
+        return read_file_path_kind(
+            pattern,
+            filename,
+            ReadPathKind::SimpleDirect,
+            &page_cache,
+            &direct,
+        );
     }
     let file_size = std::fs::metadata(filename)?.len();
     let cache_state = auto_read_cache_state(filename);
@@ -702,13 +715,24 @@ pub fn benchmark_read_variant(
                 },
                 IOMode::PageCache,
             )?;
-            let metrics =
-                visit_file_blocks_with_resolved_params(filename, params, |_| Ok::<_, io::Error>(()))?;
-            (metrics.bytes_read, metrics.file_size, params, metrics.phase_timings)
+            let metrics = visit_file_blocks_with_resolved_params(filename, params, |_| {
+                Ok::<_, io::Error>(())
+            })?;
+            (
+                metrics.bytes_read,
+                metrics.file_size,
+                params,
+                metrics.phase_timings,
+            )
         }
         ReadBenchmarkVariant::QuickProbePageCache => {
-            let (bytes_read, file_size, params) =
-                benchmark_quick_probe_page_cache(filename, strategy, mount_info, &page_cache, &direct)?;
+            let (bytes_read, file_size, params) = benchmark_quick_probe_page_cache(
+                filename,
+                strategy,
+                mount_info,
+                &page_cache,
+                &direct,
+            )?;
             (bytes_read, file_size, params, ReadPhaseTimings::default())
         }
         ReadBenchmarkVariant::MultiThreadCurrent => {
@@ -717,9 +741,15 @@ pub fn benchmark_read_variant(
                 ReadBenchmarkCacheState::Hot => IOMode::PageCache,
             };
             let params = resolve_reader_params(filename, &page_cache, &direct, io_mode)?;
-            let metrics =
-                visit_file_blocks_with_resolved_params(filename, params, |_| Ok::<_, io::Error>(()))?;
-            (metrics.bytes_read, metrics.file_size, params, metrics.phase_timings)
+            let metrics = visit_file_blocks_with_resolved_params(filename, params, |_| {
+                Ok::<_, io::Error>(())
+            })?;
+            (
+                metrics.bytes_read,
+                metrics.file_size,
+                params,
+                metrics.phase_timings,
+            )
         }
     };
     Ok(ReadBenchmarkResult {
@@ -730,4 +760,3 @@ pub fn benchmark_read_variant(
         phase_timings,
     })
 }
-

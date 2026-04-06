@@ -72,7 +72,6 @@ pub(super) fn format_bytes_compact(size: u64) -> String {
     format!("{}B", size)
 }
 
-
 pub(super) fn print_verify_report(report: &block_hash::VerifyReport) {
     println!(
         "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",

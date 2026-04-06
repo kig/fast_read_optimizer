@@ -13,7 +13,11 @@ impl ManualReadOverrides {
     }
 }
 
-pub(super) fn mark_optimizer_params(mask: &mut [bool], indices: &[usize], include_block_size: bool) {
+pub(super) fn mark_optimizer_params(
+    mask: &mut [bool],
+    indices: &[usize],
+    include_block_size: bool,
+) {
     for &index in indices {
         if include_block_size || index % 3 != 1 {
             mask[index] = true;
@@ -30,23 +34,27 @@ pub(super) fn active_optimizer_param_mask(
 ) -> Vec<bool> {
     let mut mask = [false; 9];
     match mode {
-        "read" | "grep" | "hash" | "diff" | "dual-read-bench" | "recursive-read-bench"
-        | "file-list-read-bench" | "file-list-read-uring-bench"
+        "read"
+        | "grep"
+        | "hash"
+        | "diff"
+        | "dual-read-bench"
+        | "recursive-read-bench"
+        | "file-list-read-bench"
+        | "file-list-read-uring-bench"
         | "file-list-read-open-read-close-sweep"
-        | "bench-recursive-small-file-threads" => {
-            match io_mode {
-                common::IOMode::Direct => {
-                    mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
-                }
-                common::IOMode::PageCache => {
-                    mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
-                }
-                common::IOMode::Auto => {
-                    mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
-                    mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
-                }
+        | "bench-recursive-small-file-threads" => match io_mode {
+            common::IOMode::Direct => {
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
             }
-        }
+            common::IOMode::PageCache => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+            }
+            common::IOMode::Auto => {
+                mark_optimizer_params(&mut mask, &PAGE_CACHE_PARAM_INDICES, true);
+                mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, true);
+            }
+        },
         "verify" | "recover" => match io_mode {
             common::IOMode::Direct => {
                 mark_optimizer_params(&mut mask, &DIRECT_PARAM_INDICES, false);

@@ -18,7 +18,9 @@ src/
     ops.rs
     tests.rs
   config/
+    device.rs
     mod.rs
+    storage.rs
     tests.rs
   coreutils/
     base64/
@@ -29,33 +31,49 @@ src/
       process.rs
       process_layout.rs
       tests.rs
+    wc/
+      count.rs
+      tests.rs
     base64.rs
     cat.rs
     cmp.rs
     du.rs
+    encrypt.rs
     fgrep.rs
     find.rs
     hash.rs
     head.rs
+    io_helpers.rs
     mod.rs
     mv.rs
     pv.rs
     rm.rs
     shred.rs
     tac.rs
+    tail.rs
     tar.rs
     wc.rs
+    work_queue.rs
   main_app/
     cli/
       args.rs
       execute.rs
       mod.rs
+    file_list/
+      copy_bench.rs
+      manifest.rs
+      read_bench.rs
+      uring.rs
     recursive/
       archive/
         bench.rs
+        format.rs
+        manifest.rs
+        parallel.rs
       archive.rs
       bench.rs
       delete.rs
+      move_dir.rs
       openat.rs
       paths.rs
     copy_plan.rs

@@ -1,6 +1,8 @@
 use super::*;
+use crate::main_app::util::{
+    format_bytes_compact, format_phase_duration, unique_temp_file, write_sweep_fixture,
+};
 use crate::reader;
-use crate::main_app::util::{format_bytes_compact, format_phase_duration, unique_temp_file, write_sweep_fixture};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadSweepCacheState {
@@ -17,7 +19,11 @@ impl ReadSweepCacheState {
     }
 }
 
-pub(super) fn prepare_read_sweep_cache(path: &Path, variant: ReadBenchmarkVariant, cache: ReadSweepCacheState) {
+pub(super) fn prepare_read_sweep_cache(
+    path: &Path,
+    variant: ReadBenchmarkVariant,
+    cache: ReadSweepCacheState,
+) {
     let path_str = path.to_str().unwrap();
     match (variant, cache) {
         (ReadBenchmarkVariant::SingleThreadDirect, _) => {
@@ -77,7 +83,10 @@ pub(super) fn path_kind_label(path: ReadPathKind) -> &'static str {
     }
 }
 
-pub(super) fn infer_cache_strategy(rows: &[ReadSweepRow], cache_state: ReadSweepCacheState) -> (u64, ReadPathKind, ReadPathKind) {
+pub(super) fn infer_cache_strategy(
+    rows: &[ReadSweepRow],
+    cache_state: ReadSweepCacheState,
+) -> (u64, ReadPathKind, ReadPathKind) {
     let mut by_size = std::collections::BTreeMap::<u64, Vec<&ReadSweepRow>>::new();
     for row in rows.iter().filter(|row| row.cache_state == cache_state) {
         by_size.entry(row.size).or_default().push(row);
@@ -132,12 +141,20 @@ pub(super) fn infer_cache_strategy(rows: &[ReadSweepRow], cache_state: ReadSweep
         let small_path = variants
             .iter()
             .copied()
-            .max_by(|a, b| avg_for(small_sizes, *a).partial_cmp(&avg_for(small_sizes, *b)).unwrap())
+            .max_by(|a, b| {
+                avg_for(small_sizes, *a)
+                    .partial_cmp(&avg_for(small_sizes, *b))
+                    .unwrap()
+            })
             .unwrap_or(variants[0]);
         let large_path = variants
             .iter()
             .copied()
-            .max_by(|a, b| avg_for(large_sizes, *a).partial_cmp(&avg_for(large_sizes, *b)).unwrap())
+            .max_by(|a, b| {
+                avg_for(large_sizes, *a)
+                    .partial_cmp(&avg_for(large_sizes, *b))
+                    .unwrap()
+            })
             .unwrap_or(variants[0]);
         let mut score = 0.0;
         for size in small_sizes {
@@ -378,7 +395,8 @@ pub(super) fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Res
             }
         }
         print_read_sweep_summary(&rows);
-        let (hot_cutoff, hot_small, hot_large) = infer_cache_strategy(&rows, ReadSweepCacheState::Hot);
+        let (hot_cutoff, hot_small, hot_large) =
+            infer_cache_strategy(&rows, ReadSweepCacheState::Hot);
         let (cold_cutoff, cold_small, cold_large) =
             infer_cache_strategy(&rows, ReadSweepCacheState::Cold);
         let strategy = ReadAutoStrategy {

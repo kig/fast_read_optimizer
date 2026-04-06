@@ -114,5 +114,11 @@ fn io_flag_sets() -> Vec<Vec<&'static str>> {
 mod base64;
 #[path = "coreutils/cat.rs"]
 mod cat;
+#[path = "coreutils/encrypt.rs"]
+mod encrypt;
 #[path = "coreutils/fgrep.rs"]
 mod fgrep;
+#[path = "coreutils/head.rs"]
+mod head;
+#[path = "coreutils/tail.rs"]
+mod tail;

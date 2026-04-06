@@ -1,12 +1,16 @@
+use super::process_layout::{
+    decode_input_can_use_fast_path, decode_input_can_use_wrapped_fast_path,
+    detect_regular_decode_layout, encode_input_can_use_wrapped_fast_path,
+    read_decode_fast_path_probe, wrapped_decode_block_sizes, wrapped_encode_block_sizes,
+    RegularDecodeLayout, SliceWriter,
+};
 use super::*;
-use super::process_layout::{decode_input_can_use_fast_path, decode_input_can_use_wrapped_fast_path,
-    detect_regular_decode_layout, encode_input_can_use_wrapped_fast_path, read_decode_fast_path_probe,
-    wrapped_decode_block_sizes, wrapped_encode_block_sizes, RegularDecodeLayout, SliceWriter};
 use crate::stream::allocate_pipe_output_buffer;
 use crate::stream::transform::{
-    run_file_transform_to_file, run_file_transform_to_pipe_with_owned_output,
-    run_reader_transform_to_file, run_reader_transform_to_pipe, PipeOutputPolicy,
-    ReaderTransformGeometry,
+    auto_select_transform_io_pairing, run_file_transform_to_file,
+    run_file_transform_to_pipe_with_owned_output, run_reader_transform_to_file,
+    run_reader_transform_to_pipe, PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec,
+    TransformIoPairing, TransformOutputSpec,
 };
 mod decode_reorg;
 use decode_reorg::Base64DecodeReorg;
@@ -203,9 +207,7 @@ fn process_file_to_file(
                 write_block_size,
                 input_chunk_multiple: 1,
             },
-            move |input: &[u8], out: &mut [u8]| {
-                encode_wrapped_block_into(input, wrap_cols, out)
-            },
+            move |input: &[u8], out: &mut [u8]| encode_wrapped_block_into(input, wrap_cols, out),
         )?;
         return Ok(false);
     }
@@ -291,7 +293,6 @@ fn ordered_input_block_bound(input: &StreamInput, io_mode: IOMode) -> io::Result
         _ => Ok(1 << 20),
     }
 }
-
 
 fn encode_wrapped_block_into(bytes: &[u8], wrap_cols: usize, out: &mut [u8]) -> io::Result<usize> {
     let line_input_bytes = (wrap_cols / 4) * 3;
@@ -481,10 +482,8 @@ fn encode_base64_input<W: Write>(
         let mut carry = vec![0u8; line_input_bytes];
         let mut carry_len = 0usize;
         let mut line_buf = vec![0u8; wrap_cols + 1];
-        let mut wrapped_slab = vec![
-            0u8;
-            (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)
-        ];
+        let mut wrapped_slab =
+            vec![0u8; (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)];
         visit_ordered_input(input, io_mode, |block| {
             let mut start = 0usize;
 
@@ -495,8 +494,10 @@ fn encode_base64_input<W: Write>(
                 carry_len += take;
                 start = take;
                 if carry_len == line_input_bytes {
-                    let written =
-                        encode_base64_block_into(&carry[..line_input_bytes], &mut line_buf[..wrap_cols]);
+                    let written = encode_base64_block_into(
+                        &carry[..line_input_bytes],
+                        &mut line_buf[..wrap_cols],
+                    );
                     debug_assert_eq!(written, wrap_cols);
                     line_buf[wrap_cols] = b'\n';
                     out.write_all(&line_buf)?;
@@ -525,7 +526,8 @@ fn encode_base64_input<W: Write>(
         })?;
         if carry_len != 0 {
             let encoded_len = encoded_base64_len(carry_len);
-            let written = encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
+            let written =
+                encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
             debug_assert_eq!(written, encoded_len);
             line_buf[encoded_len] = b'\n';
             out.write_all(&line_buf[..encoded_len + 1])?;
@@ -542,7 +544,11 @@ fn encode_base64_input<W: Write>(
     let mut encoded_slab = vec![0u8; max_encoded_len.max(4)];
     let mut wrapped_slab = vec![
         0u8;
-        wrapped_base64_output_capacity(max_encoded_len.max(4), wrap_cols, wrap_cols.saturating_sub(1))
+        wrapped_base64_output_capacity(
+            max_encoded_len.max(4),
+            wrap_cols,
+            wrap_cols.saturating_sub(1)
+        )
     ];
     visit_ordered_input(input, io_mode, |block| {
         let total_len = carry_len + block.len();
@@ -595,7 +601,8 @@ fn encode_base64_input<W: Write>(
     })?;
     if carry_len != 0 {
         let encoded_len = encoded_base64_len(carry_len);
-        let written = encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
+        let written =
+            encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
         let wrapped_len = wrap_encoded_bytes_into(
             &encoded_slab[..written],
             wrap_cols,
@@ -628,10 +635,8 @@ pub(super) fn encode_base64_bytes_via_wrapped_path(
         let mut carry = vec![0u8; line_input_bytes];
         let mut carry_len = 0usize;
         let mut line_buf = vec![0u8; wrap_cols + 1];
-        let mut wrapped_slab = vec![
-            0u8;
-            (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)
-        ];
+        let mut wrapped_slab =
+            vec![0u8; (full_line_input_bound / line_input_bytes) * (wrap_cols + 1)];
         let mut block = vec![0u8; 32 * 1024];
         loop {
             let read = stdin_reader.read(&mut block)?;
@@ -680,7 +685,8 @@ pub(super) fn encode_base64_bytes_via_wrapped_path(
 
         if carry_len != 0 {
             let encoded_len = encoded_base64_len(carry_len);
-            let written = encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
+            let written =
+                encode_base64_block_into(&carry[..carry_len], &mut line_buf[..encoded_len]);
             line_buf[written] = b'\n';
             out.extend_from_slice(&line_buf[..written + 1]);
         }
@@ -695,7 +701,11 @@ pub(super) fn encode_base64_bytes_via_wrapped_path(
     let mut encoded_slab = vec![0u8; max_encoded_len.max(4)];
     let mut wrapped_slab = vec![
         0u8;
-        wrapped_base64_output_capacity(max_encoded_len.max(4), wrap_cols, wrap_cols.saturating_sub(1))
+        wrapped_base64_output_capacity(
+            max_encoded_len.max(4),
+            wrap_cols,
+            wrap_cols.saturating_sub(1)
+        )
     ];
     let mut block = vec![0u8; 32 * 1024];
     loop {
@@ -751,7 +761,8 @@ pub(super) fn encode_base64_bytes_via_wrapped_path(
     }
     if carry_len != 0 {
         let encoded_len = encoded_base64_len(carry_len);
-        let written = encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
+        let written =
+            encode_base64_block_into(&carry[..carry_len], &mut encoded_slab[..encoded_len]);
         let wrapped_len = wrap_encoded_bytes_into(
             &encoded_slab[..written],
             wrap_cols,
@@ -835,9 +846,13 @@ fn encode_process_plan() -> Base64ProcessPlan {
         write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
         file_pipe_read_block_size: BASE64_ENCODE_FILE_PIPE_READ_BLOCK_SIZE,
         file_pipe_write_block_size: BASE64_ENCODE_FILE_PIPE_WRITE_BLOCK_SIZE,
-        pipe_file_read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
+        pipe_file_read_block_size: base64_parallel_encode_block_size(
+            BASE64_ENCODE_FAST_READ_BLOCK_SIZE,
+        ),
         pipe_file_write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
-        pipe_input_read_block_size: base64_parallel_encode_block_size(BASE64_ENCODE_FAST_READ_BLOCK_SIZE),
+        pipe_input_read_block_size: base64_parallel_encode_block_size(
+            BASE64_ENCODE_FAST_READ_BLOCK_SIZE,
+        ),
         pipe_input_write_block_size: BASE64_ENCODE_FAST_WRITE_BLOCK_SIZE,
         input_chunk_multiple: 3,
         process_chunk: encode_base64_block_processor,
@@ -905,12 +920,7 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
                 options.ignore_garbage,
             )?
         } else {
-            encode_base64_input(
-                &mut out,
-                &options.input,
-                options.io_mode,
-                options.wrap_cols,
-            )?;
+            encode_base64_input(&mut out, &options.input, options.io_mode, options.wrap_cols)?;
             false
         };
         out.into_inner()?;
@@ -927,45 +937,25 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
         encode_process_plan()
     };
 
-    let mut stdout = {
-        let dupfd = unsafe { libc::dup(io::stdout().as_raw_fd()) };
-        if dupfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe { File::from_raw_fd(dupfd) }
-    };
+    let pairing = auto_select_transform_io_pairing(
+        transform_input_spec(&options.input),
+        TransformOutputSpec::Stdout,
+    )?;
 
-    let invalid = match &options.input {
-        StreamInput::File(path) => {
-            if is_regular_input_path(path)? {
-                if is_stdout_dev_null() || is_stdout_file() {
-                    process_file_to_file(&mut stdout, path, &options, &plan)?
-                } else {
-                    process_file_to_pipe(&mut stdout, path, &options, &plan)?
-                }
-            } else if is_stdout_dev_null() || is_stdout_file() {
-                process_pipe_to_file(&mut stdout, &options.input, &options, &plan)?
-            } else {
-                process_pipe_to_pipe(&mut stdout, &options.input, &options, &plan)?
-            }
+    let invalid = match pairing {
+        TransformIoPairing::FileToFile {
+            input_path,
+            mut output,
+        } => process_file_to_file(&mut output, &input_path, &options, &plan)?,
+        TransformIoPairing::FileToStream {
+            input_path,
+            mut output,
+        } => process_file_to_pipe(&mut output, &input_path, &options, &plan)?,
+        TransformIoPairing::StreamToFile { mut output, .. } => {
+            process_pipe_to_file(&mut output, &options.input, &options, &plan)?
         }
-        StreamInput::Stdin { .. } => {
-            let stdin_fd = io::stdin().as_raw_fd();
-            if is_regular_fd(stdin_fd) {
-                let read_path_buf = fs::read_link(format!("/proc/self/fd/{stdin_fd}"))?;
-                let read_path = read_path_buf.to_str().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
-                })?;
-                if is_stdout_dev_null() || is_stdout_file() {
-                    process_file_to_file(&mut stdout, read_path, &options, &plan)?
-                } else {
-                    process_file_to_pipe(&mut stdout, read_path, &options, &plan)?
-                }
-            } else if is_stdout_dev_null() || is_stdout_file() {
-                process_pipe_to_file(&mut stdout, &options.input, &options, &plan)?
-            } else {
-                process_pipe_to_pipe(&mut stdout, &options.input, &options, &plan)?
-            }
+        TransformIoPairing::StreamToStream { mut output, .. } => {
+            process_pipe_to_pipe(&mut output, &options.input, &options, &plan)?
         }
     };
 
@@ -974,4 +964,11 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
         return Ok(1);
     }
     Ok(0)
+}
+
+fn transform_input_spec(input: &StreamInput) -> TransformInputSpec<'_> {
+    match input {
+        StreamInput::File(path) => TransformInputSpec::Path(path),
+        StreamInput::Stdin { .. } => TransformInputSpec::Stdin,
+    }
 }

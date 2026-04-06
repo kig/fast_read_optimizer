@@ -76,7 +76,6 @@ pub(crate) fn warm_file_page_cache(filename: &str) -> io::Result<u64> {
     }
 }
 
-
 fn auto_read_cache_state(filename: &str) -> ReadBenchmarkCacheState {
     match auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false)) {
         IOMode::PageCache => ReadBenchmarkCacheState::Hot,
@@ -774,18 +773,19 @@ pub fn resolve_reader_params_for_mode(
     io_mode: IOMode,
 ) -> std::io::Result<ResolvedReadParams> {
     match execution::resolve_reader_execution_for_mode(config, mode, filename, io_mode)? {
-        ResolvedReadExecution::Simple(params) | ResolvedReadExecution::Threaded(params) => Ok(params),
+        ResolvedReadExecution::Simple(params) | ResolvedReadExecution::Threaded(params) => {
+            Ok(params)
+        }
     }
 }
 
-
-mod execution;
-mod workers;
 mod api;
-#[cfg(test)]
-mod tests;
+mod execution;
 #[cfg(kani)]
 mod kani_proofs;
+#[cfg(test)]
+mod tests;
+mod workers;
 
 pub use api::*;
 

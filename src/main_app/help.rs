@@ -78,12 +78,61 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ),
             ],
         }),
+        "config" => Some(CommandHelp {
+            name: "config",
+            usage: "config <print|explain> [--for <path>] [-c config.json]",
+            summary: "Print raw config or explain the effective config chosen for one path.",
+            notes: &[
+                "config print emits the currently loaded config file as JSON.",
+                "config explain shows defaults, matching mount info, extracted device signature details, any matched device-db profile, any mount override, and the effective config after applying device-db params and then mount overrides.",
+                "The --for path is resolved the same way runtime path-based config selection resolves mount and device context for I/O decisions.",
+                "fro-optimize --for <path> uses the same mount selection rule when deciding which mount_overrides entry to write.",
+            ],
+            examples: &[
+                ("Print the active config file", "config print"),
+                (
+                    "Explain config selection for a file on a specific mount",
+                    "config explain --for /mnt/nvme/data.bin",
+                ),
+                (
+                    "Explain config selection using an explicit config file",
+                    "config explain -c fro.json --for ./target/test.bin",
+                ),
+            ],
+        }),
         "cat" => Some(CommandHelp {
             name: "cat",
             usage: "cat [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "Print one or more files using fro's fast read path.",
             notes: &["Useful as a compatibility wrapper over the same IO-mode flags as fro reads."],
             examples: &[("Print two files", "cat a.txt b.txt")],
+        }),
+        "rm" => Some(CommandHelp {
+            name: "rm",
+            usage: "rm [-f] [-r|-R|--recursive] [-v] <file> [file ...]",
+            summary: "Remove files or directory trees, with recursive delete using fro's tree-walk plumbing.",
+            notes: &[
+                "-f/--force ignores missing operands and missing files, matching the common cleanup flow.",
+                "Recursive removal uses the existing tree-delete helper; plain file removal stays on the simple unlink path.",
+            ],
+            examples: &[
+                ("Ignore cache-cleanup misses", "rm -f build/output.bin"),
+                ("Remove a directory tree verbosely", "rm -rv scratch-tree"),
+            ],
+        }),
+        "mv" => Some(CommandHelp {
+            name: "mv",
+            usage: "mv [-f] [-v] [-t DIRECTORY] <source>... <target>",
+            summary: "Rename files or move them into a directory, with cross-filesystem fallback via fro copy helpers.",
+            notes: &[
+                "Same-filesystem moves use rename(2) when possible.",
+                "Cross-filesystem file and directory moves fall back to the fro copy/remove path.",
+            ],
+            examples: &[
+                ("Rename one file", "mv old.bin new.bin"),
+                ("Move multiple files into a directory", "mv a.bin b.bin archive/"),
+                ("Move files into a specific directory", "mv -t archive/ a.bin b.bin"),
+            ],
         }),
         "base64" => Some(CommandHelp {
             name: "base64",
@@ -99,6 +148,48 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Decode one file", "base64 -d payload.b64"),
             ],
         }),
+        "encrypt" => Some(CommandHelp {
+            name: "encrypt",
+            usage: "encrypt --passphrase-file PATH [--cipher NAME] [-o file] [input]",
+            summary: "Encrypt data into OpenSSL-compatible aes-256-ctr output via the OpenSSL library.",
+            notes: &[
+                "Regular-file inputs are processed in parallel 512 KiB blocks.",
+                "Only aes-256-ctr is supported, derived with PBKDF2-HMAC-SHA256 and the standard `Salted__` header.",
+                "No trailing b3sum is appended because extra bytes would break `openssl enc` compatibility.",
+                "aes-256-ctr is unauthenticated, so wrong-passphrase decrypts may return garbage rather than a hard error.",
+                "Use -o/--output to write to a file; otherwise ciphertext is written to stdout.",
+            ],
+            examples: &[
+                (
+                    "Encrypt one file into a sibling output file",
+                    "encrypt --passphrase-file secret.txt -o payload.enc payload.bin",
+                ),
+                (
+                    "Encrypt stdin to stdout with the supported cipher",
+                    "encrypt --passphrase-file secret.txt --cipher aes-256-ctr < payload.bin > payload.enc",
+                ),
+            ],
+        }),
+        "decrypt" => Some(CommandHelp {
+            name: "decrypt",
+            usage: "decrypt --passphrase-file PATH [--cipher NAME] [-o file] [input]",
+            summary: "Decrypt OpenSSL-compatible aes-256-ctr ciphertext in-process.",
+            notes: &[
+                "Regular-file inputs are processed in parallel 512 KiB blocks.",
+                "Only aes-256-ctr with the OpenSSL `Salted__` header and PBKDF2-HMAC-SHA256 derivation is supported.",
+                "Ciphertext must match the bytes produced by `fro encrypt` or `openssl enc -aes-256-ctr -pbkdf2 -salt`.",
+            ],
+            examples: &[
+                (
+                    "Decrypt a file to stdout",
+                    "decrypt --passphrase-file secret.txt payload.enc > payload.bin",
+                ),
+                (
+                    "Decrypt into a named output file",
+                    "decrypt --passphrase-file secret.txt -o payload.bin payload.enc",
+                ),
+            ],
+        }),
         "cmp" => Some(CommandHelp {
             name: "cmp",
             usage: "cmp [--auto|--no-direct|--direct] <file1> <file2>",
@@ -108,10 +199,19 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "fgrep" => Some(CommandHelp {
             name: "fgrep",
-            usage: "fgrep [-n] [--auto|--no-direct|--direct] <pattern> <file> [file ...]",
+            usage: "fgrep [-n] [-i] [-x] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [pattern] <file> [file ...]",
             summary: "Literal line-oriented grep on top of fro's fast substring scanner.",
-            notes: &["Matches GNU grep -F visible behavior for the covered compatibility matrix."],
-            examples: &[("Print matching lines with numbers", "fgrep -n needle notes.txt")],
+            notes: &[
+                "Matches GNU grep -F visible behavior for the covered compatibility matrix.",
+                "-i/--ignore-case folds ASCII case for literal matching; --no-ignore-case turns it back off.",
+                "-e/--regexp and -f/--file can be repeated; if neither is provided, the first positional argument is the pattern.",
+            ],
+            examples: &[
+                ("Print matching lines with numbers", "fgrep -n needle notes.txt"),
+                ("Match any listed pattern file entry", "fgrep -f patterns.txt notes.txt"),
+                ("Match literally without ASCII case sensitivity", "fgrep -i needle notes.txt"),
+                ("Match whole lines literally", "fgrep -x needle notes.txt"),
+            ],
         }),
         "find" => Some(CommandHelp {
             name: "find",
@@ -130,6 +230,19 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             ],
             examples: &[("Summarize one tree", "du -s ."), ("Print all entries in src", "du -a src")],
         }),
+        "head" => Some(CommandHelp {
+            name: "head",
+            usage: "head [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print the first lines or bytes of each input.",
+            notes: &[
+                "Supports classic head counts including -NUM \"all but last\" forms for -n/-c.",
+                "Use -q/--quiet/--silent to suppress headers and -v/--verbose to always print them; the last one wins.",
+            ],
+            examples: &[
+                ("Print the first ten lines", "head notes.txt"),
+                ("Print all but the last 4 KiB", "head -c -4KiB disk.log"),
+            ],
+        }),
         "tac" => Some(CommandHelp {
             name: "tac",
             usage: "tac [--auto|--no-direct|--direct] <file> [file ...]",
@@ -137,12 +250,34 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[],
             examples: &[("Reverse one file by line", "tac notes.txt")],
         }),
+        "tail" => Some(CommandHelp {
+            name: "tail",
+            usage: "tail [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Print the last lines or bytes of each input.",
+            notes: &[
+                "Supports classic tail counts including +N start offsets for -n/-c.",
+                "Use -q to suppress headers and -v to always print them; the last one wins.",
+                "Byte-mode on non-seekable inputs keeps only a bounded trailing window before final output.",
+            ],
+            examples: &[
+                ("Print the last ten lines", "tail notes.txt"),
+                ("Print the last 4 KiB", "tail -c 4KiB disk.log"),
+            ],
+        }),
         "wc" => Some(CommandHelp {
             name: "wc",
-            usage: "wc [-l] [-w] [-c] [--auto|--no-direct|--direct] <file> [file ...]",
-            summary: "Count lines, words, and bytes using fro block visitors.",
-            notes: &["Without -l/-w/-c, prints all three counts."],
-            examples: &[("Count lines and words", "wc -l -w notes.txt")],
+            usage: "wc [-l] [-w] [-m] [-c] [-L] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] <file> [file ...]",
+            summary: "Count lines, words, characters, bytes, and max line length using fro block visitors.",
+            notes: &[
+                "Without -l/-w/-m/-c/-L, prints lines, words, and bytes.",
+                "--files0-from=F reads NUL-delimited input names from F (or stdin when F is -).",
+            ],
+            examples: &[
+                ("Count lines and words", "wc -l -w notes.txt"),
+                ("Count UTF-8 characters", "wc -m notes.txt"),
+                ("Print the maximum display width", "wc -L notes.txt"),
+                ("Read NUL-delimited paths from a list file", "wc --files0-from=list0"),
+            ],
         }),
         "dd" => Some(CommandHelp {
             name: "dd",
@@ -219,10 +354,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "shred" => Some(CommandHelp {
             name: "shred",
-            usage: "shred [-n passes] [-z] [-u] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "shred [-n passes] [-s size] [-z] [-u] [-f] [-v] [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "Overwrite files with random or zero patterns, optionally removing them.",
-            notes: &["This compatibility surface currently focuses on the covered basic flags."],
-            examples: &[("Zero a file once and keep it", "shred -n 0 -z scratch.bin")],
+            notes: &["This compatibility surface covers the basic GNU-compatible size, force, and verbose flags."],
+            examples: &[
+                ("Zero a file once and keep it", "shred -n 0 -z scratch.bin"),
+                ("Overwrite only the first 4 KiB verbosely", "shred -n 0 -z -v -s 4KiB scratch.bin"),
+            ],
         }),
         "write" => Some(CommandHelp {
             name: "write",
@@ -266,6 +404,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
+                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, and -T/--no-target-directory compatibility flags.",
             ],
             examples: &[
                 (
@@ -668,14 +807,31 @@ pub(super) fn print_general_help(program: &str) {
     for (name, summary) in [
         ("cat", "print files using the fro read path"),
         ("base64", "encode or decode base64 data"),
+        (
+            "encrypt",
+            "encrypt data via the in-process OpenSSL library path",
+        ),
+        (
+            "decrypt",
+            "decrypt data via the in-process OpenSSL library path",
+        ),
         ("cmp", "compare two files using the fro diff engine"),
         ("dd", "copy byte ranges with dd-style operands"),
         ("fgrep", "literal line-oriented grep compatibility wrapper"),
         ("find", "walk directory trees and print every path"),
         ("du", "report disk usage from filesystem block counts"),
         ("grep", "search for a literal byte substring while reading"),
+        (
+            "config",
+            "print config JSON or explain config selection for a path",
+        ),
+        ("head", "print the first lines or bytes of each input"),
         ("tac", "print files in reverse line order"),
-        ("wc", "count lines, words, and bytes"),
+        ("tail", "print the last lines or bytes of each input"),
+        (
+            "wc",
+            "count lines, words, characters, bytes, and max line length",
+        ),
         ("cksum", "POSIX cksum compatibility wrapper"),
         ("b3sum", "print BLAKE3 digests"),
         ("b2sum", "print BLAKE2b-512 digests"),
@@ -737,9 +893,13 @@ pub(super) fn print_general_help(program: &str) {
     println!("  dual-read-bench    benchmark the read pressure of diff");
     println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
     println!("  file-list-read-bench benchmark aggregate read throughput from a file manifest");
-    println!("  file-list-read-uring-bench sweep io_uring aggregate throughput from a file manifest");
+    println!(
+        "  file-list-read-uring-bench sweep io_uring aggregate throughput from a file manifest"
+    );
     println!("  file-list-read-open-read-close-sweep compare manifest reader variants across file-count prefixes");
-    println!("  manifest-recursive-copy-bench benchmark manifest-driven recursive copy phase timing");
+    println!(
+        "  manifest-recursive-copy-bench benchmark manifest-driven recursive copy phase timing"
+    );
     println!("  split-manifest-recursive-copy-bench benchmark split manifest-build recursive copy timing");
     println!("  bench-recursive-small-file-threads sweep recursive small-file worker counts and save hot/cold per mount");
     println!("  bench-read-sweep  sweep read variants across file sizes");
@@ -765,7 +925,7 @@ pub(super) fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp dd fgrep find du rm mv tar cat base64 tac wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp dd fgrep find du rm mv tar cat base64 encrypt decrypt head tac tail wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

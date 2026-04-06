@@ -22,7 +22,7 @@ use crate::writer::{
     copy_file_range_syscall, copy_file_with_strategy, copy_file_with_strategy_and_truncate,
     overwrite_changed_chunks_direct, write_buffer, write_file,
 };
-use crate::{config, coreutils, common};
+use crate::{common, config, coreutils};
 use iou::IoUring;
 use std::collections::VecDeque;
 use std::fs;
@@ -36,16 +36,16 @@ use std::sync::{Arc, Condvar, Mutex};
 
 pub(super) const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-mod util;
-mod read_sweep;
-mod tuning;
+mod cli;
 mod copy_plan;
 mod file_list;
-mod recursive;
 mod help;
-mod cli;
+mod read_sweep;
+mod recursive;
 #[cfg(test)]
 mod tests;
+mod tuning;
+mod util;
 
 use self::copy_plan::{CopyRewriteMode, ResolvedCopyExecution};
 use self::file_list::*;
@@ -53,7 +53,6 @@ use self::help::*;
 use self::read_sweep::*;
 use self::tuning::*;
 use self::util::*;
-
 
 const PAGE_CACHE_PARAM_INDICES: [usize; 3] = [0, 1, 2];
 const DIRECT_PARAM_INDICES: [usize; 3] = [3, 4, 5];
@@ -77,6 +76,8 @@ struct RecursiveCopyContext {
     keep_target_size: bool,
     use_lock: bool,
     relative_copy_method: RelativeCopyMethod,
+    verbose: bool,
+    cp_compat: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +92,7 @@ struct RecursiveFileTask {
     target_path: PathBuf,
     source_mode: u32,
     resolved_copy: ResolvedCopyExecution,
+    source_parent_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -188,7 +190,9 @@ impl ManifestReadVariant {
     fn label(self) -> String {
         match self {
             ManifestReadVariant::SingleThreadBlocking => "st-blocking".to_string(),
-            ManifestReadVariant::MultiThreadBlocking { threads } => format!("mt-blocking-{threads}t"),
+            ManifestReadVariant::MultiThreadBlocking { threads } => {
+                format!("mt-blocking-{threads}t")
+            }
             ManifestReadVariant::SingleThreadUring { qd } => format!("st-uring-qd{qd}"),
             ManifestReadVariant::MultiThreadUring { threads, qd } => {
                 format!("mt-uring-{threads}t-qd{qd}")
@@ -370,11 +374,18 @@ impl<T> Default for RecursiveTaskQueue<T> {
     }
 }
 
-pub(crate) fn resolve_recursive_move_target(source_root: &Path, target: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve_recursive_move_target(
+    source_root: &Path,
+    target: &Path,
+) -> io::Result<PathBuf> {
     recursive::paths::resolve_recursive_copy_root(source_root, target)
 }
 
-pub(crate) fn copy_directory_recursively(
+pub(crate) fn remove_path_recursively(path: &Path, verbose: bool) -> io::Result<u64> {
+    recursive::delete::run_recursive_delete(path, verbose)
+}
+
+pub(crate) fn move_directory_cross_filesystem(
     source_root: &Path,
     target_root: &Path,
     io_mode_read: common::IOMode,
@@ -408,12 +419,10 @@ pub(crate) fn copy_directory_recursively(
         keep_target_size: false,
         use_lock: true,
         relative_copy_method: RelativeCopyMethod::CopyFileRange,
+        verbose,
+        cp_compat: false,
     };
-    recursive::run_recursive_copy(recursive_ctx, verbose)
-}
-
-pub(crate) fn remove_path_recursively(path: &Path, verbose: bool) -> io::Result<u64> {
-    recursive::delete::run_recursive_delete(path, verbose)
+    recursive::move_dir::run_recursive_move(recursive_ctx, verbose)
 }
 
 pub(crate) fn create_tar_archive(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {

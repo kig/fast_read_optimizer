@@ -1,7 +1,7 @@
 use fro::block_hash::{default_hash_base, verify_file_with_replicas, BlockHashAlgorithm};
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::fs::symlink;
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;

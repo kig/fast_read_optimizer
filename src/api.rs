@@ -1,7 +1,9 @@
 use crate::common::CopyStrategy;
 use crate::config::load_config;
 use crate::io_util::CopyOperationGuard;
-use crate::reader::{evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache, BufReader};
+use crate::reader::{
+    evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache, BufReader,
+};
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
     self, copy_file_range_with_strategy as copy_range_internal, resolve_writer_params_for_mode,
@@ -136,8 +138,9 @@ where
     }
     grow_pipe_best_effort(dst_fd)?;
     let mut total = 0u64;
-    let mut offset = i64::try_from(range.start_offset)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "start_offset overflowed off_t"))?;
+    let mut offset = i64::try_from(range.start_offset).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "start_offset overflowed off_t")
+    })?;
     loop {
         let count = match range.end_offset {
             Some(end_offset) => {
@@ -168,11 +171,7 @@ where
     }
 }
 
-pub fn visit_path_range_ordered<P, F>(
-    path: P,
-    range: ByteRange,
-    mut visit: F,
-) -> io::Result<u64>
+pub fn visit_path_range_ordered<P, F>(path: P, range: ByteRange, mut visit: F) -> io::Result<u64>
 where
     P: AsRef<Path>,
     F: FnMut(u64, &[u8]) -> io::Result<OrderedVisitDecision>,

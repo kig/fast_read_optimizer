@@ -62,7 +62,9 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             i += 1;
             output = Some(
                 args.get(i)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing value for --file"))?
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "missing value for --file")
+                    })?
                     .clone(),
             );
         } else if !end_flags && arg.starts_with('-') && arg.len() > 1 {

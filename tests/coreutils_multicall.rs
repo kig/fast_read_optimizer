@@ -5,6 +5,7 @@ use openssl::hash::{hash, MessageDigest};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +43,35 @@ fn run_system(program: &str, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
 }
 
+fn run_system_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn {program}: {err}"));
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("missing system stdin");
+    let input = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&input).or_else(|err| match err.kind() {
+            std::io::ErrorKind::BrokenPipe => Ok(()),
+            _ => Err(err),
+        })
+    });
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("failed to collect {program} output: {err}"));
+    writer
+        .join()
+        .expect("stdin writer thread panicked")
+        .expect("failed to write system stdin");
+    output
+}
+
 fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fro"))
         .arg(command)
@@ -51,15 +81,25 @@ fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Outpu
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn fro coreutils command");
-    child
+    let mut stdin = child
         .stdin
         .take()
-        .expect("missing child stdin")
-        .write_all(stdin_bytes)
-        .expect("failed to write child stdin");
-    child
+        .expect("missing child stdin");
+    let input = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&input).or_else(|err| match err.kind() {
+            std::io::ErrorKind::BrokenPipe => Ok(()),
+            _ => Err(err),
+        })
+    });
+    let output = child
         .wait_with_output()
-        .expect("failed to read child output")
+        .expect("failed to read child output");
+    writer
+        .join()
+        .expect("stdin writer thread panicked")
+        .expect("failed to write child stdin");
+    output
 }
 
 fn assert_success(output: Output) -> Output {
@@ -160,6 +200,19 @@ fn multicall_aliases_cover_existing_copy_diff_and_grep_modes() {
 }
 
 #[test]
+fn multicall_rm_help_and_force_zero_operands_work() {
+    let help = run_fro("rm", &["--help"]);
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help_stdout.contains("rm - Remove files or directory trees"));
+    assert!(help_stdout.contains("[-f] [-r|-R|--recursive] [-v] <file> [file ...]"));
+    assert!(help_stdout.contains("ignores missing operands and missing files"));
+    assert!(help.stderr.is_empty());
+
+    assert_success(run_fro("rm", &["-f"]));
+}
+
+#[test]
 fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
     let tmp = unique_temp_dir("fro-coreutils-text");
     let path = tmp.join("text.txt");
@@ -186,6 +239,35 @@ fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
 
     let du_out = assert_success(run_fro("du", &[path.to_str().unwrap()]));
     assert!(String::from_utf8_lossy(&du_out.stdout).contains(path.to_str().unwrap()));
+}
+
+#[test]
+fn multicall_head_supports_negative_counts_and_headers() {
+    let tmp = unique_temp_dir("fro-coreutils-head");
+    let file_a = tmp.join("a.txt");
+    let file_b = tmp.join("b.txt");
+    fs::write(&file_a, b"zero\none\ntwo\nthree\n").unwrap();
+    fs::write(&file_b, b"apple\nbanana\ncarrot\n").unwrap();
+
+    let minus_lines = assert_success(run_fro("head", &["-n", "-1", file_a.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&minus_lines.stdout),
+        "zero\none\ntwo\n"
+    );
+
+    let minus_bytes = assert_success(run_fro("head", &["-c", "-2", file_a.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&minus_bytes.stdout),
+        "zero\none\ntwo\nthre"
+    );
+
+    let verbose = assert_success(run_fro(
+        "head",
+        &["-v", file_a.to_str().unwrap(), file_b.to_str().unwrap()],
+    ));
+    let verbose_stdout = String::from_utf8_lossy(&verbose.stdout);
+    assert!(verbose_stdout.contains(&format!("==> {} <==", file_a.display())));
+    assert!(verbose_stdout.contains(&format!("==> {} <==", file_b.display())));
 }
 
 #[test]
@@ -229,6 +311,120 @@ fn multicall_cat_and_wc_accept_stdin_and_dash() {
 
     let wc_dash = assert_success(run_fro_with_stdin("wc", &["-"], bytes));
     assert_eq!(String::from_utf8_lossy(&wc_dash.stdout).trim(), "2 3 14 -");
+}
+
+#[test]
+fn multicall_head_accepts_stdin_negative_counts() {
+    let bytes = b"one\ntwo\nthree\n";
+
+    let head_stdin = assert_success(run_fro_with_stdin("head", &["-n", "-1"], bytes));
+    assert_eq!(String::from_utf8_lossy(&head_stdin.stdout), "one\ntwo\n");
+
+    let head_dash = assert_success(run_fro_with_stdin("head", &["-c", "-2", "-"], bytes));
+    assert_eq!(String::from_utf8_lossy(&head_dash.stdout), "one\ntwo\nthre");
+}
+
+#[test]
+fn multicall_head_byte_prefix_matches_system_for_large_stdin_binary() {
+    let bytes = (0..(256 * 1024))
+        .map(|idx| ((idx * 17 + 31) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    let fro = assert_success(run_fro_with_stdin("head", &["-c", "65536"], &bytes));
+    let system = run_system_with_stdin("head", &["-c", "65536"], &bytes);
+    assert!(
+        system.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&system.stdout),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(fro.stdout, system.stdout);
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn multicall_head_line_prefix_matches_system_for_large_stdin_text() {
+    let line = b"needle alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu\n";
+    let mut bytes = Vec::with_capacity(line.len() * 16384);
+    for _ in 0..16384 {
+        bytes.extend_from_slice(line);
+    }
+
+    let fro = assert_success(run_fro_with_stdin("head", &["-n", "4096"], &bytes));
+    let system = run_system_with_stdin("head", &["-n", "4096"], &bytes);
+    assert!(
+        system.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&system.stdout),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(fro.stdout, system.stdout);
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn multicall_wc_supports_character_counts_on_stdin() {
+    let bytes = "aé🙂\n".as_bytes();
+
+    let wc_chars = assert_success(run_fro_with_stdin("wc", &["-m"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_chars.stdout).trim(), "4");
+
+    let wc_chars_dash = assert_success(run_fro_with_stdin("wc", &["-m", "-"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_chars_dash.stdout).trim(), "4 -");
+}
+
+#[test]
+fn multicall_wc_supports_max_line_length_on_stdin() {
+    let bytes = "e\u{0301}\n1234567\tX\n".as_bytes();
+
+    let wc_max = assert_success(run_fro_with_stdin("wc", &["-L"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_max.stdout).trim(), "9");
+
+    let wc_max_dash = assert_success(run_fro_with_stdin("wc", &["--max-line-length", "-"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_max_dash.stdout).trim(), "9 -");
+}
+
+#[test]
+fn multicall_wc_supports_files0_from_list_files() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-files0");
+    let one = tmp.join("one.txt");
+    let two = tmp.join("two.txt");
+    let list = tmp.join("inputs.list0");
+    fs::write(&one, b"one two\n").unwrap();
+    fs::write(&two, b"alpha\nbeta\n").unwrap();
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(one.as_os_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(two.as_os_str().as_bytes());
+    bytes.push(0);
+    fs::write(&list, bytes).unwrap();
+
+    let out = assert_success(run_fro(
+        "wc",
+        &["--files0-from", list.to_str().unwrap(), "-l", "-w"],
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("1 2 {}\n2 2 {}\n3 4 total\n", one.display(), two.display())
+    );
+}
+
+#[test]
+fn multicall_wc_supports_files0_from_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-files0-stdin");
+    let file = tmp.join("stdin.txt");
+    fs::write(&file, b"alpha beta\n").unwrap();
+
+    let mut list = Vec::new();
+    list.extend_from_slice(file.as_os_str().as_bytes());
+    list.push(0);
+
+    let out = assert_success(run_fro_with_stdin("wc", &["--files0-from=-", "-w"], &list));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("2 {}\n", file.display())
+    );
 }
 
 #[test]
@@ -329,6 +525,11 @@ fn multicall_and_subcommand_version_flags_print_version() {
     assert!(subcommand_stdout.contains(pkg_version));
     assert!(subcommand_stdout.contains("cat"));
 
+    let head_subcommand = assert_success(run_fro("head", &["--version"]));
+    let head_subcommand_stdout = String::from_utf8_lossy(&head_subcommand.stdout);
+    assert!(head_subcommand_stdout.contains(pkg_version));
+    assert!(head_subcommand_stdout.contains("head"));
+
     let alias_dir = unique_temp_dir("fro-coreutils-version");
     let alias_path = alias_dir.join("cat");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fro"), &alias_path).unwrap();
@@ -340,6 +541,33 @@ fn multicall_and_subcommand_version_flags_print_version() {
     let alias_stdout = String::from_utf8_lossy(&alias.stdout);
     assert!(alias_stdout.contains(pkg_version));
     assert!(alias_stdout.contains("cat"));
+
+    let head_alias_path = alias_dir.join("head");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fro"), &head_alias_path).unwrap();
+    let head_alias = Command::new(&head_alias_path)
+        .arg("--version")
+        .output()
+        .expect("failed to run head multicall alias --version");
+    let head_alias = assert_success(head_alias);
+    let head_alias_stdout = String::from_utf8_lossy(&head_alias.stdout);
+    assert!(head_alias_stdout.contains(pkg_version));
+    assert!(head_alias_stdout.contains("head"));
+
+    let encrypt_subcommand = assert_success(run_fro("encrypt", &["--version"]));
+    let encrypt_subcommand_stdout = String::from_utf8_lossy(&encrypt_subcommand.stdout);
+    assert!(encrypt_subcommand_stdout.contains(pkg_version));
+    assert!(encrypt_subcommand_stdout.contains("encrypt"));
+
+    let encrypt_alias_path = alias_dir.join("encrypt");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fro"), &encrypt_alias_path).unwrap();
+    let encrypt_alias = Command::new(&encrypt_alias_path)
+        .arg("--version")
+        .output()
+        .expect("failed to run encrypt multicall alias --version");
+    let encrypt_alias = assert_success(encrypt_alias);
+    let encrypt_alias_stdout = String::from_utf8_lossy(&encrypt_alias.stdout);
+    assert!(encrypt_alias_stdout.contains(pkg_version));
+    assert!(encrypt_alias_stdout.contains("encrypt"));
 }
 
 #[test]

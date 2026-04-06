@@ -56,4 +56,3 @@ pub(super) fn align_down(bytes: u64, align: u64) -> u64 {
 pub(super) fn fmt_gib(bytes: u64) -> String {
     format!("{:.2} GiB", (bytes as f64) / (1024.0 * 1024.0 * 1024.0))
 }
-

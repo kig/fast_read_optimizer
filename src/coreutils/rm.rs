@@ -10,19 +10,38 @@ fn mark_removed(path: &Path, is_dir: bool, verbose: bool) {
     }
 }
 
+fn print_rm_help(program: &str) {
+    println!("Usage: {program} [-f] [-r|-R|--recursive] [-v] <file> [file ...]");
+    println!("Remove files or directories.");
+    println!();
+    println!("  -f, --force        ignore missing files and allow zero operands");
+    println!("  -r, -R, --recursive remove directories and their contents recursively");
+    println!("  -v, --verbose      print a line for each removed path");
+    println!("  -h, --help         display this help and exit");
+}
+
 pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut recursive = false;
     let mut force = false;
     let mut verbose = false;
     let mut targets = Vec::new();
+    let mut end_of_options = false;
 
     for arg in args.iter().skip(1) {
+        if end_of_options {
+            targets.push(arg.to_string());
+            continue;
+        }
         match arg.as_str() {
+            "-h" | "--help" => {
+                print_rm_help(program);
+                return Ok(0);
+            }
             "--recursive" => recursive = true,
             "--force" => force = true,
             "--verbose" => verbose = true,
-            "--" => {}
+            "--" => end_of_options = true,
             other if other.starts_with("--") => targets.push(other.to_string()),
             other if other.starts_with('-') && other.len() > 1 => {
                 for ch in other[1..].chars() {
@@ -30,6 +49,10 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
                         'r' | 'R' => recursive = true,
                         'f' => force = true,
                         'v' => verbose = true,
+                        'h' => {
+                            print_rm_help(program);
+                            return Ok(0);
+                        }
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -43,7 +66,19 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
         }
     }
 
-    let targets = ensure_files(program, targets, "[-f] [-r|-R|--recursive] [-v] <file> [file ...]")?;
+    if targets.is_empty() {
+        if force {
+            return Ok(0);
+        }
+        eprintln!(
+            "Usage: {} [-f] [-r|-R|--recursive] [-v] <file> [file ...]",
+            program
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file operand",
+        ));
+    }
     let mut exit_code = 0;
     for target in targets {
         let path = Path::new(&target);

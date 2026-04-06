@@ -1,5 +1,62 @@
 # History
 
+## 2026-04-06
+
+### Archived from TODO: low-priority parity sprawl and utility long tail
+
+- Reworked `TODO.md` so the active backlog now reflects project goals and observed command usage instead of carrying a giant per-flag parity ledger.
+- Elevated shared fast-I/O work plus the highest-value utility families called out by `cmd_counts_nz.txt`: `cat`, `rm`, `find`, `cp`, `wc`, `mv`, `head`, `tail`, `dd`, `md5sum`, and `du`.
+- Kept `base64` in view only as architecturally useful transform-style I/O work, not as a top-line command-priority item.
+- De-emphasized or parked lower-return backlog items that were cluttering the active plan:
+  - exhaustive flag-by-flag compatibility tracking for every implemented utility
+  - long-tail digest CLI parity beyond common `md5sum` / shared checksum flows
+  - `parallel zstd`, compressed `tar`, HDD-specific streaming tweaks, and `rdma-pipe` integration
+- Preserved the rationale that parity work should follow the fast path: active TODO items now explicitly say to prefer high-use, path-preserving compatibility slices over low-frequency corners.
+
+### Archived from TODO: coreutils parity, config CLI, and follow-up utility work
+
+- Added a substantial coreutils parity wave and moved the completed slices out of the active backlog:
+  - `tail` landed as a multicall/subcommand using the same range/offset helpers as `head`, including default behavior, `-n`, `-c`, size suffixes, `+N` semantics, and `-q` / `-v` header controls.
+  - `fgrep` gained `-x` / `--line-regexp`, then `-i` / `--ignore-case` and `--no-ignore-case`.
+  - `wc` gained `-m` / `--chars`, `-L` / `--max-line-length`, and `--files0-from`.
+  - `shred` gained `-s` / `--size`, `-v` / `--verbose`, and `-f` / `--force`.
+  - `cp` compatibility gained `-n` / `--no-clobber`, `-u` / `--update`, `-v` / `--verbose`, and `-T` / `--no-target-directory`.
+- Added shared repo-local parity fixtures in `tests/helpers/coreutils_parity.rs` for regular files, symlinks, nested trees, and stdin/`-`, and wired new flag slices into the growing parity suite.
+- Documented the new flag slices more explicitly in repo docs so future work distinguishes path-preserving flags from flags that intentionally force slower transform/buffered execution, and so parity tests are paired with performance-path verification.
+- Added a first user-visible config/mount introspection slice:
+  - `fro config print`
+  - `fro config explain --for <path>`
+- Improved `dd` small/medium transfer routing by reusing lighter existing copy primitives instead of always forcing the threaded path.
+- Implemented a first practical `fro encrypt` / `fro decrypt` slice by delegating to the system `openssl enc` CLI with `--passphrase-file`, `--cipher`, and `-o/--output`, but this was later clarified by the user as the wrong long-term architecture.
+- The intended follow-up encryption design is now recorded as:
+  - OpenSSL **library** integration
+  - blockwise encryption/decryption in 512 KiB chunks
+  - existing `ParallelStream` mapper-style processing
+  - `num_cpus` worker parallelism
+- Writer-path follow-up work completed in the same period:
+  - small direct-write heuristics for generated writes / RAM-buffer flushes
+  - cross-filesystem recursive `mv` pending-state race fix plus regression coverage
+
+### Archived from TODO: mount/device signatures, flag-path docs, benchmarks, and in-process crypto
+
+- `config explain --for <path>` now includes richer device signature extraction:
+  - canonical `/dev/...` source resolution
+  - `/dev/disk/by-id` aliases
+  - sysfs vendor/model/rotational metadata
+  - composite `dm` / `md` stack details via recursive `slaves`
+  - flattened device `match_keys` for future profile matching
+- Documentation and benchmarking follow-ups landed for the expanding flag-parity work:
+  - docs now classify path-preserving vs path-changing flags and require perf-path verification alongside parity work
+  - benchmark notes now include flagged multicall cases
+  - a practical benchmark slice compares selected `fro` flag paths against GNU coreutils and uutils where locally available
+- More parity slices landed:
+  - `fgrep` gained `-e` / `--regexp` and `-f` / `--file`
+- A first in-process OpenSSL-library crypto path landed:
+  - regular-file encrypt/decrypt uses 512 KiB framed blocks with parallel file readers/writers and CPU-parallel workers
+  - stdin/stdout remains sequential
+  - this first version currently uses a `fro`-specific framed format and CBC-family ciphers, which the user has since redirected toward OpenSSL-compatible `aes-256-ctr`
+  - follow-up work should therefore pivot from the framed CBC container toward OpenSSL-compatible CTR output plus better automatic stream/file pairing helpers
+
 ## 2026-03-16
 
 ### Completed in PR #4
@@ -451,10 +508,117 @@ Let users download a device DB so optimization is usually unnecessary.
 
 ---
 
-## Open questions / decisions needed
+## Open questions
 
-- Should `./fro.json` in the current directory ever be auto-loaded, or only via `-c`?
-- Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
-- How conservative should the default wear budget be (bytes written per optimize run)?
-- For page-cache “hot” tests, should we cap test size relative to RAM (to avoid false “hot”)?
-- How do we want to handle devices where direct IO is unsupported or unreliable?
+- [x] Should `./fro.json` ever be auto-loaded, or only via explicit `-c`?
+    - Only via explicit `-c`.
+- [x] Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
+    - Filesystem UUID primarily. If only mountpoint string is defined, use that.
+- [x] How conservative should the default drive-write budget be?
+    - 0.05 DPWD (ok to do at least 20 optimize runs per day on 1 DPWD drive.)
+- [x] How should `fro` behave on filesystems where direct I/O is unsupported or unreliable? 
+    - Use non-direct I/O. Flag to user if --direct specified.
+
+## Compat work
+
+  - [x] `cat`
+    - [x] `-A`, `--show-all`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--number-nonblank`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-e`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-E`, `--show-ends`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--number`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-s`, `--squeeze-blank`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-t`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-T`, `--show-tabs`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-u`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-v`, `--show-nonprinting`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--print-bytes`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-initial=SKIP`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-initial=SKIP1:SKIP2`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-l`, `--verbose`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--bytes=LIMIT`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-s`, `--quiet`, `--silent`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-F`, `--fixed-strings`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--line-number`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--binary`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-c`, `--check`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--tag`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-t`, `--text`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-z`, `--zero`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--ignore-missing`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--quiet`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--status`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--strict`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-w`, `--warn`
+      - [x] equality test
+      - [x] implementation
+- [x] cksum, b2sum, md5sum, sha*sum
+  - [x] cksum
+  - [x] sha224sum / sha256sum / sha384sum / sha512sum
+  - [x] b3sum
+  - [x] b2sum
+  - [x] md5sum
+- [x] shred (this is basically write)
+- [x] wc
+- [x] head
+  - [x] `-c` fast path for regular files and regular stdin
+  - [x] suffixed counts like `1KiB`, `1MiB`, `1GiB`
+- [x] cat / tac
+- [x] pv that's a hugepages splice + print to stderr
+- [x] find, as part of dirwalk work
+- [x] Read sequentially
+- [x] Write sequentially

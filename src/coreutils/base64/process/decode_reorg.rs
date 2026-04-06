@@ -101,12 +101,12 @@ impl Base64DecodeReorg {
     ) -> io::Result<(usize, usize)> {
         #[cfg(target_arch = "x86")]
         use std::arch::x86::{
-            _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+            _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
             _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
         };
         #[cfg(target_arch = "x86_64")]
         use std::arch::x86_64::{
-            _mm256_and_si256, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+            _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
             _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
         };
 
@@ -161,8 +161,7 @@ impl Base64DecodeReorg {
                     let shifted = bits >> start;
                     let len = shifted.trailing_ones() as usize;
                     let mask = ((1u32 << len) - 1) << start;
-                    dst[write..write + len]
-                        .copy_from_slice(&raw[read + start..read + start + len]);
+                    dst[write..write + len].copy_from_slice(&raw[read + start..read + start + len]);
                     write += len;
                     bits &= !mask;
                 }

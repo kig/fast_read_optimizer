@@ -1,4 +1,6 @@
-use crate::IOMode;
+use crate::config::load_config;
+use crate::io_util::CopyOperationGuard;
+use crate::{CopyStrategy, IOMode};
 use std::fs::OpenOptions;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +16,8 @@ enum StatusMode {
 }
 
 const DEFAULT_DD_BLOCK_SIZE: u64 = 512;
+const DD_COPY_FILE_RANGE_SINGLE_MAX: u64 = 1 << 20;
+const DD_COPY_FILE_RANGE_CHUNKED_MAX: u64 = 16 << 20;
 
 struct Options {
     input: String,
@@ -168,6 +172,77 @@ fn print_summary(bytes: u64, block_size: u64, elapsed: Duration) {
     );
 }
 
+fn dd_small_medium_copy_strategy(
+    copy_len: u64,
+    input_mode: IOMode,
+    output_mode: IOMode,
+) -> Option<CopyStrategy> {
+    if copy_len == 0 || input_mode == IOMode::Direct || output_mode == IOMode::Direct {
+        return None;
+    }
+    if copy_len <= DD_COPY_FILE_RANGE_SINGLE_MAX {
+        return Some(CopyStrategy::CopyFileRangeSingle);
+    }
+    if copy_len <= DD_COPY_FILE_RANGE_CHUNKED_MAX {
+        return Some(CopyStrategy::CopyFileRange);
+    }
+    None
+}
+
+fn dd_copy_file_range_eligible(input: &str, output: &str) -> io::Result<bool> {
+    if input == output || output == "/dev/null" {
+        return Ok(false);
+    }
+    if !std::fs::metadata(input)?.file_type().is_file() {
+        return Ok(false);
+    }
+    match std::fs::metadata(output) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn copy_file_range_with_dd_strategy(
+    source: &str,
+    target: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    len: u64,
+    truncate_target: bool,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    copy_strategy: CopyStrategy,
+) -> io::Result<u64> {
+    let config = load_config(None);
+    let guard = CopyOperationGuard::new(source, target, true)?;
+    let page_cache = config.get_params_for_path("copy", false, target);
+    let direct = config.get_params_for_path("copy", true, target);
+    let copy_range = config.get_copy_range_params_for_path(target);
+    let copied = crate::writer::copy_file_range_with_strategy(
+        source,
+        target,
+        source_offset,
+        dest_offset,
+        len,
+        truncate_target,
+        page_cache.num_threads,
+        page_cache.block_size,
+        page_cache.qd,
+        direct.num_threads,
+        direct.block_size,
+        direct.qd,
+        copy_range.num_threads,
+        copy_range.block_size,
+        copy_range.qd,
+        io_mode_read,
+        io_mode_write,
+        copy_strategy,
+    )?;
+    guard.ensure_source_unchanged()?;
+    Ok(copied)
+}
+
 pub fn run_dd(args: &[String]) -> io::Result<()> {
     let opts = parse_args(args).map_err(io::Error::other)?;
     let start = Instant::now();
@@ -179,12 +254,38 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
         && !opts.notrunc
     {
         let record_block_size = DEFAULT_DD_BLOCK_SIZE;
-        let bytes = crate::copy_file_with_modes(
-            &opts.input,
-            &opts.output,
-            opts.input_mode,
-            opts.output_mode,
-        )?;
+        let bytes = if dd_copy_file_range_eligible(&opts.input, &opts.output)? {
+            match dd_small_medium_copy_strategy(
+                std::fs::metadata(&opts.input)?.len(),
+                opts.input_mode,
+                opts.output_mode,
+            ) {
+                Some(copy_strategy) => copy_file_range_with_dd_strategy(
+                    &opts.input,
+                    &opts.output,
+                    0,
+                    0,
+                    u64::MAX,
+                    true,
+                    opts.input_mode,
+                    opts.output_mode,
+                    copy_strategy,
+                )?,
+                None => crate::copy_file_with_modes(
+                    &opts.input,
+                    &opts.output,
+                    opts.input_mode,
+                    opts.output_mode,
+                )?,
+            }
+        } else {
+            crate::copy_file_with_modes(
+                &opts.input,
+                &opts.output,
+                opts.input_mode,
+                opts.output_mode,
+            )?
+        };
         if opts.fsync {
             OpenOptions::new()
                 .read(true)
@@ -232,6 +333,11 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
     };
 
     let is_dev_null = opts.output == "/dev/null";
+    let copy_strategy = if dd_copy_file_range_eligible(&opts.input, &opts.output)? {
+        dd_small_medium_copy_strategy(copy_len, opts.input_mode, opts.output_mode)
+    } else {
+        None
+    };
     let copy_result = if is_dev_null {
         input.foreach_block_parallel(block_size, move |block_index, data| {
             let block_index = block_index as u64;
@@ -242,6 +348,18 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
             Ok(())
         })?;
         Ok(copy_len)
+    } else if let Some(copy_strategy) = copy_strategy {
+        copy_file_range_with_dd_strategy(
+            &opts.input,
+            &opts.output,
+            input_offset,
+            output_offset,
+            copy_len,
+            !opts.notrunc,
+            opts.input_mode,
+            opts.output_mode,
+            copy_strategy,
+        )
     } else {
         crate::copy_file_range_with_modes(
             &opts.input,
@@ -279,4 +397,57 @@ pub fn run_dd_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     run_dd(&args)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dd_prefers_copy_file_range_paths_for_small_and_medium_page_cache_transfers() {
+        assert_eq!(
+            dd_small_medium_copy_strategy(64 * 1024, IOMode::Auto, IOMode::Auto),
+            Some(CopyStrategy::CopyFileRangeSingle)
+        );
+        assert_eq!(
+            dd_small_medium_copy_strategy(
+                DD_COPY_FILE_RANGE_SINGLE_MAX,
+                IOMode::PageCache,
+                IOMode::Auto
+            ),
+            Some(CopyStrategy::CopyFileRangeSingle)
+        );
+        assert_eq!(
+            dd_small_medium_copy_strategy(4 * 1024 * 1024, IOMode::Auto, IOMode::PageCache),
+            Some(CopyStrategy::CopyFileRange)
+        );
+        assert_eq!(
+            dd_small_medium_copy_strategy(
+                DD_COPY_FILE_RANGE_CHUNKED_MAX,
+                IOMode::Auto,
+                IOMode::Auto
+            ),
+            Some(CopyStrategy::CopyFileRange)
+        );
+    }
+
+    #[test]
+    fn dd_keeps_threaded_path_for_direct_or_large_transfers() {
+        assert_eq!(
+            dd_small_medium_copy_strategy(64 * 1024, IOMode::Direct, IOMode::Auto),
+            None
+        );
+        assert_eq!(
+            dd_small_medium_copy_strategy(64 * 1024, IOMode::Auto, IOMode::Direct),
+            None
+        );
+        assert_eq!(
+            dd_small_medium_copy_strategy(
+                DD_COPY_FILE_RANGE_CHUNKED_MAX + 1,
+                IOMode::Auto,
+                IOMode::Auto
+            ),
+            None
+        );
+    }
 }

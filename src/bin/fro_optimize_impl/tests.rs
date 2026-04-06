@@ -1,6 +1,9 @@
-use super::*;
 use super::cli_utils::parse_size;
-use super::inspect::{device_db_match, is_disk_backed_mount, parse_zfs_get_props, parse_zpool_status_leaves};
+use super::inspect::{
+    device_db_match, is_disk_backed_mount, parse_zfs_get_props, parse_zpool_status_leaves,
+};
+use super::*;
+use std::path::Path;
 
 #[test]
 fn list_devices_filters_pseudo_and_snap_fs() {
@@ -35,7 +38,10 @@ fn list_devices_filters_pseudo_and_snap_fs() {
         },
     ];
 
-    let kept: Vec<_> = entries.into_iter().filter(|e| is_disk_backed_mount(e)).collect();
+    let kept: Vec<_> = entries
+        .into_iter()
+        .filter(|e| is_disk_backed_mount(e))
+        .collect();
     assert_eq!(kept.len(), 2);
     assert_eq!(kept[0].mount_point, "/");
     assert_eq!(kept[1].mount_point, "/var/lib/data");
@@ -125,30 +131,75 @@ fn parse_size_accepts_common_suffixes() {
 
 #[test]
 fn read_pattern_does_not_match_read_to_memory_configs() {
-    let cfg = vec!["read".to_string(), "--to-memory".to_string(), "-s".to_string()];
+    let cfg = vec![
+        "read".to_string(),
+        "--to-memory".to_string(),
+        "-s".to_string(),
+    ];
     let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
     let pattern = "read";
     let matches_plain_read = cfg[0] == "read"
         && !is_to_memory
         && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
-    let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
-        && is_to_memory;
-    let matches_other = cfg[0].starts_with(pattern)
-        && !(cfg[0] == "read" && is_to_memory && pattern == "read");
+    let matches_read_to_memory =
+        (pattern == "read-to-memory" || pattern == "read_to_memory") && is_to_memory;
+    let matches_other =
+        cfg[0].starts_with(pattern) && !(cfg[0] == "read" && is_to_memory && pattern == "read");
     assert!(!(matches_plain_read || matches_read_to_memory || matches_other));
 }
 
 #[test]
 fn read_to_memory_pattern_matches_read_to_memory_configs() {
-    let cfg = vec!["read".to_string(), "--to-memory".to_string(), "-s".to_string()];
+    let cfg = vec![
+        "read".to_string(),
+        "--to-memory".to_string(),
+        "-s".to_string(),
+    ];
     let is_to_memory = cfg.iter().any(|arg| arg == "--to-memory");
     let pattern = "read-to-memory";
     let matches_plain_read = cfg[0] == "read"
         && !is_to_memory
         && (pattern == "read" || pattern == "read-page-cache" || pattern == "read-direct");
-    let matches_read_to_memory = (pattern == "read-to-memory" || pattern == "read_to_memory")
-        && is_to_memory;
-    let matches_other = cfg[0].starts_with(pattern)
-        && !(cfg[0] == "read" && is_to_memory && pattern == "read");
+    let matches_read_to_memory =
+        (pattern == "read-to-memory" || pattern == "read_to_memory") && is_to_memory;
+    let matches_other =
+        cfg[0].starts_with(pattern) && !(cfg[0] == "read" && is_to_memory && pattern == "read");
     assert!(matches_plain_read || matches_read_to_memory || matches_other);
+}
+
+#[test]
+fn resolve_target_selection_uses_target_parent_as_default_benchmark_dir() {
+    let tmp = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join("fro-optimize-target-selection");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let target = tmp.join("data.bin");
+
+    let selection = run::resolve_target_selection(None, Some(target.to_str().unwrap())).unwrap();
+    assert_eq!(selection.benchmark_dir, tmp.display().to_string());
+    assert_eq!(selection.target_path.as_deref(), target.to_str());
+    assert!(selection.target_mount.is_some());
+}
+
+#[test]
+fn resolve_target_selection_accepts_same_mount_test_dir_and_target() {
+    let tmp = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join("fro-optimize-target-selection-same-mount");
+    let bench_dir = tmp.join("bench");
+    let target_dir = tmp.join("target-dir");
+    std::fs::create_dir_all(&bench_dir).unwrap();
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target = target_dir.join("data.bin");
+
+    let selection = run::resolve_target_selection(
+        Some(bench_dir.to_str().unwrap()),
+        Some(target.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(selection.benchmark_dir, bench_dir.display().to_string());
+    assert_eq!(selection.target_path.as_deref(), target.to_str());
+    assert!(selection.target_mount.is_some());
 }

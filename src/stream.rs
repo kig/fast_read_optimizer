@@ -4,8 +4,8 @@ use crate::io_util::{
     expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
 };
 use crate::reader::{
-    resolve_reader_params, resolve_reader_params_for_mode,
-    visit_file_blocks_with_resolved_params, ResolvedReadParams,
+    resolve_reader_params, resolve_reader_params_for_mode, visit_file_blocks_with_resolved_params,
+    ResolvedReadParams,
 };
 use crate::writer::{
     resolve_writer_params_for_mode, OffsetWriter, ResolvedWriteParams, SequentialWriter,
@@ -201,11 +201,10 @@ impl ParallelFile {
             },
             io_mode,
         )?;
-        let metrics = crate::reader::visit_file_blocks_with_resolved_params(
-            &path,
-            params,
-            move |block| visit(block.block_index, block.data),
-        )?;
+        let metrics =
+            crate::reader::visit_file_blocks_with_resolved_params(&path, params, move |block| {
+                visit(block.block_index, block.data)
+            })?;
         Ok(ParallelReadReport {
             bytes_read: metrics.bytes_read,
             file_size: metrics.file_size,
@@ -834,7 +833,7 @@ impl ParallelWriter {
 pub struct ParallelStream {}
 
 mod parallel_stream;
-pub(crate) mod transform;
 mod parallel_stream_to_file;
 #[cfg(test)]
 mod tests;
+pub(crate) mod transform;

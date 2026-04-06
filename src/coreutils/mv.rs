@@ -22,24 +22,31 @@ fn move_symlink_cross_fs(source: &Path, target: &Path) -> io::Result<()> {
 
 fn move_file_cross_fs(source: &Path, target: &Path) -> io::Result<()> {
     remove_existing_non_directory(target)?;
-    fro::copy_file_with_modes(
-        source,
-        target,
-        fro::IOMode::Auto,
-        fro::IOMode::Auto,
-    )?;
+    fro::copy_file_with_modes(source, target, fro::IOMode::Auto, fro::IOMode::Auto)?;
     fs::remove_file(source)
 }
 
 fn move_directory_cross_fs(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
-    crate::main_app::copy_directory_recursively(
+    if verbose {
+        eprintln!(
+            "mv cross-fs: starting recursive move '{}' -> '{}'",
+            source.display(),
+            target.display()
+        );
+    }
+    crate::main_app::move_directory_cross_filesystem(
         source,
         target,
         crate::common::IOMode::Auto,
         crate::common::IOMode::Auto,
         verbose,
     )?;
-    crate::main_app::remove_path_recursively(source, verbose)?;
+    if verbose {
+        eprintln!(
+            "mv cross-fs: recursive move complete '{}'",
+            source.display()
+        );
+    }
     Ok(())
 }
 
@@ -53,6 +60,13 @@ fn move_path(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
         }
         Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
             let metadata = fs::symlink_metadata(source)?;
+            if verbose {
+                eprintln!(
+                    "mv cross-fs fallback: '{}' -> '{}'",
+                    source.display(),
+                    target.display()
+                );
+            }
             if metadata.file_type().is_dir() {
                 move_directory_cross_fs(source, target, verbose)?;
             } else if metadata.file_type().is_symlink() {
@@ -72,20 +86,61 @@ fn move_path(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
 pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut verbose = false;
+    let mut explicit_target_directory: Option<PathBuf> = None;
     let mut paths = Vec::new();
+    let mut end_of_options = false;
 
-    for arg in args.iter().skip(1) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if end_of_options {
+            paths.push(arg.to_string());
+            index += 1;
+            continue;
+        }
         match arg.as_str() {
             "--verbose" => verbose = true,
-            "--" => {}
+            "-t" | "--target-directory" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument for --target-directory",
+                    )
+                })?;
+                explicit_target_directory = Some(PathBuf::from(value));
+                index += 2;
+                continue;
+            }
+            other if other.starts_with("--target-directory=") => {
+                explicit_target_directory =
+                    Some(PathBuf::from(&other["--target-directory=".len()..]));
+            }
+            "--" => end_of_options = true,
             other if other.starts_with("--") => paths.push(other.to_string()),
             other if other.starts_with('-') && other.len() > 1 => {
-                for ch in other[1..].chars() {
+                let mut chars = other[1..].chars().peekable();
+                while let Some(ch) = chars.next() {
                     match ch {
                         'v' | 'f' => {
                             if ch == 'v' {
                                 verbose = true;
                             }
+                        }
+                        't' => {
+                            let remainder = chars.collect::<String>();
+                            if !remainder.is_empty() {
+                                explicit_target_directory = Some(PathBuf::from(remainder));
+                            } else {
+                                let value = args.get(index + 1).ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "missing argument for -t",
+                                    )
+                                })?;
+                                explicit_target_directory = Some(PathBuf::from(value));
+                                index += 1;
+                            }
+                            break;
                         }
                         _ => {
                             return Err(io::Error::new(
@@ -98,18 +153,41 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
             }
             other => paths.push(other.to_string()),
         }
+        index += 1;
     }
 
-    if paths.len() < 2 {
-        eprintln!("Usage: {} [-f] [-v] <source>... <target>", program);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing source or target operand",
-        ));
-    }
-
-    let destination = PathBuf::from(paths.pop().unwrap());
-    let source_paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+    let (destination, source_paths) = if let Some(target_directory) = explicit_target_directory {
+        if paths.is_empty() {
+            eprintln!(
+                "Usage: {} [-f] [-v] [-t DIRECTORY] <source>... <target>",
+                program
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing source operand",
+            ));
+        }
+        (
+            target_directory,
+            paths.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+        )
+    } else {
+        if paths.len() < 2 {
+            eprintln!(
+                "Usage: {} [-f] [-v] [-t DIRECTORY] <source>... <target>",
+                program
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing source or target operand",
+            ));
+        }
+        let destination = PathBuf::from(paths.pop().unwrap());
+        (
+            destination,
+            paths.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
+        )
+    };
     let destination_meta = fs::symlink_metadata(&destination).ok();
     let destination_is_dir = destination_meta
         .as_ref()
@@ -133,7 +211,10 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         };
         let target = if destination_is_dir {
             destination.join(source.file_name().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "source has no final path component")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source has no final path component",
+                )
             })?)
         } else if source_meta.file_type().is_dir() {
             crate::main_app::resolve_recursive_move_target(&source, &destination)?

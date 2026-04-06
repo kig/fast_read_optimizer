@@ -417,7 +417,6 @@ fn hash_base_for_file(index: usize, path: &str, hash_base: Option<&str>) -> Stri
     }
 }
 
-
 mod ops;
 #[cfg(test)]
 mod tests;

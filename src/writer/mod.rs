@@ -786,13 +786,12 @@ fn fill_write_buffer(
     ))
 }
 
-
-mod copy_ops;
 mod api;
-#[cfg(test)]
-mod tests;
+mod copy_ops;
 #[cfg(kani)]
 mod kani_proofs;
+#[cfg(test)]
+mod tests;
 
 pub use api::*;
 pub use copy_ops::*;

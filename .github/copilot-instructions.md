@@ -1,5 +1,11 @@
 # Copilot instructions for `fast_read_optimizer`
 
+## Repository top-level goals
+
+- Overall goal: keep pushing library and tools toward memory-speed / NVMe-speed ceilings so applications and multicall tools inherit wins by default.
+- Coreutils goal: make `fro` a drop-in replacement for coreutils on high-performance systems and target meaningful speedups where the system tools leave performance on the table.
+- Library goal: provide easy-to-use high-performance I/O primitives for modern systems so coding agents and applications prefer reusing the library instead of rebuilding slower ad hoc I/O paths.
+
 ## Build & run
 
 - Build release binaries:
@@ -62,6 +68,13 @@ This repo’s main automated verification is the benchmark runner binary:
 - `fro.json` is the source of truth for tuned params (per tool × {direct,page_cache}): see `src/config.rs`.
   - `AppConfig::load("fro.json")` auto-creates a default `fro.json` if missing.
   - Prefer regenerating via `fro-optimize` (or `fro ... -s`) rather than hand-editing.
+- Treat multicall/coreutils flags as part of the performance contract, not just a behavior contract:
+  - document whether a new flag is **path-preserving** (same tuned backend, extra policy/output only) or **path-changing** (requires transformation, buffering, or a different kernel primitive)
+  - `cat` without formatting flags should stay on the fast copy-style path; `-n`, `-b`, `-s`, `-E`, `-T`, `-v`, `-A`, `-e`, and `-t` intentionally force ordered line transformation
+  - `fgrep` `-n`, `-i`, `--no-ignore-case`, and `-x` should stay in the literal-search family even though `-i` adds normalization work and `-x` becomes line-oriented
+  - `wc -c` on regular files is a metadata fast path, pipe byte counting can use `splice(2)`, and `-l/-w/-m/-L` should stay in the optimized block-counting path
+  - regular-file `head`/`tail` byte-range cases should continue to use range-oriented helpers when possible; non-regular streams may need different buffering/scanning behavior
+  - `cp`/`mv` policy flags (`-n`, `-u`, `-T`, `-v`) should not replace the tuned copy engine when a real copy still occurs
 - Direct I/O safety rules are enforced in hot paths:
   - Direct reads/writes are only used when offsets are 4K-aligned and the request length is a full aligned block; otherwise the code falls back to the non-`O_DIRECT` FD.
   - Buffers for uring IO are 4096-aligned via `common::AlignedBuffer`.
@@ -117,6 +130,11 @@ When a user asks about performance, throughput, or regressions, follow this prot
     - extra format conversion or manifest rebuilding inside the timed region
   - If a benchmark reports unexpectedly low throughput, audit for accidental pre-copy or pre-processing overhead before speculating about IO limits.
 
+- **Distinguish parity flags from execution-path changes before calling something a regression.**
+  - Compare the same utility with and without the flag under the same IO mode and cache state.
+  - Some flags intentionally force different work: e.g. `cat -n` / `cat -A` must rewrite bytes, `tail -n` on streams may need full newline discovery, and cross-filesystem `mv` is not the same proposition as `rename(2)`.
+  - For flags that should preserve the optimized path (`cat -u`, `fgrep -n`, `cp -u/-n/-T/-v` when a copy actually happens), require evidence that the same tuned backend/helper is still being exercised.
+
 - **Validate warm vs cold explicitly.**
   - If the first run differs sharply from reruns, record both and label them.
   - Do not present a cold first-run result as the canonical steady-state number for RAM or hot-cache paths.
@@ -145,6 +163,11 @@ When a user asks about performance, throughput, or regressions, follow this prot
 - **Treat helper semantics as part of the benchmark contract.**
   - If a public helper is used as a benchmarked primitive, audit whether it performs extra work beyond the name's apparent promise.
   - Example: `write_buffer_range(...)` must not clone the entire source slice when the benchmark claim is about RAM-to-file write throughput.
+
+- **Pair parity testing with performance-path verification for new flags.**
+  - GNU/output equality tests prove semantics, but they do not prove that the intended fast helper is still used.
+  - For each new flag slice, add or rerun at least one matching path check: either a benchmark, a helper-selection assertion, or a syscall/profile sanity check that confirms whether the optimized path is preserved or intentionally abandoned.
+  - If the flag intentionally changes the path, document that tradeoff in the repo docs so later agents do not "fix" the slowdown by breaking semantics.
 
 - **Treat `/dev/null` and in-memory targets as upper bounds, not substitutes for real-target claims.**
   - `/dev/null` can show payload-generation or read-side ceiling behavior, but it does not measure archive-file destination behavior.

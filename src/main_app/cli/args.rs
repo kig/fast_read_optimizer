@@ -3,6 +3,8 @@ use crate::writer;
 
 pub(super) struct ParsedArgs {
     pub(super) mode: String,
+    pub(super) config_subcommand: Option<String>,
+    pub(super) config_target: Option<String>,
     pub(super) io_mode: common::IOMode,
     pub(super) io_mode_write: common::IOMode,
     pub(super) to_memory: bool,
@@ -24,6 +26,11 @@ pub(super) struct ParsedArgs {
     pub(super) force_copy_file_range_single: bool,
     pub(super) force_threaded_copy: bool,
     pub(super) force_reflink: bool,
+    pub(super) cp_compat: bool,
+    pub(super) cp_no_clobber: bool,
+    pub(super) cp_target_directory: Option<String>,
+    pub(super) cp_no_target_directory: bool,
+    pub(super) cp_update: bool,
     pub(super) verbose: bool,
     pub(super) source: Option<String>,
     pub(super) pattern: String,
@@ -84,6 +91,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     } else {
         args[1].as_str()
     };
+    let mut config_subcommand: Option<String> = None;
+    let mut config_target: Option<String> = None;
     let mut io_mode = common::IOMode::Auto;
     let mut io_mode_write = common::IOMode::Auto;
     let mut to_memory = false;
@@ -105,6 +114,11 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     let mut force_copy_file_range_single = false;
     let mut force_threaded_copy = false;
     let mut force_reflink = false;
+    let mut cp_compat = false;
+    let mut cp_no_clobber = false;
+    let mut cp_target_directory: Option<String> = None;
+    let mut cp_no_target_directory = false;
+    let mut cp_update = false;
     let mut verbose = false;
     let mut source: Option<String> = None;
     let mut pattern = String::new();
@@ -160,6 +174,11 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 i += 1;
                 if i < args.len() {
                     config_path = Some(args[i].clone());
+                }
+            } else if args[i] == "--for" {
+                i += 1;
+                if i < args.len() {
+                    config_target = Some(args[i].clone());
                 }
             } else if args[i] == "--hash-base" {
                 i += 1;
@@ -330,6 +349,23 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 force_threaded_copy = true;
             } else if args[i] == "--reflink" {
                 force_reflink = true;
+            } else if args[i] == "--cp-compat" {
+                cp_compat = true;
+            } else if args[i] == "--cp-no-clobber" {
+                cp_no_clobber = true;
+            } else if args[i] == "--cp-target-directory" {
+                i += 1;
+                if i >= args.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument for --cp-target-directory",
+                    ));
+                }
+                cp_target_directory = Some(args[i].clone());
+            } else if args[i] == "--cp-no-target-directory" {
+                cp_no_target_directory = true;
+            } else if args[i] == "--cp-update" {
+                cp_update = true;
             } else if args[i] == "-q" || args[i] == "--quiet" {
                 quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
@@ -354,6 +390,12 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 }
                 return Ok(ParseOutcome::Early(0));
             }
+        } else if mode == "config" {
+            if config_subcommand.is_none() {
+                config_subcommand = Some(args[i].clone());
+            } else {
+                extra_paths.push(args[i].clone());
+            }
         } else if mode == "copy"
             || mode == "diff"
             || mode == "dual-read-bench"
@@ -361,8 +403,12 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         {
             if source.is_none() {
                 source = Some(args[i].clone());
+            } else if mode == "copy" && cp_target_directory.is_some() {
+                extra_paths.push(args[i].clone());
             } else if filename.is_empty() {
                 filename = args[i].clone();
+            } else if mode == "copy" && cp_target_directory.is_some() {
+                extra_paths.push(args[i].clone());
             }
         } else if mode == "manifest-recursive-copy-bench" || mode == "bench-tar-archive" {
             if filename.is_empty() {
@@ -461,7 +507,86 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         }
     }
 
-    if filename.is_empty() {
+    if mode == "config" {
+        match config_subcommand.as_deref() {
+            Some("print") => {
+                if config_target.is_some() || !extra_paths.is_empty() {
+                    println!(
+                        "config print does not take a path; use fro config explain --for <path>"
+                    );
+                    return Ok(ParseOutcome::Early(1));
+                }
+            }
+            Some("explain") => {
+                if config_target.is_none() {
+                    println!("config explain requires --for <path>");
+                    return Ok(ParseOutcome::Early(1));
+                }
+                if !extra_paths.is_empty() {
+                    println!("config explain accepts only one target path");
+                    return Ok(ParseOutcome::Early(1));
+                }
+            }
+            Some(other) => {
+                println!("Unknown config subcommand: {other}");
+                return Ok(ParseOutcome::Early(1));
+            }
+            None => {
+                if let Some(help) = command_help("config") {
+                    print_command_help(args[0].as_str(), help);
+                }
+                return Ok(ParseOutcome::Early(0));
+            }
+        }
+        return Ok(ParseOutcome::Parsed(ParsedArgs {
+            mode: mode.to_string(),
+            config_subcommand,
+            config_target,
+            io_mode,
+            io_mode_write,
+            to_memory,
+            auto_lift,
+            to_memory_mode,
+            to_memory_options,
+            manual_read_overrides,
+            via_memory,
+            verify_copy,
+            verify_copy_diff,
+            recursive_copy,
+            persist_verification_hashes,
+            quiet,
+            no_lock,
+            keep_target_size,
+            force_diff_copy,
+            force_full_copy,
+            force_copy_file_range,
+            force_copy_file_range_single,
+            force_threaded_copy,
+            force_reflink,
+            cp_compat,
+            cp_no_clobber,
+            cp_target_directory,
+            cp_no_target_directory,
+            cp_update,
+            verbose,
+            source,
+            pattern,
+            filename,
+            extra_paths,
+            hash_base,
+            recover_mode,
+            hash_type,
+            hash_only,
+            create_size,
+            iterations,
+            save_config,
+            config_path,
+            overlap_large_file,
+            small_file_thread_cache_state,
+        }));
+    }
+
+    if filename.is_empty() && !(mode == "copy" && cp_target_directory.is_some()) {
         println!("Filename missing");
         return Ok(ParseOutcome::Early(1));
     }
@@ -666,6 +791,21 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         println!("copy --recursive does not support --save yet");
         return Ok(ParseOutcome::Early(1));
     }
+    if (cp_no_clobber || cp_target_directory.is_some() || cp_no_target_directory || cp_update)
+        && mode != "copy"
+    {
+        println!("cp compatibility flags are only supported for copy");
+        return Ok(ParseOutcome::Early(1));
+    }
+    if cp_target_directory.is_some() && cp_no_target_directory {
+        eprintln!("cp: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        return Ok(ParseOutcome::Early(1));
+    }
+    if mode == "copy" && cp_target_directory.is_some() && source.is_none() {
+        eprintln!("cp: missing file operand");
+        eprintln!("Try 'cp --help' for more information.");
+        return Ok(ParseOutcome::Early(1));
+    }
     if mode == "recover" && extra_paths.is_empty() {
         println!("At least one recovery copy is required");
         return Ok(ParseOutcome::Early(1));
@@ -685,6 +825,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
 
     Ok(ParseOutcome::Parsed(ParsedArgs {
         mode: mode.to_string(),
+        config_subcommand,
+        config_target,
         io_mode,
         io_mode_write,
         to_memory,
@@ -706,6 +848,11 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         force_copy_file_range_single,
         force_threaded_copy,
         force_reflink,
+        cp_compat,
+        cp_no_clobber,
+        cp_target_directory,
+        cp_no_target_directory,
+        cp_update,
         verbose,
         source,
         pattern,

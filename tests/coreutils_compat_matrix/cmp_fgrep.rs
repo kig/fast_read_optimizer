@@ -2,15 +2,16 @@ use super::*;
 
 #[test]
 fn cartesian_cmp_and_fgrep_match_system_output() {
-    let tmp = unique_temp_dir("fro-coreutils-cmp-grep-matrix");
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-cmp-grep-matrix");
+    let tmp = &fixture.root;
     let equal_a = tmp.join("equal-a.txt");
     let equal_b = tmp.join("equal-b.txt");
     let diff_a = tmp.join("diff-a.txt");
     let diff_b = tmp.join("diff-b.txt");
     let eof_a = tmp.join("eof-a.txt");
     let eof_b = tmp.join("eof-b.txt");
-    let grep_a = tmp.join("grep-a.txt");
-    let grep_b = tmp.join("grep-b.txt");
+    let grep_a = fixture.text_file.clone();
+    let grep_b = fixture.nested_text_file.clone();
 
     fs::write(&equal_a, b"same\nbytes\n").unwrap();
     fs::write(&equal_b, b"same\nbytes\n").unwrap();
@@ -18,8 +19,6 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
     fs::write(&diff_b, b"same\nbytex\n").unwrap();
     fs::write(&eof_a, b"short\n").unwrap();
     fs::write(&eof_b, b"short\nextra\n").unwrap();
-    fs::write(&grep_a, b"alpha\nneedle beta\nomega\n").unwrap();
-    fs::write(&grep_b, b"needle gamma\nzeta\n").unwrap();
 
     for flags in io_flag_sets() {
         for files in [
@@ -70,6 +69,84 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
                 run_fro("fgrep", &args),
                 run_system(system_program, &system_args),
                 &format!("fgrep {:?}", args),
+            );
+        }
+    }
+}
+
+#[test]
+fn fgrep_line_regexp_matches_system_on_nested_fixture_paths() {
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-fgrep-dir");
+
+    for (kind, path) in fixture.text_path_inputs() {
+        let file = path.to_str().unwrap();
+        assert_same_result(
+            run_fro("fgrep", &["-x", "needle beta", file]),
+            run_system("grep", &["-F", "-x", "needle beta", file]),
+            &format!("fgrep line-regexp {kind}"),
+        );
+    }
+}
+
+#[test]
+fn fgrep_pattern_sources_match_system_output() {
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-fgrep-pattern-sources");
+    let patterns = fixture.root.join("patterns.txt");
+    let empty_patterns = fixture.root.join("empty-patterns.txt");
+    fs::write(&patterns, b"needle beta\nomega\n").unwrap();
+    fs::write(&empty_patterns, b"").unwrap();
+
+    let text = fixture.text_file.to_str().unwrap();
+    let nested = fixture.nested_text_file.to_str().unwrap();
+    let text_link = fixture.text_symlink.to_str().unwrap();
+    let pattern_file = patterns.to_str().unwrap();
+    let empty_pattern_file = empty_patterns.to_str().unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-e", "needle beta", text],
+            vec!["--regexp=needle beta", text],
+            vec!["-e", "needle beta", "-e", "omega", text],
+            vec!["-eneedle beta", "-eomega", text],
+            vec!["-f", pattern_file, text],
+            vec!["--file", pattern_file, text],
+            vec!["--file=".into(), "--regexp=omega".into()],
+        ] {
+            let compat_flags = compat_flags
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            let mut fro_args = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            fro_args.extend(compat_flags.clone());
+            let mut sys_args = compat_flags.clone();
+            if sys_args.first().map(String::as_str) == Some("--file=") {
+                sys_args[0] = format!("--file={pattern_file}");
+                fro_args[flags.len()] = format!("--file={pattern_file}");
+            }
+            let fro_refs = fro_args.iter().map(String::as_str).collect::<Vec<_>>();
+            let sys_refs = sys_args.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_same_result(
+                run_fro("fgrep", &fro_refs),
+                run_system("fgrep", &sys_refs),
+                &format!("fgrep pattern source {:?}", fro_refs),
+            );
+        }
+
+        for compat_flags in [
+            vec!["-f", pattern_file, text, nested],
+            vec!["-e", "needle beta", "-f", pattern_file, text, nested],
+            vec!["-f", pattern_file, text_link],
+            vec!["-f", empty_pattern_file, text],
+        ] {
+            let mut fro_args = flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            assert_same_result(
+                run_fro("fgrep", &fro_args),
+                run_system("fgrep", &compat_flags),
+                &format!("fgrep pattern file {:?}", fro_args),
             );
         }
     }

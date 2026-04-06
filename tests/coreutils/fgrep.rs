@@ -118,3 +118,113 @@ fn fgrep_stdin_matches_pattern_crossing_block_boundary() {
         "fgrep stdin boundary match -n",
     );
 }
+
+#[test]
+fn fgrep_line_regexp_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-fgrep-line-regexp");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+
+    fs::write(&a, b"alpha\nalpha beta\nbeta alpha\nalpha\n").unwrap();
+    fs::write(&b, b"gamma\nalpha\nalphA\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-x", "alpha"],
+            vec!["--line-regexp", "alpha"],
+            vec!["-x", "-n", "alpha"],
+            vec!["-n", "--line-regexp", "alpha"],
+            vec!["-F", "-x", "alpha"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("fgrep", &fro_args),
+                    run_system("fgrep", &sys_args),
+                    &format!("fgrep -x {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+
+        for compat_flags in [
+            vec!["-x", "alpha"],
+            vec!["--line-regexp", "alpha"],
+            vec!["-x", "-n", "alpha"],
+        ] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push("-");
+            let mut sys_args = compat_flags.clone();
+            sys_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("fgrep", &fro_args, b"alpha\nalpha beta\nalpha"),
+                run_system_with_stdin("fgrep", &sys_args, b"alpha\nalpha beta\nalpha"),
+                &format!("fgrep -x stdin {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+}
+
+#[test]
+fn fgrep_ignore_case_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-fgrep-ignore-case");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+
+    fs::write(&a, b"Alpha\nalpha beta\nGAMMA\n").unwrap();
+    fs::write(&b, b"beta\nALPHA\nalpha[1]\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-i", "alpha"],
+            vec!["--ignore-case", "alpha"],
+            vec!["-F", "-i", "alpha"],
+            vec!["-i", "-n", "alpha"],
+            vec!["-i", "-x", "alpha"],
+            vec!["--ignore-case", "--line-number", "alpha"],
+            vec!["-i", "--no-ignore-case", "alpha"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("fgrep", &fro_args),
+                    run_system("fgrep", &sys_args),
+                    &format!("fgrep -i {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+
+        for compat_flags in [
+            vec!["-i", "alpha"],
+            vec!["--ignore-case", "alpha"],
+            vec!["-i", "-n", "alpha"],
+            vec!["-i", "-x", "alpha"],
+            vec!["-i", "--no-ignore-case", "alpha"],
+        ] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push("-");
+            let mut sys_args = compat_flags.clone();
+            sys_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("fgrep", &fro_args, b"Alpha\nalpha beta\nALPHA\n"),
+                run_system_with_stdin("fgrep", &sys_args, b"Alpha\nalpha beta\nALPHA\n"),
+                &format!("fgrep -i stdin {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+}

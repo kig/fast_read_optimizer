@@ -24,7 +24,11 @@ pub(super) fn line_aligned_block_size(target: u64, line_bytes: usize) -> u64 {
     let lcm = line_bytes
         .checked_mul(4096 / gcd_u64(4096, line_bytes))
         .unwrap_or(line_bytes);
-    let aligned = if target >= lcm { (target / lcm) * lcm } else { 0 };
+    let aligned = if target >= lcm {
+        (target / lcm) * lcm
+    } else {
+        0
+    };
     if aligned != 0 {
         return aligned;
     }

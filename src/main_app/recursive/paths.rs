@@ -21,7 +21,10 @@ pub(super) fn prospective_absolute_path(path: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-pub(in crate::main_app) fn resolve_recursive_copy_root(source_root: &Path, target: &Path) -> io::Result<PathBuf> {
+pub(in crate::main_app) fn resolve_recursive_copy_root(
+    source_root: &Path,
+    target: &Path,
+) -> io::Result<PathBuf> {
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(target.join(
             source_root

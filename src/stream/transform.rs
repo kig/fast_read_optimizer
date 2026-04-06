@@ -2,9 +2,10 @@ use super::allocate_pipe_output_buffer;
 use super::ParallelStream;
 use crate::config::load_config;
 use libc::{fcntl, F_SETPIPE_SZ};
+use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::mpsc;
 use std::thread;
 
@@ -18,6 +19,175 @@ pub struct ReaderTransformGeometry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipeOutputPolicy {
     GiftedAlignedPages,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformInputSpec<'a> {
+    Path(&'a str),
+    Stdin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformOutputSpec<'a> {
+    Path(&'a str),
+    Stdout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransformIoPairingKind {
+    FileToFile,
+    FileToStream,
+    StreamToFile,
+    StreamToStream,
+}
+
+pub enum TransformIoPairing {
+    FileToFile { input_path: String, output: File },
+    FileToStream { input_path: String, output: File },
+    StreamToFile { input: File, output: File },
+    StreamToStream { input: File, output: File },
+}
+
+impl TransformIoPairing {
+    pub fn kind(&self) -> TransformIoPairingKind {
+        match self {
+            Self::FileToFile { .. } => TransformIoPairingKind::FileToFile,
+            Self::FileToStream { .. } => TransformIoPairingKind::FileToStream,
+            Self::StreamToFile { .. } => TransformIoPairingKind::StreamToFile,
+            Self::StreamToStream { .. } => TransformIoPairingKind::StreamToStream,
+        }
+    }
+}
+
+pub fn classify_transform_io_pairing(
+    regular_input: bool,
+    regular_output: bool,
+) -> TransformIoPairingKind {
+    match (regular_input, regular_output) {
+        (true, true) => TransformIoPairingKind::FileToFile,
+        (true, false) => TransformIoPairingKind::FileToStream,
+        (false, true) => TransformIoPairingKind::StreamToFile,
+        (false, false) => TransformIoPairingKind::StreamToStream,
+    }
+}
+
+/// Resolve stdin/stdout-or-path arguments into the most appropriate transform pairing.
+///
+/// Transform-style workloads that can specialize for regular-file and streaming paths
+/// should use this helper so future callers inherit the same pairing behavior as
+/// `base64` and `encrypt`/`decrypt`.
+pub fn auto_select_transform_io_pairing(
+    input: TransformInputSpec<'_>,
+    output: TransformOutputSpec<'_>,
+) -> io::Result<TransformIoPairing> {
+    let regular_input_path = regular_input_path(input)?;
+    let regular_output = output_is_regular_like(output)?;
+    match classify_transform_io_pairing(regular_input_path.is_some(), regular_output) {
+        TransformIoPairingKind::FileToFile => Ok(TransformIoPairing::FileToFile {
+            input_path: regular_input_path.expect("regular input path must exist"),
+            output: open_transform_output(output)?,
+        }),
+        TransformIoPairingKind::FileToStream => Ok(TransformIoPairing::FileToStream {
+            input_path: regular_input_path.expect("regular input path must exist"),
+            output: open_transform_output(output)?,
+        }),
+        TransformIoPairingKind::StreamToFile => Ok(TransformIoPairing::StreamToFile {
+            input: open_transform_input(input)?,
+            output: open_transform_output(output)?,
+        }),
+        TransformIoPairingKind::StreamToStream => Ok(TransformIoPairing::StreamToStream {
+            input: open_transform_input(input)?,
+            output: open_transform_output(output)?,
+        }),
+    }
+}
+
+fn regular_input_path(input: TransformInputSpec<'_>) -> io::Result<Option<String>> {
+    match input {
+        TransformInputSpec::Path(path) if is_regular_input_path(path)? => {
+            Ok(Some(path.to_string()))
+        }
+        TransformInputSpec::Path(_) => Ok(None),
+        TransformInputSpec::Stdin => regular_stdin_path(),
+    }
+}
+
+fn regular_stdin_path() -> io::Result<Option<String>> {
+    if !is_regular_fd(libc::STDIN_FILENO) {
+        return Ok(None);
+    }
+    let read_path_buf = fs::read_link(format!("/proc/self/fd/{}", libc::STDIN_FILENO))?;
+    let read_path = read_path_buf.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
+    })?;
+    Ok(Some(read_path.to_string()))
+}
+
+fn output_is_regular_like(output: TransformOutputSpec<'_>) -> io::Result<bool> {
+    Ok(match output {
+        TransformOutputSpec::Path(path) => path != "-",
+        TransformOutputSpec::Stdout => is_regular_fd(libc::STDOUT_FILENO) || is_stdout_dev_null()?,
+    })
+}
+
+fn open_transform_input(input: TransformInputSpec<'_>) -> io::Result<File> {
+    match input {
+        TransformInputSpec::Path(path) => File::open(path),
+        TransformInputSpec::Stdin => dup_fd_as_file(libc::STDIN_FILENO),
+    }
+}
+
+fn open_transform_output(output: TransformOutputSpec<'_>) -> io::Result<File> {
+    match output {
+        TransformOutputSpec::Path(path) if path != "-" => File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path),
+        TransformOutputSpec::Path(_) | TransformOutputSpec::Stdout => {
+            dup_fd_as_file(libc::STDOUT_FILENO)
+        }
+    }
+}
+
+fn dup_fd_as_file(fd: RawFd) -> io::Result<File> {
+    let dupfd = unsafe { libc::dup(fd) };
+    if dupfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(dupfd) })
+}
+
+fn is_regular_input_path(path: &str) -> io::Result<bool> {
+    if path.starts_with("/dev/fd/") || path.starts_with("/proc/self/fd/") {
+        return Ok(false);
+    }
+    Ok(fs::metadata(path)?.file_type().is_file())
+}
+
+fn is_regular_fd(fd: RawFd) -> bool {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        libc::fstat(fd, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+    }
+}
+
+fn is_stdout_dev_null() -> io::Result<bool> {
+    unsafe {
+        let mut stdout_stat: libc::stat = std::mem::zeroed();
+        let mut dev_null_stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(libc::STDOUT_FILENO, &mut stdout_stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
+        if libc::stat(path, &mut dev_null_stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(
+            stdout_stat.st_dev == dev_null_stat.st_dev
+                && stdout_stat.st_ino == dev_null_stat.st_ino,
+        )
+    }
 }
 
 pub fn grow_pipe_capacity_best_effort(pipe_fd: i32, new_size: usize) {
@@ -241,6 +411,31 @@ pub fn run_reader_transform_to_pipe<R: Read>(
         .join()
         .map_err(|_| io::Error::other("transform pipe writer thread panicked"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_transform_io_pairing, TransformIoPairingKind};
+
+    #[test]
+    fn classify_transform_io_pairing_covers_all_file_and_stream_combinations() {
+        assert_eq!(
+            classify_transform_io_pairing(true, true),
+            TransformIoPairingKind::FileToFile
+        );
+        assert_eq!(
+            classify_transform_io_pairing(true, false),
+            TransformIoPairingKind::FileToStream
+        );
+        assert_eq!(
+            classify_transform_io_pairing(false, true),
+            TransformIoPairingKind::StreamToFile
+        );
+        assert_eq!(
+            classify_transform_io_pairing(false, false),
+            TransformIoPairingKind::StreamToStream
+        );
+    }
 }
 
 pub fn run_file_transform_to_pipe_with_owned_output<F>(

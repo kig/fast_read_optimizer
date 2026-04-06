@@ -1,8 +1,10 @@
 use super::*;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 struct RecursiveDeleteDirectoryTask {
     dir: PathBuf,
+    parent_dir: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -14,10 +16,52 @@ struct RecursiveDeleteStats {
     items_completed: AtomicU64,
 }
 
+struct PendingDeleteDir {
+    remaining_children: usize,
+    parent_dir: Option<PathBuf>,
+}
+
+fn finish_delete_directory(
+    dir: PathBuf,
+    parent_dir: Option<PathBuf>,
+    pending: &Mutex<HashMap<PathBuf, PendingDeleteDir>>,
+    stats: &RecursiveDeleteStats,
+    sample_counters: &ThroughputSampleCounters,
+) -> io::Result<()> {
+    let mut next = Some((dir, parent_dir));
+    while let Some((dir, parent_dir)) = next.take() {
+        fs::remove_dir(&dir)?;
+        stats.dirs_removed.fetch_add(1, Ordering::Relaxed);
+        stats.items_completed.fetch_add(1, Ordering::Relaxed);
+        sample_counters.units.fetch_add(1, Ordering::Relaxed);
+        let Some(parent) = parent_dir else {
+            continue;
+        };
+        let mut locked = pending.lock().unwrap();
+        let parent_state = locked.get_mut(&parent).ok_or_else(|| {
+            io::Error::other(format!(
+                "recursive delete lost parent pending state for {}",
+                parent.display()
+            ))
+        })?;
+        parent_state.remaining_children = parent_state.remaining_children.saturating_sub(1);
+        if parent_state.remaining_children == 0 {
+            let state = locked.remove(&parent).ok_or_else(|| {
+                io::Error::other(format!(
+                    "recursive delete could not remove completed parent state for {}",
+                    parent.display()
+                ))
+            })?;
+            next = Some((parent, state.parent_dir));
+        }
+    }
+    Ok(())
+}
+
 fn walk_recursive_delete_subtree(
     start: RecursiveDeleteDirectoryTask,
     dir_queue: &RecursiveDirectoryQueue<RecursiveDeleteDirectoryTask>,
-    directories: &Mutex<Vec<PathBuf>>,
+    pending: &Mutex<HashMap<PathBuf, PendingDeleteDir>>,
     stats: &RecursiveDeleteStats,
     sample_counters: &ThroughputSampleCounters,
     stop: &AtomicBool,
@@ -27,14 +71,16 @@ fn walk_recursive_delete_subtree(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        directories.lock().unwrap().push(task.dir.clone());
         let mut child_dirs = Vec::new();
         for entry in fs::read_dir(&task.dir)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                child_dirs.push(RecursiveDeleteDirectoryTask { dir: path });
+                child_dirs.push(RecursiveDeleteDirectoryTask {
+                    dir: path,
+                    parent_dir: Some(task.dir.clone()),
+                });
                 continue;
             }
             if file_type.is_symlink() {
@@ -47,11 +93,33 @@ fn walk_recursive_delete_subtree(
             let removed_bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
             fs::remove_file(&path)?;
             stats.files_removed.fetch_add(1, Ordering::Relaxed);
-            stats.bytes_removed.fetch_add(removed_bytes, Ordering::Relaxed);
+            stats
+                .bytes_removed
+                .fetch_add(removed_bytes, Ordering::Relaxed);
             stats.items_completed.fetch_add(1, Ordering::Relaxed);
-            sample_counters.bytes.fetch_add(removed_bytes, Ordering::Relaxed);
+            sample_counters
+                .bytes
+                .fetch_add(removed_bytes, Ordering::Relaxed);
             sample_counters.units.fetch_add(1, Ordering::Relaxed);
         }
+        let pending_children = child_dirs.len();
+        if pending_children == 0 {
+            finish_delete_directory(
+                task.dir.clone(),
+                task.parent_dir.clone(),
+                pending,
+                stats,
+                sample_counters,
+            )?;
+            continue;
+        }
+        pending.lock().unwrap().insert(
+            task.dir.clone(),
+            PendingDeleteDir {
+                remaining_children: pending_children,
+                parent_dir: task.parent_dir.clone(),
+            },
+        );
         if let Some(local_dir) = child_dirs.pop() {
             for task in child_dirs {
                 dir_queue.enqueue_one(task);
@@ -75,7 +143,7 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
     let sample_counters = Arc::new(ThroughputSampleCounters::default());
     let dir_queue = Arc::new(RecursiveDirectoryQueue::<RecursiveDeleteDirectoryTask>::default());
     let stop = Arc::new(AtomicBool::new(false));
-    let directories = Arc::new(Mutex::new(Vec::new()));
+    let pending = Arc::new(Mutex::new(HashMap::<PathBuf, PendingDeleteDir>::new()));
     let sampler = if verbose {
         Some(ThroughputSampler::start(
             "recursive-delete",
@@ -88,13 +156,14 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
 
     dir_queue.enqueue_one(RecursiveDeleteDirectoryTask {
         dir: root.to_path_buf(),
+        parent_dir: None,
     });
 
     let worker_count = recursive_copy_dir_worker_count();
     let mut walk_threads = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let dir_queue = dir_queue.clone();
-        let directories = directories.clone();
+        let pending = pending.clone();
         let stats = stats.clone();
         let stop = stop.clone();
         let sample_counters = sample_counters.clone();
@@ -103,7 +172,7 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
                 let result = walk_recursive_delete_subtree(
                     task,
                     &dir_queue,
-                    directories.as_ref(),
+                    pending.as_ref(),
                     &stats,
                     sample_counters.as_ref(),
                     &stop,
@@ -128,22 +197,6 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
             Ok(()) => {}
             Err(err) if first_error.is_none() => first_error = Some(err),
             Err(_) => {}
-        }
-    }
-
-    if first_error.is_none() {
-        let mut dirs = directories.lock().unwrap().clone();
-        dirs.sort_by(|a, b| {
-            b.components()
-                .count()
-                .cmp(&a.components().count())
-                .then_with(|| b.cmp(a))
-        });
-        for dir in dirs {
-            fs::remove_dir(&dir)?;
-            stats.dirs_removed.fetch_add(1, Ordering::Relaxed);
-            stats.items_completed.fetch_add(1, Ordering::Relaxed);
-            sample_counters.units.fetch_add(1, Ordering::Relaxed);
         }
     }
 

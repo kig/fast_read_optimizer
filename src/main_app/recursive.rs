@@ -5,9 +5,20 @@ use crate::main_app::copy_plan::{resolve_copy_execution, CopyRewriteMode, Resolv
 pub(crate) mod archive;
 pub(super) mod bench;
 pub(crate) mod delete;
+pub(crate) mod move_dir;
 pub(super) mod openat;
 pub(super) mod paths;
 
+fn maybe_print_verbose_copy(
+    verbose: bool,
+    cp_compat: bool,
+    source_path: &Path,
+    target_path: &Path,
+) {
+    if verbose && cp_compat {
+        println!("'{}' -> '{}'", source_path.display(), target_path.display());
+    }
+}
 
 pub(super) fn collect_recursive_copy_manifest(
     ctx: &RecursiveCopyContext,
@@ -38,7 +49,7 @@ pub(super) fn collect_recursive_copy_manifest(
                 continue;
             }
             if file_type.is_symlink() {
-                copy_symlink_entry(&source_path, &target_path, stats)?;
+                copy_symlink_entry(&source_path, &target_path, stats, false, false)?;
                 continue;
             }
             if !file_type.is_file() {
@@ -68,6 +79,7 @@ pub(super) fn collect_recursive_copy_manifest(
                     target_path,
                     source_mode,
                     resolved_copy,
+                    source_parent_dir: None,
                 });
             }
         }
@@ -76,7 +88,6 @@ pub(super) fn collect_recursive_copy_manifest(
     }
     Ok((small_tasks, large_tasks))
 }
-
 
 impl<T> Default for RecursiveDirectoryQueue<T> {
     fn default() -> Self {
@@ -246,11 +257,14 @@ pub(super) fn copy_symlink_entry(
     source_path: &Path,
     target_path: &Path,
     stats: &RecursiveCopyStats,
+    verbose: bool,
+    cp_compat: bool,
 ) -> io::Result<()> {
     ensure_parent_directory(target_path)?;
     ensure_removed_non_directory(target_path)?;
     let link_target = fs::read_link(source_path)?;
     symlink(&link_target, target_path)?;
+    maybe_print_verbose_copy(verbose, cp_compat, source_path, target_path);
     stats.symlinks_created.fetch_add(1, Ordering::Relaxed);
     stats.items_completed.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -303,6 +317,12 @@ fn execute_recursive_file_copy(
         &task.target_path,
         fs::Permissions::from_mode(task.source_mode),
     )?;
+    maybe_print_verbose_copy(
+        ctx.verbose,
+        ctx.cp_compat,
+        &task.source_path,
+        &task.target_path,
+    );
     stats.files_copied.fetch_add(1, Ordering::Relaxed);
     stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
     stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -363,7 +383,9 @@ pub(super) fn recursive_read_file_worker_count() -> usize {
         .max(1)
 }
 
-pub(super) fn recursive_read_file_worker_count_with_override(override_threads: Option<u64>) -> usize {
+pub(super) fn recursive_read_file_worker_count_with_override(
+    override_threads: Option<u64>,
+) -> usize {
     override_threads
         .and_then(|threads| usize::try_from(threads).ok())
         .filter(|threads| *threads > 0)
@@ -387,7 +409,10 @@ pub(super) fn recursive_small_file_worker_count_for_path(
     recursive_read_file_worker_count_with_override(Some(cache_state))
 }
 
-pub(super) fn recursive_copy_uses_small_file_range(ctx: &RecursiveCopyContext, source_len: u64) -> bool {
+pub(super) fn recursive_copy_uses_small_file_range(
+    ctx: &RecursiveCopyContext,
+    source_len: u64,
+) -> bool {
     let cutoff = std::env::var("FRO_RECURSIVE_COPY_SMALL_THRESHOLD")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -462,7 +487,10 @@ fn execute_recursive_small_file_copy(
         common::IOMode::PageCache,
     )?;
     guard.ensure_source_unchanged()?;
-    fs::set_permissions(&task.target_path, fs::Permissions::from_mode(task.source_mode))?;
+    fs::set_permissions(
+        &task.target_path,
+        fs::Permissions::from_mode(task.source_mode),
+    )?;
     stats.files_copied.fetch_add(1, Ordering::Relaxed);
     stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
     stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -507,7 +535,13 @@ fn walk_recursive_copy_subtree(
                 continue;
             }
             if file_type.is_symlink() {
-                copy_symlink_entry(&source_path, &target_path, stats)?;
+                copy_symlink_entry(
+                    &source_path,
+                    &target_path,
+                    stats,
+                    ctx.verbose,
+                    ctx.cp_compat,
+                )?;
                 continue;
             }
             if !file_type.is_file() {
@@ -535,6 +569,7 @@ fn walk_recursive_copy_subtree(
                     &target_root_fd,
                     ctx.relative_copy_method,
                 )?;
+                maybe_print_verbose_copy(ctx.verbose, ctx.cp_compat, &source_path, &target_path);
                 stats.files_copied.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
                 stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -553,6 +588,7 @@ fn walk_recursive_copy_subtree(
                     target_path,
                     source_mode,
                     resolved_copy,
+                    source_parent_dir: None,
                 })?;
                 #[cfg(feature = "read-phase-timing")]
                 lane_counters.note_queued("large");
@@ -565,6 +601,7 @@ fn walk_recursive_copy_subtree(
                     &target_root_fd,
                     ctx.relative_copy_method,
                 )?;
+                maybe_print_verbose_copy(ctx.verbose, ctx.cp_compat, &source_path, &target_path);
                 stats.files_copied.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
                 stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -654,7 +691,11 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
     #[cfg(feature = "read-phase-timing")]
     let lane_counters = Arc::new(RecursiveCopyLaneCounters::default());
     let sampler = if verbose {
-        Some(ThroughputSampler::start("recursive-copy", "items", sample_counters.clone()))
+        Some(ThroughputSampler::start(
+            "recursive-copy",
+            "items",
+            sample_counters.clone(),
+        ))
     } else {
         None
     };
@@ -774,7 +815,10 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
     Ok(bytes_copied)
 }
 
-pub(super) fn run_split_manifest_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
+pub(super) fn run_split_manifest_recursive_copy(
+    ctx: RecursiveCopyContext,
+    verbose: bool,
+) -> io::Result<u64> {
     let source_meta = fs::symlink_metadata(&ctx.source_root)?;
     if !source_meta.file_type().is_dir() {
         return Err(io::Error::new(

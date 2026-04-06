@@ -39,5 +39,8 @@ fn parse_reported_summary_extracts_speed_and_params() {
     let sample = "read 1073741824 bytes in 0.1076 s, 10.0 GB/s, [31, 131072, 1, 16, 3145728, 2, 4, 524288, 4]";
     let summary = parse_reported_summary(sample).unwrap();
     assert_eq!(summary.gbps, 10.0);
-    assert_eq!(summary.params.unwrap(), vec![31, 131072, 1, 16, 3145728, 2, 4, 524288, 4]);
+    assert_eq!(
+        summary.params.unwrap(),
+        vec![31, 131072, 1, 16, 3145728, 2, 4, 524288, 4]
+    );
 }

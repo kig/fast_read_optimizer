@@ -1,5 +1,5 @@
-use super::*;
 use super::args::ParsedArgs;
+use super::*;
 use crate::main_app::bench_tar_archive;
 use crate::main_app::copy_plan::{describe_copy_path, resolve_copy_execution};
 use crate::main_app::recursive::bench::{bench_recursive_read, bench_recursive_small_file_threads};
@@ -9,6 +9,8 @@ use crate::main_app::recursive::{run_recursive_copy, run_split_manifest_recursiv
 pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let ParsedArgs {
         mode,
+        config_subcommand,
+        config_target,
         io_mode,
         io_mode_write,
         to_memory,
@@ -30,6 +32,11 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         force_copy_file_range_single,
         force_threaded_copy,
         force_reflink,
+        cp_compat,
+        cp_no_clobber,
+        cp_target_directory,
+        cp_no_target_directory,
+        cp_update,
         verbose,
         source,
         pattern,
@@ -46,6 +53,42 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         overlap_large_file,
         small_file_thread_cache_state,
     } = parsed;
+
+    if mode == "config" {
+        let config = config::load_config(config_path.as_deref());
+        match config_subcommand.as_deref() {
+            Some("print") => {
+                println!("{}", config.to_pretty_json()?);
+                return Ok(0);
+            }
+            Some("explain") => {
+                let target = config_target.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "config explain requires --for <path>",
+                    )
+                })?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&config.explain_for_path(target))
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                );
+                return Ok(0);
+            }
+            Some(other) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown config subcommand: {other}"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing config subcommand",
+                ));
+            }
+        }
+    }
 
     let mode = mode;
     let filename = filename;
@@ -101,8 +144,13 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     } else {
         CopyRewriteMode::Auto
     };
-    let mut optimizer_mask =
-        active_optimizer_param_mask(mode.as_str(), io_mode, io_mode_write, via_memory, copy_strategy);
+    let mut optimizer_mask = active_optimizer_param_mask(
+        mode.as_str(),
+        io_mode,
+        io_mode_write,
+        via_memory,
+        copy_strategy,
+    );
     if matches!(
         mode.as_str(),
         "read"
@@ -120,8 +168,10 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
             manual_read_overrides,
         );
     }
-    let verbose = verbose || mode == "read" || mode == "write";
-    if verbose {
+    let cli_verbose = verbose;
+    let verbose = cli_verbose || mode == "read" || mode == "write";
+    let internal_verbose = verbose && !cp_compat;
+    if internal_verbose {
         eprintln!("Opening file {} for {}", filename, mode);
     }
 
@@ -220,7 +270,13 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
             )
         } else if mode == "bench-tar-archive" {
             let target = extra_paths_owned.get(1).map(Path::new);
-            bench_tar_archive(&filename, Path::new(extra_paths_owned[0].as_str()), target, io_mode, io_mode_write)
+            bench_tar_archive(
+                &filename,
+                Path::new(extra_paths_owned[0].as_str()),
+                target,
+                io_mode,
+                io_mode_write,
+            )
         } else if mode == "hash" {
             if hash_only || iterations > 1 {
                 let manifest = hash_file_blocks(
@@ -336,89 +392,256 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
             )
         } else if mode == "copy" || mode == "split-manifest-recursive-copy-bench" {
             if let Some(src) = source.as_deref() {
-                if recursive_copy || mode == "split-manifest-recursive-copy-bench" {
-                    let source_root = PathBuf::from(src);
-                    let source_metadata = fs::symlink_metadata(&source_root)?;
-                    if !source_metadata.file_type().is_dir() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            if mode == "copy" {
-                                "copy --recursive requires a directory source"
-                            } else {
-                                "split-manifest-recursive-copy-bench requires a directory source"
-                            },
-                        ));
-                    }
-                    let target_root = resolve_recursive_copy_root(&source_root, Path::new(&filename))?;
-                    let optimizer_params = std::array::from_fn(|index| p[index]);
-                    let recursive_ctx = RecursiveCopyContext {
-                        config: config.clone(),
-                        source_root,
-                        target_root,
-                        optimizer_params,
-                        requested_strategy: copy_strategy,
-                        rewrite_mode: copy_rewrite_mode,
-                        io_mode_read: io_mode,
-                        io_mode_write,
-                        keep_target_size,
-                        use_lock: !no_lock,
-                        relative_copy_method: RelativeCopyMethod::CopyFileRange,
-                    };
-                    if mode == "split-manifest-recursive-copy-bench" {
-                        run_split_manifest_recursive_copy(recursive_ctx, verbose)
-                    } else {
-                        run_recursive_copy(recursive_ctx, verbose)
-                    }
-                } else {
-                    let resolved_copy = resolve_copy_execution(
-                        &config,
-                        src,
-                        &filename,
-                        copy_strategy,
-                        copy_rewrite_mode,
-                        io_mode,
-                        io_mode_write,
-                    )?;
-                    if verbose {
-                        eprintln!("{}", describe_copy_path(resolved_copy, via_memory, keep_target_size));
-                    }
-                    if verify_copy {
-                        let target_hash_base_owned = if persist_verification_hashes {
-                            Some(
-                                hash_base_owned
-                                    .clone()
-                                    .unwrap_or_else(|| default_hash_base(&filename)),
-                            )
-                        } else {
-                            None
-                        };
-                        let report = copy_file_verified_with_options_and_lock(
-                            src,
-                            &filename,
-                            resolved_copy.io_mode_read,
-                            resolved_copy.io_mode_write,
-                            hash_type,
-                            via_memory,
-                            target_hash_base_owned.as_deref(),
-                            resolved_copy.copy_strategy,
-                            !no_lock,
-                        )?;
-                        if !quiet {
-                            eprintln!(
-                                "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
-                                report.verified_blocks,
-                                report.repaired_blocks,
-                                report.used_recovery,
-                                report.hash_type,
-                                report.hashes_persisted
-                            );
+                if let Some(target_dir) = cp_target_directory.as_deref() {
+                    match fs::symlink_metadata(target_dir) {
+                        Ok(metadata) if metadata.file_type().is_dir() => {}
+                        Ok(_) => {
+                            eprintln!("cp: target '{}' is not a directory", target_dir);
+                            exit_code = 1;
+                            return Ok(0);
                         }
-                        Ok(report.bytes_copied)
-                    } else if verify_copy_diff {
-                        let guard = CopyOperationGuard::new(src, &filename, !no_lock)?;
-                        let copied = if via_memory {
-                            let read_page_cache = config.get_params_for_path("read_to_memory", false, src);
-                            let read_direct = config.get_params_for_path("read_to_memory", true, src);
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            eprintln!(
+                                "cp: failed to access '{}': No such file or directory",
+                                target_dir
+                            );
+                            exit_code = 1;
+                            return Ok(0);
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                let copy_sources = std::iter::once(src.to_string())
+                    .chain(extra_paths_owned.iter().cloned())
+                    .collect::<Vec<_>>();
+                let mut total_copied = 0;
+                for source_arg in copy_sources {
+                    let src = source_arg.as_str();
+                    let target_name = cp_target_directory
+                        .as_deref()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| filename.clone());
+                    let target_path_buf = if cp_target_directory.is_some() {
+                        Path::new(&target_name).join(Path::new(src).file_name().ok_or_else(
+                            || {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "cp source has no final path component",
+                                )
+                            },
+                        )?)
+                    } else {
+                        PathBuf::from(&target_name)
+                    };
+                    let copied = if recursive_copy || mode == "split-manifest-recursive-copy-bench"
+                    {
+                        let source_root = PathBuf::from(src);
+                        let source_metadata = fs::symlink_metadata(&source_root)?;
+                        if !source_metadata.file_type().is_dir() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                if mode == "copy" {
+                                    "copy --recursive requires a directory source"
+                                } else {
+                                    "split-manifest-recursive-copy-bench requires a directory source"
+                                },
+                            ));
+                        }
+                        let target_root = if cp_compat && cp_no_target_directory {
+                            PathBuf::from(&target_name)
+                        } else if cp_target_directory.is_some() {
+                            target_path_buf.clone()
+                        } else {
+                            resolve_recursive_copy_root(&source_root, Path::new(&target_name))?
+                        };
+                        let optimizer_params = std::array::from_fn(|index| p[index]);
+                        let recursive_ctx = RecursiveCopyContext {
+                            config: config.clone(),
+                            source_root,
+                            target_root,
+                            optimizer_params,
+                            requested_strategy: copy_strategy,
+                            rewrite_mode: copy_rewrite_mode,
+                            io_mode_read: io_mode,
+                            io_mode_write,
+                            keep_target_size,
+                            use_lock: !no_lock,
+                            relative_copy_method: RelativeCopyMethod::CopyFileRange,
+                            verbose: internal_verbose,
+                            cp_compat,
+                        };
+                        if mode == "split-manifest-recursive-copy-bench" {
+                            run_split_manifest_recursive_copy(recursive_ctx, internal_verbose)?
+                        } else {
+                            run_recursive_copy(recursive_ctx, internal_verbose)?
+                        }
+                    } else {
+                        let source_path = Path::new(src);
+                        let target_path = target_path_buf.as_path();
+                        let target_path_string = target_path.to_string_lossy().into_owned();
+                        if cp_compat
+                            && cp_no_target_directory
+                            && fs::symlink_metadata(target_path)
+                                .is_ok_and(|metadata| metadata.file_type().is_dir())
+                        {
+                            eprintln!(
+                                "cp: cannot overwrite directory '{}' with non-directory",
+                                target_path.display()
+                            );
+                            exit_code = 1;
+                            return Ok(0);
+                        }
+                        if cp_no_clobber {
+                            if skip_copy_destination(source_path, target_path, false)? {
+                                continue;
+                            }
+                        } else if cp_update
+                            && skip_copy_destination(source_path, target_path, true)?
+                        {
+                            continue;
+                        }
+                        let resolved_copy = resolve_copy_execution(
+                            &config,
+                            src,
+                            &target_path_string,
+                            copy_strategy,
+                            copy_rewrite_mode,
+                            io_mode,
+                            io_mode_write,
+                        )?;
+                        if cli_verbose {
+                            if cp_compat {
+                                println!("'{}' -> '{}'", src, target_path.display());
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    describe_copy_path(resolved_copy, via_memory, keep_target_size)
+                                );
+                            }
+                        }
+                        if verify_copy {
+                            let target_hash_base_owned = if persist_verification_hashes {
+                                Some(
+                                    hash_base_owned
+                                        .clone()
+                                        .unwrap_or_else(|| default_hash_base(&target_path_string)),
+                                )
+                            } else {
+                                None
+                            };
+                            let report = copy_file_verified_with_options_and_lock(
+                                src,
+                                &target_path_string,
+                                resolved_copy.io_mode_read,
+                                resolved_copy.io_mode_write,
+                                hash_type,
+                                via_memory,
+                                target_hash_base_owned.as_deref(),
+                                resolved_copy.copy_strategy,
+                                !no_lock,
+                            )?;
+                            if !quiet {
+                                eprintln!(
+                                    "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
+                                    report.verified_blocks,
+                                    report.repaired_blocks,
+                                    report.used_recovery,
+                                    report.hash_type,
+                                    report.hashes_persisted
+                                );
+                            }
+                            report.bytes_copied
+                        } else if verify_copy_diff {
+                            let guard =
+                                CopyOperationGuard::new(src, &target_path_string, !no_lock)?;
+                            let copied = if via_memory {
+                                let read_page_cache =
+                                    config.get_params_for_path("read_to_memory", false, src);
+                                let read_direct =
+                                    config.get_params_for_path("read_to_memory", true, src);
+                                let loaded = load_file_to_memory(
+                                    src,
+                                    read_page_cache.num_threads,
+                                    read_page_cache.block_size,
+                                    read_page_cache.qd,
+                                    read_direct.num_threads,
+                                    read_direct.block_size,
+                                    read_direct.qd,
+                                    io_mode,
+                                )?;
+                                let write_page_cache =
+                                    config.get_params_for_path("write", false, &target_path_string);
+                                let write_direct =
+                                    config.get_params_for_path("write", true, &target_path_string);
+                                write_buffer(
+                                    &target_path_string,
+                                    &loaded.data,
+                                    write_page_cache.num_threads,
+                                    write_page_cache.block_size,
+                                    write_page_cache.qd,
+                                    write_direct.num_threads,
+                                    write_direct.block_size,
+                                    write_direct.qd,
+                                    resolved_copy.io_mode_write,
+                                )?
+                            } else {
+                                copy_file_with_strategy(
+                                    src,
+                                    &target_path_string,
+                                    p[0],
+                                    p[1],
+                                    p[2] as usize,
+                                    p[3],
+                                    p[4],
+                                    p[5] as usize,
+                                    p[6],
+                                    p[7],
+                                    p[8] as usize,
+                                    resolved_copy.io_mode_read,
+                                    resolved_copy.io_mode_write,
+                                    resolved_copy.copy_strategy,
+                                )?
+                            };
+                            sync_path(&target_path_string)?;
+                            guard.ensure_source_unchanged()?;
+                            let diff_page_cache =
+                                config.get_params_for_path("diff", false, &target_path_string);
+                            let diff_direct =
+                                config.get_params_for_path("diff", true, &target_path_string);
+                            let diff_res = diff_files(
+                                src,
+                                &target_path_string,
+                                diff_page_cache.num_threads,
+                                diff_page_cache.block_size,
+                                diff_page_cache.qd,
+                                diff_direct.num_threads,
+                                diff_direct.block_size,
+                                diff_direct.qd,
+                                io_mode,
+                                false,
+                                true,
+                            )?;
+                            if diff_res != 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "copy verify-diff found a mismatch at byte offset {}",
+                                        diff_res
+                                    ),
+                                ));
+                            }
+                            guard.ensure_source_unchanged()?;
+                            if !quiet {
+                                eprintln!("copy verify-diff: success");
+                            }
+                            copied
+                        } else if via_memory {
+                            let guard =
+                                CopyOperationGuard::new(src, &target_path_string, !no_lock)?;
+                            let read_page_cache =
+                                config.get_params_for_path("read_to_memory", false, src);
+                            let read_direct =
+                                config.get_params_for_path("read_to_memory", true, src);
                             let loaded = load_file_to_memory(
                                 src,
                                 read_page_cache.num_threads,
@@ -429,10 +652,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 read_direct.qd,
                                 io_mode,
                             )?;
-                            let write_page_cache = config.get_params_for_path("write", false, &filename);
-                            let write_direct = config.get_params_for_path("write", true, &filename);
-                            write_buffer(
-                                &filename,
+                            let write_page_cache =
+                                config.get_params_for_path("write", false, &target_path_string);
+                            let write_direct =
+                                config.get_params_for_path("write", true, &target_path_string);
+                            let copied = write_buffer(
+                                &target_path_string,
                                 &loaded.data,
                                 write_page_cache.num_threads,
                                 write_page_cache.block_size,
@@ -441,119 +666,51 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 write_direct.block_size,
                                 write_direct.qd,
                                 resolved_copy.io_mode_write,
-                            )?
+                            )?;
+                            guard.ensure_source_unchanged()?;
+                            copied
                         } else {
-                            copy_file_with_strategy(
-                                src,
-                                &filename,
-                                p[0],
-                                p[1],
-                                p[2] as usize,
-                                p[3],
-                                p[4],
-                                p[5] as usize,
-                                p[6],
-                                p[7],
-                                p[8] as usize,
-                                resolved_copy.io_mode_read,
-                                resolved_copy.io_mode_write,
-                                resolved_copy.copy_strategy,
-                            )?
-                        };
-                        sync_path(&filename)?;
-                        guard.ensure_source_unchanged()?;
-                        let diff_page_cache = config.get_params_for_path("diff", false, &filename);
-                        let diff_direct = config.get_params_for_path("diff", true, &filename);
-                        let diff_res = diff_files(
-                            src,
-                            &filename,
-                            diff_page_cache.num_threads,
-                            diff_page_cache.block_size,
-                            diff_page_cache.qd,
-                            diff_direct.num_threads,
-                            diff_direct.block_size,
-                            diff_direct.qd,
-                            io_mode,
-                            false,
-                            true,
-                        )?;
-                        if diff_res != 0 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("copy verify-diff found a mismatch at byte offset {}", diff_res),
-                            ));
+                            let guard =
+                                CopyOperationGuard::new(src, &target_path_string, !no_lock)?;
+                            let copied = if resolved_copy.diff_overwrite && !keep_target_size {
+                                let diff_scan =
+                                    config.get_params_for_path("diff", false, &target_path_string);
+                                overwrite_changed_chunks_direct(
+                                    src,
+                                    &target_path_string,
+                                    diff_scan.num_threads,
+                                    diff_scan.block_size,
+                                    diff_scan.qd,
+                                    p[3],
+                                    p[4],
+                                    p[5] as usize,
+                                )?
+                            } else {
+                                copy_file_with_strategy_and_truncate(
+                                    src,
+                                    &target_path_string,
+                                    p[0],
+                                    p[1],
+                                    p[2] as usize,
+                                    p[3],
+                                    p[4],
+                                    p[5] as usize,
+                                    p[6],
+                                    p[7],
+                                    p[8] as usize,
+                                    resolved_copy.io_mode_read,
+                                    resolved_copy.io_mode_write,
+                                    resolved_copy.copy_strategy,
+                                    !keep_target_size,
+                                )?
+                            };
+                            guard.ensure_source_unchanged()?;
+                            copied
                         }
-                        guard.ensure_source_unchanged()?;
-                        if !quiet {
-                            eprintln!("copy verify-diff: success");
-                        }
-                        Ok(copied)
-                    } else if via_memory {
-                        let guard = CopyOperationGuard::new(src, &filename, !no_lock)?;
-                        let read_page_cache = config.get_params_for_path("read_to_memory", false, src);
-                        let read_direct = config.get_params_for_path("read_to_memory", true, src);
-                        let loaded = load_file_to_memory(
-                            src,
-                            read_page_cache.num_threads,
-                            read_page_cache.block_size,
-                            read_page_cache.qd,
-                            read_direct.num_threads,
-                            read_direct.block_size,
-                            read_direct.qd,
-                            io_mode,
-                        )?;
-                        let write_page_cache = config.get_params_for_path("write", false, &filename);
-                        let write_direct = config.get_params_for_path("write", true, &filename);
-                        let copied = write_buffer(
-                            &filename,
-                            &loaded.data,
-                            write_page_cache.num_threads,
-                            write_page_cache.block_size,
-                            write_page_cache.qd,
-                            write_direct.num_threads,
-                            write_direct.block_size,
-                            write_direct.qd,
-                            resolved_copy.io_mode_write,
-                        )?;
-                        guard.ensure_source_unchanged()?;
-                        Ok(copied)
-                    } else {
-                        let guard = CopyOperationGuard::new(src, &filename, !no_lock)?;
-                        let copied = if resolved_copy.diff_overwrite && !keep_target_size {
-                            let diff_scan = config.get_params_for_path("diff", false, &filename);
-                            overwrite_changed_chunks_direct(
-                                src,
-                                &filename,
-                                diff_scan.num_threads,
-                                diff_scan.block_size,
-                                diff_scan.qd,
-                                p[3],
-                                p[4],
-                                p[5] as usize,
-                            )?
-                        } else {
-                            copy_file_with_strategy_and_truncate(
-                                src,
-                                &filename,
-                                p[0],
-                                p[1],
-                                p[2] as usize,
-                                p[3],
-                                p[4],
-                                p[5] as usize,
-                                p[6],
-                                p[7],
-                                p[8] as usize,
-                                resolved_copy.io_mode_read,
-                                resolved_copy.io_mode_write,
-                                resolved_copy.copy_strategy,
-                                !keep_target_size,
-                            )?
-                        };
-                        guard.ensure_source_unchanged()?;
-                        Ok(copied)
-                    }
+                    };
+                    total_copied += copied;
                 }
+                Ok(total_copied)
             } else {
                 eprintln!("Copy is missing a destination path.");
                 Ok(1)
@@ -563,7 +720,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
             let s1 = std::fs::metadata(src)?.len();
             let s2 = std::fs::metadata(&filename)?.len();
             if s1 != s2 {
-                if verbose {
+                if internal_verbose {
                     eprintln!("Files have different sizes: {} != {}", s1, s2);
                 }
                 if mode == "diff" {
@@ -611,7 +768,10 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         && to_memory
         && iterations == 1
         && effective_to_memory_mode.is_some_and(|mode| {
-            matches!(mode, ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages)
+            matches!(
+                mode,
+                ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages
+            )
         })
         && !to_memory_options.measure_unmap_time
     {
@@ -672,8 +832,10 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         start_params,
         params_steps,
         optimizer_mask,
-        usize::try_from(iterations).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "iterations overflow usize"))?,
-        verbose,
+        usize::try_from(iterations).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "iterations overflow usize")
+        })?,
+        internal_verbose,
         mode_callback,
     )?;
 
@@ -731,4 +893,23 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         return Ok(exit_code);
     }
     Ok(0)
+}
+
+fn skip_copy_destination(
+    source: &Path,
+    target: &Path,
+    update_only_if_newer: bool,
+) -> io::Result<bool> {
+    let target_meta = match fs::metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if update_only_if_newer {
+        let source_meta = fs::metadata(source)?;
+        if source_meta.modified()? > target_meta.modified()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

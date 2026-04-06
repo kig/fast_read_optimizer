@@ -159,13 +159,11 @@ struct MountInfoEntry {
     device_db_read_direct: Option<IOParams>,
 }
 
-
+mod cli_utils;
 mod inspect;
+mod run;
 #[cfg(test)]
 mod tests;
-mod cli_utils;
-mod run;
-
 
 pub(super) fn main_impl() {
     run::main_impl();

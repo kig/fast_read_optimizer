@@ -299,7 +299,11 @@ pub(super) fn build_tests(
         TestCase {
             name: "cp -r (recursive, hot)",
             program: "cp",
-            args: vec!["-r".into(), recursive_tree_str.clone(), recursive_copy_target.clone()],
+            args: vec![
+                "-r".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
             target: 0.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
@@ -309,7 +313,11 @@ pub(super) fn build_tests(
         TestCase {
             name: "rsync (recursive, hot)",
             program: "rsync",
-            args: vec!["-a".into(), recursive_tree_str.clone(), recursive_copy_target.clone()],
+            args: vec![
+                "-a".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
             target: 0.0,
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],

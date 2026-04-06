@@ -1,17 +1,70 @@
 use crate::common::{CopyAutoMode, ReadAutoStrategy, ReadPathKind};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-static MOUNTINFO_WARNING: Once = Once::new();
+mod device;
+mod storage;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub use self::storage::{load_config, resolve_default_config_path};
+
+use self::device::{device_db_match, mountpoint_for_path, normalize_path};
+pub use self::device::{device_signature_for_path, mount_info_for_path};
+use self::storage::{
+    default_bundle_v1, default_compute_mode_config, default_copy_auto_mode,
+    default_copy_range_params, default_hash_mode_config, default_read_auto_strategy,
+    default_read_to_memory_mode_config, default_recursive_small_file_threads,
+    default_verify_mode_config,
+};
+
+static MOUNTINFO_WARNING: Once = Once::new();
+const _: fn() -> PathBuf = resolve_default_config_path;
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct MountInfo {
     pub mount_point: String,
     pub fstype: String,
     pub mount_source: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeviceSignature {
+    pub mount_source: String,
+    pub canonical_source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_device: Option<BlockDeviceSignature>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlockDeviceSignature {
+    pub kernel_name: String,
+    pub devnode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_id: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotational: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dm_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slaves: Vec<BlockDeviceSignature>,
+}
+
+#[derive(Clone, Debug)]
+struct DeviceProbeRoots {
+    dev_root: PathBuf,
+    sys_class_block_root: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -107,6 +160,48 @@ pub struct DeviceDbConfig {
     pub allow_online_update: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct DeviceDb {
+    version: u32,
+    profiles: Vec<DeviceDbProfile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct DeviceDbProfile {
+    id: String,
+    #[serde(rename = "match")]
+    match_fields: DeviceDbMatch,
+    params: DeviceDbParams,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct DeviceDbMatch {
+    #[serde(default)]
+    fstype: Option<String>,
+    #[serde(default)]
+    dev_kind: Option<String>,
+    #[serde(default)]
+    dev_model_contains: Option<String>,
+    #[serde(default)]
+    md_level: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct DeviceDbParams {
+    #[serde(default)]
+    read: Option<ModeConfig>,
+    #[serde(default)]
+    grep: Option<ModeConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct DeviceDbSelection {
+    source_path: String,
+    profile: DeviceDbProfile,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecursiveSmallFileThreads {
     pub hot: u64,
@@ -150,12 +245,55 @@ impl LoadedConfig {
         }
     }
 
-    fn mount_patch_for_path(&self, path: &str) -> Option<&AppConfigPatch> {
+    fn mount_patch_for_mount(&self, mount: Option<&MountInfo>) -> Option<&AppConfigPatch> {
         let LoadedConfig::BundleV1 { bundle, .. } = self else {
             return None;
         };
-        let mp = mountpoint_for_path(path)?;
-        bundle.mount_overrides.by_mountpoint.get(&mp)
+        let mount = mount?;
+        bundle.mount_overrides.by_mountpoint.get(&mount.mount_point)
+    }
+
+    fn device_db_selection_for_context(
+        &self,
+        mount: Option<&MountInfo>,
+        device: Option<&DeviceSignature>,
+    ) -> Option<DeviceDbSelection> {
+        let LoadedConfig::BundleV1 { bundle, .. } = self else {
+            return None;
+        };
+        let mount = mount?;
+        for db_path in &bundle.device_db.paths {
+            let data = match fs::read_to_string(db_path) {
+                Ok(data) => data,
+                Err(_) => continue,
+            };
+            let db = match serde_json::from_str::<DeviceDb>(&data) {
+                Ok(db) if db.version == 1 => db,
+                _ => continue,
+            };
+            if let Some(profile) = device_db_match(&db, mount, device) {
+                return Some(DeviceDbSelection {
+                    source_path: db_path.clone(),
+                    profile: profile.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn effective_config_for_context(
+        &self,
+        mount: Option<&MountInfo>,
+        device: Option<&DeviceSignature>,
+    ) -> AppConfig {
+        let mut effective = self.defaults_ref().clone();
+        if let Some(selection) = self.device_db_selection_for_context(mount, device) {
+            selection.profile.params.apply_to(&mut effective);
+        }
+        if let Some(patch) = self.mount_patch_for_mount(mount) {
+            patch.apply_to(&mut effective);
+        }
+        effective
     }
 
     fn mount_patch_for_path_mut(&mut self, path: &str) -> Option<&mut AppConfigPatch> {
@@ -184,10 +322,14 @@ impl LoadedConfig {
         self.defaults_ref().get_params(mode, direct)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn get_copy_range_params(&self) -> IOParams {
         self.defaults_ref().copy_range.clone()
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn get_copy_auto_mode(&self) -> CopyAutoMode {
         self.defaults_ref().copy_auto_mode
     }
@@ -195,51 +337,100 @@ impl LoadedConfig {
     pub fn get_read_auto_strategy(&self) -> ReadAutoStrategy {
         self.defaults_ref().read_auto_strategy
     }
-
-    pub fn get_recursive_small_file_threads(&self) -> RecursiveSmallFileThreads {
-        self.defaults_ref().recursive_small_file_threads
-    }
-
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
-        let base = self.get_params(mode, direct);
-        self.mount_patch_for_path(path)
-            .and_then(|patch| patch.get_mode_patch(mode))
-            .and_then(|m| {
-                if direct {
-                    m.direct.clone()
-                } else {
-                    m.page_cache.clone()
-                }
-            })
-            .unwrap_or(base)
+        self.effective_config_for_path(path)
+            .get_params(mode, direct)
     }
 
     pub fn get_copy_range_params_for_path(&self, path: &str) -> IOParams {
-        self.mount_patch_for_path(path)
-            .and_then(|patch| patch.copy_range.clone())
-            .unwrap_or_else(|| self.get_copy_range_params())
+        self.effective_config_for_path(path).copy_range
     }
 
     pub fn get_copy_auto_mode_for_path(&self, path: &str) -> CopyAutoMode {
-        self.mount_patch_for_path(path)
-            .and_then(|patch| patch.copy_auto_mode)
-            .unwrap_or_else(|| self.get_copy_auto_mode())
+        self.effective_config_for_path(path).copy_auto_mode
     }
 
     pub fn get_read_auto_strategy_for_path(&self, path: &str) -> ReadAutoStrategy {
-        self.mount_patch_for_path(path)
-            .and_then(|patch| patch.read_auto_strategy)
-            .unwrap_or_else(|| self.get_read_auto_strategy())
+        self.effective_config_for_path(path).read_auto_strategy
     }
 
-    pub fn get_recursive_small_file_threads_for_path(&self, path: &str) -> RecursiveSmallFileThreads {
-        self.mount_patch_for_path(path)
-            .and_then(|patch| patch.recursive_small_file_threads)
-            .unwrap_or_else(|| self.get_recursive_small_file_threads())
+    pub fn get_recursive_small_file_threads_for_path(
+        &self,
+        path: &str,
+    ) -> RecursiveSmallFileThreads {
+        self.effective_config_for_path(path)
+            .recursive_small_file_threads
     }
 
     pub fn mount_info_for_path(&self, path: &str) -> Option<MountInfo> {
         mount_info_for_path(path)
+    }
+
+    pub fn device_signature_for_path(&self, path: &str) -> Option<DeviceSignature> {
+        device_signature_for_path(path)
+    }
+
+    pub fn config_path(&self) -> &Path {
+        match self {
+            LoadedConfig::Legacy { path, .. } | LoadedConfig::BundleV1 { path, .. } => {
+                path.as_path()
+            }
+        }
+    }
+
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            LoadedConfig::Legacy { .. } => "legacy",
+            LoadedConfig::BundleV1 { .. } => "bundle_v1",
+        }
+    }
+
+    pub fn effective_config_for_path(&self, path: &str) -> AppConfig {
+        let mount = self.mount_info_for_path(path);
+        let device = self.device_signature_for_path(path);
+        self.effective_config_for_context(mount.as_ref(), device.as_ref())
+    }
+
+    pub fn explain_for_path(&self, path: &str) -> Value {
+        let normalized_path = normalize_path(path);
+        let mount_info = self.mount_info_for_path(path);
+        let device = self.device_signature_for_path(path);
+        let mount_override = self.mount_patch_for_mount(mount_info.as_ref()).cloned();
+        let device_db_match =
+            self.device_db_selection_for_context(mount_info.as_ref(), device.as_ref());
+        let effective = self.effective_config_for_context(mount_info.as_ref(), device.as_ref());
+        let device_db = match self {
+            LoadedConfig::Legacy { .. } => None,
+            LoadedConfig::BundleV1 { bundle, .. } => Some(bundle.device_db.clone()),
+        };
+
+        json!({
+            "config_path": self.config_path(),
+            "config_format": self.format_name(),
+            "requested_path": path,
+            "normalized_path": normalized_path,
+            "mount": mount_info,
+            "device": device,
+            "defaults": self.defaults_ref(),
+            "device_db_match": device_db_match.as_ref().map(|selection| json!({
+                "source_path": selection.source_path,
+                "profile_id": selection.profile.id,
+                "match": selection.profile.match_fields,
+                "params": selection.profile.params,
+                "notes": selection.profile.notes,
+            })),
+            "mount_override": mount_override,
+            "effective": effective,
+            "device_db": device_db,
+        })
+    }
+
+    pub fn to_pretty_json(&self) -> io::Result<String> {
+        let rendered = match self {
+            LoadedConfig::Legacy { config, .. } => serde_json::to_string_pretty(config),
+            LoadedConfig::BundleV1 { bundle, .. } => serde_json::to_string_pretty(bundle),
+        };
+        rendered.map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     #[allow(dead_code)]
@@ -348,22 +539,6 @@ impl LoadedConfig {
 }
 
 impl AppConfigPatch {
-    fn get_mode_patch(&self, mode: &str) -> Option<&ModeConfigPatch> {
-        match mode {
-            "read" => self.read.as_ref(),
-            "read-to-memory" | "read_to_memory" => self.read_to_memory.as_ref(),
-            "write" => self.write.as_ref(),
-            "copy" => self.copy.as_ref(),
-            "grep" => self.grep.as_ref(),
-            "diff" => self.diff.as_ref(),
-            "dual-read-bench" | "dual_read_bench" => self.dual_read_bench.as_ref(),
-            "compute" => self.compute.as_ref(),
-            "hash" => self.hash.as_ref(),
-            "verify" => self.verify.as_ref(),
-            _ => None,
-        }
-    }
-
     fn set_mode_params(&mut self, mode: &str, direct: bool, params: IOParams) {
         let m = match mode {
             "read" => &mut self.read,
@@ -386,378 +561,71 @@ impl AppConfigPatch {
             mp.page_cache = Some(params);
         }
     }
-}
 
-fn mountpoint_for_path(path: &str) -> Option<String> {
-    mount_info_for_path(path).map(|info| info.mount_point)
-}
-
-pub fn mount_info_for_path(path: &str) -> Option<MountInfo> {
-    let p = std::path::Path::new(path);
-    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let path = canonical.to_string_lossy();
-
-    let data = match fs::read_to_string("/proc/self/mountinfo") {
-        Ok(data) => data,
-        Err(err) => {
-            MOUNTINFO_WARNING.call_once(|| {
-                eprintln!(
-                    "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
-                    err
-                );
-            });
-            return None;
+    fn apply_to(&self, config: &mut AppConfig) {
+        if let Some(patch) = &self.read {
+            patch.apply_to(&mut config.read);
         }
-    };
-
-    let mut best: Option<MountInfo> = None;
-    let mut best_len = 0usize;
-
-    for line in data.lines() {
-        let (lhs, rhs) = match line.split_once(" - ") {
-            Some(v) => v,
-            None => continue,
-        };
-        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
-        if left_fields.len() < 5 {
-            continue;
+        if let Some(patch) = &self.read_to_memory {
+            patch.apply_to(&mut config.read_to_memory);
         }
-
-        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
-        if right_fields.is_empty() {
-            continue;
+        if let Some(patch) = &self.write {
+            patch.apply_to(&mut config.write);
         }
-        let mp = left_fields[4];
-        if !path_starts_with_mount(&path, mp) {
-            continue;
+        if let Some(patch) = &self.copy {
+            patch.apply_to(&mut config.copy);
         }
-        if mp.len() > best_len {
-            best_len = mp.len();
-            best = Some(MountInfo {
-                mount_point: mp.to_string(),
-                fstype: right_fields[0].to_string(),
-                mount_source: right_fields.get(1).unwrap_or(&"").to_string(),
-            });
+        if let Some(params) = self.copy_range.clone() {
+            config.copy_range = params;
         }
-    }
-
-    best
-}
-
-fn path_starts_with_mount(path: &str, mount_point: &str) -> bool {
-    if mount_point == "/" {
-        return path.starts_with('/');
-    }
-    if path == mount_point {
-        return true;
-    }
-    if let Some(rest) = path.strip_prefix(mount_point) {
-        return rest.starts_with('/');
-    }
-    false
-}
-
-pub fn default_user_config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".fro").join("fro.json"))
-}
-
-pub fn default_system_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FRO_SYSTEM_CONFIG") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from("/etc/fro.json")
-}
-
-pub fn resolve_default_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("FRO_CONFIG") {
-        return PathBuf::from(p);
-    }
-
-    if let Some(p) = default_user_config_path() {
-        if p.exists() {
-            return p;
+        if let Some(mode) = self.copy_auto_mode {
+            config.copy_auto_mode = mode;
         }
-    }
-
-    let sys = default_system_config_path();
-    if sys.exists() {
-        return sys;
-    }
-
-    // Default to user path even if it doesn't exist yet.
-    default_user_config_path().unwrap_or_else(|| PathBuf::from("fro.json"))
-}
-
-pub fn load_config(path: Option<&str>) -> LoadedConfig {
-    let path = path
-        .map(PathBuf::from)
-        .unwrap_or_else(resolve_default_config_path);
-
-    if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(data) => {
-                if let Ok(bundle) = serde_json::from_str::<ConfigBundleV1>(&data) {
-                    if bundle.version == 1 {
-                        return LoadedConfig::BundleV1 { path, bundle };
-                    }
-                }
-
-                if let Ok(config) = serde_json::from_str::<AppConfig>(&data) {
-                    return LoadedConfig::Legacy { path, config };
-                }
-
-                eprintln!(
-                    "Warning: config {} is malformed; using defaults without overwriting it",
-                    path.display()
-                );
-            }
-            Err(err) => {
-                eprintln!(
-                    "Warning: could not read config {} ({}); using defaults without overwriting it",
-                    path.display(),
-                    err
-                );
-            }
+        if let Some(strategy) = self.read_auto_strategy {
+            config.read_auto_strategy = strategy;
         }
-
-        return LoadedConfig::BundleV1 {
-            path,
-            bundle: default_bundle_v1(),
-        };
-    }
-
-    // Create a default config at the chosen path.
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    let bundle = default_bundle_v1();
-
-    if let Ok(data) = serde_json::to_string_pretty(&bundle) {
-        let _ = fs::write(&path, data);
-    }
-
-    LoadedConfig::BundleV1 { path, bundle }
-}
-
-fn default_bundle_v1() -> ConfigBundleV1 {
-    let mut db_paths = vec![
-        "/etc/fro.d/disk-id.json".into(),
-        "/etc/fro.d/fro-device-db.json".into(),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        db_paths.push(format!("{}/.config/fro/fro-device-db.json", home));
-    }
-    ConfigBundleV1 {
-        version: 1,
-        defaults: AppConfig::default(),
-        mount_overrides: MountOverrides::default(),
-        device_db: DeviceDbConfig {
-            paths: db_paths,
-            allow_online_update: false,
-        },
-    }
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        let default_direct = IOParams {
-            num_threads: 16,
-            block_size: 3 * 1024 * 1024,
-            qd: 2,
-        };
-        let default_cache = IOParams {
-            num_threads: 31,
-            block_size: 128 * 1024,
-            qd: 1,
-        };
-        let default_write_direct = IOParams {
-            num_threads: 4,
-            block_size: 256 * 1024,
-            qd: 3,
-        };
-        let default_write = IOParams {
-            num_threads: 4,
-            block_size: 1024 * 1024,
-            qd: 2,
-        };
-        let default_copy_range = IOParams {
-            num_threads: 4,
-            block_size: 512 * 1024,
-            qd: 4,
-        };
-
-        let default_mode = ModeConfig {
-            direct: default_direct.clone(),
-            page_cache: default_cache.clone(),
-        };
-
-        let default_hash = IOParams {
-            num_threads: default_cache.num_threads,
-            block_size: crate::block_hash::BLOCK_HASH_SIZE,
-            qd: default_cache.qd,
-        };
-        let default_hash_direct = IOParams {
-            num_threads: default_direct.num_threads,
-            block_size: crate::block_hash::BLOCK_HASH_SIZE,
-            qd: default_direct.qd,
-        };
-        let default_hash_mode = ModeConfig {
-            direct: default_hash_direct.clone(),
-            page_cache: default_hash.clone(),
-        };
-        let default_compute_mode = ModeConfig {
-            direct: IOParams {
-                num_threads: 32,
-                block_size: crate::block_hash::BLOCK_HASH_SIZE,
-                qd: default_direct.qd,
-            },
-            page_cache: IOParams {
-                num_threads: 32,
-                block_size: crate::block_hash::BLOCK_HASH_SIZE,
-                qd: default_cache.qd,
-            },
-        };
-
-        let default_write_mode = ModeConfig {
-            direct: default_write_direct.clone(),
-            page_cache: default_write.clone(),
-        };
-
-        // Custom defaults based on previous tuning
-        let mut diff_cache = default_cache.clone();
-        diff_cache.num_threads = 4;
-
-        AppConfig {
-            read: default_mode.clone(),
-            read_to_memory: default_mode.clone(),
-            write: default_write_mode.clone(),
-            copy: default_write_mode.clone(),
-            copy_range: default_copy_range,
-            copy_auto_mode: CopyAutoMode::Heuristic,
-            read_auto_strategy: default_read_auto_strategy(),
-            recursive_small_file_threads: default_recursive_small_file_threads(),
-            grep: default_mode.clone(),
-            diff: ModeConfig {
-                direct: default_direct.clone(),
-                page_cache: diff_cache.clone(),
-            },
-            dual_read_bench: ModeConfig {
-                direct: default_direct.clone(),
-                page_cache: diff_cache.clone(),
-            },
-            compute: default_compute_mode,
-            hash: default_hash_mode.clone(),
-            verify: default_hash_mode,
+        if let Some(threads) = self.recursive_small_file_threads {
+            config.recursive_small_file_threads = threads;
+        }
+        if let Some(patch) = &self.grep {
+            patch.apply_to(&mut config.grep);
+        }
+        if let Some(patch) = &self.diff {
+            patch.apply_to(&mut config.diff);
+        }
+        if let Some(patch) = &self.dual_read_bench {
+            patch.apply_to(&mut config.dual_read_bench);
+        }
+        if let Some(patch) = &self.compute {
+            patch.apply_to(&mut config.compute);
+        }
+        if let Some(patch) = &self.hash {
+            patch.apply_to(&mut config.hash);
+        }
+        if let Some(patch) = &self.verify {
+            patch.apply_to(&mut config.verify);
         }
     }
 }
 
-impl AppConfig {
-    pub fn save(&self, path: &str) {
-        if let Ok(data) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, data);
+impl ModeConfigPatch {
+    fn apply_to(&self, mode: &mut ModeConfig) {
+        if let Some(params) = self.direct.clone() {
+            mode.direct = params;
         }
-    }
-
-    pub fn get_params(&self, mode: &str, direct: bool) -> IOParams {
-        let mode_config = match mode {
-            "read" => &self.read,
-            "read-to-memory" | "read_to_memory" => &self.read_to_memory,
-            "write" => &self.write,
-            "copy" => &self.copy,
-            "grep" => &self.grep,
-            "diff" => &self.diff,
-            "dual-read-bench" => &self.dual_read_bench,
-            "compute" => &self.compute,
-            "hash" => &self.hash,
-            "verify" => &self.verify,
-            "copy_range" => {
-                return self.copy_range.clone();
-            }
-            _ => {
-                return if direct {
-                    self.read.direct.clone()
-                } else {
-                    self.read.page_cache.clone()
-                }
-            }
-        };
-
-        if direct {
-            mode_config.direct.clone()
-        } else {
-            mode_config.page_cache.clone()
-        }
-    }
-
-    pub fn update_params(&mut self, mode: &str, direct: bool, params: IOParams) {
-        let mode_config = match mode {
-            "read" => &mut self.read,
-            "read-to-memory" | "read_to_memory" => &mut self.read_to_memory,
-            "write" => &mut self.write,
-            "copy" => &mut self.copy,
-            "grep" => &mut self.grep,
-            "diff" => &mut self.diff,
-            "dual-read-bench" => &mut self.dual_read_bench,
-            "compute" => &mut self.compute,
-            "hash" => &mut self.hash,
-            "verify" => &mut self.verify,
-            "copy_range" => {
-                self.copy_range = params;
-                return;
-            }
-            _ => return,
-        };
-
-        if direct {
-            mode_config.direct = params;
-        } else {
-            mode_config.page_cache = params;
+        if let Some(params) = self.page_cache.clone() {
+            mode.page_cache = params;
         }
     }
 }
 
-fn default_read_auto_strategy() -> ReadAutoStrategy {
-    ReadAutoStrategy {
-        hot_large_min_bytes: 256 * 1024 * 1024,
-        cold_large_min_bytes: 256 * 1024 * 1024,
-        hot_small_path: ReadPathKind::SimplePageCache,
-        hot_large_path: ReadPathKind::ThreadedPageCache,
-        cold_small_path: ReadPathKind::SimpleDirect,
-        cold_large_path: ReadPathKind::ThreadedDirect,
+impl DeviceDbParams {
+    fn apply_to(&self, config: &mut AppConfig) {
+        if let Some(read) = &self.read {
+            config.read = read.clone();
+        }
+        if let Some(grep) = &self.grep {
+            config.grep = grep.clone();
+        }
     }
 }
-
-fn default_recursive_small_file_threads() -> RecursiveSmallFileThreads {
-    RecursiveSmallFileThreads { hot: 32, cold: 32 }
-}
-
-fn default_hash_mode_config() -> ModeConfig {
-    AppConfig::default().hash
-}
-
-fn default_compute_mode_config() -> ModeConfig {
-    AppConfig::default().compute
-}
-
-fn default_read_to_memory_mode_config() -> ModeConfig {
-    AppConfig::default().read_to_memory
-}
-
-fn default_verify_mode_config() -> ModeConfig {
-    AppConfig::default().verify
-}
-
-fn default_copy_range_params() -> IOParams {
-    AppConfig::default().copy_range
-}
-
-fn default_copy_auto_mode() -> CopyAutoMode {
-    CopyAutoMode::Heuristic
-}
-
-
-#[cfg(test)]
-mod tests;

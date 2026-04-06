@@ -61,6 +61,116 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
 }
 
 #[test]
+fn shred_size_verbose_and_force_match_system_side_effects() {
+    let tmp = unique_temp_dir("fro-coreutils-shred-flags");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let size_file = tmp.join(format!("shred-size-{suffix}.bin"));
+        fs::write(&size_file, b"0123456789").unwrap();
+
+        let mut fro_size_args = flags.clone();
+        fro_size_args.extend(["-n", "0", "-z", "-s", "4", size_file.to_str().unwrap()]);
+        let sys_size_args = ["-n", "0", "-z", "-s", "4", size_file.to_str().unwrap()];
+        assert_same_result(
+            run_fro("shred", &fro_size_args),
+            run_system("shred", &sys_size_args),
+            &format!("shred size {:?}", fro_size_args),
+        );
+        assert_eq!(
+            fs::read(&size_file).unwrap(),
+            vec![0, 0, 0, 0, b'4', b'5', b'6', b'7', b'8', b'9']
+        );
+
+        let verbose_file = tmp.join(format!("shred-verbose-{suffix}.bin"));
+        fs::write(&verbose_file, b"abcdef").unwrap();
+
+        let mut fro_verbose_args = flags.clone();
+        fro_verbose_args.extend([
+            "-n",
+            "1",
+            "-z",
+            "-v",
+            "--size=2",
+            verbose_file.to_str().unwrap(),
+        ]);
+        let sys_verbose_args = [
+            "-n",
+            "1",
+            "-z",
+            "-v",
+            "--size=2",
+            verbose_file.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("shred", &fro_verbose_args),
+            run_system("shred", &sys_verbose_args),
+            &format!("shred verbose {:?}", fro_verbose_args),
+        );
+        assert_eq!(
+            fs::read(&verbose_file).unwrap(),
+            vec![0, 0, b'c', b'd', b'e', b'f']
+        );
+
+        let force_file = tmp.join(format!("shred-force-{suffix}.bin"));
+        fs::write(&force_file, b"XYZ123").unwrap();
+        fs::set_permissions(&force_file, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut fro_force_args = flags.clone();
+        fro_force_args.extend([
+            "-n",
+            "0",
+            "-z",
+            "-f",
+            "--size",
+            "2",
+            force_file.to_str().unwrap(),
+        ]);
+        let sys_force_args = [
+            "-n",
+            "0",
+            "-z",
+            "-f",
+            "--size",
+            "2",
+            force_file.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("shred", &fro_force_args),
+            run_system("shred", &sys_force_args),
+            &format!("shred force {:?}", fro_force_args),
+        );
+        assert_eq!(
+            fs::metadata(&force_file).unwrap().permissions().mode() & 0o777,
+            0o200
+        );
+        fs::set_permissions(&force_file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::read(&force_file).unwrap(),
+            vec![0, 0, b'Z', b'1', b'2', b'3']
+        );
+
+        let no_force_file = tmp.join(format!("shred-no-force-{suffix}.bin"));
+        fs::write(&no_force_file, b"locked").unwrap();
+        fs::set_permissions(&no_force_file, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut fro_no_force_args = flags;
+        fro_no_force_args.extend(["-n", "0", "-z", no_force_file.to_str().unwrap()]);
+        let sys_no_force_args = ["-n", "0", "-z", no_force_file.to_str().unwrap()];
+        assert_same_result(
+            run_fro("shred", &fro_no_force_args),
+            run_system("shred", &sys_no_force_args),
+            &format!("shred no-force {:?}", fro_no_force_args),
+        );
+    }
+}
+
+#[test]
 fn cartesian_cp_recursive_matches_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-cp-recursive-matrix");
 
@@ -104,6 +214,440 @@ fn cartesian_cp_recursive_matches_system_side_effects() {
             fro_tree, sys_tree,
             "recursive tree mismatch for {:?}",
             fro_args
+        );
+    }
+}
+
+#[test]
+fn cp_no_clobber_matches_system_for_single_file_and_recursive_copy() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-no-clobber");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source = tmp.join(format!("src-{suffix}.txt"));
+        let fro_target = tmp.join(format!("fro-target-{suffix}.txt"));
+        let sys_target = tmp.join(format!("sys-target-{suffix}.txt"));
+        fs::write(&source, b"new-data").unwrap();
+        fs::write(&fro_target, b"old-data").unwrap();
+        fs::write(&sys_target, b"old-data").unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend(["-n", source.to_str().unwrap(), fro_target.to_str().unwrap()]);
+        let sys_args = ["-n", source.to_str().unwrap(), sys_target.to_str().unwrap()];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp no-clobber {:?}", fro_args),
+        );
+        assert_eq!(
+            fs::read(&fro_target).unwrap(),
+            fs::read(&sys_target).unwrap()
+        );
+
+        let recursive_source = tmp.join(format!("tree-src-{suffix}"));
+        let fro_dest = tmp.join(format!("tree-fro-{suffix}"));
+        let sys_dest = tmp.join(format!("tree-sys-{suffix}"));
+        fs::create_dir_all(recursive_source.join("sub")).unwrap();
+        fs::create_dir_all(fro_dest.join("sub")).unwrap();
+        fs::create_dir_all(sys_dest.join("sub")).unwrap();
+        fs::write(recursive_source.join("sub/existing.txt"), b"fresh").unwrap();
+        fs::write(recursive_source.join("sub/new.txt"), b"brand-new").unwrap();
+        fs::write(fro_dest.join("sub/existing.txt"), b"keep-me").unwrap();
+        fs::write(sys_dest.join("sub/existing.txt"), b"keep-me").unwrap();
+
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-rn",
+            recursive_source.to_str().unwrap(),
+            fro_dest.to_str().unwrap(),
+        ]);
+        let sys_recursive_args = [
+            "-rn",
+            recursive_source.to_str().unwrap(),
+            sys_dest.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_args),
+            run_system("cp", &sys_recursive_args),
+            &format!("cp recursive no-clobber {:?}", fro_recursive_args),
+        );
+
+        let copied_name = recursive_source.file_name().unwrap();
+        let fro_tree = snapshot_tree(&fro_dest.join(copied_name));
+        let sys_tree = snapshot_tree(&sys_dest.join(copied_name));
+        assert_eq!(
+            fro_tree, sys_tree,
+            "recursive -n tree mismatch for {:?}",
+            fro_recursive_args
+        );
+    }
+}
+
+#[test]
+fn cp_update_matches_system_for_older_and_newer_destinations() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-update");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let newer_source = tmp.join(format!("newer-source-{suffix}.txt"));
+        let older_fro_target = tmp.join(format!("older-fro-target-{suffix}.txt"));
+        let older_sys_target = tmp.join(format!("older-sys-target-{suffix}.txt"));
+        fs::write(&newer_source, b"replace-dst").unwrap();
+        fs::write(&older_fro_target, b"stale").unwrap();
+        fs::write(&older_sys_target, b"stale").unwrap();
+        set_file_mtime(&newer_source, 1_700_000_100);
+        set_file_mtime(&older_fro_target, 1_700_000_000);
+        set_file_mtime(&older_sys_target, 1_700_000_000);
+
+        let mut fro_copy_args = flags.clone();
+        fro_copy_args.extend([
+            "-u",
+            newer_source.to_str().unwrap(),
+            older_fro_target.to_str().unwrap(),
+        ]);
+        let sys_copy_args = [
+            "-u",
+            newer_source.to_str().unwrap(),
+            older_sys_target.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_copy_args),
+            run_system("cp", &sys_copy_args),
+            &format!("cp update copy {:?}", fro_copy_args),
+        );
+        assert_eq!(
+            fs::read(&older_fro_target).unwrap(),
+            fs::read(&older_sys_target).unwrap()
+        );
+
+        let older_source = tmp.join(format!("older-source-{suffix}.txt"));
+        let newer_fro_target = tmp.join(format!("newer-fro-target-{suffix}.txt"));
+        let newer_sys_target = tmp.join(format!("newer-sys-target-{suffix}.txt"));
+        fs::write(&older_source, b"source-should-skip").unwrap();
+        fs::write(&newer_fro_target, b"stay-put").unwrap();
+        fs::write(&newer_sys_target, b"stay-put").unwrap();
+        set_file_mtime(&older_source, 1_700_000_000);
+        set_file_mtime(&newer_fro_target, 1_700_000_100);
+        set_file_mtime(&newer_sys_target, 1_700_000_100);
+
+        let mut fro_skip_args = flags.clone();
+        fro_skip_args.extend([
+            "-u",
+            older_source.to_str().unwrap(),
+            newer_fro_target.to_str().unwrap(),
+        ]);
+        let sys_skip_args = [
+            "-u",
+            older_source.to_str().unwrap(),
+            newer_sys_target.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_skip_args),
+            run_system("cp", &sys_skip_args),
+            &format!("cp update skip {:?}", fro_skip_args),
+        );
+        assert_eq!(
+            fs::read(&newer_fro_target).unwrap(),
+            fs::read(&newer_sys_target).unwrap()
+        );
+    }
+}
+
+#[test]
+fn cp_verbose_matches_system_for_copy_and_skip_cases() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-verbose");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source = tmp.join(format!("verbose-source-{suffix}.txt"));
+        let target = tmp.join(format!("verbose-target-{suffix}.txt"));
+        fs::write(&source, b"hello-verbose").unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend(["-v", source.to_str().unwrap(), target.to_str().unwrap()]);
+        let sys_args = ["-v", source.to_str().unwrap(), target.to_str().unwrap()];
+        let system = run_system("cp", &sys_args);
+        let expected = fs::read(&target).unwrap();
+        fs::remove_file(&target).unwrap();
+        let fro = run_fro("cp", &fro_args);
+        assert_same_result(fro, system, &format!("cp verbose {:?}", fro_args));
+        assert_eq!(fs::read(&target).unwrap(), expected);
+
+        let skip_source = tmp.join(format!("verbose-skip-source-{suffix}.txt"));
+        let skip_target = tmp.join(format!("verbose-skip-target-{suffix}.txt"));
+        fs::write(&skip_source, b"source-skip").unwrap();
+        fs::write(&skip_target, b"dest-skip").unwrap();
+
+        let mut fro_skip_args = flags.clone();
+        fro_skip_args.extend([
+            "-vn",
+            skip_source.to_str().unwrap(),
+            skip_target.to_str().unwrap(),
+        ]);
+        let sys_skip_args = [
+            "-vn",
+            skip_source.to_str().unwrap(),
+            skip_target.to_str().unwrap(),
+        ];
+        let system_skip = run_system("cp", &sys_skip_args);
+        let expected_skip = fs::read(&skip_target).unwrap();
+        fs::write(&skip_target, b"dest-skip").unwrap();
+        let fro_skip = run_fro("cp", &fro_skip_args);
+        assert_same_result(
+            fro_skip,
+            system_skip,
+            &format!("cp verbose no-clobber {:?}", fro_skip_args),
+        );
+        assert_eq!(fs::read(&skip_target).unwrap(), expected_skip);
+    }
+}
+
+#[test]
+fn cp_no_target_directory_matches_system_for_file_and_recursive_copy() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-no-target-directory");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source = tmp.join(format!("source-{suffix}.txt"));
+        let target_dir = tmp.join(format!("target-dir-{suffix}"));
+        fs::write(&source, b"no-target-directory").unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend(["-T", source.to_str().unwrap(), target_dir.to_str().unwrap()]);
+        let sys_args = ["-T", source.to_str().unwrap(), target_dir.to_str().unwrap()];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp -T file into existing dir {:?}", fro_args),
+        );
+
+        let source_root = tmp.join(format!("tree-src-{suffix}"));
+        let nested = source_root.join("nested/deeper");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(source_root.join("small.txt"), b"alpha\nbeta\n").unwrap();
+        fs::write(
+            nested.join("large.bin"),
+            (0..(256 * 1024 + 333))
+                .map(|i| ((i * 13) % 251) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let fro_dest = tmp.join(format!("tree-fro-{suffix}"));
+        let sys_dest = tmp.join(format!("tree-sys-{suffix}"));
+        fs::create_dir_all(&fro_dest).unwrap();
+        fs::create_dir_all(&sys_dest).unwrap();
+
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-rT",
+            source_root.to_str().unwrap(),
+            fro_dest.to_str().unwrap(),
+        ]);
+        let sys_recursive_args = [
+            "-rT",
+            source_root.to_str().unwrap(),
+            sys_dest.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_args),
+            run_system("cp", &sys_recursive_args),
+            &format!("cp recursive -T {:?}", fro_recursive_args),
+        );
+
+        let fro_tree = snapshot_tree(&fro_dest);
+        let sys_tree = snapshot_tree(&sys_dest);
+        assert_eq!(
+            fro_tree, sys_tree,
+            "recursive -T tree mismatch for {:?}",
+            fro_recursive_args
+        );
+    }
+}
+
+#[test]
+fn cp_target_directory_matches_system_for_multi_source_and_recursive_copy() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-target-directory");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let src_a = tmp.join(format!("source-a-{suffix}.txt"));
+        let src_b = tmp.join(format!("source-b-{suffix}.txt"));
+        let fro_dest = tmp.join(format!("dest-fro-{suffix}"));
+        let sys_dest = tmp.join(format!("dest-sys-{suffix}"));
+        fs::write(&src_a, b"alpha-target-dir").unwrap();
+        fs::write(&src_b, b"beta-target-dir").unwrap();
+        fs::create_dir_all(&fro_dest).unwrap();
+        fs::create_dir_all(&sys_dest).unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "-t",
+            fro_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+            src_b.to_str().unwrap(),
+        ]);
+        let sys_args = [
+            "-t",
+            sys_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+            src_b.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp -t multi-source {:?}", fro_args),
+        );
+        assert_eq!(snapshot_tree(&fro_dest), snapshot_tree(&sys_dest));
+
+        let long_fro_dest = tmp.join(format!("dest-long-fro-{suffix}"));
+        let long_sys_dest = tmp.join(format!("dest-long-sys-{suffix}"));
+        fs::create_dir_all(&long_fro_dest).unwrap();
+        fs::create_dir_all(&long_sys_dest).unwrap();
+        let fro_long_target = format!("--target-directory={}", long_fro_dest.display());
+        let sys_long_target = format!("--target-directory={}", long_sys_dest.display());
+        let mut fro_long_args = flags.clone();
+        fro_long_args.extend([fro_long_target.as_str(), src_a.to_str().unwrap()]);
+        let sys_long_args = [sys_long_target.as_str(), src_a.to_str().unwrap()];
+        assert_same_result(
+            run_fro("cp", &fro_long_args),
+            run_system("cp", &sys_long_args),
+            &format!("cp --target-directory {:?}", fro_long_args),
+        );
+        assert_eq!(snapshot_tree(&long_fro_dest), snapshot_tree(&long_sys_dest));
+
+        let sep_fro_dest = tmp.join(format!("dest-sep-fro-{suffix}"));
+        let sep_sys_dest = tmp.join(format!("dest-sep-sys-{suffix}"));
+        fs::create_dir_all(&sep_fro_dest).unwrap();
+        fs::create_dir_all(&sep_sys_dest).unwrap();
+        let mut fro_sep_args = flags.clone();
+        fro_sep_args.extend([
+            "--target-directory",
+            sep_fro_dest.to_str().unwrap(),
+            src_b.to_str().unwrap(),
+        ]);
+        let sys_sep_args = [
+            "--target-directory",
+            sep_sys_dest.to_str().unwrap(),
+            src_b.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_sep_args),
+            run_system("cp", &sys_sep_args),
+            &format!("cp --target-directory separated {:?}", fro_sep_args),
+        );
+        assert_eq!(snapshot_tree(&sep_fro_dest), snapshot_tree(&sep_sys_dest));
+
+        let source_root = tmp.join(format!("tree-src-target-{suffix}"));
+        fs::create_dir_all(source_root.join("nested")).unwrap();
+        fs::write(source_root.join("nested/file.txt"), b"recursive-target-dir").unwrap();
+        let fro_recursive_dest = tmp.join(format!("tree-dest-fro-{suffix}"));
+        let sys_recursive_dest = tmp.join(format!("tree-dest-sys-{suffix}"));
+        fs::create_dir_all(&fro_recursive_dest).unwrap();
+        fs::create_dir_all(&sys_recursive_dest).unwrap();
+
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-rt",
+            fro_recursive_dest.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ]);
+        let sys_recursive_args = [
+            "-rt",
+            sys_recursive_dest.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_args),
+            run_system("cp", &sys_recursive_args),
+            &format!("cp -rt {:?}", fro_recursive_args),
+        );
+        let copied_name = source_root.file_name().unwrap();
+        assert_eq!(
+            snapshot_tree(&fro_recursive_dest.join(copied_name)),
+            snapshot_tree(&sys_recursive_dest.join(copied_name))
+        );
+
+        let missing_dest = tmp.join(format!("missing-{suffix}"));
+        let mut fro_missing_args = flags.clone();
+        fro_missing_args.extend([
+            "-t",
+            missing_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ]);
+        let sys_missing_args = [
+            "-t",
+            missing_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_missing_args),
+            run_system("cp", &sys_missing_args),
+            &format!("cp -t missing target {:?}", fro_missing_args),
+        );
+
+        let non_dir_target = tmp.join(format!("not-a-dir-{suffix}.txt"));
+        fs::write(&non_dir_target, b"plain-file").unwrap();
+        let mut fro_non_dir_args = flags.clone();
+        fro_non_dir_args.extend([
+            "-t",
+            non_dir_target.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ]);
+        let sys_non_dir_args = [
+            "-t",
+            non_dir_target.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_non_dir_args),
+            run_system("cp", &sys_non_dir_args),
+            &format!("cp -t non-directory {:?}", fro_non_dir_args),
+        );
+
+        let mut fro_conflict_args = flags.clone();
+        fro_conflict_args.extend([
+            "-T",
+            "-t",
+            fro_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ]);
+        let sys_conflict_args = [
+            "-T",
+            "-t",
+            fro_dest.to_str().unwrap(),
+            src_a.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_conflict_args),
+            run_system("cp", &sys_conflict_args),
+            &format!("cp -T -t conflict {:?}", fro_conflict_args),
         );
     }
 }

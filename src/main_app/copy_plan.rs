@@ -530,7 +530,10 @@ pub(super) fn mount_storage_redundancy(info: &MountInfoBrief) -> StorageRedundan
     StorageRedundancy::Unknown
 }
 
-pub(super) fn detect_copy_storage_policy(source_path: &str, target_path: &str) -> (StorageRedundancy, bool) {
+pub(super) fn detect_copy_storage_policy(
+    source_path: &str,
+    target_path: &str,
+) -> (StorageRedundancy, bool) {
     let source_mount = mount_info_for_path(Path::new(source_path));
     let target_mount = mount_info_for_path(Path::new(target_path));
     let redundancy = target_mount

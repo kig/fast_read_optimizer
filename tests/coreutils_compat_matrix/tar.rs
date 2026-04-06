@@ -14,7 +14,12 @@ fn assert_success(output: Output) -> Output {
 fn cartesian_tar_create_matches_system_extraction() {
     let tmp = unique_temp_dir("fro-coreutils-tar-matrix");
     let source_root = tmp.join("tar-src");
-    let source_name = source_root.file_name().unwrap().to_str().unwrap().to_string();
+    let source_name = source_root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let nested = source_root.join("nested/deeper");
     fs::create_dir_all(&nested).unwrap();
     fs::write(source_root.join("small.txt"), b"alpha\nbeta\n").unwrap();
@@ -31,9 +36,17 @@ fn cartesian_tar_create_matches_system_extraction() {
     let sys_tar = tmp.join("sys.tar");
     let fro_out = assert_success(run_fro(
         "tar",
-        &["-cf", fro_tar.to_str().unwrap(), source_root.to_str().unwrap()],
+        &[
+            "-cf",
+            fro_tar.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ],
     ));
-    assert!(fro_out.stderr.is_empty(), "stderr:\n{}", String::from_utf8_lossy(&fro_out.stderr));
+    assert!(
+        fro_out.stderr.is_empty(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&fro_out.stderr)
+    );
     let sys_out = run_system(
         "bash",
         &[
@@ -73,11 +86,21 @@ fn cartesian_tar_create_matches_system_extraction() {
     fs::create_dir_all(&sys_extract).unwrap();
     assert_success(run_system(
         "tar",
-        &["-xf", fro_tar.to_str().unwrap(), "-C", fro_extract.to_str().unwrap()],
+        &[
+            "-xf",
+            fro_tar.to_str().unwrap(),
+            "-C",
+            fro_extract.to_str().unwrap(),
+        ],
     ));
     assert_success(run_system(
         "tar",
-        &["-xf", sys_tar.to_str().unwrap(), "-C", sys_extract.to_str().unwrap()],
+        &[
+            "-xf",
+            sys_tar.to_str().unwrap(),
+            "-C",
+            sys_extract.to_str().unwrap(),
+        ],
     ));
     let root_name = source_root.file_name().unwrap();
     let fro_tree = snapshot_tree(&fro_extract.join(root_name));

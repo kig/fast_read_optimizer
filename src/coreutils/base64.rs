@@ -3,7 +3,6 @@ use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::fs::File;
 use std::hint::black_box;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::time::Instant;
 
@@ -95,13 +94,13 @@ struct Base64Options {
     input: StreamInput,
 }
 
-mod process;
-mod process_layout;
 mod bench;
-#[cfg(test)]
-mod tests;
 #[cfg(kani)]
 mod kani_proofs;
+mod process;
+mod process_layout;
+#[cfg(test)]
+mod tests;
 
 pub(super) fn run_base64(args: &[String]) -> io::Result<i32> {
     process::run_base64(args)
@@ -128,7 +127,9 @@ fn print_base64_help() {
     println!();
     println!("  -d, --decode          decode data");
     println!("  -i, --ignore-garbage  when decoding, ignore non-alphabet characters");
-    println!("  -w, --wrap=COLS       wrap encoded lines after COLS characters (default 76, 0 disables)");
+    println!(
+        "  -w, --wrap=COLS       wrap encoded lines after COLS characters (default 76, 0 disables)"
+    );
     println!("      --auto            choose I/O mode automatically");
     println!("      --direct          force direct I/O where supported");
     println!("      --no-direct       force page-cache I/O");
@@ -698,22 +699,22 @@ unsafe fn decode_base64_block_into_avx2_with_fused_fallback(
 ) -> io::Result<Base64DecodeFastOutcome> {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8,
+        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
         _mm256_extract_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
         _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi32,
         _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_sub_epi8, _mm_storel_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpgt_epi8, _mm256_cmpeq_epi8,
+        _mm256_and_si256, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8,
         _mm256_extract_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
         _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi32,
         _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_sub_epi8, _mm_storel_epi64,
     };
 
     const PACK_SHUFFLE: [i8; 32] = [
-        2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1, 2, 1, 0, 6, 5, 4, 10, 9, 8,
-        14, 13, 12, -1, -1, -1, -1,
+        2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1, 2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13,
+        12, -1, -1, -1, -1,
     ];
 
     let mut in_index = 0usize;
@@ -764,7 +765,10 @@ unsafe fn decode_base64_block_into_avx2_with_fused_fallback(
         );
         let valid_mask = _mm256_movemask_epi8(valid);
         if valid_mask != -1 {
-            let acceptable = _mm256_or_si256(valid, _mm256_or_si256(is_pad, _mm256_or_si256(is_lf, is_cr)));
+            let acceptable = _mm256_or_si256(
+                valid,
+                _mm256_or_si256(is_pad, _mm256_or_si256(is_lf, is_cr)),
+            );
             if _mm256_movemask_epi8(acceptable) == -1 {
                 return Ok(Base64DecodeFastOutcome::NeedsFallback);
             }
@@ -807,7 +811,9 @@ fn decode_base64_block_into_with_kernel(
     requested: Base64DecodeKernel,
 ) -> io::Result<usize> {
     match decode_base64_kernel_for_block(bytes.len(), requested) {
-        Base64DecodeKernel::Scalar | Base64DecodeKernel::Auto => decode_base64_block_into_scalar(bytes, out),
+        Base64DecodeKernel::Scalar | Base64DecodeKernel::Auto => {
+            decode_base64_block_into_scalar(bytes, out)
+        }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Base64DecodeKernel::Avx2 => unsafe { decode_base64_block_into_avx2(bytes, out) },
     }
@@ -826,11 +832,15 @@ fn decode_base64_block_into_with_fused_fallback(
             {
                 Ok(Base64DecodeFastOutcome::NeedsFallback)
             } else {
-                Ok(Base64DecodeFastOutcome::Decoded(decode_base64_block_into_scalar(bytes, out)?))
+                Ok(Base64DecodeFastOutcome::Decoded(
+                    decode_base64_block_into_scalar(bytes, out)?,
+                ))
             }
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        Base64DecodeKernel::Avx2 => unsafe { decode_base64_block_into_avx2_with_fused_fallback(bytes, out) },
+        Base64DecodeKernel::Avx2 => unsafe {
+            decode_base64_block_into_avx2_with_fused_fallback(bytes, out)
+        },
     }
 }
 

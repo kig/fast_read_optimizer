@@ -1,12 +1,20 @@
 use crate::common::{CopyStrategy, IOMode};
+use crate::config;
+use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
     choose_nonredundant_full_copy_plan, describe_copy_path, parse_zpool_status_leaves,
     should_prefer_cached_diff_overwrite, should_prefer_cached_read_direct_write,
     target_is_similar_size, zfs_storage_redundancy_from_status, HeuristicCopyPlan,
     ResolvedCopyExecution, StorageRedundancy,
 };
-use crate::main_app::tuning::{active_optimizer_param_mask, apply_manual_read_overrides, ManualReadOverrides};
-
+use crate::main_app::recursive::move_dir;
+use crate::main_app::tuning::{
+    active_optimizer_param_mask, apply_manual_read_overrides, ManualReadOverrides,
+};
+use crate::main_app::{RecursiveCopyContext, RelativeCopyMethod};
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn heuristic_plan(
     source_cached: bool,
@@ -15,8 +23,7 @@ fn heuristic_plan(
     target_len: Option<u64>,
     direct_write_supported: bool,
 ) -> HeuristicCopyPlan {
-    if should_prefer_cached_diff_overwrite(source_cached, target_cached, source_len, target_len)
-    {
+    if should_prefer_cached_diff_overwrite(source_cached, target_cached, source_len, target_len) {
         if direct_write_supported {
             HeuristicCopyPlan::DiffOverwrite
         } else {
@@ -312,4 +319,73 @@ fn describe_copy_path_reports_via_memory_path() {
         path,
         "copy path: via-memory [read=page-cache, write=direct]"
     );
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+    path
+}
+
+#[test]
+fn recursive_move_keeps_pending_state_until_large_children_finish() {
+    let root = unique_temp_dir("fro-main-app-recursive-move");
+    let source_root = root.join("src");
+    let target_root = root.join("dst");
+    fs::create_dir_all(source_root.join("000/000")).unwrap();
+    fs::create_dir_all(source_root.join("000/001")).unwrap();
+
+    let large_a = vec![0x41; (17 << 20) + 123];
+    let large_b = vec![0x42; (18 << 20) + 321];
+    fs::write(source_root.join("000/000/a.bin"), &large_a).unwrap();
+    fs::write(source_root.join("000/001/b.bin"), &large_b).unwrap();
+
+    let config = config::load_config(None);
+    let target_str = target_root.to_string_lossy();
+    let params_page_cache = config.get_params_for_path("copy", false, target_str.as_ref());
+    let params_direct = config.get_params_for_path("copy", true, target_str.as_ref());
+    let params_copy_range = config.get_copy_range_params_for_path(target_str.as_ref());
+    let ctx = RecursiveCopyContext {
+        config,
+        source_root: source_root.clone(),
+        target_root: target_root.clone(),
+        optimizer_params: [
+            params_page_cache.num_threads,
+            params_page_cache.block_size,
+            params_page_cache.qd as u64,
+            params_direct.num_threads,
+            params_direct.block_size,
+            params_direct.qd as u64,
+            params_copy_range.num_threads,
+            params_copy_range.block_size,
+            params_copy_range.qd as u64,
+        ],
+        requested_strategy: CopyStrategy::Auto,
+        rewrite_mode: CopyRewriteMode::Auto,
+        io_mode_read: IOMode::Auto,
+        io_mode_write: IOMode::Auto,
+        keep_target_size: false,
+        use_lock: true,
+        relative_copy_method: RelativeCopyMethod::CopyFileRange,
+        verbose: false,
+        cp_compat: false,
+    };
+
+    let moved = move_dir::run_recursive_move(ctx, false).unwrap();
+    assert_eq!(moved, (large_a.len() + large_b.len()) as u64);
+    assert!(!source_root.exists());
+    assert_eq!(
+        fs::read(target_root.join("000/000/a.bin")).unwrap(),
+        large_a
+    );
+    assert_eq!(
+        fs::read(target_root.join("000/001/b.bin")).unwrap(),
+        large_b
+    );
+
+    let _ = fs::remove_dir_all(root);
 }

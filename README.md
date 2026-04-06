@@ -56,6 +56,20 @@ Current coreutils snapshot on `/data/ilmari_cache/fro-test/coreutils-1g.bin` (1 
 
 `wc -c` is omitted from the table because system `wc` can answer that case from file size metadata without a full data read, so it is not a fair streaming-I/O comparison.
 
+### Flag-sensitive execution-path notes
+
+Recent multicall parity work added several GNU-style flags, but they do **not** all exercise the same execution path. When benchmarking or extending a utility, first decide whether a flag preserves the optimized path or intentionally asks for extra work.
+
+| Utility | Flags that should preserve the optimized family | Flags that intentionally force a different/slower path | Practical note |
+| --- | --- | --- | --- |
+| `cat` | plain `cat`, `-u`, `--auto`, `--direct`, `--no-direct` | `-n`, `-b`, `-s`, `-E`, `-T`, `-v`, `-A`, `-e`, `-t` | Plain `cat` can stay on the fast copy-style path because output bytes still match input bytes. Formatting / numbering flags require ordered line assembly and byte rewriting, so they should be benchmarked separately from plain `cat` or `fro read`. |
+| `fgrep` | plain search, `-n`, `-i`, `--no-ignore-case`, `-x` | none of the current implemented flags replace the literal-search family, but `-i` adds ASCII folding and `-x` needs line-oriented matching | The literal matcher is still the same `memmem`-style search family. Extra flags can add CPU work without meaning the tuned read/search path disappeared. |
+| `wc` | `-l`, `-w`, `-m`, `-L`, mixed count combinations | `-c`/`--bytes` on a regular file may bypass streaming entirely via metadata; pipes can count bytes through `splice(2)` to `/dev/null` | `wc -c` is a different proposition from “stream the file and count bytes.” Use `-l/-w/-m/-L` when you want scan-path throughput, and compare pipes vs regular files separately. |
+| `head` / `tail` | regular-file byte/range cases, IO-mode selectors, `tail -q/-v` header controls | newline-oriented counts on streams may need full scanning/buffering before emission | `head -c` on a regular file can stay in a range-copy helper. `tail` on a regular file can compute the start offset and then emit a suffix efficiently, but stream inputs do not have the same seek/range options. |
+| `cp` / `mv` | decision flags such as `-n`, `-u`, `-T`, `-v` should leave the copy engine unchanged **when a copy still happens** | cross-filesystem `mv` fallback and skip/rename fast paths are intentionally different operations | Benchmark “copy happened” and “copy skipped/rename-only” separately. A parity flag that only changes policy should not silently swap in a slower bulk-copy engine once bytes actually move. |
+
+Behavior parity tests are necessary but not sufficient for these tools. When adding a flag, pair the GNU-compatibility test with at least one performance-path check or benchmark note showing whether the flag should preserve the fast helper or intentionally leave it.
+
 Example runs:
 
 ```bash
@@ -172,6 +186,8 @@ reader.foreach_block(|block_index, block| {
 ```
 
 For stream-style writes, use `fro::create(...)` for sequential output or `fro::offset_writer(...)` for parallel offset writes. `offset_writer()` prepares a fixed-size output and zero-fills any unwritten gaps by default; use `offset_writer_with_options(..., truncate = false)` when you need to preserve existing bytes outside the written ranges. See `examples/dd.rs`, `examples/sha256sum.rs`, and `examples/b3sum.rs` for end-to-end usage.
+
+For transform-style workloads that may receive either regular files or pipes, prefer `fro::auto_select_transform_io_pairing(...)` over hand-rolled stdin/stdout probing. It classifies the call as file→file, file→stream, stream→file, or stream→stream and returns the already-open handles/path needed to dispatch to the right fast path. `base64` and `encrypt`/`decrypt` use this helper now; future encode/decode/filter-style tools should do the same whenever they have distinct regular-file and streaming implementations.
 
 ### How `fro` utilities behave
 
@@ -440,10 +456,27 @@ fro-optimize --test-dir /mnt/fast --test-size 64MiB --iters 5 read
 
 This does a smaller, quicker optimization pass that is useful in tests or during development.
 
+```bash
+fro-optimize --for /mnt/fast/data.bin read grep
+```
+
+This targets the mount that contains `/mnt/fast/data.bin`, writes the tuned params into that
+mount's `mount_overrides` entry, and by default uses the target path's parent directory as the
+benchmark workspace. If you also pass `--test-dir`, it must resolve to the same mount.
+
+`fro config explain --for <path>` now reports the matched mount, extracted device signature,
+the first matching device-db profile from `device_db.paths`, any explicit `mount_overrides`
+entry, and the final effective config. Runtime precedence is:
+
+1. config defaults
+2. matched device-db profile
+3. explicit `mount_overrides` entry for the resolved mount
+
 Useful options:
 
 - `--all`
 - `--all-dir <path>` (repeatable)
+- `--for <path>`
 - `--plan`
 - `--test-dir`
 - `--test-size`

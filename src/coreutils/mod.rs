@@ -1,3 +1,4 @@
+use crate::common::AlignedBuffer;
 use crate::config::load_config;
 use crate::differ::diff_files_window;
 use crate::reader::{
@@ -24,28 +25,37 @@ mod base64;
 mod cat;
 mod cmp;
 mod du;
+mod encrypt;
 mod fgrep;
 mod find;
 mod hash;
 mod head;
+mod io_helpers;
+mod mv;
 mod pv;
 mod rm;
 mod shred;
 mod tac;
+mod tail;
 mod tar;
-mod mv;
 mod wc;
+mod work_queue;
 
+pub(crate) use self::io_helpers::*;
+pub(crate) use self::work_queue::*;
 pub(crate) use base64::{
     parse_base64_decode_kernel, parse_base64_encode_kernel, Base64DecodeKernel, Base64EncodeKernel,
 };
 const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
+const STREAM_WINDOW_BLOCK_SIZE: usize = 1 << 20;
 
 pub fn is_coreutils_command(name: &str) -> bool {
     matches!(
         name,
         "cat"
             | "base64"
+            | "encrypt"
+            | "decrypt"
             | "cmp"
             | "dd"
             | "fgrep"
@@ -62,6 +72,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "sha384sum"
             | "sha512sum"
             | "head"
+            | "tail"
             | "rm"
             | "mv"
             | "tar"
@@ -84,17 +95,114 @@ pub fn rewrite_alias_args(args: Vec<String>) -> Vec<String> {
     let mut rewritten = Vec::with_capacity(args.len() + 1);
     rewritten.push(args[0].clone());
     rewritten.push(mode.to_string());
-    rewritten.extend(args.into_iter().skip(1));
+    if invoked == "cp" {
+        rewritten.push("--cp-compat".to_string());
+        let tail = args.into_iter().skip(1).collect::<Vec<_>>();
+        rewritten.extend(rewrite_cp_command_args(&tail));
+    } else {
+        rewritten.extend(args.into_iter().skip(1));
+    }
     rewritten
 }
 
 pub fn rewrite_subcommand_alias(args: Vec<String>) -> Vec<String> {
     if args.get(1).map(String::as_str) == Some("cp") {
-        let mut rewritten = args;
-        rewritten[1] = "copy".to_string();
+        let mut rewritten = Vec::with_capacity(args.len() + 1);
+        rewritten.push(args[0].clone());
+        rewritten.push("copy".to_string());
+        rewritten.push("--cp-compat".to_string());
+        rewritten.extend(rewrite_cp_command_args(&args[2..]));
         return rewritten;
     }
     args
+}
+
+fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
+    let mut rewritten = Vec::with_capacity(command_args.len());
+    let mut end_flags = false;
+    let mut index = 0;
+    while index < command_args.len() {
+        let arg = &command_args[index];
+        if end_flags || !arg.starts_with('-') || arg == "-" {
+            rewritten.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            end_flags = true;
+            rewritten.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "-t" | "--target-directory" => {
+                if let Some(value) = command_args.get(index + 1) {
+                    rewritten.push("--cp-target-directory".to_string());
+                    rewritten.push(value.clone());
+                    index += 2;
+                    continue;
+                }
+                rewritten.push(arg.clone());
+            }
+            long if long.starts_with("--target-directory=") => {
+                rewritten.push("--cp-target-directory".to_string());
+                rewritten.push(long["--target-directory=".len()..].to_string());
+            }
+            "-n" | "--no-clobber" => rewritten.push("--cp-no-clobber".to_string()),
+            "-T" | "--no-target-directory" => {
+                rewritten.push("--cp-no-target-directory".to_string())
+            }
+            "-u" | "--update" => rewritten.push("--cp-update".to_string()),
+            short if short.starts_with('-') && !short.starts_with("--") && short.len() > 2 => {
+                if let Some((expanded, consumed_next)) =
+                    rewrite_cp_short_flag_cluster(short, command_args.get(index + 1))
+                {
+                    rewritten.extend(expanded);
+                    index += 1 + usize::from(consumed_next);
+                    continue;
+                } else {
+                    rewritten.push(arg.clone());
+                }
+            }
+            _ => rewritten.push(arg.clone()),
+        }
+        index += 1;
+    }
+    rewritten
+}
+
+fn rewrite_cp_short_flag_cluster(
+    arg: &str,
+    next_arg: Option<&String>,
+) -> Option<(Vec<String>, bool)> {
+    let mut rewritten = Vec::with_capacity(arg.len() - 1);
+    let mut chars = arg[1..].chars().peekable();
+    let mut consumed_next = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            'n' => rewritten.push("--cp-no-clobber".to_string()),
+            'T' => rewritten.push("--cp-no-target-directory".to_string()),
+            'u' => rewritten.push("--cp-update".to_string()),
+            'r' => rewritten.push("-r".to_string()),
+            'R' => rewritten.push("-R".to_string()),
+            'v' => rewritten.push("-v".to_string()),
+            't' => {
+                rewritten.push("--cp-target-directory".to_string());
+                let remainder = chars.collect::<String>();
+                if !remainder.is_empty() {
+                    rewritten.push(remainder);
+                } else if let Some(value) = next_arg {
+                    rewritten.push(value.clone());
+                    consumed_next = true;
+                } else {
+                    return None;
+                }
+                break;
+            }
+            _ => return None,
+        }
+    }
+    Some((rewritten, consumed_next))
 }
 
 pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
@@ -155,6 +263,8 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             0
         }
         "base64" => base64::run_base64(args)?,
+        "encrypt" => encrypt::run_encrypt(args)?,
+        "decrypt" => encrypt::run_decrypt(args)?,
         "cmp" => cmp::run_cmp(args)?,
         "dd" => {
             fro::dd_tool::run_dd(args)?;
@@ -167,10 +277,7 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             tac::run_tac(args)?;
             0
         }
-        "wc" => {
-            wc::run_wc(args)?;
-            0
-        }
+        "wc" => wc::run_wc(args)?,
         "cksum" => {
             hash::run_cksum(args)?;
             0
@@ -186,6 +293,10 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             head::run_head(args)?;
             0
         }
+        "tail" => {
+            tail::run_tail(args)?;
+            0
+        }
         "pv" => {
             pv::run_pv(args)?;
             0
@@ -193,579 +304,8 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         "rm" => rm::run_rm(args)?,
         "mv" => mv::run_mv(args)?,
         "tar" => tar::run_tar(args)?,
-        "shred" => {
-            shred::run_shred(args)?;
-            0
-        }
+        "shred" => shred::run_shred(args)?,
         _ => return Ok(None),
     };
     Ok(Some(code))
-}
-
-fn print_coreutils_version(invoked: &str) {
-    println!("{invoked} (fro coreutils) {FRO_VERSION}");
-}
-fn permission_denied_components(kind: io::ErrorKind, raw_os_error: Option<i32>) -> bool {
-    matches!(kind, io::ErrorKind::PermissionDenied)
-        || matches!(raw_os_error, Some(libc::EACCES | libc::EPERM))
-}
-
-fn is_permission_denied(err: &io::Error) -> bool {
-    permission_denied_components(err.kind(), err.raw_os_error())
-}
-
-fn write_warning_line(tool: &str, path: &Path, err: &io::Error, message: &str) {
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "{tool}: {message} '{}': {err}", path.display());
-}
-
-fn invoked_name(program: &str) -> Option<String> {
-    Path::new(program)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-}
-
-fn parse_io_mode(args: &[String]) -> io::Result<(IOMode, Vec<String>)> {
-    let mut io_mode = IOMode::Auto;
-    let mut files = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--auto" => io_mode = IOMode::Auto,
-            "--direct" => io_mode = IOMode::Direct,
-            "--no-direct" => io_mode = IOMode::PageCache,
-            other => files.push(other.to_string()),
-        }
-    }
-    Ok((io_mode, files))
-}
-
-fn ensure_files(program: &str, files: Vec<String>, usage: &str) -> io::Result<Vec<String>> {
-    if files.is_empty() {
-        eprintln!("Usage: {} {}", program, usage);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing file operand",
-        ));
-    }
-    Ok(files)
-}
-
-fn internal_io_mode(io_mode: IOMode) -> crate::common::IOMode {
-    match io_mode {
-        IOMode::Auto => crate::common::IOMode::Auto,
-        IOMode::Direct => crate::common::IOMode::Direct,
-        IOMode::PageCache => crate::common::IOMode::PageCache,
-    }
-}
-
-fn load_file_bytes(path: &str, io_mode: IOMode, mode: &str) -> io::Result<LoadedFile> {
-    let config = load_config(None);
-    load_file_to_memory_for_mode(&config, mode, path, internal_io_mode(io_mode))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StreamInput {
-    File(String),
-    Stdin { label: Option<String> },
-}
-
-fn parse_stream_inputs(files: Vec<String>) -> Vec<StreamInput> {
-    if files.is_empty() {
-        return vec![StreamInput::Stdin { label: None }];
-    }
-    files
-        .into_iter()
-        .map(|file| {
-            if file == "-" {
-                StreamInput::Stdin {
-                    label: Some("-".to_string()),
-                }
-            } else {
-                StreamInput::File(file)
-            }
-        })
-        .collect()
-}
-
-fn stdout_buf_writer() -> io::Result<BufWriter> {
-    let config = load_config(None);
-    let params = config.get_params("write", false);
-    BufWriter::stdout(params.qd, params.block_size, 4)
-}
-
-fn stdin_buf_reader() -> io::Result<BufReader<std::fs::File>> {
-    BufReader::stdin()
-}
-
-fn is_regular_input_path(path: &str) -> io::Result<bool> {
-    if path.starts_with("/dev/fd/") || path.starts_with("/proc/self/fd/") {
-        return Ok(false);
-    }
-    Ok(fs::metadata(path)?.file_type().is_file())
-}
-
-pub fn is_regular_fd(fd: std::os::unix::io::RawFd) -> bool {
-    unsafe {
-        let mut stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut stat) != 0 {
-            return false;
-        }
-        (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
-    }
-}
-
-pub fn is_stdout_file() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
-    is_regular_fd(stdout_fd)
-}
-
-pub fn is_stdout_dev_null() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
-    unsafe {
-        let mut stdout_stat: libc::stat = std::mem::zeroed();
-        let mut dev_null_stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(stdout_fd, &mut stdout_stat) != 0 {
-            return false;
-        }
-        // stat("/dev/null") - ensure C string is NUL terminated
-        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
-        if libc::stat(path, &mut dev_null_stat) != 0 {
-            return false;
-        }
-        stdout_stat.st_dev == dev_null_stat.st_dev && stdout_stat.st_ino == dev_null_stat.st_ino
-    }
-}
-
-fn visit_reader_blocks<R, F>(reader: &mut R, mut on_block: F) -> io::Result<()>
-where
-    R: Read,
-    F: FnMut(&[u8]) -> io::Result<()>,
-{
-    let mut buffer = vec![0_u8; 1 << 20];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(());
-        }
-        on_block(&buffer[..read])?;
-    }
-}
-
-fn visit_ordered_input<F>(input: &StreamInput, io_mode: IOMode, on_block: F) -> io::Result<()>
-where
-    F: FnMut(&[u8]) -> io::Result<()>,
-{
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
-            visit_ordered_blocks(path, io_mode, on_block)
-        }
-        StreamInput::File(path) => {
-            let mut reader = BufReader::new(std::fs::File::open(path)?);
-            visit_reader_blocks(&mut reader, on_block)
-        }
-        StreamInput::Stdin { .. } => {
-            let mut reader = stdin_buf_reader()?;
-            visit_reader_blocks(&mut reader, on_block)
-        }
-    }
-}
-
-fn loaded_or_stream_bytes(input: &StreamInput, io_mode: IOMode) -> io::Result<Vec<u8>> {
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
-            Ok(read_file_with_mode(path, io_mode)?)
-        }
-        StreamInput::File(path) => {
-            let mut reader = BufReader::new(std::fs::File::open(path)?);
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer)?;
-            Ok(buffer)
-        }
-        StreamInput::Stdin { .. } => {
-            let mut reader = stdin_buf_reader()?;
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer)?;
-            Ok(buffer)
-        }
-    }
-}
-
-fn copy_file_like_to_output<W: Write>(out: &mut W, input: &StreamInput) -> io::Result<()> {
-    match input {
-        StreamInput::File(path) => {
-            let mut reader = BufReader::new(std::fs::File::open(path)?);
-            let mut buffer = vec![0_u8; 1 << 20];
-            loop {
-                let read = reader.read(&mut buffer)?;
-                if read == 0 {
-                    return Ok(());
-                }
-                out.write_all(&buffer[..read])?;
-            }
-        }
-        StreamInput::Stdin { .. } => {
-            let mut reader = stdin_buf_reader()?;
-            let mut buffer = vec![0_u8; 1 << 20];
-            loop {
-                let read = reader.read(&mut buffer)?;
-                if read == 0 {
-                    return Ok(());
-                }
-                out.write_all(&buffer[..read])?;
-            }
-        }
-    }
-}
-
-fn fd_is_fifo(fd: libc::c_int) -> io::Result<bool> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFIFO)
-}
-
-fn fd_is_regular(fd: libc::c_int) -> io::Result<bool> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
-}
-
-fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
-    if !fd_is_fifo(fd)? {
-        return Ok(());
-    }
-    let target_size = 1 << 20;
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, target_size) };
-    if rc >= 0 {
-        return Ok(());
-    }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EPERM | libc::EINVAL | libc::EBUSY) => Ok(()),
-        _ => Err(err),
-    }
-}
-
-const FAST_COPY_SPLICE_CHUNK_SIZE: usize = 1 << 20;
-const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
-
-fn copy_regular_fd_to_fd_sendfile_counted<F>(
-    src_fd: libc::c_int,
-    dst_fd: libc::c_int,
-    progress: &mut F,
-) -> io::Result<Option<u64>>
-where
-    F: FnMut(u64) -> io::Result<()>,
-{
-    if !fd_is_regular(src_fd)? {
-        return Ok(None);
-    }
-    grow_pipe_best_effort(dst_fd)?;
-    let mut total = 0u64;
-    loop {
-        let copied = unsafe {
-            libc::sendfile(
-                dst_fd,
-                src_fd,
-                std::ptr::null_mut(),
-                FAST_COPY_SENDFILE_CHUNK_SIZE,
-            )
-        };
-        if copied > 0 {
-            total = total
-                .checked_add(copied as u64)
-                .ok_or_else(|| io::Error::other("sendfile byte count overflow"))?;
-            progress(total)?;
-            continue;
-        }
-        if copied == 0 {
-            return Ok(Some(total));
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
-            _ => return Err(err),
-        }
-    }
-}
-
-fn copy_fd_to_fd_splice_counted<F>(
-    src_fd: libc::c_int,
-    dst_fd: libc::c_int,
-    progress: &mut F,
-) -> io::Result<Option<u64>>
-where
-    F: FnMut(u64) -> io::Result<()>,
-{
-    if !fd_is_fifo(src_fd)? && !fd_is_fifo(dst_fd)? {
-        return Ok(None);
-    }
-    grow_pipe_best_effort(src_fd)?;
-    grow_pipe_best_effort(dst_fd)?;
-    let mut total = 0u64;
-    if let Ok(mut ring) = IoUring::new(8) {
-        loop {
-            let mut sqe = ring
-                .prepare_sqe()
-                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-            unsafe {
-                sqe.prep_splice(
-                    src_fd,
-                    -1,
-                    dst_fd,
-                    -1,
-                    FAST_COPY_SPLICE_CHUNK_SIZE.try_into().unwrap(),
-                    SpliceFlags::empty(),
-                );
-                sqe.set_user_data(0x5350_4c49_4345);
-            }
-            ring.submit_sqes().map_err(io::Error::other)?;
-            let cqe = ring.wait_for_cqe().map_err(io::Error::other)?;
-            match cqe.result() {
-                Ok(copied) if copied > 0 => {
-                    total = total
-                        .checked_add(copied as u64)
-                        .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
-                    progress(total)?;
-                    continue;
-                }
-                Ok(0) => return Ok(Some(total)),
-                Ok(_) => {}
-                Err(err) => match err.raw_os_error() {
-                    Some(libc::EINTR) => continue,
-                    Some(
-                        libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV,
-                    ) => break,
-                    _ => return Err(err),
-                },
-            }
-        }
-    }
-    loop {
-        let copied = unsafe {
-            libc::splice(
-                src_fd,
-                std::ptr::null_mut(),
-                dst_fd,
-                std::ptr::null_mut(),
-                FAST_COPY_SPLICE_CHUNK_SIZE,
-                0,
-            )
-        };
-        if copied > 0 {
-            total = total
-                .checked_add(copied as u64)
-                .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
-            progress(total)?;
-            continue;
-        }
-        if copied == 0 {
-            return Ok(Some(total));
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
-            _ => return Err(err),
-        }
-    }
-}
-
-fn try_fast_copy_to_stdout_counted<F>(
-    input: &StreamInput,
-    io_mode: IOMode,
-    progress: &mut F,
-) -> io::Result<Option<u64>>
-where
-    F: FnMut(u64) -> io::Result<()>,
-{
-    if io_mode == IOMode::Direct {
-        return Ok(None);
-    }
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
-            let file = std::fs::File::open(path)?;
-            copy_regular_fd_to_fd_sendfile_counted(file.as_raw_fd(), libc::STDOUT_FILENO, progress)
-        }
-        StreamInput::Stdin { .. } => {
-            if let Some(bytes) =
-                copy_regular_fd_to_fd_sendfile_counted(libc::STDIN_FILENO, libc::STDOUT_FILENO, progress)?
-            {
-                return Ok(Some(bytes));
-            }
-            copy_fd_to_fd_splice_counted(libc::STDIN_FILENO, libc::STDOUT_FILENO, progress)
-        }
-        StreamInput::File(path) => {
-            let file_type = fs::metadata(path)?.file_type();
-            if file_type.is_fifo() {
-                let file = std::fs::File::open(path)?;
-                return copy_fd_to_fd_splice_counted(
-                    file.as_raw_fd(),
-                    libc::STDOUT_FILENO,
-                    progress,
-                );
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
-    let mut noop = |_bytes: u64| Ok(());
-    Ok(try_fast_copy_to_stdout_counted(input, io_mode, &mut noop)?.is_some())
-}
-
-fn visit_ordered_blocks<F>(path: &str, io_mode: IOMode, mut on_block: F) -> io::Result<()>
-where
-    F: FnMut(&[u8]) -> io::Result<()>,
-{
-    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
-    let sender = tx.clone();
-    let visit_result = visit_blocks_with_mode(path, io_mode, move |block_index, data| {
-        sender
-            .send((block_index, data.to_vec()))
-            .map_err(|_| io::Error::other("failed to queue ordered block"))
-    });
-    drop(tx);
-
-    let mut next_block = 0usize;
-    let mut pending = BTreeMap::<usize, Vec<u8>>::new();
-    while let Ok((block_index, data)) = rx.recv() {
-        pending.insert(block_index, data);
-        while let Some(block) = pending.remove(&next_block) {
-            on_block(&block)?;
-            next_block += 1;
-        }
-    }
-    if !pending.is_empty() {
-        return Err(io::Error::other(
-            "missing block data while finalizing ordered visitor",
-        ));
-    }
-    visit_result?;
-    Ok(())
-}
-struct WorkQueue<T> {
-    state: Mutex<WorkState<T>>,
-    ready: Condvar,
-}
-
-struct WorkState<T> {
-    queue: VecDeque<T>,
-    active_workers: usize,
-}
-
-impl<T> Default for WorkQueue<T> {
-    fn default() -> Self {
-        Self {
-            state: Mutex::new(WorkState {
-                queue: VecDeque::new(),
-                active_workers: 0,
-            }),
-            ready: Condvar::new(),
-        }
-    }
-}
-
-impl<T> WorkQueue<T> {
-    fn enqueue(&self, items: impl IntoIterator<Item = T>) {
-        let mut state = self.state.lock().unwrap();
-        let mut added = false;
-        for item in items {
-            state.queue.push_back(item);
-            added = true;
-        }
-        if added {
-            self.ready.notify_all();
-        }
-    }
-
-    fn enqueue_one(&self, item: T) {
-        let mut state = self.state.lock().unwrap();
-        state.queue.push_back(item);
-        self.ready.notify_one();
-    }
-
-    fn claim(&self, stop: &AtomicBool) -> Option<T> {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                return None;
-            }
-            if let Some(item) = state.queue.pop_front() {
-                state.active_workers += 1;
-                return Some(item);
-            }
-            if state.active_workers == 0 {
-                return None;
-            }
-            state = self.ready.wait(state).unwrap();
-        }
-    }
-
-    fn complete_claim(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.active_workers = state.active_workers.saturating_sub(1);
-        self.ready.notify_all();
-    }
-
-    fn wake_all(&self) {
-        self.ready.notify_all();
-    }
-}
-fn run_parallel_work_queue<T, F>(
-    queue: Arc<WorkQueue<T>>,
-    stop: Arc<AtomicBool>,
-    worker_count: usize,
-    run_task: F,
-) -> io::Result<()>
-where
-    T: Send + 'static,
-    F: Fn(T, &WorkQueue<T>, &AtomicBool) -> io::Result<()> + Send + Sync + 'static,
-{
-    let run_task = Arc::new(run_task);
-    let mut threads = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        let queue = queue.clone();
-        let stop = stop.clone();
-        let run_task = run_task.clone();
-        threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(item) = queue.claim(&stop) {
-                let result = run_task(item, &queue, &stop);
-                queue.complete_claim();
-                if let Err(err) = result {
-                    stop.store(true, Ordering::SeqCst);
-                    queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut first_error = None;
-    for thread in threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("directory walk worker thread panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    Ok(())
 }

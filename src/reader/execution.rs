@@ -1,6 +1,11 @@
 use super::*;
 
-pub(super) fn should_use_direct_io(use_direct: bool, offset: u64, len: usize, file_size: u64) -> bool {
+pub(super) fn should_use_direct_io(
+    use_direct: bool,
+    offset: u64,
+    len: usize,
+    file_size: u64,
+) -> bool {
     if use_direct && len % 4096 == 0 {
         debug_assert_eq!(
             len % 4096,
@@ -179,7 +184,10 @@ where
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("simple read reached EOF early at offset {} of {}", offset, file_size),
+                format!(
+                    "simple read reached EOF early at offset {} of {}",
+                    offset, file_size
+                ),
             ));
         }
         visitor(ReaderBlock {
@@ -329,12 +337,28 @@ pub(super) fn read_file_path_kind(
     direct: &IOParams,
 ) -> io::Result<u64> {
     match path_kind {
-        ReadPathKind::SimplePageCache => {
-            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::PageCache)
-        }
-        ReadPathKind::SimpleDirect => {
-            read_file(pattern, filename, 1, 1024 * 1024, 1, 1, 1024 * 1024, 1, IOMode::Direct)
-        }
+        ReadPathKind::SimplePageCache => read_file(
+            pattern,
+            filename,
+            1,
+            1024 * 1024,
+            1,
+            1,
+            1024 * 1024,
+            1,
+            IOMode::PageCache,
+        ),
+        ReadPathKind::SimpleDirect => read_file(
+            pattern,
+            filename,
+            1,
+            1024 * 1024,
+            1,
+            1,
+            1024 * 1024,
+            1,
+            IOMode::Direct,
+        ),
         ReadPathKind::IoUringPageCache => read_file(
             pattern,
             filename,
@@ -380,7 +404,8 @@ pub(super) fn benchmark_quick_probe_page_cache(
 ) -> io::Result<(u64, u64, ResolvedReadParams)> {
     if mount_info.is_some_and(|info| info.fstype == "zfs") {
         let file_size = File::open(filename)?.metadata()?.len();
-        let bytes_read = read_file_path_kind("", filename, ReadPathKind::SimpleDirect, page_cache, direct)?;
+        let bytes_read =
+            read_file_path_kind("", filename, ReadPathKind::SimpleDirect, page_cache, direct)?;
         return Ok((
             bytes_read,
             file_size,
@@ -433,7 +458,9 @@ pub(super) fn benchmark_quick_probe_page_cache(
         ReadPathKind::SimplePageCache
         | ReadPathKind::IoUringPageCache
         | ReadPathKind::ThreadedPageCache => strategy.hot_large_path,
-        ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => ReadPathKind::ThreadedPageCache,
+        ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => {
+            ReadPathKind::ThreadedPageCache
+        }
     };
     let bytes_read = read_file_path_kind("", filename, selected_kind, page_cache, direct)?;
     let params = match selected_kind {
@@ -449,7 +476,9 @@ pub(super) fn benchmark_quick_probe_page_cache(
             block_size: benchmark_block_size(file_size) as u64,
             qd: benchmark_uring_qd(file_size),
         },
-        ReadPathKind::ThreadedPageCache => resolve_reader_params(filename, page_cache, direct, IOMode::PageCache)?,
+        ReadPathKind::ThreadedPageCache => {
+            resolve_reader_params(filename, page_cache, direct, IOMode::PageCache)?
+        }
         ReadPathKind::SimpleDirect | ReadPathKind::ThreadedDirect => unreachable!(),
     };
     Ok((bytes_read, file_size, params))

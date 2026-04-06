@@ -117,3 +117,50 @@ fn optimize_all_writes_target_config_and_selection_uses_mount_overrides() {
         combined
     );
 }
+
+#[test]
+fn optimize_for_path_writes_mount_override_for_target_path() {
+    let tmp = unique_temp_dir("fro-optimize-for-path");
+    let bench_dir = tmp.join("bench");
+    let target_dir = tmp.join("target-dir");
+    std::fs::create_dir_all(&bench_dir).unwrap();
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target_file = target_dir.join("data.bin");
+    std::fs::write(&target_file, b"hello").unwrap();
+
+    let cfg = tmp.join("fro.json");
+    let fro_optimize = env!("CARGO_BIN_EXE_fro-optimize");
+
+    let out = Command::new(fro_optimize)
+        .args([
+            "--for",
+            target_file.to_str().unwrap(),
+            "--test-dir",
+            bench_dir.to_str().unwrap(),
+            "--iters",
+            "1",
+            "-c",
+            cfg.to_str().unwrap(),
+            "--test-size",
+            "4KiB",
+            "read",
+        ])
+        .output()
+        .expect("failed to run fro-optimize");
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let loaded = fro::config::load_config(Some(cfg.to_str().unwrap()));
+    let explain = loaded.explain_for_path(target_file.to_str().unwrap());
+    let mount_override = explain["mount_override"]
+        .as_object()
+        .expect("expected mount override");
+    assert!(
+        mount_override.contains_key("read"),
+        "expected read mount override, got {mount_override:?}"
+    );
+}

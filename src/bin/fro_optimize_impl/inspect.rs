@@ -120,7 +120,10 @@ pub(super) fn collect_home_targets() -> Vec<PathBuf> {
     out
 }
 
-pub(super) fn find_writable_dir_for_mount(mount_point: &Path, home_targets: &[PathBuf]) -> Option<PathBuf> {
+pub(super) fn find_writable_dir_for_mount(
+    mount_point: &Path,
+    home_targets: &[PathBuf],
+) -> Option<PathBuf> {
     // 1) Prefer any $HOME symlink targets that land on this mount.
     for t in home_targets {
         if t.starts_with(mount_point) && is_user_writable_dir(t) {
@@ -745,7 +748,10 @@ pub(super) fn load_device_db() -> Option<DeviceDb> {
     Some(db)
 }
 
-pub(super) fn device_db_match<'a>(db: &'a DeviceDb, e: &MountInfoEntry) -> Option<&'a DeviceDbProfile> {
+pub(super) fn device_db_match<'a>(
+    db: &'a DeviceDb,
+    e: &MountInfoEntry,
+) -> Option<&'a DeviceDbProfile> {
     for p in &db.profiles {
         if let Some(ref f) = p.m.fstype {
             if &e.fstype != f {
@@ -807,4 +813,3 @@ pub(super) fn read_mountinfo() -> Vec<MountInfoEntry> {
     out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
     out
 }
-

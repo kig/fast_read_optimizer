@@ -1,7 +1,6 @@
 use super::*;
 use crate::writer::write_buffer;
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 
 #[derive(Clone)]
@@ -12,21 +11,6 @@ struct TarBenchOutput {
 
 unsafe impl Send for TarBenchOutput {}
 unsafe impl Sync for TarBenchOutput {}
-
-fn write_all_at(file: &fs::File, offset: u64, data: &[u8]) -> io::Result<()> {
-    let mut written = 0usize;
-    while written < data.len() {
-        let count = file.write_at(&data[written..], offset + written as u64)?;
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short tar header write",
-            ));
-        }
-        written += count;
-    }
-    Ok(())
-}
 
 fn output_slice_mut(output: &TarBenchOutput, offset: u64, len: usize) -> io::Result<&mut [u8]> {
     let start = usize_from_u64(offset, "tar benchmark output offset")?;
@@ -56,7 +40,8 @@ fn zero_output_range(output: &TarBenchOutput, offset: u64, len: u64) -> io::Resu
 
 fn write_header_to_output(output: &TarBenchOutput, entry: &TarEntry) -> io::Result<()> {
     let header = tar_header_bytes(entry)?;
-    output_slice_mut(output, entry.header_offset, TAR_BLOCK_SIZE as usize)?.copy_from_slice(&header);
+    output_slice_mut(output, entry.header_offset, TAR_BLOCK_SIZE as usize)?
+        .copy_from_slice(&header);
     Ok(())
 }
 
@@ -65,8 +50,15 @@ fn write_small_entry_to_output(output: &TarBenchOutput, entry: &TarEntry) -> io:
     match &entry.kind {
         TarEntryKind::RegularFile { size, source_path } => {
             let data_len = usize_from_u64(*size, "tar small file size")?;
-            read_small_file_into(source_path, output_slice_mut(output, entry.data_offset, data_len)?)?;
-            zero_output_range(output, entry.data_offset + *size, tar_entry_padding_len(entry))?;
+            read_small_file_into(
+                source_path,
+                output_slice_mut(output, entry.data_offset, data_len)?,
+            )?;
+            zero_output_range(
+                output,
+                entry.data_offset + *size,
+                tar_entry_padding_len(entry),
+            )?;
         }
         TarEntryKind::Directory | TarEntryKind::Symlink { .. } => {}
     }
@@ -87,15 +79,22 @@ fn write_large_entry_to_output(
         visit_file_blocks_for_mode(config, "read", &source, io_mode_read, move |block| {
             let destination = output_slice_mut(
                 &output_for_blocks,
-                base_offset
-                    .checked_add(block.offset)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tar benchmark offset overflowed"))?,
+                base_offset.checked_add(block.offset).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tar benchmark offset overflowed",
+                    )
+                })?,
                 block.data.len(),
             )?;
             destination.copy_from_slice(block.data);
             Ok(())
         })?;
-        zero_output_range(output, entry.data_offset + *size, tar_entry_padding_len(entry))?;
+        zero_output_range(
+            output,
+            entry.data_offset + *size,
+            tar_entry_padding_len(entry),
+        )?;
     }
     Ok(tar_entry_total_len(entry))
 }
@@ -127,7 +126,8 @@ fn build_tar_archive_into_output(
     )?;
 
     let slab_tasks = Arc::new(
-        tasks.iter()
+        tasks
+            .iter()
             .filter_map(|task| match task {
                 TarPlannedTask::Slab(task) => Some(task.clone()),
                 TarPlannedTask::Large(_) => None,
@@ -135,7 +135,8 @@ fn build_tar_archive_into_output(
             .collect::<Vec<_>>(),
     );
     let large_tasks = Arc::new(
-        tasks.iter()
+        tasks
+            .iter()
             .filter_map(|task| match task {
                 TarPlannedTask::Slab(_) => None,
                 TarPlannedTask::Large(task) => Some(task.clone()),
@@ -162,7 +163,10 @@ fn build_tar_archive_into_output(
                 };
                 let mut local = 0_u64;
                 for &entry_index in &task.entry_indices {
-                    local = local.saturating_add(write_small_entry_to_output(output.as_ref(), &entries[entry_index])?);
+                    local = local.saturating_add(write_small_entry_to_output(
+                        output.as_ref(),
+                        &entries[entry_index],
+                    )?);
                 }
                 bytes_written.fetch_add(local, Ordering::Relaxed);
             }
@@ -183,7 +187,12 @@ fn build_tar_archive_into_output(
                 let Some(task) = large_tasks.get(next_large.fetch_add(1, Ordering::SeqCst)) else {
                     break;
                 };
-                let written = write_large_entry_to_output(output.as_ref(), &entries[task.entry_index], &config, io_mode_read)?;
+                let written = write_large_entry_to_output(
+                    output.as_ref(),
+                    &entries[task.entry_index],
+                    &config,
+                    io_mode_read,
+                )?;
                 bytes_written.fetch_add(written, Ordering::Relaxed);
             }
             Ok(())
@@ -332,7 +341,13 @@ pub(crate) fn bench_tar_archive_variant(
                 len: total_len,
             });
             let build_start = std::time::Instant::now();
-            let result = build_tar_archive_into_output(&entries, &planned_tasks, output, &config, io_mode_read);
+            let result = build_tar_archive_into_output(
+                &entries,
+                &planned_tasks,
+                output,
+                &config,
+                io_mode_read,
+            );
             let build_elapsed = build_start.elapsed().as_secs_f64();
             let msync_start = std::time::Instant::now();
             let sync_result = unsafe { libc::msync(ptr, total_len, libc::MS_SYNC) };

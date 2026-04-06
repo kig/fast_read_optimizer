@@ -1,5 +1,5 @@
-use super::*;
 use super::execution::{should_use_direct_io, submit_read, submit_read_with_probe, wait_for_ready};
+use super::*;
 
 #[allow(dead_code)]
 pub(super) fn thread_reader(
