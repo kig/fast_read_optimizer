@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 
 impl ParallelStream {
     /// Variant that writes directly into an open destination File (no path-based open).
@@ -52,9 +53,12 @@ impl ParallelStream {
                     dest_file
                         .set_len(total_size)
                         .expect("Failed to set destination file len");
-                    unsafe {
-                        libc::posix_fallocate(dest_file.as_raw_fd(), 0, total_size as i64);
-                    }
+                    checked_posix_fallocate(
+                        dest_file,
+                        0,
+                        total_size,
+                        "failed to preallocate parallel stream destination",
+                    )?;
                 }
             }
         }

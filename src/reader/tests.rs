@@ -6,12 +6,16 @@ use std::fs;
 use std::path::PathBuf;
 
 fn unique_temp_file(prefix: &str) -> PathBuf {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp");
+    fs::create_dir_all(&base).unwrap();
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("{}-{}-{}.bin", prefix, pid, nanos))
+    base.join(format!("{}-{}-{}.bin", prefix, pid, nanos))
 }
 
 #[test]
@@ -82,6 +86,34 @@ fn measure_file_load_to_memory_multiple_targets_reports_full_length() {
         2,
         2,
         256 * 1024,
+        2,
+        IOMode::PageCache,
+        ReadToMemoryMode::MultipleTargetBuffers,
+        ReadToMemoryOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(bytes, data.len() as u64);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn measure_file_load_to_memory_multiple_targets_handles_tail_past_eof() {
+    let path = unique_temp_file("fro-load-multi-target-tail");
+    let block_size = 128 * 1024;
+    let data = (0..(block_size * 3 + 777))
+        .map(|i| ((i * 31) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &data).unwrap();
+
+    let bytes = measure_file_load_to_memory(
+        path.to_str().unwrap(),
+        4,
+        block_size as u64,
+        2,
+        2,
+        (block_size * 2) as u64,
         2,
         IOMode::PageCache,
         ReadToMemoryMode::MultipleTargetBuffers,

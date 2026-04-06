@@ -51,10 +51,7 @@ fn run_system_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> Ou
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("failed to spawn {program}: {err}"));
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("missing system stdin");
+    let mut stdin = child.stdin.take().expect("missing system stdin");
     let input = stdin_bytes.to_vec();
     let writer = std::thread::spawn(move || {
         stdin.write_all(&input).or_else(|err| match err.kind() {
@@ -81,10 +78,7 @@ fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Outpu
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn fro coreutils command");
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("missing child stdin");
+    let mut stdin = child.stdin.take().expect("missing child stdin");
     let input = stdin_bytes.to_vec();
     let writer = std::thread::spawn(move || {
         stdin.write_all(&input).or_else(|err| match err.kind() {

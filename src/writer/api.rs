@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 use std::os::unix::fs::FileExt;
 
 const SINGLE_DIRECT_WRITE_LIMIT: u64 = 512 * 1024;
@@ -17,7 +18,10 @@ struct SharedWriteBuffer {
     len: usize,
 }
 
+// SAFETY: `SharedWriteBuffer` only provides shared read-only access to caller-owned bytes that
+// remain alive until all worker threads join.
 unsafe impl Send for SharedWriteBuffer {}
+// SAFETY: Sharing the descriptor across threads is sound because it never yields mutable access.
 unsafe impl Sync for SharedWriteBuffer {}
 
 impl SharedWriteBuffer {
@@ -29,6 +33,8 @@ impl SharedWriteBuffer {
     }
 
     fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr`/`len` come from a live `&[u8]` in `new` and are only used while that
+        // backing slice is kept alive by the caller.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
@@ -474,6 +480,8 @@ pub fn write_buffer_range(
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
             f.set_len(total_size)?;
+            // SAFETY: `f` is a valid writable fd and `posix_fadvise` only consumes the fd/range
+            // arguments to adjust kernel cache heuristics.
             unsafe {
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_NOREUSE);
             }
@@ -594,6 +602,8 @@ fn _write_file_internal(
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
             f.set_len(total_size)?;
+            // SAFETY: `f` is a valid writable fd and `posix_fadvise` only consumes the fd/range
+            // arguments to adjust kernel cache heuristics.
             unsafe {
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_NOREUSE);
             }
@@ -652,11 +662,17 @@ pub fn bench_mmap_write(filename: &str) {
         .open(filename)
         .unwrap();
     f.set_len(size as u64).unwrap();
-    unsafe {
-        libc::posix_fallocate(f.as_raw_fd(), 0, size as i64);
-    }
+    checked_posix_fallocate(
+        &f,
+        0,
+        size as u64,
+        "failed to preallocate mmap benchmark output",
+    )
+    .unwrap();
     let fd = f.as_raw_fd();
 
+    // SAFETY: The file has been sized to `size`, offset 0 is page-aligned, and the returned
+    // mapping stays live until the matching `munmap` at the end of the benchmark.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -679,8 +695,12 @@ pub fn bench_mmap_write(filename: &str) {
     let chunk_size = size / num_threads;
 
     for t in 0..num_threads {
+        // SAFETY: `t * chunk_size` stays within the `size`-byte mapping and each thread gets a
+        // disjoint chunk because `chunk_size` evenly partitions the mapping here.
         let thread_ptr_addr = unsafe { ptr.add(t * chunk_size) as usize };
         threads.push(std::thread::spawn(move || {
+            // SAFETY: `thread_ptr_addr..+chunk_size` is that thread's unique subrange of the live
+            // mapping, so creating a mutable slice for it is sound.
             let slice =
                 unsafe { std::slice::from_raw_parts_mut(thread_ptr_addr as *mut u8, chunk_size) };
             let mut rng = rand::rng();
@@ -698,6 +718,7 @@ pub fn bench_mmap_write(filename: &str) {
     }
 
     // Ensure data is written to disk
+    // SAFETY: `ptr..ptr+size` is the still-live mapping created above.
     unsafe {
         libc::msync(ptr, size, libc::MS_SYNC);
     }
@@ -709,6 +730,7 @@ pub fn bench_mmap_write(filename: &str) {
         1.0 / dur
     );
 
+    // SAFETY: `ptr..ptr+size` is the mapping created above and has not been unmapped yet.
     unsafe {
         libc::munmap(ptr, size);
     }
@@ -721,9 +743,13 @@ pub fn bench_write(filename: &str) {
         .create(true)
         .open(filename)
         .unwrap();
-    unsafe {
-        libc::posix_fallocate(f.as_raw_fd(), 0, size as i64);
-    }
+    checked_posix_fallocate(
+        &f,
+        0,
+        size as u64,
+        "failed to preallocate write benchmark output",
+    )
+    .unwrap();
 
     let mut block = vec![0u8; 1024 * 1024];
     rand::rng().fill(&mut block[..]);

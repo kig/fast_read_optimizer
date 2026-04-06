@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 
 fn append_tar_entry(
     entries: &mut Vec<TarEntry>,
@@ -187,14 +188,6 @@ pub(super) fn prepare_tar_output(path: &Path, total_size: u64) -> io::Result<fs:
         .truncate(true)
         .open(path)?;
     file.set_len(total_size)?;
-    let allocate_len = i64::try_from(total_size).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "tar size does not fit in off_t",
-        )
-    })?;
-    unsafe {
-        libc::posix_fallocate(file.as_raw_fd(), 0, allocate_len);
-    }
+    checked_posix_fallocate(&file, 0, total_size, "failed to preallocate tar output")?;
     Ok(file)
 }

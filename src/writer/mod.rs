@@ -1,6 +1,8 @@
 use crate::common::{AlignedBuffer, CopyStrategy, IOMode};
 use crate::config::LoadedConfig;
-use crate::io_util::{open_direct_reader_or_fallback, open_direct_writer_or_fallback};
+use crate::io_util::{
+    checked_posix_fallocate, open_direct_reader_or_fallback, open_direct_writer_or_fallback,
+};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::RngExt;
@@ -234,6 +236,8 @@ impl SequentialWriter {
         } else {
             self.file_page_cache.as_raw_fd()
         };
+        // SAFETY: `buffer` stays owned in `self.pending[slot]` until the CQE arrives, `start`
+        // tracks a valid file offset for this append, and `slot` is reserved uniquely above.
         unsafe {
             let mut sqe = self
                 .io_uring
@@ -284,10 +288,13 @@ impl Write for SequentialWriter {
 
 impl BufWriter {
     pub fn stdout(qd: usize, block_size: u64, channel_depth: usize) -> io::Result<Self> {
+        // SAFETY: `dup` creates a new owned fd for stdout, which we validate before handing off
+        // to `File`.
         let stdout_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
         if stdout_fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `stdout_fd` came from `dup` above and is uniquely owned here.
         let file = unsafe { File::from_raw_fd(stdout_fd) };
         let _ = qd;
         Self::with_capacity(channel_depth, file, 1, block_size)
@@ -457,6 +464,8 @@ impl OffsetWriter {
         } else {
             self.file_page_cache.as_raw_fd()
         };
+        // SAFETY: `buffer` is kept alive in `self.pending[slot]` until completion, `offset` is
+        // the caller-provided destination offset, and `slot` is uniquely reserved above.
         unsafe {
             let mut sqe = self
                 .io_uring
@@ -538,9 +547,12 @@ fn open_writer_files(
             let current_len = file_page_cache.metadata()?.len();
             if truncate || current_len < size {
                 file_page_cache.set_len(size)?;
-                unsafe {
-                    libc::posix_fallocate(file_page_cache.as_raw_fd(), 0, size as i64);
-                }
+                checked_posix_fallocate(
+                    &file_page_cache,
+                    0,
+                    size,
+                    "failed to preallocate writer output",
+                )?;
             }
         }
     }
@@ -622,6 +634,8 @@ fn thread_writer(
             } else {
                 src_pagecache.as_raw_fd()
             };
+            // SAFETY: `buffers[i]` remains allocated until the matching CQE is processed, and the
+            // chosen fd matches the alignment constraints checked just above.
             unsafe {
                 let mut sqe = io_uring
                     .prepare_sqe()
@@ -647,6 +661,8 @@ fn thread_writer(
             } else {
                 dest_file.1.as_raw_fd()
             };
+            // SAFETY: `buffers[i]` stays alive for the in-flight write, and direct writes are only
+            // selected for block-aligned offsets/full-block lengths.
             unsafe {
                 let mut sqe = io_uring
                     .prepare_sqe()
@@ -680,6 +696,8 @@ fn thread_writer(
             } else {
                 dest_file.1.as_raw_fd()
             };
+            // SAFETY: The buffer remains owned by `buffers[idx]` across submission/completion, and
+            // the write range corresponds to the completed read for this slot.
             unsafe {
                 let mut sqe = io_uring
                     .prepare_sqe()
@@ -705,6 +723,8 @@ fn thread_writer(
                     } else {
                         src_pagecache.as_raw_fd()
                     };
+                    // SAFETY: `buffers[idx]` remains allocated for this slot, and the direct-read
+                    // path is only used when the offset/length satisfy the required alignment.
                     unsafe {
                         let mut sqe = io_uring
                             .prepare_sqe()
@@ -730,6 +750,8 @@ fn thread_writer(
                     } else {
                         dest_file.1.as_raw_fd()
                     };
+                    // SAFETY: `buffers[idx]` stays alive until the corresponding CQE, and the
+                    // chosen fd matches the alignment checks above.
                     unsafe {
                         let mut sqe = io_uring
                             .prepare_sqe()

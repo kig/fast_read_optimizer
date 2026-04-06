@@ -52,6 +52,8 @@ fn auto_lift_mode_for_residency(first_page_resident: bool) -> IOMode {
 #[allow(dead_code)]
 pub(crate) fn evict_file_cache(filename: &str) -> io::Result<()> {
     let file = File::open(filename)?;
+    // SAFETY: `file` is a valid open fd for the duration of the call, and `posix_fadvise`
+    // only observes the fd plus plain integer arguments.
     let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     if result == 0 {
         Ok(())
@@ -108,10 +110,13 @@ fn choose_path_kind_for_state(
 
 impl BufReader<File> {
     pub fn stdin() -> io::Result<Self> {
+        // SAFETY: `dup` returns a new owned fd referring to stdin; we check for errors before
+        // transferring ownership to `File`.
         let stdin_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
         if stdin_fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `stdin_fd` came from `dup` above and is uniquely owned here.
         Ok(Self::new(unsafe { File::from_raw_fd(stdin_fd) }))
     }
 }
@@ -418,6 +423,8 @@ pub struct MappedReadBuffer {
 impl MappedReadBuffer {
     fn map(file: &File, len: usize, options: ReadToMemoryOptions) -> std::io::Result<Self> {
         let map_len = len.max(1);
+        // SAFETY: `file` stays open for the call, offset 0 is page-aligned, and we record the
+        // returned mapping base/length so the exact region can be unmapped later.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -432,6 +439,7 @@ impl MappedReadBuffer {
             return Err(std::io::Error::last_os_error());
         }
         if let Err(err) = advise_mapped_read_region(ptr, map_len, options) {
+            // SAFETY: `ptr` is the mapping returned by `mmap` above and has not been unmapped yet.
             unsafe {
                 let _ = libc::munmap(ptr, map_len);
             }
@@ -449,6 +457,8 @@ impl MappedReadBuffer {
         if self.len == 0 {
             return &[];
         }
+        // SAFETY: `self.ptr` points into the live mapping tracked by `self.map_ptr/self.map_len`,
+        // and `self.len` is kept within the still-mapped prefix.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -468,10 +478,14 @@ impl MappedReadBuffer {
             return Ok(0);
         }
         let unmap_len = unmap_len.min(self.map_len);
+        // SAFETY: `self.map_ptr..self.map_ptr+unmap_len` is the still-mapped prefix of this
+        // mapping, page-aligned by construction, and we shrink the tracked region after success.
         let rc = unsafe { libc::munmap(self.map_ptr, unmap_len) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: Advancing by `unmap_len <= self.map_len` keeps the pointer at the start of the
+        // remaining mapped region.
         self.map_ptr = unsafe { self.map_ptr.add(unmap_len) };
         self.ptr = self.map_ptr.cast();
         self.map_len -= unmap_len;
@@ -485,6 +499,8 @@ impl Drop for MappedReadBuffer {
         if self.map_len == 0 {
             return;
         }
+        // SAFETY: `self.map_ptr..self.map_ptr+self.map_len` is the remaining live mapping owned by
+        // this buffer after any successful prefix unmaps.
         unsafe {
             let _ = libc::munmap(self.map_ptr, self.map_len);
         }
@@ -492,6 +508,8 @@ impl Drop for MappedReadBuffer {
 }
 
 fn madvise_best_effort(ptr: *mut libc::c_void, len: usize, advice: libc::c_int) -> io::Result<()> {
+    // SAFETY: The caller passes a currently mapped region; `madvise` only inspects that mapping
+    // and the integer advice value.
     if unsafe { libc::madvise(ptr, len, advice) } == 0 {
         return Ok(());
     }
@@ -514,7 +532,10 @@ fn advise_mapped_read_region(
     Ok(())
 }
 
+// SAFETY: The mapping is owned by this value and is read-only (`PROT_READ`), so moving it across
+// threads or sharing `&MappedReadBuffer` does not permit unsynchronized mutation.
 unsafe impl Send for MappedReadBuffer {}
+// SAFETY: Shared access only exposes immutable slices into a read-only mapping.
 unsafe impl Sync for MappedReadBuffer {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,7 +567,11 @@ struct SharedOutput {
     len: usize,
 }
 
+// SAFETY: `SharedOutput` is just a raw pointer/length pair to storage kept alive by the owning
+// buffer outside the worker threads; callers are responsible for partitioning writes.
 unsafe impl Send for SharedOutput {}
+// SAFETY: Sharing this descriptor is sound because mutation only happens through carefully
+// partitioned ranges, enforced by the surrounding read scheduler.
 unsafe impl Sync for SharedOutput {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,6 +815,10 @@ mod workers;
 pub use api::*;
 
 unsafe fn output_slice_mut(output: &SharedOutput, offset: usize, len: usize) -> &mut [u8] {
+    debug_assert!(offset <= output.len);
+    debug_assert!(len <= output.len.saturating_sub(offset));
+    // SAFETY: The caller guarantees that `offset..offset+len` is within `output` and does not
+    // overlap any other live mutable borrow derived from the same buffer.
     std::slice::from_raw_parts_mut(output.ptr.add(offset), len)
 }
 
@@ -815,6 +844,8 @@ fn read_all_bytes(data: &[u8], num_threads: u64) -> std::io::Result<()> {
             let end = shared.len.min(start + chunk_size);
             let mut local = 0u64;
             for offset in start..end {
+                // SAFETY: Each `offset` is bounded by `end <= shared.len`, and this loop performs
+                // read-only access into the immutable `data` slice borrowed for the whole call.
                 let value = unsafe { *shared.ptr.add(offset) as u64 };
                 local = local.wrapping_add(value);
             }

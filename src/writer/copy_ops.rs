@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 
 pub(super) fn prepare_copy_destination(
     filename: &str,
@@ -25,7 +26,6 @@ pub(super) fn prepare_copy_destination(
             if current_len < required_size {
                 let fadvise_offset = to_off_t(dest_offset, "destination offset")?;
                 let fadvise_len = to_off_t(copy_size, "copy size")?;
-                let allocate_len = to_off_t(required_size, "required size")?;
                 unsafe {
                     libc::posix_fadvise(
                         f.as_raw_fd(),
@@ -33,8 +33,13 @@ pub(super) fn prepare_copy_destination(
                         fadvise_len,
                         libc::POSIX_FADV_NOREUSE,
                     );
-                    libc::posix_fallocate(f.as_raw_fd(), 0, allocate_len);
                 }
+                checked_posix_fallocate(
+                    &f,
+                    0,
+                    required_size,
+                    "failed to preallocate copy destination",
+                )?;
             }
         }
     }

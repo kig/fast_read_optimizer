@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 use crate::writer::write_buffer;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
@@ -319,9 +320,12 @@ pub(crate) fn bench_tar_archive_variant(
                 .truncate(true)
                 .open(target)?;
             file.set_len(total_size)?;
-            unsafe {
-                libc::posix_fallocate(file.as_raw_fd(), 0, total_size as i64);
-            }
+            checked_posix_fallocate(
+                &file,
+                0,
+                total_size,
+                "failed to preallocate tar benchmark output",
+            )?;
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),

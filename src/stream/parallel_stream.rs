@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 
 impl ParallelStream {
     /// Simple fallback: read from a pipe/file and write processed blocks to a pipe (dest).
@@ -178,9 +179,12 @@ impl ParallelStream {
                 let current_len = metadata.len();
                 if current_len != total_size {
                     dest_file.set_len(total_size)?;
-                    unsafe {
-                        libc::posix_fallocate(dest_file.as_raw_fd(), 0, total_size as i64);
-                    }
+                    checked_posix_fallocate(
+                        &dest_file,
+                        0,
+                        total_size,
+                        "failed to preallocate parallel stream output",
+                    )?;
                 }
             }
         }

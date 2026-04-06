@@ -209,9 +209,14 @@ pub(super) fn thread_loader_range(
         buffers.push(AlignedBuffer::new(block_size as usize));
     }
 
+    let file_size = file.seek(SeekFrom::End(0))?;
     let end_offset = start_offset
         .checked_add(len as u64)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed"))?;
+    let effective_end = end_offset.min(file_size);
+    if start_offset >= effective_end {
+        return Ok(());
+    }
     let mut block_num = 0u64;
     let mut inflight = 0usize;
     let mut pending = PendingReadSlots::new(qd);
@@ -224,11 +229,11 @@ pub(super) fn thread_loader_range(
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
             })?;
-        if current_offset >= end_offset {
+        if current_offset >= effective_end {
             break;
         }
         pending.reserve(slot, block_num)?;
-        submit_read(
+        submit_range_read(
             io_uring,
             file,
             file_direct,
@@ -236,7 +241,9 @@ pub(super) fn thread_loader_range(
             current_offset,
             slot as u64,
             use_direct,
-            end_offset,
+            effective_end,
+            file_size,
+            block_size,
         )?;
         block_num += 1;
         inflight += 1;
@@ -260,7 +267,8 @@ pub(super) fn thread_loader_range(
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
                 })?;
-            let expected_len = expected_read_len(end_offset, current_offset, block_size)?;
+            let expected_len =
+                expected_range_read_len(file_size, effective_end, current_offset, block_size)?;
             let actual_len =
                 validate_read_result("load-file-range", current_offset, expected_len, result)?;
             if actual_len > 0 {
@@ -284,9 +292,9 @@ pub(super) fn thread_loader_range(
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflowed")
                 })?;
-            if next_offset < end_offset {
+            if next_offset < effective_end {
                 pending.reserve(slot, block_num)?;
-                submit_read(
+                submit_range_read(
                     io_uring,
                     file,
                     file_direct,
@@ -294,7 +302,9 @@ pub(super) fn thread_loader_range(
                     next_offset,
                     slot as u64,
                     use_direct,
-                    end_offset,
+                    effective_end,
+                    file_size,
+                    block_size,
                 )?;
                 block_num += 1;
                 inflight += 1;
@@ -305,6 +315,48 @@ pub(super) fn thread_loader_range(
             return Ok(());
         }
     }
+}
+
+fn expected_range_read_len(
+    file_size: u64,
+    end_offset: u64,
+    offset: u64,
+    block_size: u64,
+) -> std::io::Result<usize> {
+    let effective_end = file_size.min(end_offset);
+    expected_read_len(effective_end, offset, block_size)
+}
+
+fn submit_range_read(
+    io_uring: &mut IoUring,
+    file: &File,
+    file_direct: &File,
+    buffer: &mut AlignedBuffer,
+    offset: u64,
+    block_id: u64,
+    use_direct: bool,
+    end_offset: u64,
+    file_size: u64,
+    block_size: u64,
+) -> std::io::Result<()> {
+    let len = expected_range_read_len(file_size, end_offset, offset, block_size)?;
+    let direct = should_use_direct_io(use_direct, offset, len, file_size);
+    unsafe {
+        let mut sqe = io_uring
+            .prepare_sqe()
+            .ok_or_else(|| std::io::Error::other("io_uring submission queue is full"))?;
+        if direct {
+            sqe.prep_read(
+                file_direct.as_raw_fd(),
+                &mut buffer.as_mut_slice()[..len],
+                offset,
+            );
+        } else {
+            sqe.prep_read(file.as_raw_fd(), &mut buffer.as_mut_slice()[..len], offset);
+        }
+        sqe.set_user_data(block_id);
+    }
+    Ok(())
 }
 
 pub(super) fn resolve_load_file_request(

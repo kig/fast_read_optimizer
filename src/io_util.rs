@@ -60,6 +60,33 @@ pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File
     Ok((file, file_direct))
 }
 
+pub fn checked_posix_fallocate(
+    file: &File,
+    offset: u64,
+    len: u64,
+    context: &str,
+) -> io::Result<()> {
+    let offset = i64::try_from(offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{context}: offset does not fit in off_t"),
+        )
+    })?;
+    let len = i64::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{context}: length does not fit in off_t"),
+        )
+    })?;
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, len) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::from_raw_os_error(rc);
+        Err(io::Error::new(err.kind(), format!("{context}: {err}")))
+    }
+}
+
 pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
     OpenOptions::new()
         .read(true)
@@ -474,6 +501,25 @@ mod tests {
         let err = guard.ensure_source_unchanged().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("source changed during copy"));
+    }
+
+    #[test]
+    fn checked_posix_fallocate_rejects_length_that_does_not_fit_off_t() {
+        let tmp = unique_temp_dir("fro-posix-fallocate-overflow");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("file.bin");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+
+        let err = checked_posix_fallocate(&file, 0, (i64::MAX as u64) + 1, "test allocation")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("length does not fit in off_t"));
     }
 }
 

@@ -38,6 +38,8 @@ impl AlignedBuffer {
 
     pub fn new_uninit(len: usize) -> std::io::Result<Self> {
         let map_len = len.max(1).div_ceil(4096) * 4096;
+        // SAFETY: We request a private anonymous mapping and keep both the base pointer and
+        // rounded allocation length so Drop can unmap exactly the same region once.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -67,10 +69,13 @@ impl AlignedBuffer {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `self.ptr` points to `self.len` initialized bytes owned by this buffer, and
+        // `&mut self` guarantees no other Rust references to that range exist.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.ptr` remains valid for `self.len` bytes for the lifetime of `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -104,6 +109,8 @@ impl fmt::Debug for AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         if let AlignedBufferStorage::Mapping { ptr, map_len } = &self.storage {
+            // SAFETY: `ptr..ptr+map_len` is the mapping created by `new_uninit` and has not been
+            // unmapped yet; Drop runs at most once for this owner.
             unsafe {
                 let _ = libc::munmap(*ptr, *map_len);
             }
@@ -111,7 +118,11 @@ impl Drop for AlignedBuffer {
     }
 }
 
+// SAFETY: `AlignedBuffer` owns its allocation/mapping and only exposes mutation through `&mut
+// self`, so moving it to another thread does not create aliasing.
 unsafe impl Send for AlignedBuffer {}
+// SAFETY: Shared references only permit read-only slice access; callers need `&mut self` to
+// obtain mutable access to the backing storage.
 unsafe impl Sync for AlignedBuffer {}
 
 #[derive(PartialEq, Copy, Clone)]
