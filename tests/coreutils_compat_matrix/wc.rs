@@ -60,6 +60,33 @@ fn wc_short_flag_bundles_match_system_output() {
 }
 
 #[test]
+fn wc_long_count_flags_match_system_output() {
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-wc-long-flags");
+    let path = fixture.text_file;
+
+    for flags in io_flag_sets() {
+        for wc_flags in [
+            vec!["--lines"],
+            vec!["--words"],
+            vec!["--chars"],
+            vec!["--lines", "--words", "--bytes"],
+            vec!["--lines", "--chars"],
+        ] {
+            let mut args = flags.clone();
+            args.extend(wc_flags.iter().copied());
+            args.push(path.to_str().unwrap());
+            let mut sys_args = wc_flags;
+            sys_args.push(path.to_str().unwrap());
+            assert_same_wc(
+                run_fro("wc", &args),
+                run_system("wc", &sys_args),
+                &format!("wc long flags {:?}", args),
+            );
+        }
+    }
+}
+
+#[test]
 fn wc_files0_from_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-wc-files0");
     let one = tmp.join("one.txt");

@@ -195,9 +195,9 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
-            "-l" => print_lines = true,
-            "-w" => print_words = true,
-            "-m" => print_chars = true,
+            "-l" | "--lines" => print_lines = true,
+            "-w" | "--words" => print_words = true,
+            "-m" | "--chars" => print_chars = true,
             "-c" | "--bytes" => print_bytes = true,
             "-L" | "--max-line-length" => print_max_line_length = true,
             "--files0-from" => {

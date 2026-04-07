@@ -294,10 +294,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "wc" => Some(CommandHelp {
             name: "wc",
-            usage: "wc [-l] [-w] [-m] [-c] [-L] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "wc [-l] [-w] [-m] [-c] [-L] [--lines] [--words] [--chars] [--bytes] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "Count lines, words, characters, bytes, and max line length using fro block visitors.",
             notes: &[
                 "Without -l/-w/-m/-c/-L, prints lines, words, and bytes.",
+                "--lines/--words/--chars/--bytes match the GNU wc long count flags.",
                 "--files0-from=F reads NUL-delimited input names from F (or stdin when F is -).",
             ],
             examples: &[
