@@ -382,7 +382,7 @@ fn encrypt_rejects_unsupported_cipher() {
 }
 
 #[test]
-fn encrypt_help_mentions_openssl_compatibility_and_no_b3sum() {
+fn encrypt_help_mentions_openssl_compatibility_and_unauthenticated_boundary() {
     let output = run_fro("encrypt", &["--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -390,4 +390,16 @@ fn encrypt_help_mentions_openssl_compatibility_and_no_b3sum() {
     assert!(stdout.contains("aes-256-ctr"));
     assert!(stdout.contains("No trailing b3sum"));
     assert!(stdout.contains("unauthenticated"));
+    assert!(stdout.contains("wrong-passphrase"));
+    assert!(stdout.contains("external MAC, signature, or hash"));
+}
+
+#[test]
+fn decrypt_help_mentions_unauthenticated_boundary() {
+    let output = run_fro("decrypt", &["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unauthenticated"));
+    assert!(stdout.contains("wrong-passphrase"));
+    assert!(stdout.contains("external MAC, signature, or hash"));
 }

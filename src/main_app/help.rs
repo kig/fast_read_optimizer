@@ -160,7 +160,8 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Regular-file inputs are processed in parallel 512 KiB blocks.",
                 "Only aes-256-ctr is supported, derived with PBKDF2-HMAC-SHA256 and the standard `Salted__` header.",
                 "No trailing b3sum is appended because extra bytes would break `openssl enc` compatibility.",
-                "aes-256-ctr is unauthenticated, so wrong-passphrase decrypts may return garbage rather than a hard error.",
+                "aes-256-ctr is unauthenticated, so wrong-passphrase or tampered decrypts may return garbage rather than a hard error.",
+                "Verify decrypted output with an external MAC, signature, or hash before trusting it.",
                 "Use -o/--output to write to a file; otherwise ciphertext is written to stdout.",
             ],
             examples: &[
@@ -182,6 +183,8 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Regular-file inputs are processed in parallel 512 KiB blocks.",
                 "Only aes-256-ctr with the OpenSSL `Salted__` header and PBKDF2-HMAC-SHA256 derivation is supported.",
                 "Ciphertext must match the bytes produced by `fro encrypt` or `openssl enc -aes-256-ctr -pbkdf2 -salt`.",
+                "aes-256-ctr is unauthenticated, so wrong-passphrase or tampered decrypts may still produce output bytes.",
+                "Verify decrypted output with an external MAC, signature, or hash before trusting it.",
             ],
             examples: &[
                 (
