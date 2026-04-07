@@ -68,8 +68,12 @@ fn set_path_timestamps(
     Err(io::Error::last_os_error())
 }
 
-pub(super) fn preserve_file_timestamps(source_path: &Path, target_path: &Path) -> io::Result<()> {
+pub(super) fn preserve_file_metadata(source_path: &Path, target_path: &Path) -> io::Result<()> {
     let metadata = fs::metadata(source_path)?;
+    fs::set_permissions(
+        target_path,
+        fs::Permissions::from_mode(metadata.permissions().mode()),
+    )?;
     set_path_timestamps(
         target_path,
         preserved_timestamps_from_metadata(&metadata),
@@ -698,10 +702,10 @@ pub(super) fn walk_recursive_read_subtree(
     Ok(())
 }
 
+pub(crate) mod scheduling;
+pub(crate) mod split_manifest;
 #[cfg(test)]
 mod tests;
-pub(crate) mod split_manifest;
-pub(crate) mod scheduling;
 
 pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
     let source_meta = fs::symlink_metadata(&ctx.source_root)?;

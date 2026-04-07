@@ -421,10 +421,21 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     } else {
                         PathBuf::from(&target_name)
                     };
-                    let copied = if recursive_copy || mode == "split-manifest-recursive-copy-bench"
-                    {
+                    let source_metadata = (recursive_copy
+                        || mode == "split-manifest-recursive-copy-bench")
+                        .then(|| fs::symlink_metadata(src))
+                        .transpose()?;
+                    let use_recursive_copy = mode == "split-manifest-recursive-copy-bench"
+                        || (recursive_copy
+                            && source_metadata.as_ref().is_some_and(|metadata| {
+                                metadata.file_type().is_dir()
+                                    || (cp_compat
+                                        && cp_no_dereference
+                                        && metadata.file_type().is_symlink())
+                            }));
+                    let copied = if use_recursive_copy {
                         let source_root = PathBuf::from(src);
-                        let source_metadata = fs::symlink_metadata(&source_root)?;
+                        let source_metadata = source_metadata.as_ref().unwrap();
                         let target_root = if cp_compat && cp_no_target_directory {
                             PathBuf::from(&target_name)
                         } else if cp_target_directory.is_some() {
@@ -447,16 +458,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             )?;
                             0
                         } else {
-                            if !source_metadata.file_type().is_dir() {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    if mode == "copy" {
-                                        "copy --recursive requires a directory source"
-                                    } else {
-                                        "split-manifest-recursive-copy-bench requires a directory source"
-                                    },
-                                ));
-                            }
+                            debug_assert!(source_metadata.file_type().is_dir());
                             let optimizer_params = std::array::from_fn(|index| p[index]);
                             let recursive_ctx = RecursiveCopyContext {
                                 config: config.clone(),
@@ -783,7 +785,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 };
                                 guard.ensure_source_unchanged()?;
                                 if cp_preserve {
-                                    recursive::preserve_file_timestamps(
+                                    recursive::preserve_file_metadata(
                                         source_path,
                                         &copied_target_path,
                                     )?;

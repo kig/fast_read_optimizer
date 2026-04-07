@@ -13,9 +13,9 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [ ] If this section gets unwieldy, split compatibility work by utility family into separate source files/tests while keeping this TODO as the index.
   - [ ] `cmp`
   - [ ] `cp` / `fro copy`
-    - [ ] `-a`, `--archive`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-a`, `--archive`
+      - [x] equality test
+      - [x] implementation
     - [ ] `--attributes-only`
       - [ ] equality test
       - [ ] implementation
