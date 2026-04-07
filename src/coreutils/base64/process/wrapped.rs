@@ -1,4 +1,5 @@
 use super::*;
+use crate::coreutils::base64::process_layout::regular_input_path;
 
 #[cfg(test)]
 pub(in super::super) fn append_wrapped_base64_bytes(
@@ -87,11 +88,11 @@ impl<'a, W: Write> OrderedWriteBatcher<'a, W> {
 }
 
 pub(super) fn ordered_input_block_bound(input: &StreamInput, io_mode: IOMode) -> io::Result<usize> {
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
+    match regular_input_path(input)? {
+        Some(path) => {
             let config = load_config(None);
-            let page_cache = config.get_params_for_path("read", false, path);
-            let direct = config.get_params_for_path("read", true, path);
+            let page_cache = config.get_params_for_path("read", false, &path);
+            let direct = config.get_params_for_path("read", true, &path);
             let block_size = match io_mode {
                 IOMode::Direct => direct.block_size,
                 IOMode::PageCache => page_cache.block_size,

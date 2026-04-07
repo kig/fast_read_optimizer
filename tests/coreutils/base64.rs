@@ -43,6 +43,28 @@ struct MatrixRun {
     status: std::process::ExitStatus,
 }
 
+fn run_with_redirected_regular_stdio(
+    program: &str,
+    subcommand: Option<&str>,
+    args: &[&str],
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> std::process::Output {
+    let stdin = File::open(input_path).unwrap();
+    let stdout = File::create(output_path).unwrap();
+    let mut command = Command::new(program);
+    if let Some(subcommand) = subcommand {
+        command.arg(subcommand);
+    }
+    command
+        .args(args)
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+}
+
 fn spawn_base64_case(
     tmp: &std::path::Path,
     case_name: &str,
@@ -317,6 +339,114 @@ fn base64_wrap_argument_forms_match_system_errors_and_output() {
         run_system("base64", &["--wrap"]),
         "base64 missing --wrap argument",
     );
+}
+
+#[test]
+fn base64_regular_stdin_to_regular_stdout_matches_system_encode() {
+    let tmp = unique_temp_dir("fro-coreutils-base64-redirected-encode");
+    let input_path = tmp.join("input.bin");
+    let fro_output_path = tmp.join("fro-output.txt");
+    let sys_output_path = tmp.join("sys-output.txt");
+    let bytes = (0..((256 * 1024) + 37))
+        .map(|i| ((i * 41 + 3) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&input_path, &bytes).unwrap();
+
+    for io_flags in io_flag_sets() {
+        let mut fro_args = io_flags.clone();
+        fro_args.extend(["-w", "20"]);
+        let fro = run_with_redirected_regular_stdio(
+            env!("CARGO_BIN_EXE_fro"),
+            Some("base64"),
+            &fro_args,
+            &input_path,
+            &fro_output_path,
+        );
+        let sys = run_with_redirected_regular_stdio(
+            "base64",
+            None,
+            &["-w", "20"],
+            &input_path,
+            &sys_output_path,
+        );
+        assert_eq!(
+            fro.status.code(),
+            sys.status.code(),
+            "redirected encode status mismatch for {:?}\nfro stderr:\n{}\nsys stderr:\n{}",
+            io_flags,
+            String::from_utf8_lossy(&fro.stderr),
+            String::from_utf8_lossy(&sys.stderr),
+        );
+        assert_eq!(
+            fro.stderr, sys.stderr,
+            "redirected encode stderr mismatch for {:?}",
+            io_flags
+        );
+        assert_eq!(
+            fs::read(&fro_output_path).unwrap(),
+            fs::read(&sys_output_path).unwrap(),
+            "redirected encode stdout mismatch for {:?}",
+            io_flags
+        );
+    }
+}
+
+#[test]
+fn base64_regular_stdin_to_regular_stdout_matches_system_decode() {
+    let tmp = unique_temp_dir("fro-coreutils-base64-redirected-decode");
+    let raw_path = tmp.join("raw.bin");
+    let encoded_path = tmp.join("input.txt");
+    let fro_output_path = tmp.join("fro-output.bin");
+    let sys_output_path = tmp.join("sys-output.bin");
+    let bytes = (0..((256 * 1024) + 19))
+        .map(|i| ((i * 29 + 17) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&raw_path, &bytes).unwrap();
+    let encoded = run_system("base64", &["-w", "19", raw_path.to_str().unwrap()]);
+    assert!(
+        encoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    fs::write(&encoded_path, &encoded.stdout).unwrap();
+
+    for io_flags in io_flag_sets() {
+        let mut fro_args = io_flags.clone();
+        fro_args.extend(["-d"]);
+        let fro = run_with_redirected_regular_stdio(
+            env!("CARGO_BIN_EXE_fro"),
+            Some("base64"),
+            &fro_args,
+            &encoded_path,
+            &fro_output_path,
+        );
+        let sys = run_with_redirected_regular_stdio(
+            "base64",
+            None,
+            &["-d"],
+            &encoded_path,
+            &sys_output_path,
+        );
+        assert_eq!(
+            fro.status.code(),
+            sys.status.code(),
+            "redirected decode status mismatch for {:?}\nfro stderr:\n{}\nsys stderr:\n{}",
+            io_flags,
+            String::from_utf8_lossy(&fro.stderr),
+            String::from_utf8_lossy(&sys.stderr),
+        );
+        assert_eq!(
+            fro.stderr, sys.stderr,
+            "redirected decode stderr mismatch for {:?}",
+            io_flags
+        );
+        assert_eq!(
+            fs::read(&fro_output_path).unwrap(),
+            fs::read(&sys_output_path).unwrap(),
+            "redirected decode stdout mismatch for {:?}",
+            io_flags
+        );
+    }
 }
 
 #[test]

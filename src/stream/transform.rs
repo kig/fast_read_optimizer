@@ -71,6 +71,23 @@ pub fn classify_transform_io_pairing(
     }
 }
 
+/// Resolve a transform input into a reusable regular-file path when one exists.
+///
+/// Transform-style planners should use this helper instead of hand-rolling
+/// `/proc/self/fd/*` probing so stdin redirection and ordinary file arguments share
+/// the same regular-file detection rules as `auto_select_transform_io_pairing(...)`.
+pub fn resolve_regular_transform_input_path(
+    input: TransformInputSpec<'_>,
+) -> io::Result<Option<String>> {
+    match input {
+        TransformInputSpec::Path(path) if is_regular_input_path(path)? => {
+            Ok(Some(path.to_string()))
+        }
+        TransformInputSpec::Path(_) => Ok(None),
+        TransformInputSpec::Stdin => regular_stdin_path(),
+    }
+}
+
 /// Resolve stdin/stdout-or-path arguments into the most appropriate transform pairing.
 ///
 /// Transform-style workloads that can specialize for regular-file and streaming paths
@@ -80,7 +97,7 @@ pub fn auto_select_transform_io_pairing(
     input: TransformInputSpec<'_>,
     output: TransformOutputSpec<'_>,
 ) -> io::Result<TransformIoPairing> {
-    let regular_input_path = regular_input_path(input)?;
+    let regular_input_path = resolve_regular_transform_input_path(input)?;
     let regular_output = output_is_regular_like(output)?;
     match classify_transform_io_pairing(regular_input_path.is_some(), regular_output) {
         TransformIoPairingKind::FileToFile => Ok(TransformIoPairing::FileToFile {
@@ -146,16 +163,6 @@ where
         stream_to_file,
         stream_to_stream,
     )
-}
-
-fn regular_input_path(input: TransformInputSpec<'_>) -> io::Result<Option<String>> {
-    match input {
-        TransformInputSpec::Path(path) if is_regular_input_path(path)? => {
-            Ok(Some(path.to_string()))
-        }
-        TransformInputSpec::Path(_) => Ok(None),
-        TransformInputSpec::Stdin => regular_stdin_path(),
-    }
 }
 
 fn regular_stdin_path() -> io::Result<Option<String>> {
@@ -462,10 +469,30 @@ pub fn run_reader_transform_to_pipe<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_transform_io_pairing, run_transform_io_pairing, TransformIoPairing,
-        TransformIoPairingKind,
+        classify_transform_io_pairing, resolve_regular_transform_input_path,
+        run_transform_io_pairing, TransformInputSpec, TransformIoPairing, TransformIoPairingKind,
     };
-    use std::fs::File;
+    use std::fs::{self, File};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&base).expect("create test temp base");
+        let path = base.join(format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create test temp dir");
+        path
+    }
 
     #[test]
     fn classify_transform_io_pairing_covers_all_file_and_stream_combinations() {
@@ -542,6 +569,31 @@ mod tests {
         )
         .expect("dispatch stream to stream");
         assert_eq!(stream_to_stream, "stream-stream");
+    }
+
+    #[test]
+    fn resolve_regular_transform_input_path_matches_regular_files_only() {
+        let tmp = unique_temp_dir("fro-transform-regular-input");
+        let regular = tmp.join("input.bin");
+        fs::write(&regular, b"hello").expect("write regular input");
+
+        assert_eq!(
+            resolve_regular_transform_input_path(TransformInputSpec::Path(
+                regular.to_str().expect("utf-8 test path")
+            ))
+            .expect("resolve regular path"),
+            Some(regular.to_str().expect("utf-8 test path").to_string())
+        );
+        assert_eq!(
+            resolve_regular_transform_input_path(TransformInputSpec::Path("/proc/self/fd/0"))
+                .expect("resolve proc fd path"),
+            None
+        );
+        assert_eq!(
+            resolve_regular_transform_input_path(TransformInputSpec::Path("/dev/fd/0"))
+                .expect("resolve dev fd path"),
+            None
+        );
     }
 }
 
