@@ -47,6 +47,7 @@ impl FindFileType {
 struct FindPlan {
     type_filter: Option<FindFileType>,
     name_pattern: Option<CString>,
+    path_pattern: Option<CString>,
     max_depth: Option<usize>,
     output_delimiter: u8,
 }
@@ -61,6 +62,10 @@ impl FindPlan {
                 .name_pattern
                 .as_ref()
                 .is_none_or(|pattern| find_name_matches(pattern, path))
+            && self
+                .path_pattern
+                .as_ref()
+                .is_none_or(|pattern| find_path_matches(pattern, path))
     }
 
     fn should_descend(&self, depth: usize) -> bool {
@@ -224,6 +229,7 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
 
     let mut type_filter = None;
     let mut name_pattern = None;
+    let mut path_pattern = None;
     let mut max_depth = None;
     let mut output_delimiter = b'\n';
     let mut explicit_output_action = false;
@@ -264,6 +270,21 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
                 })?);
                 index += 2;
             }
+            "-path" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument to find -path",
+                    )
+                })?;
+                path_pattern = Some(CString::new(value.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "find -path pattern cannot contain NUL",
+                    )
+                })?);
+                index += 2;
+            }
             "-print" => {
                 if explicit_output_action && output_delimiter != b'\n' {
                     return Err(io::Error::new(
@@ -300,6 +321,7 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
         FindPlan {
             type_filter,
             name_pattern,
+            path_pattern,
             max_depth,
             output_delimiter,
         },
@@ -312,13 +334,14 @@ fn is_find_expression_token(arg: &str) -> bool {
 
 fn print_find_help(program: &str) {
     println!(
-        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-print|-print0]"
+        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
     );
     println!("Walk directory trees and print matching paths.");
     println!();
     println!("  -maxdepth N        descend at most N levels below each starting path");
     println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
     println!("  -name PATTERN      match the final path component using shell glob syntax");
+    println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
     println!("  -print             print each matching path followed by a newline (default)");
     println!("  -print0            print each matching path followed by NUL");
     println!("  -h, --help         display this help and exit");
@@ -337,10 +360,18 @@ fn append_find_path(chunk: &mut Vec<u8>, path: &Path, output_delimiter: u8) {
 
 fn find_name_matches(pattern: &CStr, path: &Path) -> bool {
     let name = path.file_name().unwrap_or(path.as_os_str());
-    let Ok(name) = CString::new(name.as_bytes()) else {
+    find_glob_matches(pattern, name.as_bytes())
+}
+
+fn find_path_matches(pattern: &CStr, path: &Path) -> bool {
+    find_glob_matches(pattern, path.as_os_str().as_bytes())
+}
+
+fn find_glob_matches(pattern: &CStr, candidate: &[u8]) -> bool {
+    let Ok(candidate) = CString::new(candidate) else {
         return false;
     };
-    unsafe { libc::fnmatch(pattern.as_ptr(), name.as_ptr(), 0) == 0 }
+    unsafe { libc::fnmatch(pattern.as_ptr(), candidate.as_ptr(), 0) == 0 }
 }
 
 fn parse_find_max_depth(value: &str) -> io::Result<usize> {
@@ -375,6 +406,7 @@ mod tests {
         let plan = FindPlan {
             type_filter: None,
             name_pattern: None,
+            path_pattern: None,
             max_depth: Some(1),
             output_delimiter: b'\n',
         };

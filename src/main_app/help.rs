@@ -203,11 +203,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "fgrep" => Some(CommandHelp {
             name: "fgrep",
-            usage: "fgrep [-n] [-i] [-x] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [pattern] <file> [file ...]",
+            usage: "fgrep [-n] [-i] [-x] [-v] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [pattern] <file> [file ...]",
             summary: "Literal line-oriented grep on top of fro's fast substring scanner.",
             notes: &[
                 "Matches GNU grep -F visible behavior for the covered compatibility matrix.",
                 "-i/--ignore-case folds ASCII case for literal matching; --no-ignore-case turns it back off.",
+                "-v/--invert-match selects non-matching lines while keeping the same literal matcher.",
                 "-e/--regexp and -f/--file can be repeated; if neither is provided, the first positional argument is the pattern.",
             ],
             examples: &[
@@ -215,17 +216,19 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Match any listed pattern file entry", "fgrep -f patterns.txt notes.txt"),
                 ("Match literally without ASCII case sensitivity", "fgrep -i needle notes.txt"),
                 ("Match whole lines literally", "fgrep -x needle notes.txt"),
+                ("Print lines that do not contain the literal", "fgrep -v needle notes.txt"),
             ],
         }),
         "find" => Some(CommandHelp {
             name: "find",
-            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-print|-print0]",
+            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
             summary: "Walk one or more directory trees and print matching paths.",
             notes: &[
                 "This correctness slice does not guarantee output ordering.",
                 "-maxdepth limits descent below each starting path while still printing matching roots.",
                 "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s.",
                 "-name matches only the final path component using shell glob syntax.",
+                "-path matches the whole emitted path using shell glob syntax.",
                 "-print is the default action; -print0 emits NUL-delimited paths for xargs -0 style pipelines.",
             ],
             examples: &[
@@ -234,6 +237,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Walk two roots", "find src tests"),
                 ("List only regular files", "find . -type f"),
                 ("Match Rust sources by basename", "find src -name '*.rs'"),
+                ("Match a subtree by emitted path", "find . -path '*/target/*'"),
                 ("Emit NUL-delimited directory paths", "find src -type d -print0"),
             ],
         }),
