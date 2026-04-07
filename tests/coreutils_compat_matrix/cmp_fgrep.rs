@@ -153,6 +153,45 @@ fn fgrep_pattern_sources_match_system_output() {
 }
 
 #[test]
+fn cmp_end_of_options_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-end-of-options");
+    let dash_a = tmp.join("--left.bin");
+    let dash_b = tmp.join("--right.bin");
+    let flag_named = tmp.join("-s");
+    let normal = tmp.join("normal.bin");
+
+    fs::write(&dash_a, b"same\nbytes\n").unwrap();
+    fs::write(&dash_b, b"same\nbytex\n").unwrap();
+    fs::write(&flag_named, b"abc").unwrap();
+    fs::write(&normal, b"abc").unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["--"],
+            vec!["-s", "--"],
+            vec!["-b", "--"],
+            vec!["-i", "2", "--"],
+        ] {
+            for files in [
+                vec![dash_a.to_str().unwrap(), dash_b.to_str().unwrap()],
+                vec![flag_named.to_str().unwrap(), normal.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, compat_flags),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn cmp_bytes_flag_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-cmp-bytes");
     let equal_a = tmp.join("equal-a.txt");
@@ -183,6 +222,53 @@ fn cmp_bytes_flag_matches_system_output() {
                 vec![equal_a.to_str().unwrap(), equal_b.to_str().unwrap()],
                 vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
                 vec![short.to_str().unwrap(), long.to_str().unwrap()],
+            ] {
+                let mut fro_args = flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("cmp", &fro_args),
+                    run_system("cmp", &sys_args),
+                    &format!("cmp {:?} {:?}", flags, compat_flags),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cmp_suffix_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-suffixes");
+    let prefix = vec![b'a'; 2_100_000];
+    let mut left = prefix.clone();
+    left.push(b'X');
+    let mut right = prefix;
+    right.push(b'Y');
+    let equal = vec![b'z'; 4096];
+    let equal_a = tmp.join("equal-a.bin");
+    let equal_b = tmp.join("equal-b.bin");
+    let diff_a = tmp.join("diff-a.bin");
+    let diff_b = tmp.join("diff-b.bin");
+
+    fs::write(&equal_a, &equal).unwrap();
+    fs::write(&equal_b, &equal).unwrap();
+    fs::write(&diff_a, &left).unwrap();
+    fs::write(&diff_b, &right).unwrap();
+
+    for flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-n", "1k"],
+            vec!["-n", "1KB"],
+            vec!["--bytes=1MiB"],
+            vec!["-i", "1K"],
+            vec!["-i", "1KB:1K"],
+            vec!["--ignore-initial=1MiB", "--bytes=1K"],
+        ] {
+            for files in [
+                vec![equal_a.to_str().unwrap(), equal_b.to_str().unwrap()],
+                vec![diff_a.to_str().unwrap(), diff_b.to_str().unwrap()],
             ] {
                 let mut fro_args = flags.clone();
                 fro_args.extend(compat_flags.iter().copied());

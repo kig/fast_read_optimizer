@@ -6,6 +6,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fro::test_sizing::{
+    align_down as shared_align_down, choose_auto_test_size, FsSizingStats, TestSizingPolicy,
+};
+
 #[derive(Clone)]
 enum CacheState {
     None,
@@ -21,6 +25,7 @@ struct TestCase {
     cache_state: CacheState,
     files_to_prep: Vec<String>,
     bytes_hint: BytesHint,
+    metric: MetricKind,
     kind: CommandKind,
 }
 
@@ -29,6 +34,21 @@ enum BytesHint {
     None,
     SourceFile,
     RecursiveTree,
+}
+
+#[derive(Clone, Copy)]
+enum MetricKind {
+    Gbps,
+    FilesPerSecond,
+}
+
+impl MetricKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gbps => "GB/s",
+            Self::FilesPerSecond => "files/s",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -320,6 +340,40 @@ fn create_recursive_tree_fixture(root: &std::path::Path, total_bytes: u64) {
     }
 }
 
+fn write_recursive_tree_manifest(
+    root: &std::path::Path,
+    manifest: &std::path::Path,
+) -> std::io::Result<usize> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut children = fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+        children.sort_by_key(|entry| entry.path());
+        for entry in children.into_iter().rev() {
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(manifest)?;
+    let mut writer = BufWriter::new(file);
+    for path in &files {
+        writeln!(writer, "{}", path.display())?;
+    }
+    writer.flush()?;
+    Ok(files.len())
+}
+
 fn matches_any_pattern<S: AsRef<str>>(name: &str, patterns: &[S]) -> bool {
     patterns
         .iter()
@@ -357,44 +411,35 @@ fn recursive_tree_effective_bytes(
     recursive_tree_fixture_bytes.max(size.saturating_mul(recursive_tree_equiv_files))
 }
 
-fn align_down(bytes: u64, align: u64) -> u64 {
-    if align == 0 {
-        return bytes;
-    }
-    bytes / align * align
-}
-
 fn choose_test_size(
     fs: FsStats,
     file_count: u64,
     num_full_writes: u64,
+    fixed_write_bytes: u64,
     min_size: u64,
     max_size: u64,
     max_drive_writes: f64,
 ) -> u64 {
-    if file_count == 0 {
-        return 0;
-    }
+    choose_auto_test_size(
+        FsSizingStats {
+            total_bytes: fs.total_bytes,
+            avail_bytes: fs.avail_bytes,
+        },
+        TestSizingPolicy {
+            explicit_test_size: None,
+            file_count,
+            num_full_writes,
+            fixed_write_bytes,
+            min_test_size: min_size,
+            max_test_size: max_size,
+            max_drive_writes,
+            fallback_test_size: 4 * 1024 * 1024 * 1024,
+        },
+    )
+}
 
-    let space_cap = ((fs.avail_bytes as f64) * 0.60 / (file_count as f64)) as u64;
-    let wear_cap = if num_full_writes == 0 {
-        u64::MAX
-    } else {
-        ((fs.total_bytes as f64) * max_drive_writes / (num_full_writes as f64)) as u64
-    };
-
-    let mut size = max_size.min(space_cap).min(wear_cap);
-    size = align_down(size, 4096).max(4096);
-
-    if size < min_size {
-        eprintln!(
-            "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
-            format_bytes(size),
-            format_bytes(min_size),
-        );
-    }
-
-    size
+fn align_down(bytes: u64, align: u64) -> u64 {
+    shared_align_down(bytes, align)
 }
 
 mod run;

@@ -87,6 +87,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut verbose = false;
     let mut explicit_target_directory: Option<PathBuf> = None;
+    let mut no_target_directory = false;
     let mut paths = Vec::new();
     let mut end_of_options = false;
 
@@ -100,6 +101,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         }
         match arg.as_str() {
             "--verbose" => verbose = true,
+            "-T" | "--no-target-directory" => no_target_directory = true,
             "-t" | "--target-directory" => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     io::Error::new(
@@ -121,9 +123,11 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
                 let mut chars = other[1..].chars().peekable();
                 while let Some(ch) = chars.next() {
                     match ch {
-                        'v' | 'f' => {
+                        'v' | 'f' | 'T' => {
                             if ch == 'v' {
                                 verbose = true;
+                            } else if ch == 'T' {
+                                no_target_directory = true;
                             }
                         }
                         't' => {
@@ -156,10 +160,15 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         index += 1;
     }
 
+    if explicit_target_directory.is_some() && no_target_directory {
+        eprintln!("mv: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        return Ok(1);
+    }
+
     let (destination, source_paths) = if let Some(target_directory) = explicit_target_directory {
         if paths.is_empty() {
             eprintln!(
-                "Usage: {} [-f] [-v] [-t DIRECTORY] <source>... <target>",
+                "Usage: {} [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
             return Err(io::Error::new(
@@ -172,9 +181,14 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
             paths.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
         )
     } else {
+        if no_target_directory && paths.len() > 2 {
+            eprintln!("mv: extra operand '{}'", paths[2]);
+            eprintln!("Try 'mv --help' for more information.");
+            return Ok(1);
+        }
         if paths.len() < 2 {
             eprintln!(
-                "Usage: {} [-f] [-v] [-t DIRECTORY] <source>... <target>",
+                "Usage: {} [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
             return Err(io::Error::new(
@@ -209,7 +223,17 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
                 continue;
             }
         };
-        let target = if destination_is_dir {
+        if no_target_directory && destination_is_dir && !source_meta.file_type().is_dir() {
+            eprintln!(
+                "mv: cannot overwrite directory '{}' with non-directory",
+                destination.display()
+            );
+            exit_code = 1;
+            continue;
+        }
+        let target = if no_target_directory {
+            destination.clone()
+        } else if destination_is_dir {
             destination.join(source.file_name().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,

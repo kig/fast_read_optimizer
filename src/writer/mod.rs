@@ -1,7 +1,8 @@
 use crate::common::{AlignedBuffer, CopyStrategy, IOMode};
 use crate::config::LoadedConfig;
 use crate::io_util::{
-    checked_posix_fallocate, open_direct_reader_or_fallback, open_direct_writer_or_fallback,
+    checked_posix_fallocate, note_direct_unaligned_fallback, open_direct_reader_or_fallback,
+    open_direct_writer_or_fallback,
 };
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
@@ -231,6 +232,9 @@ impl SequentialWriter {
         let mut buffer = AlignedBuffer::new(data.len());
         buffer.as_mut_slice().copy_from_slice(data);
         let use_direct = direct_requested && start % 4096 == 0 && data.len() % 4096 == 0;
+        if direct_requested && !use_direct {
+            note_direct_unaligned_fallback("write", start, data.len());
+        }
         let fd = if use_direct {
             self.file_direct.as_raw_fd()
         } else {
@@ -459,6 +463,9 @@ impl OffsetWriter {
         let mut buffer = AlignedBuffer::new(data.len());
         buffer.as_mut_slice().copy_from_slice(data);
         let use_direct = self.use_direct && offset % 4096 == 0 && data.len() % 4096 == 0;
+        if self.use_direct && !use_direct {
+            note_direct_unaligned_fallback("write", offset, data.len());
+        }
         let fd = if use_direct {
             self.file_direct.as_raw_fd()
         } else {
@@ -628,6 +635,9 @@ fn thread_writer(
         let src_offset = source_base_offset + next_offset;
         let dst_offset = dest_base_offset + next_offset;
         let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
+        if use_direct_read && !is_aligned_read {
+            note_direct_unaligned_fallback("copy-read", src_offset, len as usize);
+        }
         if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
             let fd = if use_direct_read && is_aligned_read {
                 src_direct.as_raw_fd()
@@ -656,6 +666,9 @@ fn thread_writer(
                 next_offset,
             )?;
             let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
+            if use_direct_write && !is_aligned_write {
+                note_direct_unaligned_fallback("write", dst_offset, len as usize);
+            }
             let fd = if use_direct_write && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
@@ -691,6 +704,9 @@ fn thread_writer(
             let len = result as u64;
             let dst_offset = dest_base_offset + buffer_offsets[idx];
             let is_aligned_write = (dst_offset % 4096 == 0) && (len % 4096 == 0);
+            if use_direct_write && !is_aligned_write {
+                note_direct_unaligned_fallback("write", dst_offset, len as usize);
+            }
             let fd = if use_direct_write && is_aligned_write {
                 dest_file.0.as_raw_fd()
             } else {
@@ -717,6 +733,9 @@ fn thread_writer(
                 let src_offset = source_base_offset + next_offset;
                 let dst_offset = dest_base_offset + next_offset;
                 let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
+                if use_direct_read && !is_aligned_read {
+                    note_direct_unaligned_fallback("copy-read", src_offset, len as usize);
+                }
                 if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
                     let fd = if use_direct_read && is_aligned_read {
                         src_direct.as_raw_fd()
@@ -745,6 +764,9 @@ fn thread_writer(
                         next_offset,
                     )?;
                     let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
+                    if use_direct_write && !is_aligned_write {
+                        note_direct_unaligned_fallback("write", dst_offset, len as usize);
+                    }
                     let fd = if use_direct_write && is_aligned_write {
                         dest_file.0.as_raw_fd()
                     } else {

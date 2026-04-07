@@ -33,6 +33,33 @@ fn cartesian_wc_matches_system_output() {
 }
 
 #[test]
+fn wc_short_flag_bundles_match_system_output() {
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-wc-bundles");
+    let path = fixture.text_file;
+
+    for flags in io_flag_sets() {
+        for wc_flags in [
+            vec!["-lw"],
+            vec!["-cl"],
+            vec!["-lwc"],
+            vec!["-mL"],
+            vec!["-lmL"],
+        ] {
+            let mut args = flags.clone();
+            args.extend(wc_flags.iter().copied());
+            args.push(path.to_str().unwrap());
+            let mut sys_args = wc_flags;
+            sys_args.push(path.to_str().unwrap());
+            assert_same_wc(
+                run_fro("wc", &args),
+                run_system("wc", &sys_args),
+                &format!("wc bundled {:?}", args),
+            );
+        }
+    }
+}
+
+#[test]
 fn wc_files0_from_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-wc-files0");
     let one = tmp.join("one.txt");
@@ -238,6 +265,25 @@ fn wc_byte_count_matches_system_on_sparse_regular_file() {
             run_fro("wc", &args),
             run_system("wc", &["-c", path.to_str().unwrap()]),
             &format!("wc sparse {:?}", args),
+        );
+    }
+}
+
+#[test]
+fn wc_long_bytes_flag_matches_system_on_sparse_regular_file() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-sparse-long");
+    let path = tmp.join("sparse.bin");
+    let file = fs::File::create(&path).unwrap();
+    file.set_len((16_u64 << 20) + 33).unwrap();
+
+    for flags in io_flag_sets() {
+        let mut args = flags.clone();
+        args.push("--bytes");
+        args.push(path.to_str().unwrap());
+        assert_same_wc(
+            run_fro("wc", &args),
+            run_system("wc", &["--bytes", path.to_str().unwrap()]),
+            &format!("wc long bytes {:?}", args),
         );
     }
 }

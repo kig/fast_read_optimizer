@@ -199,8 +199,9 @@ fn multicall_rm_help_and_force_zero_operands_work() {
     let help_stdout = String::from_utf8_lossy(&help.stdout);
     assert_eq!(help.status.code(), Some(0));
     assert!(help_stdout.contains("rm - Remove files or directory trees"));
-    assert!(help_stdout.contains("[-f] [-r|-R|--recursive] [-v] <file> [file ...]"));
+    assert!(help_stdout.contains("[-f] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"));
     assert!(help_stdout.contains("ignores missing operands and missing files"));
+    assert!(help_stdout.contains("-d/--dir removes empty directories"));
     assert!(help.stderr.is_empty());
 
     assert_success(run_fro("rm", &["-f"]));
@@ -255,6 +256,15 @@ fn multicall_head_supports_negative_counts_and_headers() {
         "zero\none\ntwo\nthre"
     );
 
+    let long_lines = assert_success(run_fro("head", &["--lines=-1", file_a.to_str().unwrap()]));
+    assert_eq!(
+        String::from_utf8_lossy(&long_lines.stdout),
+        "zero\none\ntwo\n"
+    );
+
+    let long_bytes = assert_success(run_fro("head", &["--bytes=4", file_a.to_str().unwrap()]));
+    assert_eq!(String::from_utf8_lossy(&long_bytes.stdout), "zero");
+
     let verbose = assert_success(run_fro(
         "head",
         &["-v", file_a.to_str().unwrap(), file_b.to_str().unwrap()],
@@ -308,6 +318,54 @@ fn multicall_cat_and_wc_accept_stdin_and_dash() {
 }
 
 #[test]
+fn multicall_wc_byte_count_pipe_matches_system_for_large_stdin() {
+    let bytes = (0..(3 * 1024 * 1024 + 123))
+        .map(|idx| ((idx * 17 + 31) % 251) as u8)
+        .collect::<Vec<_>>();
+
+    let fro = assert_success(run_fro_with_stdin("wc", &["-c"], &bytes));
+    let system = run_system_with_stdin("wc", &["-c"], &bytes);
+    assert!(
+        system.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&system.stdout),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&fro.stdout),
+        String::from_utf8_lossy(&system.stdout)
+    );
+}
+
+#[test]
+fn multicall_wc_default_counts_large_streamed_stdin_matches_system() {
+    let line = b"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega\n";
+    let mut bytes = Vec::with_capacity(line.len() * 16384);
+    for _ in 0..16384 {
+        bytes.extend_from_slice(line);
+    }
+
+    let fro = assert_success(run_fro_with_stdin("wc", &[], &bytes));
+    let system = run_system_with_stdin("wc", &[], &bytes);
+    assert!(
+        system.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&system.stdout),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    let fro_tokens = String::from_utf8_lossy(&fro.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let system_tokens = String::from_utf8_lossy(&system.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(fro_tokens, system_tokens);
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
 fn multicall_head_accepts_stdin_negative_counts() {
     let bytes = b"one\ntwo\nthree\n";
 
@@ -316,6 +374,18 @@ fn multicall_head_accepts_stdin_negative_counts() {
 
     let head_dash = assert_success(run_fro_with_stdin("head", &["-c", "-2", "-"], bytes));
     assert_eq!(String::from_utf8_lossy(&head_dash.stdout), "one\ntwo\nthre");
+
+    let head_long_lines = assert_success(run_fro_with_stdin("head", &["--lines", "2"], bytes));
+    assert_eq!(
+        String::from_utf8_lossy(&head_long_lines.stdout),
+        "one\ntwo\n"
+    );
+
+    let head_long_bytes = assert_success(run_fro_with_stdin("head", &["--bytes=-2"], bytes));
+    assert_eq!(
+        String::from_utf8_lossy(&head_long_bytes.stdout),
+        "one\ntwo\nthre"
+    );
 }
 
 #[test]
@@ -365,6 +435,20 @@ fn multicall_wc_supports_character_counts_on_stdin() {
 
     let wc_chars_dash = assert_success(run_fro_with_stdin("wc", &["-m", "-"], bytes));
     assert_eq!(String::from_utf8_lossy(&wc_chars_dash.stdout).trim(), "4 -");
+}
+
+#[test]
+fn multicall_wc_supports_long_bytes_flag_on_stdin() {
+    let bytes = b"one two\nthree\n";
+
+    let wc_bytes = assert_success(run_fro_with_stdin("wc", &["--bytes"], bytes));
+    assert_eq!(String::from_utf8_lossy(&wc_bytes.stdout).trim(), "14");
+
+    let wc_bytes_dash = assert_success(run_fro_with_stdin("wc", &["--bytes", "-"], bytes));
+    assert_eq!(
+        String::from_utf8_lossy(&wc_bytes_dash.stdout).trim(),
+        "14 -"
+    );
 }
 
 #[test]
@@ -457,6 +541,25 @@ fn multicall_fgrep_and_tac_accept_stdin() {
 }
 
 #[test]
+fn multicall_tac_supports_double_dash_and_rejects_unknown_options() {
+    let tmp = unique_temp_dir("fro-coreutils-tac-options");
+    let path = tmp.join("-dash.txt");
+    fs::write(&path, b"one\ntwo\n").unwrap();
+
+    let out = assert_success(run_fro("tac", &["--", path.to_str().unwrap()]));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "two\none\n");
+
+    let fro = run_fro("tac", &["--bogus", path.to_str().unwrap()]);
+    let sys = run_system("tac", &["--bogus", path.to_str().unwrap()]);
+    assert_eq!(fro.status.success(), sys.status.success());
+    assert_eq!(fro.status.code(), sys.status.code());
+    let fro_stderr = String::from_utf8_lossy(&fro.stderr);
+    let sys_stderr = String::from_utf8_lossy(&sys.stderr);
+    assert!(fro_stderr.starts_with(sys_stderr.as_ref()));
+    assert!(fro_stderr.contains("Error: unrecognized option"));
+}
+
+#[test]
 fn multicall_hash_sums_print_expected_digests() {
     let tmp = unique_temp_dir("fro-coreutils-hash");
     let path = tmp.join("hash.bin");
@@ -508,6 +611,27 @@ fn multicall_hash_sums_print_expected_digests() {
             path.to_str().unwrap()
         )
     );
+}
+
+#[test]
+fn multicall_hash_sums_support_double_dash_for_dash_prefixed_files() {
+    let tmp = unique_temp_dir("fro-coreutils-hash-double-dash");
+    let path = tmp.join("-hash.bin");
+    let bytes = (0..8193)
+        .map(|i| ((i * 41) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &bytes).unwrap();
+
+    for tool in ["sha256sum", "md5sum", "b2sum", "b3sum"] {
+        let fro = assert_success(run_fro(tool, &["--", path.to_str().unwrap()]));
+        let sys = assert_success(run_system(tool, &["--", path.to_str().unwrap()]));
+        assert_eq!(
+            String::from_utf8_lossy(&fro.stdout),
+            String::from_utf8_lossy(&sys.stdout),
+            "{tool} stdout mismatch"
+        );
+        assert_eq!(fro.stderr, sys.stderr, "{tool} stderr mismatch");
+    }
 }
 
 #[test]

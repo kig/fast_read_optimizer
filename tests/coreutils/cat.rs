@@ -509,3 +509,68 @@ fn cat_show_all_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cat_mixed_stdin_and_file_inputs_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cat-mixed-stdin-file");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"FILE-A\n").unwrap();
+    fs::write(&b, b"FILE-B\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for files in [
+            vec!["-", a.to_str().unwrap()],
+            vec![a.to_str().unwrap(), "-"],
+            vec!["-", a.to_str().unwrap(), "-", b.to_str().unwrap()],
+        ] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(files.iter().copied());
+            assert_same_result(
+                run_fro_with_stdin("cat", &fro_args, b"STDIN\n"),
+                run_system_with_stdin("cat", &files, b"STDIN\n"),
+                &format!("cat mixed stdin+files {:?} {:?}", io_flags, files),
+            );
+        }
+    }
+}
+
+#[test]
+fn cat_combined_short_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cat-combined-short");
+    let input = tmp.join("input.txt");
+    fs::write(&input, b"alpha\n\n\tbeta\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [vec!["-ben"], vec!["-A", "-s"], vec!["-tvs"]] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push(input.to_str().unwrap());
+            let mut sys_args = compat_flags.clone();
+            sys_args.push(input.to_str().unwrap());
+            assert_same_result(
+                run_fro("cat", &fro_args),
+                run_system("cat", &sys_args),
+                &format!("cat combined {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+}
+
+#[test]
+fn cat_double_dash_treats_following_operands_as_files() {
+    let tmp = unique_temp_dir("fro-coreutils-cat-double-dash");
+    let named_like_flag = tmp.join("--show-all");
+    fs::write(&named_like_flag, b"literal flag-like file\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        let mut fro_args = io_flags.clone();
+        fro_args.push("--");
+        fro_args.push(named_like_flag.to_str().unwrap());
+        assert_same_result(
+            run_fro("cat", &fro_args),
+            run_system("cat", &["--", named_like_flag.to_str().unwrap()]),
+            &format!("cat double dash {:?}", io_flags),
+        );
+    }
+}

@@ -16,10 +16,18 @@ fn tail_byte_mode_matches_system_for_small_stdin_suffix() {
         .map(|idx| b'a' + (idx % 23) as u8)
         .collect::<Vec<_>>();
 
-    for args in [vec!["-c", "65536"], vec!["--no-direct", "-c", "65536"]] {
+    for args in [
+        vec!["-c", "64"],
+        vec!["-c", "4096"],
+        vec!["-c", "65536"],
+        vec!["--no-direct", "-c", "64"],
+        vec!["--no-direct", "-c", "4096"],
+        vec!["--no-direct", "-c", "65536"],
+    ] {
+        let count = *args.last().unwrap();
         assert_same_result(
             run_fro_with_stdin("tail", &args, &input),
-            run_system_with_stdin("tail", &["-c", "65536"], &input),
+            run_system_with_stdin("tail", &["-c", count], &input),
             &format!("tail stdin bytes {:?}", args),
         );
     }

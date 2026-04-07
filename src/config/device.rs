@@ -121,38 +121,7 @@ pub fn mount_info_for_path(path: &str) -> Option<MountInfo> {
         }
     };
 
-    let mut best: Option<MountInfo> = None;
-    let mut best_len = 0usize;
-
-    for line in data.lines() {
-        let (lhs, rhs) = match line.split_once(" - ") {
-            Some(v) => v,
-            None => continue,
-        };
-        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
-        if left_fields.len() < 5 {
-            continue;
-        }
-
-        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
-        if right_fields.is_empty() {
-            continue;
-        }
-        let mp = left_fields[4];
-        if !path_starts_with_mount(&path, mp) {
-            continue;
-        }
-        if mp.len() > best_len {
-            best_len = mp.len();
-            best = Some(MountInfo {
-                mount_point: mp.to_string(),
-                fstype: right_fields[0].to_string(),
-                mount_source: right_fields.get(1).unwrap_or(&"").to_string(),
-            });
-        }
-    }
-
-    best
+    mount_info_for_path_from_data(&path, &data)
 }
 
 pub fn device_signature_for_path(path: &str) -> Option<DeviceSignature> {
@@ -319,6 +288,10 @@ fn device_match_keys(
     if let Some(block) = block {
         push_unique(&mut keys, format!("devnode={}", block.devnode));
         push_unique(&mut keys, format!("kernel={}", block.kernel_name));
+        push_unique(
+            &mut keys,
+            format!("kind={}", device_kind_for_kernel_name(&block.kernel_name)),
+        );
         if let Some(dm_name) = &block.dm_name {
             push_unique(&mut keys, format!("dm_name={dm_name}"));
         }
@@ -343,6 +316,7 @@ fn device_match_keys(
         for slave in &block.slaves {
             extend_match_keys_for_child(&mut keys, "slave", slave);
         }
+        extend_composite_match_keys(&mut keys, block);
     }
     keys
 }
@@ -350,6 +324,13 @@ fn device_match_keys(
 fn extend_match_keys_for_child(keys: &mut Vec<String>, prefix: &str, block: &BlockDeviceSignature) {
     push_unique(keys, format!("{prefix}.kernel={}", block.kernel_name));
     push_unique(keys, format!("{prefix}.devnode={}", block.devnode));
+    push_unique(
+        keys,
+        format!(
+            "{prefix}.kind={}",
+            device_kind_for_kernel_name(&block.kernel_name)
+        ),
+    );
     if let Some(dm_name) = &block.dm_name {
         push_unique(keys, format!("{prefix}.dm_name={dm_name}"));
     }
@@ -374,6 +355,57 @@ fn extend_match_keys_for_child(keys: &mut Vec<String>, prefix: &str, block: &Blo
     for child in &block.slaves {
         extend_match_keys_for_child(keys, &format!("{prefix}.slave"), child);
     }
+}
+
+fn extend_composite_match_keys(keys: &mut Vec<String>, block: &BlockDeviceSignature) {
+    let mut stack = Vec::new();
+    collect_composite_match_keys(keys, block, &mut stack);
+}
+
+fn collect_composite_match_keys(
+    keys: &mut Vec<String>,
+    block: &BlockDeviceSignature,
+    stack: &mut Vec<String>,
+) {
+    let kind = device_kind_for_kernel_name(&block.kernel_name);
+    push_unique(keys, format!("component.kind={kind}"));
+    for by_id in &block.by_id {
+        push_unique(keys, format!("component.by-id={by_id}"));
+    }
+    if let Some(dm_name) = &block.dm_name {
+        push_unique(keys, format!("component.dm_name={dm_name}"));
+    }
+    if let Some(md_level) = &block.md_level {
+        push_unique(keys, format!("component.md_level={md_level}"));
+    }
+
+    stack.push(kind.clone());
+    push_unique(keys, format!("stack={}", stack.join(">")));
+
+    if block.slaves.is_empty() {
+        push_unique(keys, format!("leaf.kind={kind}"));
+        for by_id in &block.by_id {
+            push_unique(keys, format!("leaf.by-id={by_id}"));
+        }
+        if let Some(vendor) = &block.vendor {
+            push_unique(keys, format!("leaf.vendor={vendor}"));
+        }
+        if let Some(model) = &block.model {
+            push_unique(keys, format!("leaf.model={model}"));
+        }
+        if let Some(rotational) = block.rotational {
+            push_unique(
+                keys,
+                format!("leaf.rotational={}", if rotational { 1 } else { 0 }),
+            );
+        }
+    } else {
+        for child in &block.slaves {
+            collect_composite_match_keys(keys, child, stack);
+        }
+    }
+
+    stack.pop();
 }
 
 fn push_unique(keys: &mut Vec<String>, value: String) {
@@ -436,4 +468,63 @@ fn path_starts_with_mount(path: &str, mount_point: &str) -> bool {
         return rest.starts_with('/');
     }
     false
+}
+
+pub(super) fn mount_info_for_path_from_data(path: &str, data: &str) -> Option<MountInfo> {
+    let mut best: Option<MountInfo> = None;
+    let mut best_len = 0usize;
+
+    for line in data.lines() {
+        let (lhs, rhs) = match line.split_once(" - ") {
+            Some(v) => v,
+            None => continue,
+        };
+        let left_fields: Vec<&str> = lhs.split_whitespace().collect();
+        if left_fields.len() < 5 {
+            continue;
+        }
+
+        let right_fields: Vec<&str> = rhs.split_whitespace().collect();
+        if right_fields.is_empty() {
+            continue;
+        }
+
+        let mount_point = decode_mountinfo_field(left_fields[4]);
+        if !path_starts_with_mount(path, &mount_point) {
+            continue;
+        }
+        if mount_point.len() > best_len {
+            best_len = mount_point.len();
+            best = Some(MountInfo {
+                mount_point,
+                fstype: decode_mountinfo_field(right_fields[0]),
+                mount_source: right_fields
+                    .get(1)
+                    .map(|value| decode_mountinfo_field(value))
+                    .unwrap_or_default(),
+            });
+        }
+    }
+
+    best
+}
+
+fn decode_mountinfo_field(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let octal = &bytes[i + 1..i + 4];
+            if octal.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                let code = ((octal[0] - b'0') << 6) | ((octal[1] - b'0') << 3) | (octal[2] - b'0');
+                decoded.push(char::from(code));
+                i += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[i] as char);
+        i += 1;
+    }
+    decoded
 }

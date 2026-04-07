@@ -5,6 +5,7 @@ pub mod dd_tool;
 mod file_hash;
 mod io_util;
 mod mincore;
+pub mod test_sizing;
 mod verified_copy;
 
 pub mod block_hash;
@@ -31,8 +32,9 @@ pub use reader::{BufReader, MappedReadBuffer};
 pub use stream::transform::{
     auto_select_transform_io_pairing, grow_pipe_capacity_best_effort, run_file_transform_to_file,
     run_file_transform_to_pipe_with_owned_output, run_reader_transform_to_file,
-    run_reader_transform_to_pipe, PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec,
-    TransformIoPairing, TransformIoPairingKind, TransformOutputSpec,
+    run_reader_transform_to_pipe, run_transform_io_pairing, run_transform_with_specs,
+    PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec, TransformIoPairing,
+    TransformIoPairingKind, TransformOutputSpec,
 };
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,

@@ -78,28 +78,95 @@ mod unix_matrix {
             )
     }
 
-    fn assert_error_class<T: std::fmt::Debug>(
-        name: &str,
-        result: io::Result<T>,
-        expected: ExpectedClass,
-    ) {
+    fn assert_error_class<T>(name: &str, result: io::Result<T>, expected: ExpectedClass) {
         match expected.resolve() {
             ResultClass::Success => {
-                assert!(result.is_ok(), "{name}: expected success, got {result:?}");
+                if let Err(err) = result {
+                    panic!("{name}: expected success, got {err:?}");
+                }
             }
-            ResultClass::PermissionDenied => {
-                let err = result.expect_err(name);
-                assert_eq!(
+            ResultClass::PermissionDenied => match result {
+                Ok(_) => panic!("{name}: expected permission denied, got success"),
+                Err(err) => assert_eq!(
                     err.kind(),
                     io::ErrorKind::PermissionDenied,
                     "{name}: expected permission denied, got {err:?}"
-                );
-            }
-            ResultClass::InvalidInputClass => {
-                let err = result.expect_err(name);
-                assert!(
+                ),
+            },
+            ResultClass::InvalidInputClass => match result {
+                Ok(_) => panic!("{name}: expected invalid-input-class error, got success"),
+                Err(err) => assert!(
                     is_invalid_input_class(&err),
                     "{name}: expected invalid-input-class error, got {err:?}"
+                ),
+            },
+        }
+    }
+
+    fn assert_read_surface_compatibility(
+        surface: &str,
+        name: &str,
+        path: &Path,
+        expected: ExpectedClass,
+        expected_bytes: Option<&[u8]>,
+    ) {
+        let label = format!("{surface}/{name}");
+        match expected.resolve() {
+            ResultClass::Success => {
+                let expected_bytes = expected_bytes.expect("success cases must provide bytes");
+
+                let file = fro::open_with_mode(path, fro::IOMode::PageCache)
+                    .unwrap_or_else(|err| panic!("{label}: expected success, got {err:?}"));
+                assert_eq!(
+                    file.len()
+                        .unwrap_or_else(|err| panic!("{label}: len failed: {err:?}")),
+                    expected_bytes.len() as u64,
+                    "{label}: len mismatch"
+                );
+
+                let block_size = fro::optimal_block_size_with_mode(path, fro::IOMode::PageCache)
+                    .unwrap_or_else(|err| panic!("{label}: block size failed: {err:?}"));
+                assert!(block_size > 0, "{label}: block size must be non-zero");
+
+                let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let collected_for_visit = collected.clone();
+                let report = fro::visit_blocks_with_mode(
+                    path,
+                    fro::IOMode::PageCache,
+                    move |_index, data| {
+                        collected_for_visit.lock().unwrap().extend_from_slice(data);
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|err| panic!("{label}: visit failed: {err:?}"));
+                assert_eq!(
+                    report.bytes_read,
+                    expected_bytes.len() as u64,
+                    "{label}: bytes_read mismatch"
+                );
+                assert_eq!(
+                    &*collected.lock().unwrap(),
+                    expected_bytes,
+                    "{label}: visited bytes mismatch"
+                );
+            }
+            _ => {
+                assert_error_class(
+                    &format!("{label}/open"),
+                    fro::open_with_mode(path, fro::IOMode::PageCache),
+                    expected,
+                );
+                assert_error_class(
+                    &format!("{label}/block-size"),
+                    fro::optimal_block_size_with_mode(path, fro::IOMode::PageCache),
+                    expected,
+                );
+                assert_error_class(
+                    &format!("{label}/visit"),
+                    fro::visit_blocks_with_mode(path, fro::IOMode::PageCache, |_index, _data| {
+                        Ok(())
+                    }),
+                    expected,
                 );
             }
         }
@@ -186,6 +253,77 @@ mod unix_matrix {
                     expected,
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn local_read_access_surface_compatibility_matrix() {
+        let tmp = unique_temp_dir("fro-compat-read-surfaces");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let readable = tmp.join("readable.bin");
+        let unreadable = tmp.join("unreadable.bin");
+        let directory = tmp.join("directory");
+        let readable_symlink = tmp.join("readable-link");
+        let directory_symlink = tmp.join("directory-link");
+        let unreadable_symlink = tmp.join("unreadable-link");
+        let bytes = b"compatibility-read-surface-bytes".to_vec();
+
+        fs::write(&readable, &bytes).unwrap();
+        fs::write(&unreadable, &bytes).unwrap();
+        set_mode(&unreadable, 0o000);
+        fs::create_dir(&directory).unwrap();
+        symlink(&readable, &readable_symlink).unwrap();
+        symlink(&directory, &directory_symlink).unwrap();
+        symlink(&unreadable, &unreadable_symlink).unwrap();
+
+        let cases = [
+            (
+                "regular-0644",
+                readable.as_path(),
+                ExpectedClass::same(ResultClass::Success),
+                Some(bytes.as_slice()),
+            ),
+            (
+                "regular-0000",
+                unreadable.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+                Some(bytes.as_slice()),
+            ),
+            (
+                "directory-0755",
+                directory.as_path(),
+                ExpectedClass::same(ResultClass::InvalidInputClass),
+                None,
+            ),
+            (
+                "symlink-to-regular",
+                readable_symlink.as_path(),
+                ExpectedClass::same(ResultClass::Success),
+                Some(bytes.as_slice()),
+            ),
+            (
+                "symlink-to-directory",
+                directory_symlink.as_path(),
+                ExpectedClass::same(ResultClass::InvalidInputClass),
+                None,
+            ),
+            (
+                "symlink-to-0000",
+                unreadable_symlink.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+                Some(bytes.as_slice()),
+            ),
+        ];
+
+        for (name, path, expected, expected_bytes) in cases {
+            assert_read_surface_compatibility("page-cache", name, path, expected, expected_bytes);
         }
     }
 

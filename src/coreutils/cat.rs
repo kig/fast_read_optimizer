@@ -1,6 +1,92 @@
 use super::*;
 use memchr::memchr_iter;
 
+#[derive(Clone)]
+struct CatArgs {
+    io_mode: IOMode,
+    number: bool,
+    number_nonblank: bool,
+    show_ends: bool,
+    show_tabs: bool,
+    show_nonprinting: bool,
+    squeeze_blank: bool,
+    files: Vec<String>,
+}
+
+fn parse_short_cat_flags(arg: &str, parsed: &mut CatArgs) -> io::Result<bool> {
+    if !arg.starts_with('-') || arg.len() <= 1 || arg.starts_with("--") {
+        return Ok(false);
+    }
+    for flag in arg[1..].bytes() {
+        match flag {
+            b'n' => parsed.number = true,
+            b'b' => parsed.number_nonblank = true,
+            b'E' => parsed.show_ends = true,
+            b'T' => parsed.show_tabs = true,
+            b'v' => parsed.show_nonprinting = true,
+            b's' => parsed.squeeze_blank = true,
+            b'u' => {}
+            b'e' | b't' | b'A' => {
+                let (flag_show_ends, flag_show_tabs, flag_show_nonprinting) =
+                    cat_short_visual_flag_effect(flag).unwrap();
+                parsed.show_ends |= flag_show_ends;
+                parsed.show_tabs |= flag_show_tabs;
+                parsed.show_nonprinting |= flag_show_nonprinting;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported cat flag -{}", flag as char),
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn parse_cat_args(args: &[String]) -> io::Result<CatArgs> {
+    let mut parsed = CatArgs {
+        io_mode: IOMode::Auto,
+        number: false,
+        number_nonblank: false,
+        show_ends: false,
+        show_tabs: false,
+        show_nonprinting: false,
+        squeeze_blank: false,
+        files: Vec::new(),
+    };
+    let mut end_flags = false;
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--" if !end_flags => end_flags = true,
+            "--auto" if !end_flags => parsed.io_mode = IOMode::Auto,
+            "--direct" if !end_flags => parsed.io_mode = IOMode::Direct,
+            "--no-direct" if !end_flags => parsed.io_mode = IOMode::PageCache,
+            "-n" | "--number" if !end_flags => parsed.number = true,
+            "-b" | "--number-nonblank" if !end_flags => parsed.number_nonblank = true,
+            "-E" | "--show-ends" if !end_flags => parsed.show_ends = true,
+            "-T" | "--show-tabs" if !end_flags => parsed.show_tabs = true,
+            "-u" if !end_flags => {}
+            "--show-nonprinting" if !end_flags => parsed.show_nonprinting = true,
+            "--show-all" if !end_flags => {
+                let (flag_show_ends, flag_show_tabs, flag_show_nonprinting) =
+                    cat_short_visual_flag_effect(b'A').unwrap();
+                parsed.show_ends |= flag_show_ends;
+                parsed.show_tabs |= flag_show_tabs;
+                parsed.show_nonprinting |= flag_show_nonprinting;
+            }
+            "-s" | "--squeeze-blank" if !end_flags => parsed.squeeze_blank = true,
+            other => {
+                if !end_flags && parse_short_cat_flags(other, &mut parsed)? {
+                    continue;
+                }
+                parsed.files.push(other.to_string());
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 pub(super) fn cat_numbering_step(
     next_line_number: u64,
     at_line_start: bool,
@@ -223,54 +309,16 @@ fn cat_write_transformed_line<W: Write>(
 }
 
 pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
-    let mut io_mode = IOMode::Auto;
-    let mut number = false;
-    let mut number_nonblank = false;
-    let mut show_ends = false;
-    let mut show_tabs = false;
-    let mut show_nonprinting = false;
-    let mut squeeze_blank = false;
-    let mut files = Vec::new();
-    for arg in &args[1..] {
-        match arg.as_str() {
-            "--auto" => io_mode = IOMode::Auto,
-            "--direct" => io_mode = IOMode::Direct,
-            "--no-direct" => io_mode = IOMode::PageCache,
-            "-n" | "--number" => number = true,
-            "-b" | "--number-nonblank" => number_nonblank = true,
-            "-E" | "--show-ends" => show_ends = true,
-            "-T" | "--show-tabs" => show_tabs = true,
-            "-t" => {
-                show_tabs = true;
-                show_nonprinting = true;
-            }
-            "-u" => {}
-            "--show-nonprinting" => show_nonprinting = true,
-            "--show-all" => {
-                let (flag_show_ends, flag_show_tabs, flag_show_nonprinting) =
-                    cat_short_visual_flag_effect(b'A').unwrap();
-                show_ends |= flag_show_ends;
-                show_tabs |= flag_show_tabs;
-                show_nonprinting |= flag_show_nonprinting;
-            }
-            "-s" | "--squeeze-blank" => squeeze_blank = true,
-            other => {
-                if let [b'-', flag] = other.as_bytes() {
-                    if let Some((flag_show_ends, flag_show_tabs, flag_show_nonprinting)) =
-                        cat_short_visual_flag_effect(*flag)
-                    {
-                        show_ends |= flag_show_ends;
-                        show_tabs |= flag_show_tabs;
-                        show_nonprinting |= flag_show_nonprinting;
-                        continue;
-                    }
-                }
-                files.push(other.to_string());
-            }
-        }
-    }
+    let parsed = parse_cat_args(args)?;
+    let io_mode = parsed.io_mode;
+    let number = parsed.number;
+    let number_nonblank = parsed.number_nonblank;
+    let show_ends = parsed.show_ends;
+    let show_tabs = parsed.show_tabs;
+    let show_nonprinting = parsed.show_nonprinting;
+    let squeeze_blank = parsed.squeeze_blank;
+    let files = parsed.files;
     let inputs = parse_stream_inputs(files);
-    let mut out = stdout_buf_writer()?;
     if cat_uses_transform_path(
         number,
         number_nonblank,
@@ -279,6 +327,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
         show_nonprinting,
         squeeze_blank,
     ) {
+        let mut out = stdout_buf_writer()?;
         let mut next_line_number = 1u64;
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
@@ -324,13 +373,18 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
         }
         return out.into_inner();
     }
+    let mut out = None;
     for input in inputs {
         if try_fast_cat_copy(&input, io_mode)? {
             continue;
         }
-        copy_file_like_to_output(&mut out, &input)?;
+        let out = out.get_or_insert(stdout_buf_writer()?);
+        copy_file_like_to_output(out, &input)?;
     }
-    out.into_inner()
+    match out {
+        Some(out) => out.into_inner(),
+        None => Ok(()),
+    }
 }
 
 #[cfg(kani)]
@@ -513,8 +567,10 @@ mod tests {
     use super::{
         cat_numbering_step, cat_short_visual_flag_effect, cat_should_number_line,
         cat_show_ends_rendered_len, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
-        cat_uses_transform_path, cat_visible_byte_rendered_len,
+        cat_uses_transform_path, cat_visible_byte_rendered_len, parse_cat_args,
+        parse_short_cat_flags, CatArgs,
     };
+    use std::io;
 
     #[test]
     fn cat_numbering_step_numbers_only_at_line_starts() {
@@ -638,5 +694,66 @@ mod tests {
     #[test]
     fn cat_short_visual_flag_effect_maps_show_all_to_all_visual_bits() {
         assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
+    }
+
+    #[test]
+    fn parse_short_cat_flags_supports_combined_common_flags() {
+        let mut parsed = CatArgs {
+            io_mode: super::IOMode::Auto,
+            number: false,
+            number_nonblank: false,
+            show_ends: false,
+            show_tabs: false,
+            show_nonprinting: false,
+            squeeze_blank: false,
+            files: Vec::new(),
+        };
+        assert!(parse_short_cat_flags("-benst", &mut parsed).unwrap());
+        assert!(parsed.number);
+        assert!(parsed.number_nonblank);
+        assert!(parsed.show_ends);
+        assert!(parsed.show_tabs);
+        assert!(parsed.show_nonprinting);
+        assert!(parsed.squeeze_blank);
+    }
+
+    #[test]
+    fn parse_short_cat_flags_rejects_unknown_combined_flags() {
+        let mut parsed = CatArgs {
+            io_mode: super::IOMode::Auto,
+            number: false,
+            number_nonblank: false,
+            show_ends: false,
+            show_tabs: false,
+            show_nonprinting: false,
+            squeeze_blank: false,
+            files: Vec::new(),
+        };
+        let err = parse_short_cat_flags("-nx", &mut parsed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("unsupported cat flag -x"));
+    }
+
+    #[test]
+    fn parse_cat_args_honors_double_dash_and_combined_flags() {
+        let args = vec![
+            "cat".to_string(),
+            "-ben".to_string(),
+            "--".to_string(),
+            "--show-all".to_string(),
+            "-".to_string(),
+        ];
+        let parsed = parse_cat_args(&args).unwrap();
+        assert!(matches!(parsed.io_mode, super::IOMode::Auto));
+        assert!(parsed.number);
+        assert!(parsed.number_nonblank);
+        assert!(parsed.show_ends);
+        assert!(!parsed.show_tabs);
+        assert!(parsed.show_nonprinting);
+        assert!(!parsed.squeeze_blank);
+        assert_eq!(
+            parsed.files,
+            vec!["--show-all".to_string(), "-".to_string()]
+        );
     }
 }

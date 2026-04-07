@@ -3,7 +3,9 @@ use super::inspect::{
     device_db_match, is_disk_backed_mount, parse_zfs_get_props, parse_zpool_status_leaves,
 };
 use super::*;
+use fro::test_sizing::{resolve_test_size, FsSizingStats, TestSizeSource, TestSizingPolicy};
 use std::path::Path;
+use std::process::Command;
 
 #[test]
 fn list_devices_filters_pseudo_and_snap_fs() {
@@ -202,4 +204,230 @@ fn resolve_target_selection_accepts_same_mount_test_dir_and_target() {
     assert_eq!(selection.benchmark_dir, bench_dir.display().to_string());
     assert_eq!(selection.target_path.as_deref(), target.to_str());
     assert!(selection.target_mount.is_some());
+}
+
+#[derive(serde::Deserialize)]
+struct OptimizeConfigFile {
+    defaults: OptimizeAppConfig,
+    #[serde(default)]
+    mount_overrides: OptimizeMountOverrides,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct OptimizeMountOverrides {
+    #[serde(default)]
+    by_mountpoint: std::collections::HashMap<String, OptimizeAppConfigPatch>,
+}
+
+#[derive(serde::Deserialize)]
+struct OptimizeAppConfig {
+    read: OptimizeModeConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct OptimizeModeConfig {
+    direct: IOParams,
+    page_cache: IOParams,
+}
+
+#[derive(serde::Deserialize)]
+struct OptimizeAppConfigPatch {
+    #[serde(default)]
+    read: Option<OptimizeModeConfigPatch>,
+}
+
+#[derive(serde::Deserialize)]
+struct OptimizeModeConfigPatch {
+    #[serde(default)]
+    direct: Option<IOParams>,
+    #[serde(default)]
+    page_cache: Option<IOParams>,
+}
+
+#[test]
+fn fro_optimize_for_path_persists_into_mount_override() {
+    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join(format!(
+            "fro-optimize-mount-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let config_path = target_dir.join("fro.json");
+    let target_path = target_dir.join("data.bin");
+    std::fs::write(&target_path, b"x").unwrap();
+
+    let status = Command::new("cargo")
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "fro-optimize",
+            "--",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--for",
+            target_path.to_str().unwrap(),
+            "--test-size",
+            "4096",
+            "--iters",
+            "1",
+            "read",
+        ])
+        .status()
+        .expect("run fro-optimize");
+    assert!(status.success());
+
+    let saved: OptimizeConfigFile =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mount = fro::config::mount_info_for_path(target_path.to_str().unwrap()).unwrap();
+    let override_entry = saved
+        .mount_overrides
+        .by_mountpoint
+        .get(&mount.mount_point)
+        .expect("mount override entry");
+    let read_patch = override_entry.read.as_ref().expect("read override");
+    assert!(read_patch.direct.is_some());
+    assert!(read_patch.page_cache.is_some());
+    assert_eq!(
+        saved.defaults.read.direct.block_size,
+        fro::config::AppConfig::default().read.direct.block_size
+    );
+    assert_eq!(
+        saved.defaults.read.page_cache.block_size,
+        fro::config::AppConfig::default().read.page_cache.block_size
+    );
+
+    let _ = std::fs::remove_dir_all(target_dir);
+}
+
+#[test]
+fn fro_optimize_global_for_path_promotes_mount_override_into_defaults() {
+    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join(format!(
+            "fro-optimize-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let config_path = target_dir.join("fro.json");
+    let target_path = target_dir.join("data.bin");
+    std::fs::write(&target_path, b"x").unwrap();
+
+    let status = Command::new("cargo")
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "fro-optimize",
+            "--",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--global",
+            "--for",
+            target_path.to_str().unwrap(),
+            "--test-size",
+            "4096",
+            "--iters",
+            "1",
+            "read",
+        ])
+        .status()
+        .expect("run fro-optimize --global");
+    assert!(status.success());
+
+    let saved: OptimizeConfigFile =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mount = fro::config::mount_info_for_path(target_path.to_str().unwrap()).unwrap();
+    assert!(!saved
+        .mount_overrides
+        .by_mountpoint
+        .contains_key(&mount.mount_point));
+    let loaded = fro::config::load_config(Some(config_path.to_str().unwrap()));
+    let explained = loaded.explain_for_path(target_path.to_str().unwrap());
+    assert!(explained["mount_override"].is_null());
+    assert_eq!(
+        explained["effective"]["read"]["direct"],
+        explained["defaults"]["read"]["direct"]
+    );
+    assert_eq!(
+        explained["effective"]["read"]["page_cache"],
+        explained["defaults"]["read"]["page_cache"]
+    );
+
+    let _ = std::fs::remove_dir_all(target_dir);
+}
+
+#[test]
+fn fro_optimize_global_requires_for_path() {
+    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join(format!(
+            "fro-optimize-global-requires-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let config_path = target_dir.join("fro.json");
+
+    let status = Command::new("cargo")
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "fro-optimize",
+            "--",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--global",
+            "--test-size",
+            "4096",
+            "--iters",
+            "1",
+            "read",
+        ])
+        .status()
+        .expect("run fro-optimize --global without target");
+    assert!(!status.success());
+
+    let _ = std::fs::remove_dir_all(target_dir);
+}
+
+#[test]
+fn resolve_test_size_preserves_explicit_override_for_optimizer() {
+    let resolved = resolve_test_size(
+        Some(FsSizingStats {
+            total_bytes: 1024_u64.pow(4),
+            avail_bytes: 1024_u64.pow(4),
+        }),
+        TestSizingPolicy {
+            explicit_test_size: Some(12345),
+            file_count: 3,
+            num_full_writes: 83,
+            fixed_write_bytes: 0,
+            min_test_size: 256 * 1024 * 1024,
+            max_test_size: 1024 * 1024 * 1024,
+            max_drive_writes: 0.05,
+            fallback_test_size: 4 * 1024 * 1024 * 1024,
+        },
+    );
+    assert_eq!(resolved.size_bytes, 12288);
+    assert_eq!(resolved.source, TestSizeSource::Explicit);
 }

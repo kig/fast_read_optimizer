@@ -2,12 +2,87 @@ use super::*;
 
 const FIND_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 
+#[derive(Clone, Copy)]
+enum FindFileType {
+    Block,
+    Character,
+    Directory,
+    Fifo,
+    File,
+    Symlink,
+    Socket,
+}
+
+impl FindFileType {
+    fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "b" => Ok(Self::Block),
+            "c" => Ok(Self::Character),
+            "d" => Ok(Self::Directory),
+            "p" => Ok(Self::Fifo),
+            "f" => Ok(Self::File),
+            "l" => Ok(Self::Symlink),
+            "s" => Ok(Self::Socket),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported find -type '{value}'"),
+            )),
+        }
+    }
+
+    fn matches(self, file_type: fs::FileType) -> bool {
+        match self {
+            Self::Block => file_type.is_block_device(),
+            Self::Character => file_type.is_char_device(),
+            Self::Directory => file_type.is_dir(),
+            Self::Fifo => file_type.is_fifo(),
+            Self::File => file_type.is_file(),
+            Self::Symlink => file_type.is_symlink(),
+            Self::Socket => file_type.is_socket(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FindPlan {
+    type_filter: Option<FindFileType>,
+    name_pattern: Option<CString>,
+    max_depth: Option<usize>,
+    output_delimiter: u8,
+}
+
+impl FindPlan {
+    fn matches(&self, path: &Path, file_type: fs::FileType, depth: usize) -> bool {
+        self.max_depth.is_none_or(|max_depth| depth <= max_depth)
+            && self
+                .type_filter
+                .is_none_or(|expected| expected.matches(file_type))
+            && self
+                .name_pattern
+                .as_ref()
+                .is_none_or(|pattern| find_name_matches(pattern, path))
+    }
+
+    fn should_descend(&self, depth: usize) -> bool {
+        self.max_depth.is_none_or(|max_depth| depth < max_depth)
+    }
+}
+
+#[derive(Clone)]
+struct FindTask {
+    dir: PathBuf,
+    depth: usize,
+}
+
 pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
-    let roots = if args.len() > 1 {
-        args[1..].to_vec()
-    } else {
-        vec![".".to_string()]
-    };
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
+        print_find_help(args[0].as_str());
+        return Ok(0);
+    }
+    let (roots, plan) = parse_find_args(args)?;
     let worker_count = parallel_find_worker_count();
     let config = load_config(None);
     let write_params = config.get_params("write", false);
@@ -31,9 +106,14 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
             }
             Err(err) => return Err(err),
         };
-        write_find_path(&output, &path)?;
-        if metadata.file_type().is_dir() {
-            queue.enqueue_one(path);
+        if plan.matches(&path, metadata.file_type(), 0) {
+            write_find_path(&output, &path, plan.output_delimiter)?;
+        }
+        if metadata.file_type().is_dir() && plan.should_descend(0) {
+            queue.enqueue_one(FindTask {
+                dir: path,
+                depth: 0,
+            });
         }
     }
 
@@ -41,7 +121,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         let output = output.clone();
         let had_warnings = had_warnings.clone();
         move |start_dir, queue, stop| {
-            walk_find_subtree(start_dir, queue, &output, stop, &had_warnings)
+            walk_find_subtree(start_dir, queue, &output, stop, &had_warnings, &plan)
         }
     })?;
     let output = Arc::into_inner(output)
@@ -55,18 +135,21 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
 }
 
 fn walk_find_subtree(
-    start_dir: PathBuf,
-    queue: &WorkQueue<PathBuf>,
+    start_dir: FindTask,
+    queue: &WorkQueue<FindTask>,
     output: &BufWriter,
     stop: &AtomicBool,
     had_warnings: &AtomicBool,
+    plan: &FindPlan,
 ) -> io::Result<()> {
     let mut stack = vec![start_dir];
     let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
-    while let Some(dir) = stack.pop() {
+    while let Some(task) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        let dir = task.dir;
+        let child_depth = task.depth + 1;
         let mut child_dirs = Vec::new();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -88,10 +171,6 @@ fn walk_find_subtree(
                 Err(err) => return Err(err),
             };
             let path = entry.path();
-            append_find_path(&mut chunk, &path);
-            if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
-                output.write_all(&std::mem::take(&mut chunk))?;
-            }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) if is_permission_denied(&err) => {
@@ -101,8 +180,17 @@ fn walk_find_subtree(
                 }
                 Err(err) => return Err(err),
             };
-            if file_type.is_dir() {
-                child_dirs.push(path);
+            if plan.matches(&path, file_type, child_depth) {
+                append_find_path(&mut chunk, &path, plan.output_delimiter);
+                if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
+                    output.write_all(&std::mem::take(&mut chunk))?;
+                }
+            }
+            if file_type.is_dir() && plan.should_descend(child_depth) {
+                child_dirs.push(FindTask {
+                    dir: path,
+                    depth: child_depth,
+                });
             }
         }
         if let Some(local_dir) = child_dirs.pop() {
@@ -120,13 +208,178 @@ fn parallel_find_worker_count() -> usize {
         .max(1)
 }
 
-fn write_find_path(output: &BufWriter, path: &Path) -> io::Result<()> {
+fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
+    let mut roots = Vec::new();
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        if is_find_expression_token(arg) {
+            break;
+        }
+        roots.push(arg.clone());
+        index += 1;
+    }
+    if roots.is_empty() {
+        roots.push(".".to_string());
+    }
+
+    let mut type_filter = None;
+    let mut name_pattern = None;
+    let mut max_depth = None;
+    let mut output_delimiter = b'\n';
+    let mut explicit_output_action = false;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-maxdepth" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument to find -maxdepth",
+                    )
+                })?;
+                max_depth = Some(parse_find_max_depth(value)?);
+                index += 2;
+            }
+            "-type" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument to find -type",
+                    )
+                })?;
+                type_filter = Some(FindFileType::parse(value)?);
+                index += 2;
+            }
+            "-name" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument to find -name",
+                    )
+                })?;
+                name_pattern = Some(CString::new(value.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "find -name pattern cannot contain NUL",
+                    )
+                })?);
+                index += 2;
+            }
+            "-print" => {
+                if explicit_output_action && output_delimiter != b'\n' {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "multiple explicit find output actions are not supported",
+                    ));
+                }
+                explicit_output_action = true;
+                output_delimiter = b'\n';
+                index += 1;
+            }
+            "-print0" => {
+                if explicit_output_action && output_delimiter != b'\0' {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "multiple explicit find output actions are not supported",
+                    ));
+                }
+                explicit_output_action = true;
+                output_delimiter = b'\0';
+                index += 1;
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported find expression: {other}"),
+                ))
+            }
+        }
+    }
+
+    Ok((
+        roots,
+        FindPlan {
+            type_filter,
+            name_pattern,
+            max_depth,
+            output_delimiter,
+        },
+    ))
+}
+
+fn is_find_expression_token(arg: &str) -> bool {
+    arg.starts_with('-') || matches!(arg, "!" | "(" | ")")
+}
+
+fn print_find_help(program: &str) {
+    println!(
+        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-print|-print0]"
+    );
+    println!("Walk directory trees and print matching paths.");
+    println!();
+    println!("  -maxdepth N        descend at most N levels below each starting path");
+    println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
+    println!("  -name PATTERN      match the final path component using shell glob syntax");
+    println!("  -print             print each matching path followed by a newline (default)");
+    println!("  -print0            print each matching path followed by NUL");
+    println!("  -h, --help         display this help and exit");
+}
+
+fn write_find_path(output: &BufWriter, path: &Path, output_delimiter: u8) -> io::Result<()> {
     let mut chunk = Vec::with_capacity(path.as_os_str().as_bytes().len() + 1);
-    append_find_path(&mut chunk, path);
+    append_find_path(&mut chunk, path, output_delimiter);
     output.write_all(&chunk)
 }
 
-fn append_find_path(chunk: &mut Vec<u8>, path: &Path) {
+fn append_find_path(chunk: &mut Vec<u8>, path: &Path, output_delimiter: u8) {
     chunk.extend_from_slice(path.as_os_str().as_bytes());
-    chunk.push(b'\n');
+    chunk.push(output_delimiter);
+}
+
+fn find_name_matches(pattern: &CStr, path: &Path) -> bool {
+    let name = path.file_name().unwrap_or(path.as_os_str());
+    let Ok(name) = CString::new(name.as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::fnmatch(pattern.as_ptr(), name.as_ptr(), 0) == 0 }
+}
+
+fn parse_find_max_depth(value: &str) -> io::Result<usize> {
+    value.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid find -maxdepth '{value}'"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_find_max_depth_accepts_non_negative_integers() {
+        assert_eq!(parse_find_max_depth("0").unwrap(), 0);
+        assert_eq!(parse_find_max_depth("12").unwrap(), 12);
+        assert_eq!(
+            parse_find_max_depth("-1").unwrap_err().to_string(),
+            "invalid find -maxdepth '-1'"
+        );
+        assert_eq!(
+            parse_find_max_depth("abc").unwrap_err().to_string(),
+            "invalid find -maxdepth 'abc'"
+        );
+    }
+
+    #[test]
+    fn find_plan_should_descend_stops_at_max_depth_boundary() {
+        let plan = FindPlan {
+            type_filter: None,
+            name_pattern: None,
+            max_depth: Some(1),
+            output_delimiter: b'\n',
+        };
+
+        assert!(plan.should_descend(0));
+        assert!(!plan.should_descend(1));
+    }
 }

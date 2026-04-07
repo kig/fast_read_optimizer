@@ -39,6 +39,19 @@ If you only want one family:
 ./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB copy
 ```
 
+For recursive/tree-walk work, use the focused tree slice instead of the full suite:
+
+```bash
+./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB --no-fail 'tree compare:'
+```
+
+That slice is intentionally narrow:
+
+- read-side: `recursive-read-bench` vs `file-list-read-bench` vs `fd walk`
+- copy-side: `fro copy --recursive` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
+
+Interpret it primarily via `files/s`, with elapsed time as the tie-breaker. `file-list-read-bench` removes tree-walk cost, so the gap between it and `recursive-read-bench` is the current traversal tax. The three recursive-copy variants separate walk-as-you-go scheduling from split-manifest and prebuilt-manifest designs before comparing all of them to `cp -r`.
+
 ## Hot path development rule
 
 If you change a hot code path, rerun `fro-benchmark` before trusting `fro-optimize`.

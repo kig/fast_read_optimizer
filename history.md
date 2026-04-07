@@ -1,5 +1,45 @@
 # History
 
+## 2026-04-07
+
+### Archived from TODO: focused throughput/parity slices and config layering follow-up
+
+- `cat` stdin/plain-copy handling now avoids creating the buffered stdout writer thread when every input can stay on the fast kernel-copy path, so redirected stdin stays near pathname-speed on the plain byte-copy case without changing mixed stdin/file semantics.
+- `wc` byte-counting advanced in a path-preserving way:
+  - `wc --bytes` now reaches the existing regular-file metadata-length fast path just like `wc -c`
+  - the metadata shortcut is explicitly blocked for combinations like `--bytes -L` where streaming inspection is still required
+  - focused parity and multicall coverage now exercises sparse-file `--bytes` behavior and stdin `--bytes`
+- Device-db profile matching now layers using the same sparse patch shape as mount overrides:
+  - resolved precedence is `defaults -> matched device-db profile -> explicit mount override`
+  - matched profiles can now affect non-`read`/`grep` settings such as `copy_auto_mode` and recursive small-file thread counts
+  - focused config-selection tests cover sparse profile application and override precedence
+- Wrapped `base64` output no longer emits tiny per-line writes in the stateful wrapped path:
+  - wrapped chunks and trailing newlines are batched before flushing to stdout/pipes
+  - exact output behavior is preserved, including final newline handling
+  - validation also fixed a latent wrapped-stateful slice-length bug and added a batching-oriented regression test
+- `fro-optimize --for <path>` now persists tuned params into the selected mount override entry instead of flattening them into global defaults, with end-to-end coverage that the resolved `mount_overrides.by_mountpoint` entry receives the saved `read` params while defaults stay unchanged.
+- The compatibility/API matrix gained a compact read-surface slice over regular files, directories, symlinks, and permission-gated paths, and `ParallelFile::open` now rejects non-regular files up front with `InvalidInput` instead of allowing surprising successes deeper in the stack.
+- Benchmark/optimizer auto-sizing now uses a shared deterministic sizing policy that subtracts fixed benchmark-write overhead from the wear budget before deriving `test_size`, while still preserving explicit `--test-size` overrides.
+- Recursive `cp` advanced with a focused preserve-metadata slice: `cp -p`, `-rp`, and `--preserve` now keep mode + timestamps for regular files, symlinks, and directories while still using the existing optimized recursive-copy backend and scheduling lanes.
+- Config/device selection gained stable composite stack match keys for `dm`/`md` storage graphs (`kind=*`, `component.*`, `stack=*`, and `leaf.*`) so profile matching can target layered storage reliably.
+- Config regression coverage now includes compact contract tests for precedence and path-specific save/explain behavior, plus host-independent mountinfo/device-signature tests for longest mount matching, octal escape decoding, missing sources, and minimal signatures for non-block mounts.
+- `fro-optimize` now supports a narrow `--global --for <path>` flow: it tunes the selected mount as usual, then promotes that mount's saved override into config defaults and removes the override entry, while rejecting unsupported `--global` combinations cleanly.
+- `head -n` gained a tiny streamed-stdin fast path for small single-input cutoffs (`-n <= 64`, no headers), bypassing the async stdout writer when setup overhead would dominate the job.
+- `find` gained a compact high-value parity slice: common `-type {b,c,d,p,f,l,s}` filtering plus explicit `-print` / `-print0`, implemented as emission-time filtering so the existing parallel traversal stays intact.
+- Shared digest tools (`md5sum` and family) now accept GNU-style tagged manifests during `--check`, while still rejecting `--check --tag` with GNU-matching behavior and parity coverage.
+- Recursive `rm` now batches wide directory fanout into the shared directory queue instead of enqueueing one child at a time, reducing futex/condvar churn on large trees while preserving delete semantics and byte accounting.
+- The hot-cache `fro cat file | fro wc` pipeline improved materially by raising the shared coreutils pipe target size to 2 MiB and reusing that helper in `wc`, cutting syscall churn and moving the 1 GiB hot path from roughly `0.48–0.54s` down to `0.33–0.35s`.
+- Streamed `wc` default counting now uses a large buffered reader after best-effort pipe growth instead of the old `vmsplice`-driven pipe fast path, keeping the same counting logic while reducing syscall-pattern overhead on large stdin streams and adding large-stdin parity coverage for both default `wc` and `wc -c`.
+- `base64` transport/orchestration now reuses shared transform runner dispatch helpers in `src/stream/transform.rs`, so future transform-style tools can build on the same file/stream pairing path while base64 keeps its format-specific fast paths and wrapped-output behavior.
+- Forced direct-I/O modes now surface when they really fall back to the page cache:
+  - one scoped stderr warning is emitted when `O_DIRECT` open is unsupported
+  - one scoped stderr warning is emitted when forced direct requests hit unaligned tail/range fallbacks
+  - read-path CLI coverage and tracker unit tests now pin this behavior without breaking `cp` compatibility stderr parity
+- `fro-benchmark` gained a focused `tree compare:` slice for recursive/tree-walk work:
+  - read-side compares `recursive-read-bench`, `file-list-read-bench`, and `fd`
+  - copy-side compares `fro copy --recursive`, split/prebuilt-manifest recursive-copy variants, and `cp -r`
+  - the slice reports `files/s` while keeping elapsed-time summaries, and the docs now point tree-work profiling toward this narrower benchmark family
+
 ## 2026-04-06
 
 ### Archived from TODO: low-priority parity sprawl and utility long tail

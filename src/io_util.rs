@@ -4,6 +4,110 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct DirectIoFallbackTracker {
+    saw_open_fallback: AtomicBool,
+    saw_unaligned_fallback: AtomicBool,
+    emitted_open_warning: AtomicBool,
+    emitted_unaligned_warning: AtomicBool,
+    first_open_detail: Mutex<Option<String>>,
+    first_unaligned_detail: Mutex<Option<String>>,
+}
+
+#[allow(dead_code)]
+impl DirectIoFallbackTracker {
+    pub fn record_open_fallback(&self, operation: &str, err: &io::Error) {
+        self.saw_open_fallback.store(true, Ordering::Relaxed);
+        let mut detail = self.first_open_detail.lock().unwrap();
+        if detail.is_none() {
+            *detail = Some(format!("{operation}: {err}"));
+        }
+    }
+
+    pub fn record_unaligned_fallback(&self, operation: &str, offset: u64, len: usize) {
+        self.saw_unaligned_fallback.store(true, Ordering::Relaxed);
+        let mut detail = self.first_unaligned_detail.lock().unwrap();
+        if detail.is_none() {
+            *detail = Some(format!("{operation} offset {offset} len {len}"));
+        }
+    }
+
+    pub fn take_warning_lines(&self, request_label: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.saw_open_fallback.load(Ordering::Relaxed)
+            && !self.emitted_open_warning.swap(true, Ordering::SeqCst)
+        {
+            let detail = self
+                .first_open_detail
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "direct open fallback".to_string());
+            warnings.push(format!(
+                "warning: {request_label} fell back to page cache because O_DIRECT open was not supported ({detail})"
+            ));
+        }
+        if self.saw_unaligned_fallback.load(Ordering::Relaxed)
+            && !self.emitted_unaligned_warning.swap(true, Ordering::SeqCst)
+        {
+            let detail = self
+                .first_unaligned_detail
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "unaligned request".to_string());
+            warnings.push(format!(
+                "warning: {request_label} used page cache for at least one unaligned tail/range ({detail})"
+            ));
+        }
+        warnings
+    }
+}
+
+static ACTIVE_DIRECT_IO_TRACKER: OnceLock<Mutex<Option<Arc<DirectIoFallbackTracker>>>> =
+    OnceLock::new();
+
+fn active_direct_io_tracker_slot() -> &'static Mutex<Option<Arc<DirectIoFallbackTracker>>> {
+    ACTIVE_DIRECT_IO_TRACKER.get_or_init(|| Mutex::new(None))
+}
+
+fn active_direct_io_tracker() -> Option<Arc<DirectIoFallbackTracker>> {
+    active_direct_io_tracker_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(Arc::clone)
+}
+
+#[allow(dead_code)]
+pub struct ActiveDirectIoTrackerGuard {
+    previous: Option<Arc<DirectIoFallbackTracker>>,
+}
+
+impl Drop for ActiveDirectIoTrackerGuard {
+    fn drop(&mut self) {
+        *active_direct_io_tracker_slot().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[allow(dead_code)]
+pub fn install_active_direct_io_tracker(
+    tracker: Arc<DirectIoFallbackTracker>,
+) -> ActiveDirectIoTrackerGuard {
+    let mut slot = active_direct_io_tracker_slot().lock().unwrap();
+    let previous = slot.replace(tracker);
+    ActiveDirectIoTrackerGuard { previous }
+}
+
+pub fn note_direct_unaligned_fallback(operation: &str, offset: u64, len: usize) {
+    if let Some(tracker) = active_direct_io_tracker() {
+        tracker.record_unaligned_fallback(operation, offset, len);
+    }
+}
 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     matches!(
@@ -12,28 +116,42 @@ pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     ) || err.kind() == io::ErrorKind::InvalidInput
 }
 
-pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
+fn open_direct_with_fallback<F>(
+    fallback: &File,
+    operation: &str,
+    open_direct: F,
+) -> io::Result<File>
+where
+    F: FnOnce() -> io::Result<File>,
+{
+    match open_direct() {
         Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
+        Err(err) if direct_open_should_fallback(&err) => {
+            if let Some(tracker) = active_direct_io_tracker() {
+                tracker.record_open_fallback(operation, &err);
+            }
+            fallback.try_clone()
+        }
         Err(err) => Err(err),
     }
 }
 
+pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
+    open_direct_with_fallback(fallback, "direct reader open", || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+    })
+}
+
 pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
-        Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
-        Err(err) => Err(err),
-    }
+    open_direct_with_fallback(fallback, "direct writer open", || {
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+    })
 }
 
 #[allow(dead_code)]
@@ -408,6 +526,25 @@ mod tests {
         let err = validate_read_result("read", 12_288, 4_096, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(err.to_string().contains("expected 4096 bytes, got 0"));
+    }
+
+    #[test]
+    fn direct_io_fallback_tracker_reports_both_fallback_kinds_once() {
+        let tracker = DirectIoFallbackTracker::default();
+        tracker.record_open_fallback(
+            "direct reader open",
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+        );
+        tracker.record_unaligned_fallback("read", 4096, 123);
+
+        let warnings = tracker.take_warning_lines("forced --direct read");
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("O_DIRECT open was not supported"));
+        assert!(warnings[1].contains("unaligned tail/range"));
+
+        assert!(tracker
+            .take_warning_lines("forced --direct read")
+            .is_empty());
     }
 
     #[test]

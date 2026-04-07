@@ -45,6 +45,40 @@ fn cartesian_hash_tools_match_system_output() {
 }
 
 #[test]
+fn cksum_special_filenames_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-cksum-special-filenames");
+    let backslash_path = tmp.join("slash\\name.txt");
+    let newline_path = tmp.join("line\nname.txt");
+    fs::write(
+        &backslash_path,
+        (0..4097)
+            .map(|i| ((i * 97 + 31) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &newline_path,
+        (0..4097)
+            .map(|i| ((i * 101 + 37) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for path in [backslash_path.as_path(), newline_path.as_path()] {
+        for io_flags in io_flag_sets() {
+            let mut fro_args = io_flags.clone();
+            fro_args.push(path.to_str().unwrap());
+            let sys_args = [path.to_str().unwrap()];
+            assert_same_result(
+                run_fro("cksum", &fro_args),
+                run_system("cksum", &sys_args),
+                &format!("cksum {:?} {:?}", io_flags, path),
+            );
+        }
+    }
+}
+
+#[test]
 fn digest_family_format_flags_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-digest-flags");
     let path = tmp.join("hash file.txt");
@@ -84,6 +118,172 @@ fn digest_family_format_flags_match_system_output() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn digest_family_double_dash_treats_following_operands_as_files() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-double-dash");
+    let dash_path = tmp.join("-leading-dash.txt");
+    fs::write(
+        &dash_path,
+        (0..4097)
+            .map(|i| ((i * 13 + 5) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        for io_flags in io_flag_sets() {
+            let mut fro_args = io_flags.clone();
+            fro_args.push("--");
+            fro_args.push(dash_path.to_str().unwrap());
+            let sys_args = ["--", dash_path.to_str().unwrap()];
+            assert_same_result(
+                run_fro(name, &fro_args),
+                run_system(system_name, &sys_args),
+                &format!("{name} {:?} -- {:?}", io_flags, dash_path),
+            );
+        }
+    }
+}
+
+#[test]
+fn digest_family_escapes_special_filenames_like_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-escape-filenames");
+    let backslash_path = tmp.join("slash\\name.txt");
+    let newline_path = tmp.join("line\nname.txt");
+    fs::write(
+        &backslash_path,
+        (0..4097)
+            .map(|i| ((i * 73 + 17) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &newline_path,
+        (0..4097)
+            .map(|i| ((i * 79 + 19) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        for compat_flags in [vec![], vec!["-b"], vec!["--tag"], vec!["-z"]] {
+            for path in [backslash_path.as_path(), newline_path.as_path()] {
+                let mut fro_args = compat_flags.clone();
+                fro_args.push(path.to_str().unwrap());
+                let mut sys_args = compat_flags.clone();
+                sys_args.push(path.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &fro_args),
+                    run_system(system_name, &sys_args),
+                    &format!("{name} {:?} {:?}", compat_flags, path),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn digest_family_tagged_check_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-tagged");
+    let path_ok = tmp.join("ok file).bin");
+    let path_bad = tmp.join("bad file).bin");
+    fs::write(
+        &path_ok,
+        (0..8193)
+            .map(|i| ((i * 59 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &path_bad,
+        (0..8193)
+            .map(|i| ((i * 61 + 11) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest_ok = tmp.join(format!("{name}-tagged-ok.txt"));
+        let manifest_bad = tmp.join(format!("{name}-tagged-bad.txt"));
+        let ok_manifest = run_system(system_name, &["--tag", path_ok.to_str().unwrap()]);
+        assert!(
+            ok_manifest.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok_manifest.stderr)
+        );
+        fs::write(&manifest_ok, &ok_manifest.stdout).unwrap();
+
+        let bad_manifest = String::from_utf8(ok_manifest.stdout.clone())
+            .unwrap()
+            .replace(path_ok.to_str().unwrap(), path_bad.to_str().unwrap());
+        fs::write(&manifest_bad, bad_manifest).unwrap();
+
+        for manifest in [manifest_ok.as_path(), manifest_bad.as_path()] {
+            let args = ["-c", manifest.to_str().unwrap()];
+            assert_same_result(
+                run_fro(name, &args),
+                run_system(system_name, &args),
+                &format!("{name} tagged check {:?}", manifest),
+            );
+        }
+    }
+}
+
+#[test]
+fn digest_family_check_rejects_check_plus_tag_flag_like_system() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-tag-flag");
+    let path = tmp.join("ok.bin");
+    fs::write(
+        &path,
+        (0..4097)
+            .map(|i| ((i * 67 + 13) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        let manifest = tmp.join(format!("{name}-tagged.txt"));
+        let tagged = run_system(system_name, &["--tag", path.to_str().unwrap()]);
+        assert!(tagged.status.success());
+        fs::write(&manifest, tagged.stdout).unwrap();
+
+        let args = ["--check", "--tag", manifest.to_str().unwrap()];
+        assert_same_result(
+            run_fro(name, &args),
+            run_system(system_name, &args),
+            &format!("{name} check+tag {:?}", manifest),
+        );
     }
 }
 
@@ -359,6 +559,63 @@ fn digest_family_check_missing_file_modes_match_system_output() {
             ),
         ] {
             for manifest in manifests {
+                let mut args = extra_flags.clone();
+                args.push(manifest.to_str().unwrap());
+                assert_same_result(
+                    run_fro(name, &args),
+                    run_system(system_name, &args),
+                    &format!("{name} {:?} {:?}", extra_flags, manifest),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn digest_family_check_escaped_manifest_paths_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-digest-check-escaped-paths");
+    let backslash_path = tmp.join("slash\\name.txt");
+    let newline_path = tmp.join("line\nname.txt");
+    fs::write(
+        &backslash_path,
+        (0..4097)
+            .map(|i| ((i * 83 + 23) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    fs::write(
+        &newline_path,
+        (0..4097)
+            .map(|i| ((i * 89 + 29) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (name, system_name) in [
+        ("sha224sum", "sha224sum"),
+        ("sha256sum", "sha256sum"),
+        ("sha384sum", "sha384sum"),
+        ("sha512sum", "sha512sum"),
+        ("md5sum", "md5sum"),
+        ("b2sum", "b2sum"),
+    ] {
+        for path in [backslash_path.as_path(), newline_path.as_path()] {
+            let manifest = tmp.join(format!(
+                "{name}-{}.txt",
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\n', "_nl_")
+            ));
+            let generated = run_system(system_name, &[path.to_str().unwrap()]);
+            assert!(
+                generated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            fs::write(&manifest, &generated.stdout).unwrap();
+
+            for extra_flags in [vec!["-c"], vec!["--quiet", "-c"], vec!["--status", "-c"]] {
                 let mut args = extra_flags.clone();
                 args.push(manifest.to_str().unwrap());
                 assert_same_result(

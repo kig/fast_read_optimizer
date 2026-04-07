@@ -47,7 +47,6 @@ fn get_regular_file_path<R: AsRawFd>(reader: &mut R) -> Option<String> {
 }
 
 const WC_STREAM_BLOCK_SIZE: usize = 2 << 20;
-
 use libc::{madvise, MADV_HUGEPAGE};
 
 fn get_aligned_wc_block() -> Vec<u8> {
@@ -681,60 +680,18 @@ pub(super) fn wc_totals_from_fd_parallel<R: AsRawFd + Read>(
         return Ok(reduce_wc_counts(&blocks.blocks));
     }
 
-    // Set pipe size fcntl to 1MB
     let fd = reader.as_raw_fd();
-    unsafe {
-        let _res = libc::fcntl(fd, libc::F_SETPIPE_SZ, WC_STREAM_BLOCK_SIZE);
-    }
-    let mut totals = WcTotals {
-        lines: 0,
-        words: 0,
-        chars: 0,
-        bytes: 0,
-        max_line_length: 0,
-    };
-    let mut previous_ended_in_word = false;
-    let buffer = get_aligned_wc_block();
-    let ptr = buffer.as_ptr();
-    let iov = libc::iovec {
-        iov_base: ptr as *mut libc::c_void,
-        iov_len: WC_STREAM_BLOCK_SIZE,
-    };
-    loop {
-        let read =
-            unsafe { libc::vmsplice(fd, &iov as *const libc::iovec, 1, libc::SPLICE_F_NONBLOCK) };
-        if read == 0 {
-            return Ok(totals);
-        } else if read < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => continue,
-                _ => return Err(err),
-            }
-        }
-        let block = &buffer[..read as usize];
-        let counts = count_wc_block(
-            block,
-            WcCountOptions {
-                max_line_length: false,
-                ..options
-            },
-        );
-        merge_wc_counts(
-            &mut totals,
-            &mut previous_ended_in_word,
-            counts,
-            options.words,
-        );
-    }
+    grow_pipe_best_effort(fd)?;
+    let mut pipe_reader = crate::reader::BufReader::with_capacity(WC_STREAM_BLOCK_SIZE, reader);
+    wc_totals_from_reader(&mut pipe_reader, options)
 }
 
 pub(super) fn wc_metadata_totals(
     input: &StreamInput,
     options: WcCountOptions,
 ) -> io::Result<Option<WcTotals>> {
-    if !options.bytes || options.lines || options.words || options.chars {
+    if !options.bytes || options.lines || options.words || options.chars || options.max_line_length
+    {
         return Ok(None);
     }
     let StreamInput::File(path) = input else {

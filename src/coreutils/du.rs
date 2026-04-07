@@ -29,6 +29,26 @@ fn append_du_line(chunk: &mut Vec<u8>, kib: u64, path: &Path, human_readable: bo
     chunk.push(b'\n');
 }
 
+fn du_depth_included(depth: usize, max_depth: Option<usize>) -> bool {
+    max_depth.is_none_or(|limit| depth <= limit)
+}
+
+fn parse_du_max_depth(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid maximum depth ‘{value}’"))
+}
+
+fn write_du_stderr_line(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "du: {message}");
+}
+
+fn write_du_try_help() {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "Try 'du --help' for more information.");
+}
+
 fn du_apply_short_flag(
     summarize: bool,
     all: bool,
@@ -168,6 +188,7 @@ impl Drop for DirHandle {
 struct DuTraversalTask {
     path: PathBuf,
     node_id: usize,
+    depth: usize,
 }
 
 fn du_node_ready(
@@ -234,6 +255,7 @@ fn walk_du_subtree(
     had_warnings: &AtomicBool,
     summarize: bool,
     all: bool,
+    max_depth: Option<usize>,
 ) -> io::Result<()> {
     let mut stack = vec![start];
     while let Some(task) = stack.pop() {
@@ -281,6 +303,7 @@ fn walk_du_subtree(
             };
             let kib = disk_usage_kib(stat.st_blocks as u64);
             if stat_is_dir(&stat) {
+                let child_depth = task.depth + 1;
                 let child_id = {
                     let mut nodes = state.nodes.lock().unwrap();
                     let child_id = nodes.len();
@@ -293,17 +316,18 @@ fn walk_du_subtree(
                         scanned: false,
                         own_stat_done: true,
                         completed: false,
-                        emit: !summarize,
+                        emit: !summarize && du_depth_included(child_depth, max_depth),
                     });
                     child_id
                 };
                 child_dirs.push(DuTraversalTask {
                     path: child_path,
                     node_id: child_id,
+                    depth: child_depth,
                 });
             } else {
                 file_total_kib += kib;
-                if all {
+                if all && du_depth_included(task.depth + 1, max_depth) {
                     file_lines.push(DuLine {
                         path: child_path,
                         kib,
@@ -341,6 +365,7 @@ fn append_du_output(
     path: &Path,
     summarize: bool,
     all: bool,
+    max_depth: Option<usize>,
     human_readable: bool,
     output: &mut Vec<u8>,
     had_warnings: Arc<AtomicBool>,
@@ -371,12 +396,22 @@ fn append_du_output(
     dir_queue.enqueue_one(DuTraversalTask {
         path: path.to_path_buf(),
         node_id: 0,
+        depth: 0,
     });
     run_parallel_work_queue(dir_queue, stop.clone(), parallel_du_worker_count(), {
         let state = state.clone();
         let had_warnings = had_warnings.clone();
         move |task, dir_queue, stop| {
-            walk_du_subtree(task, dir_queue, &state, stop, &had_warnings, summarize, all)
+            walk_du_subtree(
+                task,
+                dir_queue,
+                &state,
+                stop,
+                &had_warnings,
+                summarize,
+                all,
+                max_depth,
+            )
         }
     })?;
 
@@ -432,6 +467,23 @@ mod du_tests {
         let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, b'c').unwrap();
         let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, b's').unwrap();
         assert_eq!(hcs, (true, false, true, true));
+    }
+
+    #[test]
+    fn du_depth_included_respects_optional_limit() {
+        assert!(du_depth_included(0, None));
+        assert!(du_depth_included(1, Some(1)));
+        assert!(!du_depth_included(2, Some(1)));
+    }
+
+    #[test]
+    fn parse_du_max_depth_accepts_non_negative_integers() {
+        assert_eq!(parse_du_max_depth("0").unwrap(), 0);
+        assert_eq!(parse_du_max_depth("17").unwrap(), 17);
+        assert_eq!(
+            parse_du_max_depth("bad").unwrap_err(),
+            "invalid maximum depth ‘bad’"
+        );
     }
 
     #[test]
@@ -580,17 +632,82 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
     let mut all = false;
     let mut human_readable = false;
     let mut total = false;
+    let mut max_depth = None;
+    let mut end_of_options = false;
     let mut paths = Vec::new();
-    for arg in &args[1..] {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if end_of_options {
+            paths.push(arg.clone());
+            index += 1;
+            continue;
+        }
         match arg.as_str() {
+            "--" => end_of_options = true,
             "-s" | "--summarize" => summarize = true,
             "-a" | "--all" => all = true,
             "-h" | "--human-readable" => human_readable = true,
             "-c" | "--total" => total = true,
+            "--max-depth" | "-d" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing value for {arg}"),
+                    ));
+                };
+                match parse_du_max_depth(value) {
+                    Ok(depth) => max_depth = Some(depth),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        write_du_try_help();
+                        return Ok(1);
+                    }
+                }
+            }
+            other if other.starts_with("--max-depth=") => {
+                match parse_du_max_depth(other.trim_start_matches("--max-depth=")) {
+                    Ok(depth) => max_depth = Some(depth),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        write_du_try_help();
+                        return Ok(1);
+                    }
+                }
+            }
             other if other.starts_with('-') && other != "-" && !other.starts_with("--") => {
-                for flag in other.as_bytes().iter().copied().skip(1) {
+                let bytes = other.as_bytes();
+                let mut short_index = 1usize;
+                while short_index < bytes.len() {
+                    let flag = bytes[short_index];
+                    if flag == b'd' {
+                        let value = if short_index + 1 < bytes.len() {
+                            std::str::from_utf8(&bytes[(short_index + 1)..]).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("unsupported du flag: {other}"),
+                                )
+                            })?
+                        } else {
+                            index += 1;
+                            args.get(index).map(String::as_str).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "missing value for -d")
+                            })?
+                        };
+                        match parse_du_max_depth(value) {
+                            Ok(depth) => max_depth = Some(depth),
+                            Err(message) => {
+                                write_du_stderr_line(&message);
+                                write_du_try_help();
+                                return Ok(1);
+                            }
+                        }
+                        break;
+                    }
                     (summarize, all, human_readable, total) =
                         du_apply_short_flag(summarize, all, human_readable, total, flag)?;
+                    short_index += 1;
                 }
             }
             other if other.starts_with('-') && other != "-" => {
@@ -601,6 +718,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             }
             other => paths.push(other.to_string()),
         }
+        index += 1;
     }
 
     if paths.is_empty() {
@@ -612,6 +730,19 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             "du does not support combining -a/--all with -s/--summarize",
         ));
     }
+    if summarize {
+        if let Some(depth) = max_depth {
+            if depth == 0 {
+                write_du_stderr_line("warning: summarizing is the same as using --max-depth=0");
+            } else {
+                write_du_stderr_line(&format!(
+                    "warning: summarizing conflicts with --max-depth={depth}"
+                ));
+                write_du_try_help();
+                return Ok(1);
+            }
+        }
+    }
 
     let out = stdout_buf_writer()?;
     let had_warnings = Arc::new(AtomicBool::new(false));
@@ -622,6 +753,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             Path::new(&path),
             summarize,
             all,
+            max_depth,
             human_readable,
             &mut chunk,
             had_warnings.clone(),

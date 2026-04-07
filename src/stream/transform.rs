@@ -102,6 +102,52 @@ pub fn auto_select_transform_io_pairing(
     }
 }
 
+pub fn run_transform_io_pairing<T, FF2F, FF2S, SF2F, SF2S>(
+    pairing: TransformIoPairing,
+    file_to_file: FF2F,
+    file_to_stream: FF2S,
+    stream_to_file: SF2F,
+    stream_to_stream: SF2S,
+) -> io::Result<T>
+where
+    FF2F: FnOnce(String, File) -> io::Result<T>,
+    FF2S: FnOnce(String, File) -> io::Result<T>,
+    SF2F: FnOnce(File, File) -> io::Result<T>,
+    SF2S: FnOnce(File, File) -> io::Result<T>,
+{
+    match pairing {
+        TransformIoPairing::FileToFile { input_path, output } => file_to_file(input_path, output),
+        TransformIoPairing::FileToStream { input_path, output } => {
+            file_to_stream(input_path, output)
+        }
+        TransformIoPairing::StreamToFile { input, output } => stream_to_file(input, output),
+        TransformIoPairing::StreamToStream { input, output } => stream_to_stream(input, output),
+    }
+}
+
+pub fn run_transform_with_specs<T, FF2F, FF2S, SF2F, SF2S>(
+    input: TransformInputSpec<'_>,
+    output: TransformOutputSpec<'_>,
+    file_to_file: FF2F,
+    file_to_stream: FF2S,
+    stream_to_file: SF2F,
+    stream_to_stream: SF2S,
+) -> io::Result<T>
+where
+    FF2F: FnOnce(String, File) -> io::Result<T>,
+    FF2S: FnOnce(String, File) -> io::Result<T>,
+    SF2F: FnOnce(File, File) -> io::Result<T>,
+    SF2S: FnOnce(File, File) -> io::Result<T>,
+{
+    run_transform_io_pairing(
+        auto_select_transform_io_pairing(input, output)?,
+        file_to_file,
+        file_to_stream,
+        stream_to_file,
+        stream_to_stream,
+    )
+}
+
 fn regular_input_path(input: TransformInputSpec<'_>) -> io::Result<Option<String>> {
     match input {
         TransformInputSpec::Path(path) if is_regular_input_path(path)? => {
@@ -415,7 +461,11 @@ pub fn run_reader_transform_to_pipe<R: Read>(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_transform_io_pairing, TransformIoPairingKind};
+    use super::{
+        classify_transform_io_pairing, run_transform_io_pairing, TransformIoPairing,
+        TransformIoPairingKind,
+    };
+    use std::fs::File;
 
     #[test]
     fn classify_transform_io_pairing_covers_all_file_and_stream_combinations() {
@@ -435,6 +485,63 @@ mod tests {
             classify_transform_io_pairing(false, false),
             TransformIoPairingKind::StreamToStream
         );
+    }
+
+    #[test]
+    fn run_transform_io_pairing_dispatches_each_variant() {
+        let file = || File::open("/dev/null").expect("open /dev/null");
+
+        let file_to_file = run_transform_io_pairing(
+            TransformIoPairing::FileToFile {
+                input_path: "in".to_string(),
+                output: file(),
+            },
+            |input_path, _| Ok(format!("file-file:{input_path}")),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+        )
+        .expect("dispatch file to file");
+        assert_eq!(file_to_file, "file-file:in");
+
+        let file_to_stream = run_transform_io_pairing(
+            TransformIoPairing::FileToStream {
+                input_path: "in".to_string(),
+                output: file(),
+            },
+            |_, _| unreachable!("wrong branch"),
+            |input_path, _| Ok(format!("file-stream:{input_path}")),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+        )
+        .expect("dispatch file to stream");
+        assert_eq!(file_to_stream, "file-stream:in");
+
+        let stream_to_file = run_transform_io_pairing(
+            TransformIoPairing::StreamToFile {
+                input: file(),
+                output: file(),
+            },
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| Ok("stream-file".to_string()),
+            |_, _| unreachable!("wrong branch"),
+        )
+        .expect("dispatch stream to file");
+        assert_eq!(stream_to_file, "stream-file");
+
+        let stream_to_stream = run_transform_io_pairing(
+            TransformIoPairing::StreamToStream {
+                input: file(),
+                output: file(),
+            },
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| unreachable!("wrong branch"),
+            |_, _| Ok("stream-stream".to_string()),
+        )
+        .expect("dispatch stream to stream");
+        assert_eq!(stream_to_stream, "stream-stream");
     }
 }
 

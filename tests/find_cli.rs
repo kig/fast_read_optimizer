@@ -63,6 +63,16 @@ fn sorted_lines(bytes: &[u8]) -> Vec<String> {
     lines
 }
 
+fn sorted_nul_fields(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut fields = bytes
+        .split(|&byte| byte == b'\0')
+        .filter(|field| !field.is_empty())
+        .map(|field| field.to_vec())
+        .collect::<Vec<_>>();
+    fields.sort();
+    fields
+}
+
 #[test]
 fn find_matches_system_for_nested_tree_ignoring_order() {
     let tmp = unique_temp_dir("fro-find-tree");
@@ -175,4 +185,204 @@ fn find_matches_system_for_symlinks_broken_symlinks_and_fifos() {
 
     assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
     assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_type_f_matches_system_for_regular_files_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-type-f");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let regular = root.join("regular.txt");
+    let symlink_path = root.join("regular-link");
+    let fifo = root.join("events.fifo");
+    fs::write(&regular, b"regular").unwrap();
+    fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+    std::os::unix::fs::symlink(&regular, &symlink_path).unwrap();
+    make_fifo(&fifo);
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap(), "-type", "f"]));
+    let system = assert_success(run_system(&[root.to_str().unwrap(), "-type", "f"]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_type_d_matches_system_for_directories_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-type-d");
+    let root = tmp.join("root");
+    let nested = root.join("nested").join("deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap(), "-type", "d"]));
+    let system = assert_success(run_system(&[root.to_str().unwrap(), "-type", "d"]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_name_matches_system_for_basename_globs_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-name");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    let deeper = nested.join("deeper");
+    fs::create_dir_all(&deeper).unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+    fs::write(root.join("top.log"), b"log").unwrap();
+    fs::write(nested.join("mid.txt"), b"mid").unwrap();
+    fs::write(deeper.join("leaf.txt"), b"leaf").unwrap();
+    fs::write(deeper.join("leaf.md"), b"leaf-md").unwrap();
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap(), "-name", "*.txt"]));
+    let system = assert_success(run_system(&[root.to_str().unwrap(), "-name", "*.txt"]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_name_combines_with_type_and_print0_like_system_find() {
+    let tmp = unique_temp_dir("fro-find-name-print0");
+    let root = tmp.join("root");
+    let nested = root.join("nested.rs");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("main.rs"), b"fn main() {}\n").unwrap();
+    fs::write(root.join("main.txt"), b"txt").unwrap();
+    fs::write(nested.join("lib.rs"), b"pub fn lib() {}\n").unwrap();
+    fs::write(nested.join("note.rs.bak"), b"bak").unwrap();
+
+    let fro = assert_success(run_fro(&[
+        "find",
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-name",
+        "*.rs",
+        "-print0",
+    ]));
+    let system = assert_success(run_system(&[
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-name",
+        "*.rs",
+        "-print0",
+    ]));
+
+    assert_eq!(
+        sorted_nul_fields(&fro.stdout),
+        sorted_nul_fields(&system.stdout)
+    );
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_maxdepth_matches_system_for_common_tree_limits_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-maxdepth");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    let deeper = nested.join("deeper");
+    fs::create_dir_all(&deeper).unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+    fs::write(nested.join("mid.txt"), b"mid").unwrap();
+    fs::write(deeper.join("leaf.txt"), b"leaf").unwrap();
+
+    let fro = assert_success(run_fro(&[
+        "find",
+        root.to_str().unwrap(),
+        "-maxdepth",
+        "1",
+    ]));
+    let system = assert_success(run_system(&[
+        root.to_str().unwrap(),
+        "-maxdepth",
+        "1",
+    ]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_maxdepth_combines_with_type_and_name_like_system_find() {
+    let tmp = unique_temp_dir("fro-find-maxdepth-name");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    let deeper = nested.join("deeper");
+    fs::create_dir_all(&deeper).unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+    fs::write(nested.join("mid.txt"), b"mid").unwrap();
+    fs::write(deeper.join("leaf.txt"), b"leaf").unwrap();
+    fs::write(nested.join("mid.log"), b"log").unwrap();
+
+    let fro = assert_success(run_fro(&[
+        "find",
+        root.to_str().unwrap(),
+        "-maxdepth",
+        "2",
+        "-type",
+        "f",
+        "-name",
+        "*.txt",
+    ]));
+    let system = assert_success(run_system(&[
+        root.to_str().unwrap(),
+        "-maxdepth",
+        "2",
+        "-type",
+        "f",
+        "-name",
+        "*.txt",
+    ]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_print0_matches_system_for_regular_files_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-print0");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let spaced = root.join("space name.txt");
+    fs::write(&spaced, b"regular").unwrap();
+    fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+
+    let fro = assert_success(run_fro(&[
+        "find",
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-print0",
+    ]));
+    let system = assert_success(run_system(&[
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-print0",
+    ]));
+
+    assert_eq!(
+        sorted_nul_fields(&fro.stdout),
+        sorted_nul_fields(&system.stdout)
+    );
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_help_mentions_type_and_print0_surface() {
+    let output = run_fro(&["find", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("find - Walk one or more directory trees and print matching paths."));
+    assert!(stdout.contains("[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-print|-print0]"));
+    assert!(stdout.contains("-maxdepth limits descent below each starting path"));
+    assert!(stdout.contains("-type supports the common GNU/POSIX letters"));
+    assert!(stdout.contains("-name matches only the final path component"));
+    assert!(stdout.contains("-print0 emits NUL-delimited paths"));
+    assert!(output.stderr.is_empty());
 }

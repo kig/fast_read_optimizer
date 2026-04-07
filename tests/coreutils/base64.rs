@@ -141,9 +141,13 @@ fn base64_encode_flags_match_system_output() {
         for compat_flags in [
             vec![],
             vec!["-w", "0"],
+            vec!["--wrap", "0"],
             vec!["--wrap=0"],
+            vec!["-w0"],
             vec!["-w", "12"],
+            vec!["--wrap", "12"],
             vec!["--wrap=12"],
+            vec!["-w12"],
         ] {
             let mut fro_args = io_flags.clone();
             fro_args.extend(compat_flags.iter().copied());
@@ -157,7 +161,15 @@ fn base64_encode_flags_match_system_output() {
             );
         }
 
-        for compat_flags in [vec![], vec!["-w", "0"], vec!["--wrap=12"]] {
+        for compat_flags in [
+            vec![],
+            vec!["-w", "0"],
+            vec!["--wrap", "0"],
+            vec!["-w0"],
+            vec!["--wrap=12"],
+            vec!["--wrap", "12"],
+            vec!["-w12"],
+        ] {
             let mut fro_args = io_flags.clone();
             fro_args.extend(compat_flags.iter().copied());
             assert_same_result(
@@ -273,6 +285,37 @@ fn base64_rejects_extra_operands_like_system() {
         run_fro("base64", &[a.to_str().unwrap(), b.to_str().unwrap()]),
         run_system("base64", &[a.to_str().unwrap(), b.to_str().unwrap()]),
         "base64 extra operand",
+    );
+}
+
+#[test]
+fn base64_wrap_argument_forms_match_system_errors_and_output() {
+    let tmp = unique_temp_dir("fro-coreutils-base64-wrap-forms");
+    let path = tmp.join("input.bin");
+    let bytes = (0..137)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &bytes).unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["--wrap", "12", path.to_str().unwrap()],
+            vec!["-w12", path.to_str().unwrap()],
+            vec!["--wrap", "0", path.to_str().unwrap()],
+            vec!["-w0", path.to_str().unwrap()],
+        ] {
+            assert_same_result(
+                run_fro("base64", &[io_flags.clone(), compat_flags.clone()].concat()),
+                run_system("base64", &compat_flags),
+                &format!("base64 wrap form {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+
+    assert_same_result(
+        run_fro("base64", &["--wrap"]),
+        run_system("base64", &["--wrap"]),
+        "base64 missing --wrap argument",
     );
 }
 

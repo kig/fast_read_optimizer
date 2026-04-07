@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::note_direct_unaligned_fallback;
 
 pub(super) fn should_use_direct_io(
     use_direct: bool,
@@ -13,7 +14,14 @@ pub(super) fn should_use_direct_io(
             "Direct I/O requires a 4096-byte aligned read length"
         );
     }
-    use_direct && (offset % 4096 == 0) && (len % 4096 == 0) && (offset + len as u64 <= file_size)
+    let direct = use_direct
+        && (offset % 4096 == 0)
+        && (len % 4096 == 0)
+        && (offset + len as u64 <= file_size);
+    if use_direct && !direct {
+        note_direct_unaligned_fallback("read", offset, len);
+    }
+    direct
 }
 
 pub(super) fn submit_read(

@@ -95,38 +95,80 @@ fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'st
 }
 
 fn parse_cmp_limit(value: &str) -> io::Result<u64> {
-    value.parse::<u64>().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid --bytes value '{value}'"),
-        )
-    })
+    parse_cmp_count(value, "--bytes")
 }
 
 fn parse_cmp_skip_spec(value: &str) -> io::Result<(u64, u64)> {
     if let Some((left, right)) = value.split_once(':') {
-        let first_skip = left.parse::<u64>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid --ignore-initial value '{value}'"),
-            )
-        })?;
-        let second_skip = right.parse::<u64>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid --ignore-initial value '{value}'"),
-            )
-        })?;
+        let first_skip =
+            parse_cmp_count(left, "--ignore-initial").map_err(|_| invalid_cmp_skip_spec(value))?;
+        let second_skip =
+            parse_cmp_count(right, "--ignore-initial").map_err(|_| invalid_cmp_skip_spec(value))?;
         Ok((first_skip, second_skip))
     } else {
-        let skip = value.parse::<u64>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid --ignore-initial value '{value}'"),
-            )
-        })?;
+        let skip =
+            parse_cmp_count(value, "--ignore-initial").map_err(|_| invalid_cmp_skip_spec(value))?;
         Ok((skip, skip))
     }
+}
+
+fn parse_cmp_count(value: &str, flag: &str) -> io::Result<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {flag} value '{value}'"),
+        ));
+    }
+
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num_str, suffix) = value.split_at(split);
+    let num = num_str.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {flag} value '{value}'"),
+        )
+    })?;
+    let multiplier = cmp_suffix_multiplier(suffix).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {flag} value '{value}'"),
+        )
+    })?;
+    num.checked_mul(multiplier).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {flag} value '{value}'"),
+        )
+    })
+}
+
+fn cmp_suffix_multiplier(suffix: &str) -> Option<u64> {
+    match suffix.trim() {
+        "" => Some(1),
+        "kB" | "KB" => Some(1_000),
+        "k" | "K" | "KiB" => Some(1 << 10),
+        "MB" => Some(1_000_000),
+        "M" | "MiB" => Some(1 << 20),
+        "GB" => Some(1_000_000_000),
+        "G" | "GiB" => Some(1 << 30),
+        "TB" => Some(1_000_000_000_000),
+        "T" | "TiB" => Some(1_u64 << 40),
+        "PB" => Some(1_000_000_000_000_000),
+        "P" | "PiB" => Some(1_u64 << 50),
+        "EB" => Some(1_000_000_000_000_000_000),
+        "E" | "EiB" => Some(1_u64 << 60),
+        _ => None,
+    }
+}
+
+fn invalid_cmp_skip_spec(value: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid --ignore-initial value '{value}'"),
+    )
 }
 
 pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
@@ -139,9 +181,16 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let mut first_skip = 0u64;
     let mut second_skip = 0u64;
     let mut files = Vec::new();
+    let mut end_of_options = false;
     let mut i = 1usize;
     while i < args.len() {
+        if end_of_options {
+            files.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
+            "--" => end_of_options = true,
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
@@ -186,7 +235,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [-l|--verbose] [-b|--print-bytes] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] <file1> <file2>",
+        "[-s|--quiet|--silent] [-l|--verbose] [-b|--print-bytes] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] [--] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -496,15 +545,22 @@ mod tests {
     fn parse_cmp_limit_accepts_decimal_counts() {
         assert_eq!(parse_cmp_limit("0").unwrap(), 0);
         assert_eq!(parse_cmp_limit("17").unwrap(), 17);
+        assert_eq!(parse_cmp_limit("1k").unwrap(), 1024);
+        assert_eq!(parse_cmp_limit("1KB").unwrap(), 1000);
+        assert_eq!(parse_cmp_limit("2MiB").unwrap(), 2 << 20);
         assert!(parse_cmp_limit("x").is_err());
+        assert!(parse_cmp_limit("1mb").is_err());
     }
 
     #[test]
     fn parse_cmp_skip_spec_accepts_shared_and_split_skips() {
         assert_eq!(parse_cmp_skip_spec("4").unwrap(), (4, 4));
         assert_eq!(parse_cmp_skip_spec("3:9").unwrap(), (3, 9));
+        assert_eq!(parse_cmp_skip_spec("1K:1KB").unwrap(), (1024, 1000));
+        assert_eq!(parse_cmp_skip_spec("2MiB").unwrap(), (2 << 20, 2 << 20));
         assert!(parse_cmp_skip_spec("x").is_err());
         assert!(parse_cmp_skip_spec("1:x").is_err());
+        assert!(parse_cmp_skip_spec("1mb").is_err());
     }
 
     #[test]

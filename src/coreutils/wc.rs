@@ -143,6 +143,46 @@ fn wc_totals_for_input(
     }
 }
 
+fn apply_wc_short_flag_bundle(
+    arg: &str,
+    print_lines: &mut bool,
+    print_words: &mut bool,
+    print_chars: &mut bool,
+    print_bytes: &mut bool,
+    print_max_line_length: &mut bool,
+) -> bool {
+    let Some(bundle) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if bundle.is_empty() || bundle.starts_with('-') {
+        return false;
+    }
+
+    let mut next_lines = *print_lines;
+    let mut next_words = *print_words;
+    let mut next_chars = *print_chars;
+    let mut next_bytes = *print_bytes;
+    let mut next_max_line_length = *print_max_line_length;
+
+    for flag in bundle.bytes() {
+        match flag {
+            b'l' => next_lines = true,
+            b'w' => next_words = true,
+            b'm' => next_chars = true,
+            b'c' => next_bytes = true,
+            b'L' => next_max_line_length = true,
+            _ => return false,
+        }
+    }
+
+    *print_lines = next_lines;
+    *print_words = next_words;
+    *print_chars = next_chars;
+    *print_bytes = next_bytes;
+    *print_max_line_length = next_max_line_length;
+    true
+}
+
 pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
     let mut print_lines = false;
     let mut print_words = false;
@@ -158,7 +198,7 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
             "-l" => print_lines = true,
             "-w" => print_words = true,
             "-m" => print_chars = true,
-            "-c" => print_bytes = true,
+            "-c" | "--bytes" => print_bytes = true,
             "-L" | "--max-line-length" => print_max_line_length = true,
             "--files0-from" => {
                 i += 1;
@@ -175,6 +215,15 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            other
+                if apply_wc_short_flag_bundle(
+                    other,
+                    &mut print_lines,
+                    &mut print_words,
+                    &mut print_chars,
+                    &mut print_bytes,
+                    &mut print_max_line_length,
+                ) => {}
             other => files.push(other.to_string()),
         }
         i += 1;

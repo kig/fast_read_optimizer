@@ -476,6 +476,7 @@ Useful options:
 
 - `--all`
 - `--all-dir <path>` (repeatable)
+- `--global` (single-target `--for <path>` flow: promotes the tuned mount into config defaults)
 - `--for <path>`
 - `--plan`
 - `--test-dir`
@@ -528,11 +529,20 @@ Useful options:
 - `--test-size`
 - `--max-drive-writes`
 
+Focused tree-comparison slice:
+
+- `fro-benchmark --skip-build --no-fail --iters 1 --test-size 64MiB 'tree compare:'`
+- This runs a narrow recursive/tree-walk comparison set:
+  - `recursive-read-bench` vs `file-list-read-bench` vs `fd`
+  - `fro copy --recursive` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
+- The tree slice reports `files/s` so future dirwalk and recursive-copy work can compare traversal-heavy designs without pretending tiny-file trees are primarily about bulk GB/s.
+
 Wear note:
 
 - a full benchmark run does real writes too
 - rough rule of thumb:
   - `bytes_written ~= 13 x test_size + 2 GiB`
+- auto-sizing now counts that fixed `+ 2 GiB` style benchmark overhead against `--max-drive-writes`, so write-heavy microbench slices shrink deterministically when the remaining budget is small
 
 ### Microbenchmarks
 

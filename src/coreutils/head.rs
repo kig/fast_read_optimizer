@@ -28,6 +28,8 @@ enum HeaderMode {
 }
 
 const HEAD_LINE_PREFIX_SCAN_BLOCK_SIZE: usize = 256 << 10;
+const HEAD_SMALL_STREAM_LINE_CUTOFF: u64 = 64;
+const OBSOLETE_HEAD_BLOCK_MULTIPLIER: u64 = 512;
 
 fn regular_stdin_path() -> io::Result<Option<&'static str>> {
     if fd_is_regular(libc::STDIN_FILENO)? {
@@ -92,6 +94,75 @@ fn parse_head_count(value: &str, flag: &str) -> io::Result<HeadCount> {
     })
 }
 
+fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<HeaderMode>)>> {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return Ok(None);
+    };
+    if rest.is_empty() || !rest.as_bytes()[0].is_ascii_digit() {
+        return Ok(None);
+    }
+
+    let digit_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let count = rest[..digit_end].parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid obsolete head count: {arg}"),
+        )
+    })?;
+
+    let mut mode = HeadMode::Lines(HeadCount::FromStart(count));
+    let mut header_mode = None;
+    for flag in rest[digit_end..].chars() {
+        match flag.to_ascii_lowercase() {
+            'c' => mode = HeadMode::Bytes(HeadCount::FromStart(count)),
+            'b' => {
+                mode = HeadMode::Bytes(HeadCount::FromStart(
+                    count
+                        .checked_mul(OBSOLETE_HEAD_BLOCK_MULTIPLIER)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid obsolete head count: {arg}"),
+                            )
+                        })?,
+                ))
+            }
+            'k' => {
+                mode = HeadMode::Bytes(HeadCount::FromStart(count.checked_mul(1024).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid obsolete head count: {arg}"),
+                        )
+                    },
+                )?))
+            }
+            'm' => {
+                mode = HeadMode::Bytes(HeadCount::FromStart(
+                    count.checked_mul(1024_u64.pow(2)).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid obsolete head count: {arg}"),
+                        )
+                    })?,
+                ))
+            }
+            'q' => header_mode = Some(HeaderMode::Never),
+            'v' => header_mode = Some(HeaderMode::Always),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported head flag: {arg}"),
+                ))
+            }
+        }
+    }
+
+    Ok(Some((mode, header_mode)))
+}
+
 fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMode, Vec<String>)> {
     let mut io_mode = IOMode::Auto;
     let mut mode = HeadMode::Lines(HeadCount::FromStart(10));
@@ -105,6 +176,20 @@ fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMo
             "--no-direct" => io_mode = IOMode::PageCache,
             "--quiet" | "--silent" => header_mode = HeaderMode::Never,
             "--verbose" => header_mode = HeaderMode::Always,
+            "--lines" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for --lines")
+                })?;
+                mode = HeadMode::Lines(parse_head_count(value, "--lines")?);
+            }
+            "--bytes" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for --bytes")
+                })?;
+                mode = HeadMode::Bytes(parse_head_count(value, "--bytes")?);
+            }
             "-q" => header_mode = HeaderMode::Never,
             "-v" => header_mode = HeaderMode::Always,
             "-n" => {
@@ -127,21 +212,36 @@ fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMo
             other if other.starts_with("-c") && other.len() > 2 => {
                 mode = HeadMode::Bytes(parse_head_count(&other[2..], "-c")?);
             }
-            other if other.starts_with('-') && other != "-" => {
-                for flag in other[1..].chars() {
-                    match flag {
-                        'q' => header_mode = HeaderMode::Never,
-                        'v' => header_mode = HeaderMode::Always,
-                        _ => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unsupported head flag: {other}"),
-                            ))
+            other if other.starts_with("--lines=") => {
+                mode = HeadMode::Lines(parse_head_count(&other["--lines=".len()..], "--lines")?);
+            }
+            other if other.starts_with("--bytes=") => {
+                mode = HeadMode::Bytes(parse_head_count(&other["--bytes=".len()..], "--bytes")?);
+            }
+            other => {
+                if let Some((obsolete_mode, obsolete_header_mode)) = parse_obsolete_head_arg(other)?
+                {
+                    mode = obsolete_mode;
+                    if let Some(header) = obsolete_header_mode {
+                        header_mode = header;
+                    }
+                } else if other.starts_with('-') && other != "-" {
+                    for flag in other[1..].chars() {
+                        match flag {
+                            'q' => header_mode = HeaderMode::Never,
+                            'v' => header_mode = HeaderMode::Always,
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("unsupported head flag: {other}"),
+                                ))
+                            }
                         }
                     }
+                } else {
+                    files.push(other.to_string());
                 }
             }
-            other => files.push(other.to_string()),
         }
         i += 1;
     }
@@ -169,6 +269,9 @@ fn write_head_bytes_from_start<W: Write>(
 }
 
 fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
+    if cfg!(test) {
+        return Ok(false);
+    }
     if bytes == 0 {
         return Ok(true);
     }
@@ -391,6 +494,32 @@ fn write_head_lines_all_but_last<W: Write>(
     out.write_all(&bytes[..end])
 }
 
+fn should_use_small_stream_stdout_fast_path(
+    inputs: &[StreamInput],
+    mode: HeadMode,
+    show_headers: bool,
+) -> io::Result<bool> {
+    if cfg!(test) {
+        return Ok(false);
+    }
+    if show_headers {
+        return Ok(false);
+    }
+    let [input] = inputs else {
+        return Ok(false);
+    };
+    let HeadMode::Lines(HeadCount::FromStart(lines)) = mode else {
+        return Ok(false);
+    };
+    if lines > HEAD_SMALL_STREAM_LINE_CUTOFF {
+        return Ok(false);
+    }
+    match input {
+        StreamInput::Stdin { .. } => Ok(regular_stdin_path()?.is_none()),
+        _ => Ok(false),
+    }
+}
+
 pub(super) fn run_head(args: &[String]) -> io::Result<()> {
     let (io_mode, mode, header_mode, files) = parse_head_options(args)?;
     let inputs = parse_stream_inputs(files);
@@ -399,6 +528,19 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
         HeaderMode::Always => true,
         HeaderMode::Never => false,
     };
+    if should_use_small_stream_stdout_fast_path(&inputs, mode, show_headers)? {
+        let [input] = inputs.as_slice() else {
+            unreachable!("small stream fast path requires a single stdin input");
+        };
+        let HeadMode::Lines(HeadCount::FromStart(lines)) = mode else {
+            unreachable!("small stream fast path only supports line prefixes");
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        write_head_lines_from_start(&mut out, input, lines)?;
+        out.flush()?;
+        return Ok(());
+    }
     let mut out = stdout_buf_writer()?;
     for (index, input) in inputs.iter().enumerate() {
         if show_headers {

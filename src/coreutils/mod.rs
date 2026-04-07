@@ -153,6 +153,9 @@ fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
                 rewritten.push("--cp-no-target-directory".to_string())
             }
             "-u" | "--update" => rewritten.push("--cp-update".to_string()),
+            "-p" | "--preserve" | "--preserve=mode,ownership,timestamps" => {
+                rewritten.push("--cp-preserve".to_string())
+            }
             short if short.starts_with('-') && !short.starts_with("--") && short.len() > 2 => {
                 if let Some((expanded, consumed_next)) =
                     rewrite_cp_short_flag_cluster(short, command_args.get(index + 1))
@@ -183,6 +186,7 @@ fn rewrite_cp_short_flag_cluster(
             'n' => rewritten.push("--cp-no-clobber".to_string()),
             'T' => rewritten.push("--cp-no-target-directory".to_string()),
             'u' => rewritten.push("--cp-update".to_string()),
+            'p' => rewritten.push("--cp-preserve".to_string()),
             'r' => rewritten.push("-r".to_string()),
             'R' => rewritten.push("-R".to_string()),
             'v' => rewritten.push("-v".to_string()),

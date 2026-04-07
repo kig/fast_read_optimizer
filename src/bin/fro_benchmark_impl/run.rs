@@ -124,6 +124,8 @@ pub(super) fn main_impl() {
     let target_file_cache = run_dir.join("fro_bench_tmp_cache").display().to_string();
     let recursive_tree = test_path.join("fro_bench_recursive_tree");
     let recursive_tree_str = recursive_tree.display().to_string();
+    let recursive_tree_manifest = run_dir.join("fro_bench_recursive_tree_manifest.txt");
+    let recursive_tree_manifest_str = recursive_tree_manifest.display().to_string();
     let recursive_copy_target = run_dir
         .join("fro_bench_recursive_copy_out")
         .display()
@@ -134,6 +136,7 @@ pub(super) fn main_impl() {
         target_file_dir.clone(),
         target_file_cache.clone(),
         recursive_tree_str.clone(),
+        recursive_tree_manifest_str.clone(),
         recursive_copy_target.clone(),
     );
 
@@ -149,16 +152,19 @@ pub(super) fn main_impl() {
         println!("{}", combined);
     }
 
-    let recursive_selected_explicitly =
-        matches_any_pattern("recursive-read-bench (hot)", &patterns)
-            || matches_any_pattern("copy (recursive, hot)", &patterns);
+    let recursive_selected_explicitly = [
+        "recursive-read-bench (hot)",
+        "copy (recursive, hot)",
+        "tree compare:",
+    ]
+    .iter()
+    .any(|pattern| matches_any_pattern(pattern, &patterns));
     let recursive_fixture_stats = recursive_tree_fixture_stats(&recursive_tree);
     let recursive_fixture_exists = recursive_fixture_stats.is_some();
     let mut selected_tests = Vec::new();
     for t in tests {
         if patterns.is_empty() {
-            let needs_recursive_fixture =
-                t.name.starts_with("recursive-read-bench") || t.name.starts_with("copy (recursive");
+            let needs_recursive_fixture = matches!(t.bytes_hint, BytesHint::RecursiveTree);
             if needs_recursive_fixture && !recursive_fixture_exists {
                 continue;
             }
@@ -207,6 +213,7 @@ pub(super) fn main_impl() {
     let mut need_recursive_tree = false;
     let mut need_target_dir_matching = false;
     let mut need_target_cache_matching = false;
+    let mut need_recursive_tree_manifest = false;
 
     let mut num_full_writes: u64 = 0;
     let mut fixed_write_bytes: u64 = 0;
@@ -223,6 +230,10 @@ pub(super) fn main_impl() {
             need_target_cache = true;
         }
         if t.args.iter().any(|s| s == &recursive_tree_str) {
+            need_recursive_tree = true;
+        }
+        if t.args.iter().any(|s| s == &recursive_tree_manifest_str) {
+            need_recursive_tree_manifest = true;
             need_recursive_tree = true;
         }
 
@@ -280,6 +291,7 @@ pub(super) fn main_impl() {
             fs,
             file_count,
             num_full_writes,
+            fixed_write_bytes,
             min_test_size,
             max_test_size,
             max_drive_writes,
@@ -289,10 +301,17 @@ pub(super) fn main_impl() {
         4 * 1024 * 1024 * 1024
     };
 
-    let est_user_writes = size
-        .saturating_mul(num_full_writes)
-        .saturating_add(fixed_write_bytes);
-    let alloc = size.saturating_mul(file_count);
+    if file_count > 0 && test_size.is_none() && size < min_test_size {
+        eprintln!(
+            "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
+            format_bytes(size),
+            format_bytes(min_test_size),
+        );
+    }
+
+    let est_user_writes =
+        fro::test_sizing::estimate_user_writes(size, num_full_writes, fixed_write_bytes);
+    let alloc = fro::test_sizing::estimate_alloc_bytes(size, file_count);
     let recursive_tree_fixture_files = if let Some((_, file_count)) = recursive_fixture_stats {
         file_count
     } else if need_recursive_tree && recursive_selected_explicitly {
@@ -399,16 +418,27 @@ pub(super) fn main_impl() {
     if need_recursive_tree && recursive_selected_explicitly && !recursive_fixture_exists {
         create_recursive_tree_fixture(&recursive_tree, size);
     }
+    if need_recursive_tree_manifest && recursive_tree.is_dir() {
+        write_recursive_tree_manifest(&recursive_tree, &recursive_tree_manifest).unwrap_or_else(
+            |e| {
+                panic!(
+                    "Could not create recursive benchmark manifest {} {}",
+                    recursive_tree_manifest.display(),
+                    e
+                )
+            },
+        );
+    }
 
     let mut regressions = false;
 
     println!(
-        "{:<35} | {:<12} | {:<12} | {:<12} | {:<12} | {:<10}",
-        "Benchmark", "Best (GB/s)", "Min", "Max", "Target", "Status"
+        "{:<48} | {:<10} | {:<12} | {:<12} | {:<12} | {:<12} | {:<10}",
+        "Benchmark", "Metric", "Best", "Min", "Max", "Target", "Status"
     );
     println!(
-        "{:-<35}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<10}",
-        "", "", "", "", "", ""
+        "{:-<48}-|-{:-<10}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<12}-|-{:-<10}",
+        "", "", "", "", "", "", ""
     );
 
     for t in selected_tests {
@@ -456,18 +486,27 @@ pub(super) fn main_impl() {
                     size,
                 )),
             };
+            let file_count_for_effective_speed = match t.bytes_hint {
+                BytesHint::RecursiveTree => Some(recursive_tree_fixture_files as f64),
+                _ => None,
+            };
             let summary = match t.kind {
                 CommandKind::Fro => parse_reported_summary(&combined),
                 CommandKind::ExternalDiscardStdout => None,
             };
-            let speed = match t.kind {
-                CommandKind::Fro => summary.as_ref().map(|s| s.gbps).unwrap_or_else(|| {
-                    bytes_for_effective_speed
+            let speed = match t.metric {
+                MetricKind::Gbps => match t.kind {
+                    CommandKind::Fro => summary.as_ref().map(|s| s.gbps).unwrap_or_else(|| {
+                        bytes_for_effective_speed
+                            .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
+                            .unwrap_or(0.0)
+                    }),
+                    CommandKind::ExternalDiscardStdout => bytes_for_effective_speed
                         .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
-                        .unwrap_or(0.0)
-                }),
-                CommandKind::ExternalDiscardStdout => bytes_for_effective_speed
-                    .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
+                        .unwrap_or(0.0),
+                },
+                MetricKind::FilesPerSecond => file_count_for_effective_speed
+                    .map(|files| files / elapsed.as_secs_f64().max(1e-9))
                     .unwrap_or(0.0),
             };
             min_speed = min_speed.min(speed);
@@ -503,8 +542,15 @@ pub(super) fn main_impl() {
             .unwrap_or_default();
 
         println!(
-            "{:<35} | {:<12.2} | {:<12.2} | {:<12.2} | {:<12.2} | {}{}",
-            t.name, best_speed, min_speed, max_speed, t.target, status, best_params
+            "{:<48} | {:<10} | {:<12.2} | {:<12.2} | {:<12.2} | {:<12.2} | {}{}",
+            t.name,
+            t.metric.label(),
+            best_speed,
+            min_speed,
+            max_speed,
+            t.target,
+            status,
+            best_params
         );
 
         if best_speed == 0.0 {

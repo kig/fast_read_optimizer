@@ -30,6 +30,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[
                 "Use -n 1 for one measured run with the current tuned parameters.",
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
+                "With --direct, fro prints one stderr warning if any requested direct read falls back to page cache because O_DIRECT open failed or a tail/range was unaligned.",
                 "--auto-lift starts cold files on the direct path while a background thread warms the page cache for later iterations in the same process.",
                 "--to-memory defaults to an auto backend: mmap when the first page looks cached, otherwise the direct/shared-buffer loader.",
                 "--paged-shared-buffer forces the old shared destination-buffer loader for read --to-memory.",
@@ -65,6 +66,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[
                 "This is a literal substring search, not a regex engine.",
                 "Matches are printed as offset:pattern.",
+                "With --direct, fro prints one stderr warning if any requested direct scan falls back to page cache because O_DIRECT open failed or a tail request was unaligned.",
                 "--auto-lift starts cold files on the direct path while a background thread warms the page cache for later iterations in the same process.",
             ],
             examples: &[
@@ -109,9 +111,10 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "rm" => Some(CommandHelp {
             name: "rm",
-            usage: "rm [-f] [-r|-R|--recursive] [-v] <file> [file ...]",
+            usage: "rm [-f] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
             summary: "Remove files or directory trees, with recursive delete using fro's tree-walk plumbing.",
             notes: &[
+                "-d/--dir removes empty directories without switching to the recursive tree-walk path.",
                 "-f/--force ignores missing operands and missing files, matching the common cleanup flow.",
                 "Recursive removal uses the existing tree-delete helper; plain file removal stays on the simple unlink path.",
             ],
@@ -122,11 +125,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "mv" => Some(CommandHelp {
             name: "mv",
-            usage: "mv [-f] [-v] [-t DIRECTORY] <source>... <target>",
+            usage: "mv [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
             summary: "Rename files or move them into a directory, with cross-filesystem fallback via fro copy helpers.",
             notes: &[
                 "Same-filesystem moves use rename(2) when possible.",
                 "Cross-filesystem file and directory moves fall back to the fro copy/remove path.",
+                "-T/--no-target-directory treats the destination as a path, matching GNU mv.",
             ],
             examples: &[
                 ("Rename one file", "mv old.bin new.bin"),
@@ -192,7 +196,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "cmp" => Some(CommandHelp {
             name: "cmp",
-            usage: "cmp [--auto|--no-direct|--direct] <file1> <file2>",
+            usage: "cmp [--auto|--no-direct|--direct] [--] <file1> <file2>",
             summary: "Compare two files using fro's diff engine and GNU cmp-style reporting.",
             notes: &["Exits nonzero on mismatch or size difference."],
             examples: &[("Compare two files", "cmp a.bin b.bin")],
@@ -215,27 +219,47 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "find" => Some(CommandHelp {
             name: "find",
-            usage: "find [path ...]",
-            summary: "Walk one or more directory trees and print every encountered path.",
-            notes: &["This first correctness slice does not guarantee output ordering."],
-            examples: &[("Walk the current tree", "find ."), ("Walk two roots", "find src tests")],
+            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-print|-print0]",
+            summary: "Walk one or more directory trees and print matching paths.",
+            notes: &[
+                "This correctness slice does not guarantee output ordering.",
+                "-maxdepth limits descent below each starting path while still printing matching roots.",
+                "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s.",
+                "-name matches only the final path component using shell glob syntax.",
+                "-print is the default action; -print0 emits NUL-delimited paths for xargs -0 style pipelines.",
+            ],
+            examples: &[
+                ("Walk the current tree", "find ."),
+                ("Stay at the top level", "find src -maxdepth 1"),
+                ("Walk two roots", "find src tests"),
+                ("List only regular files", "find . -type f"),
+                ("Match Rust sources by basename", "find src -name '*.rs'"),
+                ("Emit NUL-delimited directory paths", "find src -type d -print0"),
+            ],
         }),
         "du" => Some(CommandHelp {
             name: "du",
-            usage: "du [-s] [-a] [path ...]",
+            usage: "du [-s] [-a] [-d depth|--max-depth=depth] [--] [path ...]",
             summary: "Report disk usage from filesystem block counts for files and directories.",
             notes: &[
                 "Without -s, directory arguments print descendant directory totals plus the root total.",
                 "-a includes non-directory entries in the output.",
+                "-d/--max-depth limits which descendant depths are printed while preserving full subtree totals.",
+                "-- stops option parsing so paths beginning with '-' are treated as operands.",
             ],
-            examples: &[("Summarize one tree", "du -s ."), ("Print all entries in src", "du -a src")],
+            examples: &[
+                ("Summarize one tree", "du -s ."),
+                ("Print all entries in src", "du -a src"),
+                ("Show only top-level directory totals", "du --max-depth=1 ."),
+            ],
         }),
         "head" => Some(CommandHelp {
             name: "head",
-            usage: "head [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "head [-n lines|-c bytes] [--lines=lines|--bytes=bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "Print the first lines or bytes of each input.",
             notes: &[
-                "Supports classic head counts including -NUM \"all but last\" forms for -n/-c.",
+                "Supports classic head counts including obsolete -NUM and -NUM[bkm][cqv] forms, plus -NUM \"all but last\" forms for -n/-c.",
+                "GNU-style --lines/--bytes long forms are accepted, including =VALUE syntax and negative counts.",
                 "Use -q/--quiet/--silent to suppress headers and -v/--verbose to always print them; the last one wins.",
             ],
             examples: &[
@@ -293,54 +317,54 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             name: "cksum",
             usage: "cksum [--auto|--no-direct|--direct] <file> [file ...]",
             summary: "POSIX cksum compatibility wrapper on top of fro file reads.",
-            notes: &["TODO: replace the current CRC32 path with a fast-crc32-grade implementation."],
+            notes: &["Uses a table-driven POSIX CRC32 path while reusing the existing ordered input reader."],
             examples: &[("Print POSIX CRC32 and size", "cksum archive.tar")],
         }),
         "b3sum" => Some(CommandHelp {
             name: "b3sum",
-            usage: "b3sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "b3sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print BLAKE3 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
         }),
         "b2sum" => Some(CommandHelp {
             name: "b2sum",
-            usage: "b2sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "b2sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print BLAKE2b-512 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with BLAKE2b-512", "b2sum bigfile.dat")],
         }),
         "md5sum" => Some(CommandHelp {
             name: "md5sum",
-            usage: "md5sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "md5sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print MD5 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with MD5", "md5sum bigfile.dat")],
         }),
         "sha224sum" => Some(CommandHelp {
             name: "sha224sum",
-            usage: "sha224sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "sha224sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print SHA-224 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with SHA-224", "sha224sum bigfile.dat")],
         }),
         "sha256sum" => Some(CommandHelp {
             name: "sha256sum",
-            usage: "sha256sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "sha256sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print SHA-256 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with SHA-256", "sha256sum bigfile.dat")],
         }),
         "sha384sum" => Some(CommandHelp {
             name: "sha384sum",
-            usage: "sha384sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "sha384sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print SHA-384 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with SHA-384", "sha384sum bigfile.dat")],
         }),
         "sha512sum" => Some(CommandHelp {
             name: "sha512sum",
-            usage: "sha512sum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "sha512sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
             summary: "Print SHA-512 digests for one or more files.",
             notes: &[],
             examples: &[("Hash one file with SHA-512", "sha512sum bigfile.dat")],
@@ -369,6 +393,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[
                 "Without --create, the existing file size is used.",
                 "--direct/--no-direct control the read-side planner mode; --direct-write/--no-direct-write control the write side.",
+                "With --direct-write, fro prints one stderr warning if any requested direct write falls back to page cache because O_DIRECT open failed or a tail block was unaligned.",
             ],
             examples: &[
                 (
@@ -388,6 +413,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[
                 "--direct/--no-direct/--auto control source reads.",
                 "--direct-write/--no-direct-write/--auto-write control destination writes.",
+                "With forced direct read/write flags, fro prints one stderr warning if any source or destination leg falls back to page cache because O_DIRECT open failed or a request tail was unaligned.",
                 "--recursive (or -r/-R) enables directory-tree copies; the destination behaves like cp -r, so an existing destination directory receives the source basename as a child.",
                 "--copy-file-range uses the tunable multi-call copy_file_range(2) strategy with its own optimizer params.",
                 "--copy-file-range-single forces the one-call copy_file_range(2) baseline for benchmarking.",
@@ -404,7 +430,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
-                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, and -T/--no-target-directory compatibility flags.",
+                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, and -p/--preserve (mode+timestamps for recursive and regular copies; ownership is not preserved) compatibility flags.",
             ],
             examples: &[
                 (

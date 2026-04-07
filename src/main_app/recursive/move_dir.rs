@@ -231,6 +231,7 @@ fn walk_recursive_move_subtree(
             let metadata = entry.metadata()?;
             let source_len = metadata.len();
             let source_mode = metadata.permissions().mode();
+            let source_timestamps = super::preserved_timestamps_from_metadata(&metadata);
             let relative_path = source_path
                 .strip_prefix(&ctx.source_root)
                 .map_err(|_| io::Error::other("recursive move path escaped source root"))?
@@ -255,6 +256,7 @@ fn walk_recursive_move_subtree(
                     source_path,
                     target_path,
                     source_mode,
+                    source_timestamps,
                     resolved_copy,
                     source_parent_dir: Some(task.source_dir.clone()),
                 });

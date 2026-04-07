@@ -5,6 +5,7 @@ pub(super) fn build_tests(
     target_file_dir: String,
     target_file_cache: String,
     recursive_tree_str: String,
+    recursive_tree_manifest: String,
     recursive_copy_target: String,
 ) -> Vec<TestCase> {
     vec![
@@ -16,6 +17,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -33,6 +35,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_dir.clone()],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -50,6 +53,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_cache.clone()],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -67,6 +71,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![target_file_cache.clone()],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -83,6 +88,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![target_file_cache.clone()],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -99,6 +105,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![target_file_cache.clone()],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -116,6 +123,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -133,6 +141,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -149,6 +158,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -165,6 +175,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -182,6 +193,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -199,6 +211,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -217,6 +230,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -236,6 +250,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -252,6 +267,41 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::Gbps,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "tree compare: recursive-read-bench (hot)",
+            program: "fro",
+            args: vec![
+                "recursive-read-bench".into(),
+                "--no-direct".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_str.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "tree compare: file-list-read-bench (hot)",
+            program: "fro",
+            args: vec![
+                "file-list-read-bench".into(),
+                "--no-direct".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_manifest.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -262,6 +312,18 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
+            kind: CommandKind::ExternalDiscardStdout,
+        },
+        TestCase {
+            name: "tree compare: fd walk (hot)",
+            program: "fd",
+            args: vec!["-u".into(), ".".into(), recursive_tree_str.clone()],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
             kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
@@ -276,6 +338,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::Gbps,
             kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
@@ -294,6 +357,63 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::Gbps,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "tree compare: copy --recursive (hot)",
+            program: "fro",
+            args: vec![
+                "copy".into(),
+                "--recursive".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "tree compare: split-manifest-recursive-copy-bench (hot)",
+            program: "fro",
+            args: vec![
+                "split-manifest-recursive-copy-bench".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
+            kind: CommandKind::Fro,
+        },
+        TestCase {
+            name: "tree compare: manifest-recursive-copy-bench (hot)",
+            program: "fro",
+            args: vec![
+                "manifest-recursive-copy-bench".into(),
+                "-v".into(),
+                "-n".into(),
+                "1".into(),
+                recursive_tree_manifest.clone(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -308,6 +428,22 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::Gbps,
+            kind: CommandKind::ExternalDiscardStdout,
+        },
+        TestCase {
+            name: "tree compare: cp -r (hot)",
+            program: "cp",
+            args: vec![
+                "-r".into(),
+                recursive_tree_str.clone(),
+                recursive_copy_target.clone(),
+            ],
+            target: 0.0,
+            cache_state: CacheState::Hot,
+            files_to_prep: vec![recursive_tree_str.clone()],
+            bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::FilesPerSecond,
             kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
@@ -322,6 +458,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![recursive_tree_str.clone()],
             bytes_hint: BytesHint::RecursiveTree,
+            metric: MetricKind::Gbps,
             kind: CommandKind::ExternalDiscardStdout,
         },
         TestCase {
@@ -340,6 +477,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -359,6 +497,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -378,6 +517,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -397,6 +537,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -416,6 +557,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -435,6 +577,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -454,6 +597,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -474,6 +618,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -494,6 +639,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -511,6 +657,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -528,6 +675,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -544,6 +692,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -560,6 +709,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -576,6 +726,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -591,6 +742,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -606,6 +758,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -622,6 +775,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -638,6 +792,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -654,6 +809,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_cache.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -669,6 +825,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -684,6 +841,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone(), target_file_dir.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -702,6 +860,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -720,6 +879,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -737,6 +897,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Cold,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -754,6 +915,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::Hot,
             files_to_prep: vec![source_file.clone()],
             bytes_hint: BytesHint::SourceFile,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -764,6 +926,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
         TestCase {
@@ -774,6 +937,7 @@ pub(super) fn build_tests(
             cache_state: CacheState::None,
             files_to_prep: vec![],
             bytes_hint: BytesHint::None,
+            metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
     ]

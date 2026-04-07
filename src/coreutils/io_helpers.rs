@@ -250,11 +250,13 @@ pub(crate) fn fd_is_regular(fd: libc::c_int) -> io::Result<bool> {
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
 }
 
+const COREUTILS_PIPE_TARGET_SIZE: usize = 2 << 20;
+
 pub(crate) fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
     if !fd_is_fifo(fd)? {
         return Ok(());
     }
-    let target_size = 1 << 20;
+    let target_size = COREUTILS_PIPE_TARGET_SIZE;
     let rc = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, target_size) };
     if rc >= 0 {
         return Ok(());

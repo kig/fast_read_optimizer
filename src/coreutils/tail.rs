@@ -30,6 +30,8 @@ enum HeaderMode {
 
 const TAIL_SCAN_BLOCK_SIZE: usize = 1 << 20;
 const TAIL_PIPE_WINDOW_SIZE: usize = 1 << 20;
+const TAIL_PIPE_WINDOW_MIN_CAPACITY: usize = 64 << 10;
+const TAIL_STDIN_PREBUFFER_LIMIT: usize = 64 << 10;
 
 fn regular_stdin_path() -> io::Result<Option<&'static str>> {
     if fd_is_regular(libc::STDIN_FILENO)? {
@@ -255,16 +257,17 @@ impl ByteTailPipeWindow {
             )
         })?;
         let capacity = requested
-            .max(TAIL_PIPE_WINDOW_SIZE)
-            .next_multiple_of(TAIL_PIPE_WINDOW_SIZE);
-        let slot_count = capacity / TAIL_PIPE_WINDOW_SIZE;
+            .max(TAIL_PIPE_WINDOW_MIN_CAPACITY)
+            .next_multiple_of(4096);
+        let slot_len = capacity.min(TAIL_PIPE_WINDOW_SIZE);
+        let slot_count = capacity.div_ceil(slot_len);
         let mut slots = Vec::with_capacity(slot_count);
         for _ in 0..slot_count {
-            slots.push(AlignedBuffer::new(TAIL_PIPE_WINDOW_SIZE));
+            slots.push(AlignedBuffer::new_uninit(slot_len)?);
         }
         Ok(Self {
             slots,
-            slot_len: TAIL_PIPE_WINDOW_SIZE,
+            slot_len,
             capacity,
             write_pos: 0,
             total_seen: 0,
@@ -284,10 +287,14 @@ impl ByteTailPipeWindow {
             let copy_len = (self.slot_len - slot_offset).min(data.len());
             self.slots[slot_index][slot_offset..slot_offset + copy_len]
                 .copy_from_slice(&data[..copy_len]);
-            self.write_pos = (self.write_pos + copy_len) % self.capacity;
-            self.total_seen = self.total_seen.saturating_add(copy_len as u64);
+            self.advance(copy_len);
             data = &data[copy_len..];
         }
+    }
+
+    fn advance(&mut self, len: usize) {
+        self.write_pos = (self.write_pos + len) % self.capacity;
+        self.total_seen = self.total_seen.saturating_add(len as u64);
     }
 
     fn read_from<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
@@ -298,12 +305,33 @@ impl ByteTailPipeWindow {
             if read == 0 {
                 return Ok(());
             }
-            self.write_pos = (self.write_pos + read) % self.capacity;
-            self.total_seen = self.total_seen.saturating_add(read as u64);
+            self.advance(read);
         }
     }
 
-    fn write_last<W: Write>(&self, out: &mut W, count: u64) -> io::Result<()> {
+    fn read_from_raw_fd_until(&mut self, fd: libc::c_int, limit: usize) -> io::Result<bool> {
+        let mut remaining = limit;
+        while remaining != 0 {
+            let slot_index = self.write_pos / self.slot_len;
+            let slot_offset = self.write_pos % self.slot_len;
+            let read_len = (self.slot_len - slot_offset).min(remaining);
+            let read = read_raw_fd(
+                fd,
+                &mut self.slots[slot_index][slot_offset..slot_offset + read_len],
+            )?;
+            if read == 0 {
+                return Ok(true);
+            }
+            self.advance(read);
+            remaining -= read;
+        }
+        Ok(false)
+    }
+
+    fn for_each_tail_chunk<F>(&self, count: u64, mut visit: F) -> io::Result<usize>
+    where
+        F: FnMut(&[u8]) -> io::Result<()>,
+    {
         let keep = usize::try_from(count.min(self.total_seen)).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -311,7 +339,7 @@ impl ByteTailPipeWindow {
             )
         })?;
         if keep == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let start = if keep == self.capacity {
             self.write_pos
@@ -324,11 +352,35 @@ impl ByteTailPipeWindow {
             let slot_index = pos / self.slot_len;
             let slot_offset = pos % self.slot_len;
             let chunk_len = remaining.min(self.slot_len - slot_offset);
-            out.write_all(&self.slots[slot_index][slot_offset..slot_offset + chunk_len])?;
+            visit(&self.slots[slot_index][slot_offset..slot_offset + chunk_len])?;
             remaining -= chunk_len;
             pos = (pos + chunk_len) % self.capacity;
         }
+        Ok(keep)
+    }
+
+    fn write_last<W: Write>(&self, out: &mut W, count: u64) -> io::Result<()> {
+        self.for_each_tail_chunk(count, |chunk| out.write_all(chunk))?;
         Ok(())
+    }
+
+    fn write_last_to_raw_fd(&self, fd: libc::c_int, count: u64) -> io::Result<u64> {
+        let keep = self.for_each_tail_chunk(count, |chunk| write_raw_fd_all(fd, chunk))?;
+        Ok(keep as u64)
+    }
+}
+
+fn read_raw_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if read >= 0 {
+            return Ok(read as usize);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => continue,
+            _ => return Err(err),
+        }
     }
 }
 
@@ -390,6 +442,109 @@ fn write_tail_bytes_windowed_from_reader<W: Write, R: Read>(
     window.write_last(out, count)
 }
 
+fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
+    let mut window = ByteTailPipeWindow::new(count)?;
+    let prebuffer_limit = TAIL_STDIN_PREBUFFER_LIMIT
+        .max(count as usize)
+        .min(TAIL_PIPE_WINDOW_SIZE);
+    if window.read_from_raw_fd_until(libc::STDIN_FILENO, prebuffer_limit)? {
+        window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+        return Ok(true);
+    }
+
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
+        window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+        return Ok(true);
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
+    let result = (|| -> io::Result<bool> {
+        let desired = STREAM_WINDOW_BLOCK_SIZE
+            .max(count as usize)
+            .saturating_add(4096);
+        let actual_size = pipe_size_best_effort(pipe_write, desired)?;
+        if actual_size as u64 <= count {
+            window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
+            window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+            return Ok(true);
+        }
+        grow_pipe_best_effort(libc::STDIN_FILENO)?;
+        grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+        let mut buffered = window.write_last_to_raw_fd(pipe_write, count)?;
+        let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        let dev_null_fd = dev_null.as_raw_fd();
+        loop {
+            let free_space = (actual_size as u64).saturating_sub(buffered);
+            if free_space == 0 {
+                let drop_len = buffered.saturating_sub(count);
+                if drop_len == 0 {
+                    window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
+                    window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+                    return Ok(true);
+                }
+                let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
+                if dropped != drop_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "pipe tail short drop while trimming prefetched prefix",
+                    ));
+                }
+                buffered -= dropped;
+                continue;
+            }
+            let read_len = free_space.min(TAIL_PIPE_WINDOW_SIZE as u64) as usize;
+            let moved = unsafe {
+                libc::splice(
+                    libc::STDIN_FILENO,
+                    std::ptr::null_mut(),
+                    pipe_write,
+                    std::ptr::null_mut(),
+                    read_len,
+                    0,
+                )
+            };
+            if moved > 0 {
+                buffered = buffered
+                    .checked_add(moved as u64)
+                    .ok_or_else(|| io::Error::other("pipe tail byte count overflow"))?;
+                if buffered > count {
+                    let drop_len = buffered - count;
+                    let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
+                    if dropped != drop_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "pipe tail short drop while trimming prefetched prefix",
+                        ));
+                    }
+                    buffered -= dropped;
+                }
+                continue;
+            }
+            if moved == 0 {
+                let emitted = splice_all(pipe_read, libc::STDOUT_FILENO, buffered)?;
+                return Ok(emitted == buffered);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR | libc::EAGAIN) => continue,
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                    window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
+                    window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+                    return Ok(true);
+                }
+                _ => return Err(err),
+            }
+        }
+    })();
+    unsafe {
+        libc::close(pipe_read);
+        libc::close(pipe_write);
+    }
+    result
+}
+
 fn try_write_tail_pipe_bytes_fast(input: &StreamInput, count: u64) -> io::Result<bool> {
     if count == 0 {
         return Ok(true);
@@ -397,7 +552,7 @@ fn try_write_tail_pipe_bytes_fast(input: &StreamInput, count: u64) -> io::Result
     match input {
         StreamInput::Stdin { .. } => {
             let copied = if count <= TAIL_PIPE_WINDOW_SIZE as u64 {
-                copy_pipe_tail_to_stdout_small(libc::STDIN_FILENO, count)?
+                return try_write_tail_stdin_small_prefetched(count);
             } else {
                 copy_pipe_tail_to_stdout_large(libc::STDIN_FILENO, count)?
             };
@@ -643,15 +798,15 @@ mod tests {
     }
 
     #[test]
-    fn byte_tail_pipe_window_uses_single_mib_for_small_counts() {
+    fn byte_tail_pipe_window_uses_64k_floor_for_small_counts() {
         let window = ByteTailPipeWindow::new(65_536).unwrap();
-        assert_eq!(window.capacity(), TAIL_PIPE_WINDOW_SIZE);
+        assert_eq!(window.capacity(), TAIL_PIPE_WINDOW_MIN_CAPACITY);
     }
 
     #[test]
-    fn byte_tail_pipe_window_rounds_large_counts_to_mib_multiple() {
-        let window = ByteTailPipeWindow::new((TAIL_PIPE_WINDOW_SIZE as u64) + 1).unwrap();
-        assert_eq!(window.capacity(), TAIL_PIPE_WINDOW_SIZE * 2);
+    fn byte_tail_pipe_window_rounds_large_counts_to_4k_multiple() {
+        let window = ByteTailPipeWindow::new(65_537).unwrap();
+        assert_eq!(window.capacity(), 69_632);
     }
 
     #[test]

@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -119,12 +118,19 @@ impl ParallelFile {
         path: &str,
         io_mode: IOMode,
     ) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{path} is not a regular file"),
+            ));
+        }
         Ok(Self {
             config: config.clone(),
             mode: mode.to_string(),
             path: path.to_string(),
             io_mode,
-            file: Arc::new(File::open(path)?),
+            file: Arc::new(file),
         })
     }
 

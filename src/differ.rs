@@ -1,11 +1,11 @@
 use crate::common::{AlignedBuffer, IOMode};
+use crate::io_util::{note_direct_unaligned_fallback, open_direct_reader_or_fallback};
 use crate::mincore::is_first_page_resident;
 use iou::IoUring;
 use rand::RngExt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::prelude::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -51,6 +51,13 @@ fn thread_differ(
 
         let is_aligned =
             (file1_offset % 4096 == 0) && (file2_offset % 4096 == 0) && (len == block_size);
+        if use_direct && !is_aligned {
+            note_direct_unaligned_fallback(
+                "diff-read",
+                file1_offset.min(file2_offset),
+                len as usize,
+            );
+        }
         let f1_fd = if use_direct && is_aligned {
             file1.0.as_raw_fd()
         } else {
@@ -180,6 +187,13 @@ fn thread_differ(
                 let is_aligned = (file1_offset % 4096 == 0)
                     && (file2_offset % 4096 == 0)
                     && (next_len == block_size);
+                if use_direct && !is_aligned {
+                    note_direct_unaligned_fallback(
+                        "diff-read",
+                        file1_offset.min(file2_offset),
+                        next_len as usize,
+                    );
+                }
                 let f1_fd = if use_direct && is_aligned {
                     file1.0.as_raw_fd()
                 } else {
@@ -301,15 +315,9 @@ pub fn diff_files_window(
         let f2_name = file2.to_string();
         threads.push(std::thread::spawn(move || -> io::Result<()> {
             let f1_pagecache = File::open(&f1_name)?;
-            let f1_direct = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&f1_name)?;
+            let f1_direct = open_direct_reader_or_fallback(&f1_name, &f1_pagecache)?;
             let f2_pagecache = File::open(&f2_name)?;
-            let f2_direct = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&f2_name)?;
+            let f2_direct = open_direct_reader_or_fallback(&f2_name, &f2_pagecache)?;
             let mut io_uring = IoUring::new(1024).map_err(io::Error::other)?;
             thread_differ(
                 thread_id,

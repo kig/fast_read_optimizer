@@ -121,8 +121,8 @@ fn walk_recursive_delete_subtree(
             },
         );
         if let Some(local_dir) = child_dirs.pop() {
-            for task in child_dirs {
-                dir_queue.enqueue_one(task);
+            if !child_dirs.is_empty() {
+                dir_queue.enqueue(child_dirs);
             }
             stack.push(local_dir);
         }
@@ -218,4 +218,49 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
         );
     }
     Ok(bytes_removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_recursive_delete_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from("target")
+            .join("test-artifacts")
+            .join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn run_recursive_delete_removes_wide_tree_and_counts_regular_file_bytes() {
+        let root = unique_recursive_delete_test_dir("recursive-delete-wide");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut expected_bytes = 0_u64;
+        for dir_index in 0..24 {
+            let dir = root.join(format!("dir-{dir_index}"));
+            let nested = dir.join("nested");
+            fs::create_dir_all(&nested).unwrap();
+
+            let top_bytes = vec![b'a' + (dir_index % 26) as u8; 64 + dir_index];
+            expected_bytes += top_bytes.len() as u64;
+            fs::write(dir.join("top.bin"), top_bytes).unwrap();
+
+            let nested_bytes = vec![b'z' - (dir_index % 26) as u8; 128 + dir_index];
+            expected_bytes += nested_bytes.len() as u64;
+            fs::write(nested.join("deep.bin"), nested_bytes).unwrap();
+
+            symlink("nested/deep.bin", dir.join("deep-link")).unwrap();
+        }
+
+        let removed_bytes = run_recursive_delete(&root, false).unwrap();
+
+        assert_eq!(removed_bytes, expected_bytes);
+        assert!(!root.exists());
+    }
 }

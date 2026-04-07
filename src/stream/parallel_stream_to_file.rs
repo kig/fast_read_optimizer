@@ -1,5 +1,7 @@
 use super::*;
-use crate::io_util::checked_posix_fallocate;
+use crate::io_util::{
+    checked_posix_fallocate, note_direct_unaligned_fallback, open_direct_writer_or_fallback,
+};
 
 impl ParallelStream {
     /// Variant that writes directly into an open destination File (no path-based open).
@@ -120,19 +122,14 @@ impl ParallelStream {
                 let proc_path = format!("/proc/self/fd/{}", fd);
 
                 // Create an independent Open File Description for Direct I/O
-                let dest_direct = OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_DIRECT) // Set O_DIRECT during open
-                    .open(&proc_path)
-                    .unwrap_or_else(|_| dest_file.try_clone().expect("Failed to clone dest_file"));
-
-                // Create another independent one for Page Cache (standard open)
                 let dest_pagecache = OpenOptions::new()
                     .write(true)
                     .open(&proc_path)
                     .unwrap_or_else(|_| {
                         dest_file.try_clone().expect("Failed to clone dest_file 2")
                     });
+                let dest_direct = open_direct_writer_or_fallback(&proc_path, &dest_pagecache)
+                    .unwrap_or_else(|_| dest_file.try_clone().expect("Failed to clone dest_file"));
 
                 let file_size = file.seek(SeekFrom::End(0)).expect("Failed to seek file");
                 let thread_base = thread_id * read_block_size;
@@ -326,6 +323,13 @@ impl ParallelStream {
 
                                 let is_aligned_write =
                                     dst_offset % 4096 == 0 && produced_len % 4096 == 0;
+                                if write_params.use_direct && !is_aligned_write {
+                                    note_direct_unaligned_fallback(
+                                        "write",
+                                        dst_offset,
+                                        produced_len,
+                                    );
+                                }
                                 let fd = if write_params.use_direct && is_aligned_write {
                                     dest_direct.as_raw_fd()
                                 } else {

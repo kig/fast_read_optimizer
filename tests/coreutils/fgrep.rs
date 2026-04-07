@@ -228,3 +228,86 @@ fn fgrep_ignore_case_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn fgrep_count_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-fgrep-count");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    let c = tmp.join("c.txt");
+    let patterns = tmp.join("patterns.txt");
+    let empty_patterns = tmp.join("empty-patterns.txt");
+
+    fs::write(&a, b"alpha\nfoo\nalpha\n").unwrap();
+    fs::write(&b, b"beta\nALPHA\nalpha beta\n").unwrap();
+    fs::write(&c, b"gamma\ndelta\n").unwrap();
+    fs::write(&patterns, b"alpha\nbeta\n").unwrap();
+    fs::write(&empty_patterns, b"").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for compat_flags in [
+            vec!["-c", "alpha"],
+            vec!["--count", "alpha"],
+            vec!["-c", "-n", "alpha"],
+            vec!["-c", "-i", "alpha"],
+            vec!["-c", "-x", "alpha"],
+            vec!["-c", "-f", patterns.to_str().unwrap()],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+                vec![c.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(compat_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = compat_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("fgrep", &fro_args),
+                    run_system("fgrep", &sys_args),
+                    &format!("fgrep -c {:?} {:?}", io_flags, compat_flags),
+                );
+            }
+        }
+
+        for compat_flags in [
+            vec!["-c", "alpha"],
+            vec!["--count", "alpha"],
+            vec!["-c", "-i", "alpha"],
+            vec!["-c", "-x", "alpha"],
+        ] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push("-");
+            let mut sys_args = compat_flags.clone();
+            sys_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("fgrep", &fro_args, b"Alpha\nalpha\nbeta\n"),
+                run_system_with_stdin("fgrep", &sys_args, b"Alpha\nalpha\nbeta\n"),
+                &format!("fgrep -c stdin {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+
+        let mut fro_args = io_flags.clone();
+        fro_args.extend([
+            "-c",
+            "-f",
+            empty_patterns.to_str().unwrap(),
+            a.to_str().unwrap(),
+        ]);
+        assert_same_result(
+            run_fro("fgrep", &fro_args),
+            run_system(
+                "fgrep",
+                &[
+                    "-c",
+                    "-f",
+                    empty_patterns.to_str().unwrap(),
+                    a.to_str().unwrap(),
+                ],
+            ),
+            &format!("fgrep -c empty pattern file {:?}", io_flags),
+        );
+    }
+}

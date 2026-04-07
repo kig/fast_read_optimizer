@@ -373,6 +373,8 @@ fn recursive_move_keeps_pending_state_until_large_children_finish() {
         relative_copy_method: RelativeCopyMethod::CopyFileRange,
         verbose: false,
         cp_compat: false,
+        cp_no_clobber: false,
+        preserve_timestamps: false,
     };
 
     let moved = move_dir::run_recursive_move(ctx, false).unwrap();

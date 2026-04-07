@@ -3,6 +3,7 @@ use std::borrow::Cow;
 
 #[derive(Clone, Copy)]
 struct FgrepOptions {
+    count_only: bool,
     print_line_numbers: bool,
     line_regexp: bool,
     ignore_case: bool,
@@ -170,6 +171,21 @@ fn write_matching_line<W: Write>(
     Ok(())
 }
 
+fn write_count_line<W: Write>(
+    out: &mut W,
+    label: Option<&str>,
+    count: u64,
+    multi_file: bool,
+) -> io::Result<()> {
+    if multi_file {
+        if let Some(label) = label {
+            write!(out, "{label}:")?;
+        }
+    }
+    writeln!(out, "{count}")?;
+    Ok(())
+}
+
 fn finish_pending_line<W: Write>(
     out: &mut W,
     label: Option<&str>,
@@ -180,10 +196,14 @@ fn finish_pending_line<W: Write>(
     multi_file: bool,
     options: FgrepOptions,
     matched_any: &mut bool,
+    match_count: &mut u64,
 ) -> io::Result<()> {
     if fgrep_line_matches(pending_line, pattern, normalized_pattern, options) {
         *matched_any = true;
-        write_matching_line(out, label, pending_line, line_no, multi_file, options)?;
+        *match_count += 1;
+        if !options.count_only {
+            write_matching_line(out, label, pending_line, line_no, multi_file, options)?;
+        }
     }
     pending_line.clear();
     Ok(())
@@ -201,6 +221,7 @@ fn write_matching_stream_lines<W: Write>(
 ) -> io::Result<bool> {
     if options.line_regexp {
         let mut matched_any = false;
+        let mut match_count = 0_u64;
         let mut pending_line = Vec::new();
         let mut line_no = 1_u64;
         visit_ordered_input(input, io_mode, |block| {
@@ -218,6 +239,7 @@ fn write_matching_stream_lines<W: Write>(
                     multi_file,
                     options,
                     &mut matched_any,
+                    &mut match_count,
                 )?;
                 line_no += 1;
                 line_start = line_end;
@@ -238,13 +260,18 @@ fn write_matching_stream_lines<W: Write>(
                 multi_file,
                 options,
                 &mut matched_any,
+                &mut match_count,
             )?;
+        }
+        if options.count_only {
+            write_count_line(out, label, match_count, multi_file)?;
         }
         return Ok(matched_any);
     }
 
     let finder = Finder::new(normalized_pattern);
     let mut matched_any = false;
+    let mut match_count = 0_u64;
     let mut pending_line = Vec::new();
     let mut pending_line_has_match = pattern.is_empty();
     let mut boundary_tail = Vec::new();
@@ -282,13 +309,26 @@ fn write_matching_stream_lines<W: Write>(
                 let line = &block[line_start..line_end];
                 if pending_line_has_match {
                     matched_any = true;
-                    write_matching_line(out, label, line, line_no, multi_file, options)?;
+                    match_count += 1;
+                    if !options.count_only {
+                        write_matching_line(out, label, line, line_no, multi_file, options)?;
+                    }
                 }
             } else {
                 pending_line.extend_from_slice(&block[line_start..line_end]);
                 if pending_line_has_match {
                     matched_any = true;
-                    write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+                    match_count += 1;
+                    if !options.count_only {
+                        write_matching_line(
+                            out,
+                            label,
+                            &pending_line,
+                            line_no,
+                            multi_file,
+                            options,
+                        )?;
+                    }
                 }
                 pending_line.clear();
             }
@@ -314,7 +354,13 @@ fn write_matching_stream_lines<W: Write>(
     })?;
     if !pending_line.is_empty() && pending_line_has_match {
         matched_any = true;
-        write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+        match_count += 1;
+        if !options.count_only {
+            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+        }
+    }
+    if options.count_only {
+        write_count_line(out, label, match_count, multi_file)?;
     }
     Ok(matched_any)
 }
@@ -329,6 +375,7 @@ fn write_matching_stream_lines_multi<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<bool> {
     let mut matched_any = false;
+    let mut match_count = 0_u64;
     let mut pending_line = Vec::new();
     let mut line_no = 1_u64;
     visit_ordered_input(input, io_mode, |block| {
@@ -338,7 +385,10 @@ fn write_matching_stream_lines_multi<W: Write>(
             pending_line.extend_from_slice(&block[line_start..line_end]);
             if fgrep_line_matches_any(&pending_line, patterns, options) {
                 matched_any = true;
-                write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+                match_count += 1;
+                if !options.count_only {
+                    write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+                }
             }
             pending_line.clear();
             line_no += 1;
@@ -351,7 +401,13 @@ fn write_matching_stream_lines_multi<W: Write>(
     })?;
     if !pending_line.is_empty() && fgrep_line_matches_any(&pending_line, patterns, options) {
         matched_any = true;
-        write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+        match_count += 1;
+        if !options.count_only {
+            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
+        }
+    }
+    if options.count_only {
+        write_count_line(out, label, match_count, multi_file)?;
     }
     Ok(matched_any)
 }
@@ -364,6 +420,10 @@ fn write_matching_lines<W: Write>(
     multi_file: bool,
     options: FgrepOptions,
 ) -> io::Result<()> {
+    let count = count_matches_in_lines(data, matches);
+    if options.count_only {
+        return write_count_line(out, Some(file), count, multi_file);
+    }
     let bytes = data;
     let mut next_match = 0usize;
     let mut line_start = 0usize;
@@ -398,6 +458,32 @@ fn write_matching_lines<W: Write>(
     Ok(())
 }
 
+fn count_matches_in_lines(data: &[u8], matches: &[u64]) -> u64 {
+    let mut count = 0_u64;
+    let mut next_match = 0usize;
+    let mut line_start = 0usize;
+    while line_start < data.len() {
+        let rel_end = data[line_start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(data.len() - line_start);
+        let line_end = line_start + rel_end;
+        let mut matched = false;
+        while next_match < matches.len() && matches[next_match] < line_end as u64 {
+            if matches[next_match] >= line_start as u64 {
+                matched = true;
+            }
+            next_match += 1;
+        }
+        if matched {
+            count += 1;
+        }
+        line_start = line_end;
+    }
+    count
+}
+
 fn write_line_regexp_matches<W: Write>(
     out: &mut W,
     file: &str,
@@ -408,6 +494,7 @@ fn write_line_regexp_matches<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<bool> {
     let mut matched_any = false;
+    let mut match_count = 0_u64;
     let mut line_start = 0usize;
     let mut line_no = 1_u64;
     while line_start < data.len() {
@@ -420,10 +507,16 @@ fn write_line_regexp_matches<W: Write>(
         let line = &data[line_start..line_end];
         if fgrep_line_matches(line, pattern, normalized_pattern, options) {
             matched_any = true;
-            write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            match_count += 1;
+            if !options.count_only {
+                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            }
         }
         line_start = line_end;
         line_no += 1;
+    }
+    if options.count_only {
+        write_count_line(out, Some(file), match_count, multi_file)?;
     }
     Ok(matched_any)
 }
@@ -438,6 +531,7 @@ fn write_filtered_lines<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<bool> {
     let mut matched_any = false;
+    let mut match_count = 0_u64;
     let mut line_start = 0usize;
     let mut line_no = 1_u64;
     while line_start < data.len() {
@@ -450,10 +544,16 @@ fn write_filtered_lines<W: Write>(
         let line = &data[line_start..line_end];
         if fgrep_line_matches(line, pattern, normalized_pattern, options) {
             matched_any = true;
-            write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            match_count += 1;
+            if !options.count_only {
+                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            }
         }
         line_start = line_end;
         line_no += 1;
+    }
+    if options.count_only {
+        write_count_line(out, Some(file), match_count, multi_file)?;
     }
     Ok(matched_any)
 }
@@ -467,6 +567,7 @@ fn write_filtered_lines_multi<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<bool> {
     let mut matched_any = false;
+    let mut match_count = 0_u64;
     let mut line_start = 0usize;
     let mut line_no = 1_u64;
     while line_start < data.len() {
@@ -479,10 +580,16 @@ fn write_filtered_lines_multi<W: Write>(
         let line = &data[line_start..line_end];
         if fgrep_line_matches_any(line, patterns, options) {
             matched_any = true;
-            write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            match_count += 1;
+            if !options.count_only {
+                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
+            }
         }
         line_start = line_end;
         line_no += 1;
+    }
+    if options.count_only {
+        write_count_line(out, Some(file), match_count, multi_file)?;
     }
     Ok(matched_any)
 }
@@ -490,6 +597,7 @@ fn write_filtered_lines_multi<W: Write>(
 pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut options = FgrepOptions {
+        count_only: false,
         print_line_numbers: false,
         line_regexp: false,
         ignore_case: false,
@@ -511,6 +619,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
             continue;
         }
         match arg.as_str() {
+            "-c" => options.count_only = true,
+            "--count" => options.count_only = true,
             "-n" => options.print_line_numbers = true,
             "--line-number" => options.print_line_numbers = true,
             "-x" => options.line_regexp = true,
@@ -646,6 +756,9 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         pattern.raw.as_slice(),
                     )?;
                     if matches.is_empty() {
+                        if options.count_only {
+                            write_count_line(&mut out, Some(file), 0, multi_file)?;
+                        }
                         continue;
                     }
                     matched_any = true;
@@ -748,6 +861,7 @@ mod kani_proofs {
     fn fgrep_line_matches_line_regexp_trims_one_newline() {
         let payload = [b'a', b'\n'];
         let options = FgrepOptions {
+            count_only: false,
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: false,
@@ -779,6 +893,7 @@ mod tests {
     #[test]
     fn fgrep_line_matches_honors_line_regexp() {
         let options = FgrepOptions {
+            count_only: false,
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: false,
@@ -799,6 +914,7 @@ mod tests {
     #[test]
     fn fgrep_line_matches_honors_ignore_case() {
         let contains_options = FgrepOptions {
+            count_only: false,
             print_line_numbers: false,
             line_regexp: false,
             ignore_case: true,
@@ -817,6 +933,7 @@ mod tests {
         ));
 
         let line_options = FgrepOptions {
+            count_only: false,
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: true,
@@ -850,6 +967,7 @@ mod tests {
     #[test]
     fn fgrep_line_matches_any_checks_all_patterns() {
         let options = FgrepOptions {
+            count_only: false,
             print_line_numbers: false,
             line_regexp: false,
             ignore_case: true,

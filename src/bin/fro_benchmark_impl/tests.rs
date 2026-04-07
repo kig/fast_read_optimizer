@@ -30,8 +30,29 @@ fn choose_test_size_respects_wear_cap() {
         total_bytes: 1024_u64.pow(4),
         avail_bytes: 1024_u64.pow(4),
     };
-    let size = choose_test_size(fs, 3, 13, 256 * 1024 * 1024, 4 * 1024 * 1024 * 1024, 0.01);
+    let size = choose_test_size(
+        fs,
+        3,
+        13,
+        0,
+        256 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+        0.01,
+    );
     assert!(size <= 900 * 1024 * 1024);
+}
+
+#[test]
+fn choose_test_size_counts_fixed_write_budget_against_wear_cap() {
+    let gib = 1024_u64.pow(3);
+    let fs = FsStats {
+        total_bytes: 1024_u64.pow(4),
+        avail_bytes: 1024_u64.pow(4),
+    };
+    let size = choose_test_size(fs, 1, 10, 8 * gib, 256 * 1024 * 1024, 4 * gib, 0.01);
+    let total_write_budget = ((fs.total_bytes as f64) * 0.01) as u64;
+    let expected = align_down(total_write_budget.saturating_sub(8 * gib) / 10, 4096);
+    assert_eq!(size, expected);
 }
 
 #[test]
@@ -43,4 +64,42 @@ fn parse_reported_summary_extracts_speed_and_params() {
         summary.params.unwrap(),
         vec![31, 131072, 1, 16, 3145728, 2, 4, 524288, 4]
     );
+}
+
+#[test]
+fn write_recursive_tree_manifest_lists_all_files_in_sorted_order() {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
+        .join(format!(
+            "recursive-tree-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let root = base.join("tree");
+    let manifest = base.join("tree.txt");
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::write(root.join("b").join("second.bin"), b"2").unwrap();
+    std::fs::write(root.join("a").join("first.bin"), b"1").unwrap();
+    std::fs::write(root.join("root.bin"), b"0").unwrap();
+
+    let count = write_recursive_tree_manifest(&root, &manifest).unwrap();
+    assert_eq!(count, 3);
+
+    let content = std::fs::read_to_string(&manifest).unwrap();
+    let lines = content.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![
+            root.join("a").join("first.bin").display().to_string(),
+            root.join("b").join("second.bin").display().to_string(),
+            root.join("root.bin").display().to_string(),
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(base);
 }

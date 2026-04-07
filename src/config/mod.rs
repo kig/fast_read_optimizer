@@ -9,6 +9,8 @@ use std::sync::Once;
 
 mod device;
 mod storage;
+#[cfg(test)]
+mod tests;
 
 pub use self::storage::{load_config, resolve_default_config_path};
 
@@ -171,7 +173,7 @@ struct DeviceDbProfile {
     id: String,
     #[serde(rename = "match")]
     match_fields: DeviceDbMatch,
-    params: DeviceDbParams,
+    params: AppConfigPatch,
     #[serde(default)]
     notes: Option<String>,
 }
@@ -186,14 +188,6 @@ struct DeviceDbMatch {
     dev_model_contains: Option<String>,
     #[serde(default)]
     md_level: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-struct DeviceDbParams {
-    #[serde(default)]
-    read: Option<ModeConfig>,
-    #[serde(default)]
-    grep: Option<ModeConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -524,6 +518,23 @@ impl LoadedConfig {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn promote_mount_override_to_defaults_for_path(&mut self, path: &str) -> bool {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            return false;
+        }
+
+        let LoadedConfig::BundleV1 { bundle, .. } = self else {
+            return false;
+        };
+        let mount_point = mountpoint_for_path(path).unwrap_or_else(|| "/".to_string());
+        let Some(patch) = bundle.mount_overrides.by_mountpoint.remove(&mount_point) else {
+            return false;
+        };
+        patch.apply_to(&mut bundle.defaults);
+        true
+    }
+
     pub fn save(&self) {
         match self {
             LoadedConfig::Legacy { path, config } => {
@@ -615,17 +626,6 @@ impl ModeConfigPatch {
         }
         if let Some(params) = self.page_cache.clone() {
             mode.page_cache = params;
-        }
-    }
-}
-
-impl DeviceDbParams {
-    fn apply_to(&self, config: &mut AppConfig) {
-        if let Some(read) = &self.read {
-            config.read = read.clone();
-        }
-        if let Some(grep) = &self.grep {
-            config.grep = grep.clone();
         }
     }
 }

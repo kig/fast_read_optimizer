@@ -7,7 +7,7 @@
 - [ ] Add config introspection commands such as `fro config print` and `fro config explain --for <file>`.
 - [ ] Implement richer device signature extraction via sysfs and `/dev/disk/by-id`.
 - [ ] Implement composite signatures for `md` and `dm` stacks.
-- [ ] Apply device-db profile matching with clear precedence over defaults and under explicit mount overrides.
+- [x] Apply device-db profile matching with clear precedence over defaults and under explicit mount overrides.
 
 ### Per-mount optimization workflow
 

@@ -1,9 +1,13 @@
-use super::cli_utils::{align_down, fmt_gib, fs_stats_for_path, parse_size};
+use super::cli_utils::{fmt_gib, fs_stats_for_path, parse_size};
 use super::inspect::{
     collect_home_targets, device_db_match, fill_device_info, find_writable_dir_for_mount,
     is_disk_backed_mount, load_device_db, read_mountinfo,
 };
 use super::*;
+use fro::test_sizing::{
+    estimate_alloc_bytes, estimate_user_writes, resolve_test_size, FsSizingStats, TestSizeSource,
+    TestSizingPolicy,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TargetSelection {
@@ -87,6 +91,7 @@ pub(super) fn main_impl() {
              - --test-size 1GiB         (force fixed size)\n\
              - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)"
         );
+        println!("--global writes tuned results into config defaults for the selected --for target mount.");
         println!("\n--list-devices prints likely disk-backed mountpoints as JSON and exits.");
         println!("--list-devices-all prints all mountpoints from /proc/self/mountinfo as JSON and exits.");
         println!("--all runs the optimizer for each discovered disk-backed mount (best-effort writable_dir discovery).");
@@ -104,6 +109,7 @@ pub(super) fn main_impl() {
     let mut max_drive_writes: f64 = 0.05;
     let mut plan = false;
     let mut all = false;
+    let mut global = false;
     let mut list_devices = false;
     let mut list_devices_all = false;
     let mut config_path: Option<&str> = None;
@@ -129,6 +135,8 @@ pub(super) fn main_impl() {
             i += 1;
         } else if arg == "-a" || arg == "--all" {
             all = true;
+        } else if arg == "-g" || arg == "--global" {
+            global = true;
         } else if arg == "--all-dir" {
             all = true;
             all_dirs.push(args[i].clone());
@@ -211,6 +219,16 @@ pub(super) fn main_impl() {
 
     if target_path.is_some() && all {
         eprintln!("--for cannot be combined with --all/--all-dir");
+        std::process::exit(2);
+    }
+    if global && all {
+        eprintln!("--global cannot be combined with --all/--all-dir in the current optimizer flow");
+        std::process::exit(2);
+    }
+    if global && target_path.is_none() {
+        eprintln!(
+            "--global currently requires --for <path> so fro-optimize knows which mount to promote"
+        );
         std::process::exit(2);
     }
 
@@ -386,6 +404,12 @@ pub(super) fn main_impl() {
                 c.insert(1, "-c".to_string());
             }
         }
+        if let Some(target) = target_path {
+            for c in configs.iter_mut() {
+                c.insert(1, target.to_string());
+                c.insert(1, "--for".to_string());
+            }
+        }
 
         let mut selected = Vec::new();
         for cfg in configs {
@@ -483,37 +507,39 @@ pub(super) fn main_impl() {
             + (need_target_cache_matching as u64);
         num_full_writes = num_full_writes.saturating_add(setup_writes);
 
-        let size = if let Some(s) = test_size {
-            align_down(s, 4096).max(4096)
-        } else if let Some((total, avail)) = fs_stats_for_path(test_path) {
-            let space_cap = ((avail as f64) * 0.60 / (file_count as f64)) as u64;
-            let wear_cap = if num_full_writes == 0 {
-                u64::MAX
-            } else {
-                ((total as f64) * max_drive_writes / (num_full_writes as f64)) as u64
-            };
+        let resolved_size = resolve_test_size(
+            fs_stats_for_path(test_path).map(|(total, avail)| FsSizingStats {
+                total_bytes: total,
+                avail_bytes: avail,
+            }),
+            TestSizingPolicy {
+                explicit_test_size: test_size,
+                file_count,
+                num_full_writes,
+                fixed_write_bytes: 0,
+                min_test_size,
+                max_test_size,
+                max_drive_writes,
+                fallback_test_size: 4 * 1024 * 1024 * 1024,
+            },
+        );
+        let size = resolved_size.size_bytes;
 
-            let mut size = max_test_size.min(space_cap).min(wear_cap);
-            size = align_down(size, 4096).max(4096);
-
-            if size < min_test_size {
-                eprintln!(
-                    "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
-                    fmt_gib(size),
-                    fmt_gib(min_test_size)
-                );
-            }
-
-            size
-        } else {
+        if resolved_size.source == TestSizeSource::Fallback {
             eprintln!("Warning: statvfs failed for --test-dir; falling back to 4GiB");
-            4 * 1024 * 1024 * 1024
-        };
+        }
+        if resolved_size.source == TestSizeSource::Auto && size < min_test_size {
+            eprintln!(
+                "Warning: wear/space cap suggests a small test file: {} (min requested: {})",
+                fmt_gib(size),
+                fmt_gib(min_test_size)
+            );
+        }
 
-        let est_user_writes = size.saturating_mul(num_full_writes);
-        let alloc = size.saturating_mul(file_count);
+        let est_user_writes = estimate_user_writes(size, num_full_writes, 0);
+        let alloc = estimate_alloc_bytes(size, file_count);
 
-        if test_size.is_none() {
+        if resolved_size.source == TestSizeSource::Auto {
             eprintln!(
             "Auto-sized test file: {} (alloc={} across {} files; est_writes={} => est_user_writes={})",
             fmt_gib(size),
@@ -634,6 +660,18 @@ pub(super) fn main_impl() {
             );
             cfg.save();
             println!("Saved copy auto mode: {:?}", fro::CopyAutoMode::Heuristic);
+        }
+        if global {
+            if let Some(target_path) = target_path {
+                let mut cfg = fro::config::load_config(config_path);
+                if cfg.promote_mount_override_to_defaults_for_path(target_path) {
+                    cfg.save();
+                    println!(
+                        "Promoted tuned settings for {} into config defaults (--global)",
+                        target_path
+                    );
+                }
+            }
         }
 
         let _ = fs::remove_file(source_file);

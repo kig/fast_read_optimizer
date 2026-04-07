@@ -172,6 +172,20 @@ fn dd_example_matches_system_dd_for_supported_flag_combinations() {
                 "status=none",
             ],
         },
+        DdCase {
+            name: "byte-count-flags",
+            initial_output: Some(b"abcdefghijklmnopqrstuvwxyz0123456789"),
+            flags: &[
+                "bs=8",
+                "skip=5",
+                "seek=3",
+                "count=13",
+                "iflag=skip_bytes,count_bytes",
+                "oflag=seek_bytes",
+                "conv=notrunc",
+                "status=none",
+            ],
+        },
     ];
 
     for case in cases {
@@ -396,4 +410,51 @@ fn dd_example_prints_dd_style_record_counts() {
         fro_stderr.contains("97 bytes copied in"),
         "stderr=\n{fro_stderr}"
     );
+}
+
+#[test]
+fn dd_count_zero_seek_matches_system_dd_and_preserves_notrunc() {
+    let tmp = unique_temp_dir("dd-count-zero-seek");
+    let input = tmp.join("input.bin");
+    fs::write(&input, b"abcdef").unwrap();
+
+    for case in [
+        (
+            "truncate-seek",
+            None,
+            vec!["bs=1", "count=0", "seek=5", "status=none"],
+        ),
+        (
+            "preserve-notrunc",
+            Some(b"abcdefghij".as_slice()),
+            vec!["bs=1", "count=0", "seek=12", "conv=notrunc", "status=none"],
+        ),
+    ] {
+        let case_dir = tmp.join(case.0);
+        fs::create_dir_all(&case_dir).unwrap();
+        let example_output = case_dir.join("example.bin");
+        let fro_output = case_dir.join("fro.bin");
+        let system_output = case_dir.join("system.bin");
+        if let Some(initial) = case.1 {
+            fs::write(&example_output, initial).unwrap();
+            fs::write(&fro_output, initial).unwrap();
+            fs::write(&system_output, initial).unwrap();
+        }
+        let example_args = build_args(&input, &example_output, &case.2);
+        let fro_args = build_args(&input, &fro_output, &case.2);
+        let system_args = build_args(&input, &system_output, &case.2);
+        let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
+        let system = run_system_dd(&system_args);
+
+        compare_outputs(
+            case.0,
+            "example",
+            &example,
+            &system,
+            &example_output,
+            &system_output,
+        );
+        compare_outputs(case.0, "fro dd", &fro, &system, &fro_output, &system_output);
+    }
 }

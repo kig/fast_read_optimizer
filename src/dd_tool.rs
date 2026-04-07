@@ -28,6 +28,9 @@ struct Options {
     seek: u64,
     input_mode: IOMode,
     output_mode: IOMode,
+    count_bytes: bool,
+    skip_bytes: bool,
+    seek_bytes: bool,
     notrunc: bool,
     fsync: bool,
     status: StatusMode,
@@ -35,7 +38,7 @@ struct Options {
 
 pub fn usage(program: &str) {
     eprintln!(
-        "USAGE: {} if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct] [oflag=direct] [conv=notrunc,fsync] [status=none|progress]",
+        "USAGE: {} if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct,count_bytes,skip_bytes] [oflag=direct,seek_bytes] [conv=notrunc,fsync] [status=none|progress]",
         program
     );
 }
@@ -77,6 +80,42 @@ fn parse_mode(value: &str) -> Result<IOMode, String> {
     }
 }
 
+fn parse_input_flags(
+    value: &str,
+    input_mode: &mut IOMode,
+    count_bytes: &mut bool,
+    skip_bytes: &mut bool,
+) -> Result<(), String> {
+    for flag in value.split(',').filter(|item| !item.is_empty()) {
+        match flag {
+            "count_bytes" => *count_bytes = true,
+            "skip_bytes" => *skip_bytes = true,
+            "direct" | "pagecache" | "page-cache" | "cached" | "auto" => {
+                *input_mode = parse_mode(flag)?;
+            }
+            other => return Err(format!("unsupported iflag option: {}", other)),
+        }
+    }
+    Ok(())
+}
+
+fn parse_output_flags(
+    value: &str,
+    output_mode: &mut IOMode,
+    seek_bytes: &mut bool,
+) -> Result<(), String> {
+    for flag in value.split(',').filter(|item| !item.is_empty()) {
+        match flag {
+            "seek_bytes" => *seek_bytes = true,
+            "direct" | "pagecache" | "page-cache" | "cached" | "auto" => {
+                *output_mode = parse_mode(flag)?;
+            }
+            other => return Err(format!("unsupported oflag option: {}", other)),
+        }
+    }
+    Ok(())
+}
+
 fn parse_args(args: &[String]) -> Result<Options, String> {
     if args.len() < 3 {
         usage(&args[0]);
@@ -91,6 +130,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut seek = 0;
     let mut input_mode = IOMode::Auto;
     let mut output_mode = IOMode::Auto;
+    let mut count_bytes = false;
+    let mut skip_bytes = false;
+    let mut seek_bytes = false;
     let mut notrunc = false;
     let mut fsync = false;
     let mut status = StatusMode::Summary;
@@ -111,8 +153,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "count" => count = Some(parse_size(value)?),
             "skip" => skip = parse_size(value)?,
             "seek" => seek = parse_size(value)?,
-            "iflag" => input_mode = parse_mode(value)?,
-            "oflag" => output_mode = parse_mode(value)?,
+            "iflag" => {
+                parse_input_flags(value, &mut input_mode, &mut count_bytes, &mut skip_bytes)?
+            }
+            "oflag" => parse_output_flags(value, &mut output_mode, &mut seek_bytes)?,
             "conv" => {
                 for conv in value.split(',').filter(|item| !item.is_empty()) {
                     match conv {
@@ -143,6 +187,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         seek,
         input_mode,
         output_mode,
+        count_bytes,
+        skip_bytes,
+        seek_bytes,
         notrunc,
         fsync,
         status,
@@ -243,9 +290,39 @@ fn copy_file_range_with_dd_strategy(
     Ok(copied)
 }
 
+fn prepare_zero_count_output(path: &str, output_offset: u64, notrunc: bool) -> io::Result<()> {
+    let file = OpenOptions::new().create(true).write(true).open(path)?;
+    if !notrunc && file.metadata()?.file_type().is_file() {
+        file.set_len(output_offset)?;
+    }
+    Ok(())
+}
+
 pub fn run_dd(args: &[String]) -> io::Result<()> {
     let opts = parse_args(args).map_err(io::Error::other)?;
     let start = Instant::now();
+    let block_size = opts.block_size.unwrap_or(DEFAULT_DD_BLOCK_SIZE);
+
+    if opts.count == Some(0) {
+        std::fs::File::open(&opts.input)?;
+        let output_offset = if opts.seek_bytes {
+            opts.seek
+        } else {
+            opts.seek.saturating_mul(block_size)
+        };
+        prepare_zero_count_output(&opts.output, output_offset, opts.notrunc)?;
+        if opts.fsync {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&opts.output)?
+                .sync_all()?;
+        }
+        if opts.status != StatusMode::None {
+            print_summary(0, block_size, start.elapsed());
+        }
+        return Ok(());
+    }
 
     if opts.block_size.is_none()
         && opts.count.is_none()
@@ -300,16 +377,29 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
     }
 
     let input = crate::open_with_mode(&opts.input, opts.input_mode)?;
-    let block_size = opts.block_size.unwrap_or(DEFAULT_DD_BLOCK_SIZE);
     let input_size = input.len()?;
-    let input_offset = opts.skip.saturating_mul(block_size);
+    let input_offset = if opts.skip_bytes {
+        opts.skip
+    } else {
+        opts.skip.saturating_mul(block_size)
+    };
     let available = input_size.saturating_sub(input_offset);
     let requested = opts
         .count
-        .map(|blocks| blocks.saturating_mul(block_size))
+        .map(|count| {
+            if opts.count_bytes {
+                count
+            } else {
+                count.saturating_mul(block_size)
+            }
+        })
         .unwrap_or(available);
     let copy_len = available.min(requested);
-    let output_offset = opts.seek.saturating_mul(block_size);
+    let output_offset = if opts.seek_bytes {
+        opts.seek
+    } else {
+        opts.seek.saturating_mul(block_size)
+    };
     let job_count = if copy_len == 0 {
         0
     } else {
@@ -449,5 +539,43 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn dd_parse_iflag_and_oflag_byte_modes() {
+        let opts = parse_args(&[
+            "dd".to_string(),
+            "if=input.bin".to_string(),
+            "of=output.bin".to_string(),
+            "iflag=skip_bytes,count_bytes,direct".to_string(),
+            "oflag=seek_bytes,pagecache".to_string(),
+        ])
+        .expect("parse dd args");
+
+        assert!(matches!(opts.input_mode, IOMode::Direct));
+        assert!(matches!(opts.output_mode, IOMode::PageCache));
+        assert!(opts.skip_bytes);
+        assert!(opts.count_bytes);
+        assert!(opts.seek_bytes);
+    }
+
+    #[test]
+    fn zero_count_output_truncates_only_without_notrunc() {
+        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("fro-dd-zero-count-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.parent().expect("tmp parent")).expect("create temp dir");
+        let path = tmp;
+        std::fs::write(&path, b"abcdefghij").expect("seed output");
+
+        prepare_zero_count_output(path.to_str().unwrap(), 5, false).expect("truncate output");
+        assert_eq!(std::fs::read(&path).expect("read output"), b"abcde");
+
+        std::fs::write(&path, b"abcdefghij").expect("reseed output");
+        prepare_zero_count_output(path.to_str().unwrap(), 12, true).expect("preserve output");
+        assert_eq!(std::fs::read(&path).expect("read preserved"), b"abcdefghij");
+
+        std::fs::remove_file(path).ok();
     }
 }

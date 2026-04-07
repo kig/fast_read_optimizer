@@ -42,6 +42,53 @@ fn du_hcs_matches_system_output() {
 }
 
 #[test]
+fn du_max_depth_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-max-depth");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested/deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(tree.join("nested/child.txt"), vec![0x22; 8192]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 16384]).unwrap();
+
+    for du_args in [
+        vec!["--max-depth=0", tree.to_str().unwrap()],
+        vec!["--max-depth=1", tree.to_str().unwrap()],
+        vec!["--max-depth", "1", tree.to_str().unwrap()],
+        vec!["-d1", tree.to_str().unwrap()],
+        vec!["-a", "--max-depth=1", tree.to_str().unwrap()],
+        vec!["-hd1", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du max-depth {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_max_depth_conflicts_and_errors_match_system() {
+    let tmp = unique_temp_dir("fro-coreutils-du-max-depth-errors");
+    let tree = tmp.join("tree");
+    fs::create_dir_all(tree.join("nested")).unwrap();
+    fs::write(tree.join("nested/file.bin"), vec![0x33; 4096]).unwrap();
+
+    for du_args in [
+        vec!["-s", "--max-depth=0", tree.to_str().unwrap()],
+        vec!["-s", "--max-depth=1", tree.to_str().unwrap()],
+        vec!["--max-depth=bad", tree.to_str().unwrap()],
+        vec!["-d", "bad", tree.to_str().unwrap()],
+    ] {
+        assert_same_result(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du max-depth error {:?}", du_args),
+        );
+    }
+}
+
+#[test]
 fn du_matches_system_for_symlinks_broken_symlinks_and_fifos() {
     let tmp = unique_temp_dir("fro-coreutils-du-special");
     let tree = tmp.join("tree");
@@ -68,6 +115,28 @@ fn du_matches_system_for_symlinks_broken_symlinks_and_fifos() {
             run_fro("du", &du_args),
             run_system("du", &du_args),
             &format!("du special {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_double_dash_treats_dash_prefixed_paths_as_operands() {
+    let tmp = unique_temp_dir("fro-coreutils-du-double-dash");
+    let tree = tmp.join("-tree");
+    let nested = tree.join("-nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 8192]).unwrap();
+
+    for du_args in [
+        vec!["--", tree.to_str().unwrap()],
+        vec!["-a", "--", tree.to_str().unwrap()],
+        vec!["--max-depth=1", "--", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du double-dash {:?}", du_args),
         );
     }
 }

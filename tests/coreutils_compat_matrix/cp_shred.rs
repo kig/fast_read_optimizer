@@ -289,6 +289,59 @@ fn cp_no_clobber_matches_system_for_single_file_and_recursive_copy() {
 }
 
 #[test]
+fn cp_recursive_no_clobber_matches_system_when_merging_into_existing_tree() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-recursive-no-clobber-merge");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source_root = tmp.join(format!("merge-src-{suffix}"));
+        let source_nested = source_root.join("nested");
+        fs::create_dir_all(&source_nested).unwrap();
+        fs::write(source_nested.join("existing.txt"), b"fresh-data").unwrap();
+        fs::write(source_nested.join("new.txt"), b"brand-new").unwrap();
+        symlink("nested/new.txt", source_root.join("link")).unwrap();
+
+        let fro_dest = tmp.join(format!("merge-fro-{suffix}"));
+        let sys_dest = tmp.join(format!("merge-sys-{suffix}"));
+        fs::create_dir_all(fro_dest.join("nested")).unwrap();
+        fs::create_dir_all(sys_dest.join("nested")).unwrap();
+        fs::write(fro_dest.join("nested/existing.txt"), b"keep-me").unwrap();
+        fs::write(sys_dest.join("nested/existing.txt"), b"keep-me").unwrap();
+        fs::write(fro_dest.join("link"), b"existing-link-placeholder").unwrap();
+        fs::write(sys_dest.join("link"), b"existing-link-placeholder").unwrap();
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "-rnT",
+            source_root.to_str().unwrap(),
+            fro_dest.to_str().unwrap(),
+        ]);
+        let sys_args = [
+            "-rnT",
+            source_root.to_str().unwrap(),
+            sys_dest.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp recursive no-clobber merge {:?}", fro_args),
+        );
+
+        assert_eq!(
+            snapshot_tree(&fro_dest),
+            snapshot_tree(&sys_dest),
+            "recursive -n -T merge tree mismatch for {:?}",
+            fro_args
+        );
+    }
+}
+
+#[test]
 fn cp_update_matches_system_for_older_and_newer_destinations() {
     let tmp = unique_temp_dir("fro-coreutils-cp-update");
 
@@ -360,6 +413,90 @@ fn cp_update_matches_system_for_older_and_newer_destinations() {
             fs::read(&newer_fro_target).unwrap(),
             fs::read(&newer_sys_target).unwrap()
         );
+    }
+}
+
+#[test]
+fn cp_preserve_matches_system_for_recursive_timestamps() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = unique_temp_dir("fro-coreutils-cp-preserve");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source_root = tmp.join(format!("preserve-src-{suffix}"));
+        let fro_dest_parent = tmp.join(format!("preserve-fro-{suffix}"));
+        let sys_dest_parent = tmp.join(format!("preserve-sys-{suffix}"));
+        let nested = source_root.join("nested/deeper");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&fro_dest_parent).unwrap();
+        fs::create_dir_all(&sys_dest_parent).unwrap();
+
+        let file = source_root.join("small.txt");
+        let nested_dir = source_root.join("nested");
+        let link = nested_dir.join("link-small");
+        fs::write(&file, b"alpha\nbeta\n").unwrap();
+        fs::write(nested.join("large.bin"), b"payload").unwrap();
+        symlink("../small.txt", &link).unwrap();
+
+        set_file_mtime(&file, 1_700_210_000);
+        set_file_mtime(&nested.join("large.bin"), 1_700_210_010);
+        set_file_mtime(&nested_dir, 1_700_210_020);
+        set_file_mtime(&source_root, 1_700_210_030);
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "-rp",
+            source_root.to_str().unwrap(),
+            fro_dest_parent.to_str().unwrap(),
+        ]);
+        let sys_args = [
+            "-rp",
+            source_root.to_str().unwrap(),
+            sys_dest_parent.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp preserve recursive {:?}", fro_args),
+        );
+
+        let copied_name = source_root.file_name().unwrap();
+        let fro_root = fro_dest_parent.join(copied_name);
+        let sys_root = sys_dest_parent.join(copied_name);
+        let fro_tree = snapshot_tree(&fro_root);
+        let sys_tree = snapshot_tree(&sys_root);
+        assert_eq!(
+            fro_tree, sys_tree,
+            "recursive -p tree mismatch for {:?}",
+            fro_args
+        );
+
+        for rel in [
+            std::path::Path::new("small.txt"),
+            std::path::Path::new("nested"),
+            std::path::Path::new("nested/deeper/large.bin"),
+        ] {
+            let fro_meta = fs::metadata(fro_root.join(rel)).unwrap();
+            let sys_meta = fs::metadata(sys_root.join(rel)).unwrap();
+            assert_eq!(
+                fro_meta.mtime(),
+                sys_meta.mtime(),
+                "mtime mismatch for {:?}",
+                rel
+            );
+            assert_eq!(
+                fro_meta.mtime_nsec(),
+                sys_meta.mtime_nsec(),
+                "mtime_nsec mismatch for {:?}",
+                rel
+            );
+        }
     }
 }
 

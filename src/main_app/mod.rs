@@ -27,7 +27,7 @@ use iou::IoUring;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
+use std::os::unix::fs::{symlink, FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +78,8 @@ struct RecursiveCopyContext {
     relative_copy_method: RelativeCopyMethod,
     verbose: bool,
     cp_compat: bool,
+    cp_no_clobber: bool,
+    preserve_timestamps: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +93,7 @@ struct RecursiveFileTask {
     source_path: PathBuf,
     target_path: PathBuf,
     source_mode: u32,
+    source_timestamps: recursive::PreservedTimestamps,
     resolved_copy: ResolvedCopyExecution,
     source_parent_dir: Option<PathBuf>,
 }
@@ -101,6 +104,8 @@ struct RecursiveSmallFileTask {
     target_path: PathBuf,
     source_len: u64,
     source_mode: u32,
+    source_timestamps: recursive::PreservedTimestamps,
+    preserve_timestamps: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +426,8 @@ pub(crate) fn move_directory_cross_filesystem(
         relative_copy_method: RelativeCopyMethod::CopyFileRange,
         verbose,
         cp_compat: false,
+        cp_no_clobber: false,
+        preserve_timestamps: false,
     };
     recursive::move_dir::run_recursive_move(recursive_ctx, verbose)
 }

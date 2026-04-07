@@ -105,3 +105,22 @@ pub(super) fn is_broken_pipe_error(err: &io::Error) -> bool {
 pub(super) fn is_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     panic_payload_message(payload).is_some_and(|message| message.contains("Broken pipe"))
 }
+
+pub(super) fn skip_copy_destination(
+    source: &Path,
+    target: &Path,
+    update_only_if_newer: bool,
+) -> io::Result<bool> {
+    let target_meta = match fs::metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if update_only_if_newer {
+        let source_meta = fs::metadata(source)?;
+        if source_meta.modified()? > target_meta.modified()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
