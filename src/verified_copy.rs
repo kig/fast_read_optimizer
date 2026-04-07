@@ -4,7 +4,7 @@ use crate::block_hash::{
 };
 use crate::common::{CopyStrategy, IOMode};
 use crate::config::{load_config, IOParams};
-use crate::io_util::{sync_parent_directory, sync_path, CopyOperationGuard};
+use crate::io_util::{sync_parent_directory, sync_path, utf8_path, CopyOperationGuard};
 use crate::reader::load_file_to_memory_for_mode;
 use crate::writer::{copy_file_with_strategy as copy_file_inner, write_buffer};
 use std::fs::{File, OpenOptions};
@@ -22,15 +22,6 @@ pub struct VerifiedCopyReport {
     pub used_recovery: bool,
     pub hash_type: BlockHashAlgorithm,
     pub hashes_persisted: bool,
-}
-
-fn path_str(path: &Path) -> io::Result<&str> {
-    path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path is not valid UTF-8: {}", path.display()),
-        )
-    })
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -360,13 +351,13 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     copy_strategy: CopyStrategy,
     use_lock: bool,
 ) -> io::Result<VerifiedCopyReport> {
-    let source = path_str(source.as_ref())?;
+    let source = utf8_path(source.as_ref())?;
     let target_path = target.as_ref();
-    let target = path_str(target_path)?;
+    let target = utf8_path(target_path)?;
     let target_missing_before_guard = !target_path.exists();
     let _guard = CopyOperationGuard::new(source, target, use_lock)?;
     let pending_target = PendingVerifiedTarget::new(target_path, target_missing_before_guard)?;
-    let working_target = path_str(pending_target.working_path())?;
+    let working_target = utf8_path(pending_target.working_path())?;
     let config = load_config(None);
 
     let source_page_cache = config.get_params_for_path("verify", false, source);

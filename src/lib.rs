@@ -1,3 +1,8 @@
+//! Public path-taking helpers accept `AsRef<Path>` for ergonomic call sites, but
+//! the current optimized implementation resolves config and worker paths through
+//! UTF-8 `&str` values. On Unix, non-UTF-8 paths are therefore rejected with
+//! `io::ErrorKind::InvalidInput` instead of being lossily converted.
+
 mod api;
 mod blake3_hash;
 mod common;

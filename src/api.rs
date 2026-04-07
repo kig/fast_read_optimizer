@@ -1,6 +1,6 @@
 use crate::common::CopyStrategy;
 use crate::config::load_config;
-use crate::io_util::CopyOperationGuard;
+use crate::io_util::{utf8_path, CopyOperationGuard};
 use crate::reader::{
     evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache, BufReader,
 };
@@ -16,15 +16,6 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn path_str(path: &Path) -> io::Result<&str> {
-    path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path is not valid UTF-8: {}", path.display()),
-        )
-    })
-}
 
 const ORDERED_SCAN_BLOCK_SIZE: usize = 8 << 20;
 const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
@@ -234,12 +225,59 @@ pub fn open<P: AsRef<Path>>(path: P) -> io::Result<ParallelFile> {
 
 #[cfg(test)]
 mod tests {
-    use super::page_cache_lift_checkpoint_nanos;
+    use super::{copy_file, create, open, page_cache_lift_checkpoint_nanos};
+    use std::io;
+
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    fn non_utf8_path() -> PathBuf {
+        PathBuf::from(OsString::from_vec(vec![b'f', b'r', b'o', 0x80]))
+    }
+
+    #[cfg(unix)]
+    fn assert_utf8_path_error<T>(result: io::Result<T>) {
+        let err = match result {
+            Ok(_) => panic!("non-UTF-8 path should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("currently require UTF-8 paths"));
+    }
 
     #[test]
     fn page_cache_lift_checkpoint_never_precedes_foreground_completion() {
         assert_eq!(page_cache_lift_checkpoint_nanos(9, 3), 9);
         assert_eq!(page_cache_lift_checkpoint_nanos(9, 14), 14);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_non_utf8_paths() {
+        assert_utf8_path_error(open(non_utf8_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_rejects_non_utf8_paths() {
+        assert_utf8_path_error(create(non_utf8_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_file_rejects_non_utf8_paths() {
+        assert_utf8_path_error(copy_file(non_utf8_path(), "ignored-target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_copy_rejects_non_utf8_paths() {
+        assert_utf8_path_error(crate::copy_file_verified(non_utf8_path(), "ignored-target"));
     }
 }
 
@@ -259,7 +297,7 @@ mod kani_proofs {
 
 pub fn open_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<ParallelFile> {
     let config = load_config(None);
-    ParallelFile::open(&config, "read", path_str(path.as_ref())?, io_mode)
+    ParallelFile::open(&config, "read", utf8_path(path.as_ref())?, io_mode)
 }
 
 pub fn create<P: AsRef<Path>>(path: P) -> io::Result<SequentialWriter> {
@@ -268,7 +306,7 @@ pub fn create<P: AsRef<Path>>(path: P) -> io::Result<SequentialWriter> {
 
 pub fn create_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<SequentialWriter> {
     let config = load_config(None);
-    let path = path_str(path.as_ref())?;
+    let path = utf8_path(path.as_ref())?;
     let params = resolve_writer_params_for_mode(&config, "write", path, io_mode);
     SequentialWriter::create(path, params.qd, params.block_size, io_mode)
 }
@@ -286,7 +324,7 @@ pub fn indexed_writer_with_mode<P: AsRef<Path>>(
     ParallelWriter::indexed(
         &config,
         "write",
-        path_str(path.as_ref())?,
+        utf8_path(path.as_ref())?,
         io_mode,
         block_count,
     )
@@ -329,7 +367,7 @@ pub fn offset_writer_with_options<P: AsRef<Path>>(
     ParallelWriter::fixed_size_with_truncate(
         &config,
         "write",
-        path_str(path.as_ref())?,
+        utf8_path(path.as_ref())?,
         io_mode,
         total_size,
         truncate,
@@ -342,12 +380,15 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_file_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<Vec<u8>> {
     let config = load_config(None);
-    Ok(
-        load_file_to_memory_for_mode(&config, "read_to_memory", path_str(path.as_ref())?, io_mode)?
-            .data
-            .as_slice()
-            .to_vec(),
-    )
+    Ok(load_file_to_memory_for_mode(
+        &config,
+        "read_to_memory",
+        utf8_path(path.as_ref())?,
+        io_mode,
+    )?
+    .data
+    .as_slice()
+    .to_vec())
 }
 
 /// Benchmark a cold-start direct-to-memory load while warming the page cache in
@@ -363,7 +404,7 @@ pub fn benchmark_page_cache_lift<P: AsRef<Path>>(
     path: P,
 ) -> io::Result<PageCacheLiftBenchmarkReport> {
     let path = path.as_ref();
-    let path_string = path_str(path)?.to_owned();
+    let path_string = utf8_path(path)?.to_owned();
     evict_file_cache(&path_string)?;
 
     let start_barrier = Arc::new(Barrier::new(2));
@@ -486,8 +527,8 @@ pub fn copy_file_via_memory_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
-    let source = path_str(source.as_ref())?;
-    let target = path_str(target.as_ref())?;
+    let source = utf8_path(source.as_ref())?;
+    let target = utf8_path(target.as_ref())?;
     let guard = CopyOperationGuard::new(source, target, true)?;
     let data = read_file_with_mode(source, io_mode_read)?;
     let copied = write_file_with_mode(target, &data, io_mode_write)?;
@@ -502,8 +543,8 @@ pub fn copy_file_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
     let config = load_config(None);
-    let source = path_str(source.as_ref())?;
-    let target = path_str(target.as_ref())?;
+    let source = utf8_path(source.as_ref())?;
+    let target = utf8_path(target.as_ref())?;
     let guard = CopyOperationGuard::new(source, target, true)?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
@@ -538,8 +579,8 @@ pub fn copy_file_range_with_modes<S: AsRef<Path>, D: AsRef<Path>>(
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
     let config = load_config(None);
-    let source = path_str(source.as_ref())?;
-    let target = path_str(target.as_ref())?;
+    let source = utf8_path(source.as_ref())?;
+    let target = utf8_path(target.as_ref())?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
     let copy_range = config.get_copy_range_params_for_path(target);
