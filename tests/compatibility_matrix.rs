@@ -12,6 +12,7 @@ mod unix_matrix {
         Success,
         PermissionDenied,
         InvalidInputClass,
+        NotFound,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -100,6 +101,14 @@ mod unix_matrix {
                     "{name}: expected invalid-input-class error, got {err:?}"
                 ),
             },
+            ResultClass::NotFound => match result {
+                Ok(_) => panic!("{name}: expected not-found error, got success"),
+                Err(err) => assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::NotFound,
+                    "{name}: expected not-found error, got {err:?}"
+                ),
+            },
         }
     }
 
@@ -180,18 +189,25 @@ mod unix_matrix {
         let readable = tmp.join("readable.bin");
         let unreadable = tmp.join("unreadable.bin");
         let directory = tmp.join("directory");
+        let traversal_blocked_dir = tmp.join("traversal-blocked");
+        let traversal_blocked_file = traversal_blocked_dir.join("child.bin");
         let readable_symlink = tmp.join("readable-link");
         let directory_symlink = tmp.join("directory-link");
         let unreadable_symlink = tmp.join("unreadable-link");
+        let dangling_symlink = tmp.join("dangling-link");
         let bytes = b"compatibility-read-bytes".to_vec();
 
         fs::write(&readable, &bytes).unwrap();
         fs::write(&unreadable, &bytes).unwrap();
         set_mode(&unreadable, 0o000);
         fs::create_dir(&directory).unwrap();
+        fs::create_dir(&traversal_blocked_dir).unwrap();
+        fs::write(&traversal_blocked_file, &bytes).unwrap();
+        set_mode(&traversal_blocked_dir, 0o666);
         symlink(&readable, &readable_symlink).unwrap();
         symlink(&directory, &directory_symlink).unwrap();
         symlink(&unreadable, &unreadable_symlink).unwrap();
+        symlink(tmp.join("missing-target.bin"), &dangling_symlink).unwrap();
 
         let cases = [
             (
@@ -216,6 +232,15 @@ mod unix_matrix {
                 None,
             ),
             (
+                "regular-under-0666-parent",
+                &traversal_blocked_file,
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+                Some(bytes.clone()),
+            ),
+            (
                 "symlink-to-regular",
                 &readable_symlink,
                 ExpectedClass::same(ResultClass::Success),
@@ -235,6 +260,12 @@ mod unix_matrix {
                     ResultClass::Success,
                 ),
                 Some(bytes.clone()),
+            ),
+            (
+                "dangling-symlink",
+                &dangling_symlink,
+                ExpectedClass::same(ResultClass::NotFound),
+                None,
             ),
         ];
 
@@ -264,18 +295,25 @@ mod unix_matrix {
         let readable = tmp.join("readable.bin");
         let unreadable = tmp.join("unreadable.bin");
         let directory = tmp.join("directory");
+        let traversal_blocked_dir = tmp.join("traversal-blocked");
+        let traversal_blocked_file = traversal_blocked_dir.join("child.bin");
         let readable_symlink = tmp.join("readable-link");
         let directory_symlink = tmp.join("directory-link");
         let unreadable_symlink = tmp.join("unreadable-link");
+        let dangling_symlink = tmp.join("dangling-link");
         let bytes = b"compatibility-read-surface-bytes".to_vec();
 
         fs::write(&readable, &bytes).unwrap();
         fs::write(&unreadable, &bytes).unwrap();
         set_mode(&unreadable, 0o000);
         fs::create_dir(&directory).unwrap();
+        fs::create_dir(&traversal_blocked_dir).unwrap();
+        fs::write(&traversal_blocked_file, &bytes).unwrap();
+        set_mode(&traversal_blocked_dir, 0o666);
         symlink(&readable, &readable_symlink).unwrap();
         symlink(&directory, &directory_symlink).unwrap();
         symlink(&unreadable, &unreadable_symlink).unwrap();
+        symlink(tmp.join("missing-target.bin"), &dangling_symlink).unwrap();
 
         let cases = [
             (
@@ -300,6 +338,15 @@ mod unix_matrix {
                 None,
             ),
             (
+                "regular-under-0666-parent",
+                traversal_blocked_file.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+                Some(bytes.as_slice()),
+            ),
+            (
                 "symlink-to-regular",
                 readable_symlink.as_path(),
                 ExpectedClass::same(ResultClass::Success),
@@ -319,6 +366,12 @@ mod unix_matrix {
                     ResultClass::Success,
                 ),
                 Some(bytes.as_slice()),
+            ),
+            (
+                "dangling-symlink",
+                dangling_symlink.as_path(),
+                ExpectedClass::same(ResultClass::NotFound),
+                None,
             ),
         ];
 
@@ -341,6 +394,8 @@ mod unix_matrix {
         let directory_symlink = tmp.join("directory-link");
         let locked_dir = tmp.join("locked-dir");
         let locked_child = locked_dir.join("child.bin");
+        let traversal_blocked_dir = tmp.join("traversal-blocked");
+        let traversal_blocked_file = traversal_blocked_dir.join("child.bin");
         let bytes = b"compatibility-write-bytes".to_vec();
 
         fs::write(&writable, b"old").unwrap();
@@ -354,6 +409,9 @@ mod unix_matrix {
         symlink(&directory, &directory_symlink).unwrap();
         fs::create_dir(&locked_dir).unwrap();
         set_mode(&locked_dir, 0o555);
+        fs::create_dir(&traversal_blocked_dir).unwrap();
+        fs::write(&traversal_blocked_file, b"old").unwrap();
+        set_mode(&traversal_blocked_dir, 0o666);
 
         let cases = [
             (
@@ -385,6 +443,15 @@ mod unix_matrix {
                 directory.as_path(),
                 ExpectedClass::same(ResultClass::InvalidInputClass),
                 None,
+            ),
+            (
+                "regular-under-0666-parent",
+                traversal_blocked_file.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+                Some(traversal_blocked_file.as_path()),
             ),
             (
                 "symlink-to-regular",
@@ -446,8 +513,15 @@ mod unix_matrix {
         let copy_from_symlink = tmp.join("copy-from-symlink.bin");
         let copy_from_directory = tmp.join("copy-from-directory.bin");
         let copy_from_inaccessible = tmp.join("copy-from-0000.bin");
+        let dangling_source_symlink = tmp.join("dangling-source-link");
+        let copy_from_dangling = tmp.join("copy-from-dangling.bin");
         let locked_dir = tmp.join("locked-dir");
         let locked_dest = locked_dir.join("copy.bin");
+        let traversal_blocked_source_dir = tmp.join("traversal-blocked-source");
+        let traversal_blocked_source = traversal_blocked_source_dir.join("child.bin");
+        let copy_from_traversal_blocked = tmp.join("copy-from-traversal-blocked.bin");
+        let traversal_blocked_dest_dir = tmp.join("traversal-blocked-dest");
+        let traversal_blocked_dest = traversal_blocked_dest_dir.join("copy.bin");
         let bytes = b"compatibility-copy-bytes".to_vec();
 
         fs::write(&readable, &bytes).unwrap();
@@ -455,8 +529,15 @@ mod unix_matrix {
         set_mode(&unreadable, 0o000);
         fs::create_dir(&directory).unwrap();
         symlink(&readable, &source_symlink).unwrap();
+        symlink(tmp.join("missing-source.bin"), &dangling_source_symlink).unwrap();
         fs::create_dir(&locked_dir).unwrap();
         set_mode(&locked_dir, 0o555);
+        fs::create_dir(&traversal_blocked_source_dir).unwrap();
+        fs::write(&traversal_blocked_source, &bytes).unwrap();
+        set_mode(&traversal_blocked_source_dir, 0o666);
+        fs::create_dir(&traversal_blocked_dest_dir).unwrap();
+        fs::write(&traversal_blocked_dest, b"old").unwrap();
+        set_mode(&traversal_blocked_dest_dir, 0o666);
 
         let cases = [
             (
@@ -487,10 +568,34 @@ mod unix_matrix {
                 ),
             ),
             (
+                "dangling-symlink-source",
+                dangling_source_symlink.as_path(),
+                copy_from_dangling.as_path(),
+                ExpectedClass::same(ResultClass::NotFound),
+            ),
+            (
+                "source-under-0666-parent",
+                traversal_blocked_source.as_path(),
+                copy_from_traversal_blocked.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
+            ),
+            (
                 "destination-is-directory",
                 readable.as_path(),
                 directory.as_path(),
                 ExpectedClass::same(ResultClass::InvalidInputClass),
+            ),
+            (
+                "destination-under-0666-parent",
+                readable.as_path(),
+                traversal_blocked_dest.as_path(),
+                ExpectedClass::privilege_sensitive(
+                    ResultClass::PermissionDenied,
+                    ResultClass::Success,
+                ),
             ),
             (
                 "destination-in-0555-directory",
