@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 enum StatusMode {
     Summary,
     None,
+    NoXfer,
     Progress,
 }
 
@@ -38,7 +39,7 @@ struct Options {
 
 pub fn usage(program: &str) {
     eprintln!(
-        "USAGE: {} if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct,count_bytes,skip_bytes] [oflag=direct,seek_bytes] [conv=notrunc,fsync] [status=none|progress]",
+        "USAGE: {} if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct,count_bytes,skip_bytes] [oflag=direct,seek_bytes] [conv=notrunc,fsync] [status=none|noxfer|progress]",
         program
     );
 }
@@ -169,6 +170,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "status" => {
                 status = match value {
                     "none" => StatusMode::None,
+                    "noxfer" => StatusMode::NoXfer,
                     "progress" => StatusMode::Progress,
                     "summary" | "default" => StatusMode::Summary,
                     other => return Err(format!("unsupported status mode: {}", other)),
@@ -217,6 +219,12 @@ fn print_summary(bytes: u64, block_size: u64, elapsed: Duration) {
             bytes as f64 / secs / 1e9
         }
     );
+}
+
+fn print_records_only(bytes: u64, block_size: u64) {
+    let (full_records, partial_records) = record_counts(bytes, block_size);
+    eprintln!("{}+{} records in", full_records, partial_records);
+    eprintln!("{}+{} records out", full_records, partial_records);
 }
 
 fn dd_small_medium_copy_strategy(
@@ -318,8 +326,12 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
                 .open(&opts.output)?
                 .sync_all()?;
         }
-        if opts.status != StatusMode::None {
-            print_summary(0, block_size, start.elapsed());
+        match opts.status {
+            StatusMode::None => {}
+            StatusMode::NoXfer => print_records_only(0, block_size),
+            StatusMode::Summary | StatusMode::Progress => {
+                print_summary(0, block_size, start.elapsed())
+            }
         }
         return Ok(());
     }
@@ -370,8 +382,12 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
                 .open(&opts.output)?
                 .sync_all()?;
         }
-        if opts.status != StatusMode::None {
-            print_summary(bytes, record_block_size, start.elapsed());
+        match opts.status {
+            StatusMode::None => {}
+            StatusMode::NoXfer => print_records_only(bytes, record_block_size),
+            StatusMode::Summary | StatusMode::Progress => {
+                print_summary(bytes, record_block_size, start.elapsed())
+            }
         }
         return Ok(());
     }
@@ -477,8 +493,12 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
             .open(&opts.output)?
             .sync_all()?;
     }
-    if opts.status != StatusMode::None {
-        print_summary(bytes_copied, block_size, start.elapsed());
+    match opts.status {
+        StatusMode::None => {}
+        StatusMode::NoXfer => print_records_only(bytes_copied, block_size),
+        StatusMode::Summary | StatusMode::Progress => {
+            print_summary(bytes_copied, block_size, start.elapsed())
+        }
     }
     Ok(())
 }
@@ -557,6 +577,19 @@ mod tests {
         assert!(opts.skip_bytes);
         assert!(opts.count_bytes);
         assert!(opts.seek_bytes);
+    }
+
+    #[test]
+    fn dd_parse_status_noxfer() {
+        let opts = parse_args(&[
+            "dd".to_string(),
+            "if=input.bin".to_string(),
+            "of=output.bin".to_string(),
+            "status=noxfer".to_string(),
+        ])
+        .expect("parse dd args");
+
+        assert!(matches!(opts.status, StatusMode::NoXfer));
     }
 
     #[test]

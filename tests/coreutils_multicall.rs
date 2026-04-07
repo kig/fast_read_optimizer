@@ -301,6 +301,42 @@ fn multicall_dd_copies_requested_range() {
 }
 
 #[test]
+fn multicall_dd_status_noxfer_prints_records_only() {
+    let tmp = unique_temp_dir("fro-coreutils-dd-noxfer");
+    let input = tmp.join("input.bin");
+    let output = tmp.join("output.bin");
+    let bytes = (0..97).map(|i| ((i * 13) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, &bytes).unwrap();
+
+    let out = assert_success(run_fro(
+        "dd",
+        &[
+            &format!("if={}", input.display()),
+            &format!("of={}", output.display()),
+            "bs=10",
+            "status=noxfer",
+        ],
+    ));
+    assert_eq!(fs::read(&output).unwrap(), bytes);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("9+1 records in"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        stderr.contains("9+1 records out"),
+        "stderr:
+{stderr}"
+    );
+    assert!(
+        !stderr.contains("bytes copied"),
+        "stderr:
+{stderr}"
+    );
+}
+
+#[test]
 fn multicall_cat_and_wc_accept_stdin_and_dash() {
     let bytes = b"one two\nthree\n";
 

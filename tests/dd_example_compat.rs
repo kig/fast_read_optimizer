@@ -413,6 +413,68 @@ fn dd_example_prints_dd_style_record_counts() {
 }
 
 #[test]
+fn dd_status_noxfer_matches_system_dd() {
+    let tmp = unique_temp_dir("dd-status-noxfer");
+    let input = tmp.join("input.bin");
+    let input_bytes = (0..97).map(|i| ((i * 29) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, input_bytes).unwrap();
+
+    for case in [
+        (
+            "full-copy",
+            vec!["bs=10".to_string(), "status=noxfer".to_string()],
+        ),
+        (
+            "count-zero",
+            vec![
+                "bs=4".to_string(),
+                "count=0".to_string(),
+                "status=noxfer".to_string(),
+            ],
+        ),
+    ] {
+        let case_dir = tmp.join(case.0);
+        fs::create_dir_all(&case_dir).unwrap();
+        let example_output = case_dir.join("example.bin");
+        let fro_output = case_dir.join("fro.bin");
+        let system_output = case_dir.join("system.bin");
+
+        let mut example_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", example_output.display()),
+        ];
+        example_args.extend(case.1.iter().cloned());
+
+        let mut fro_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", fro_output.display()),
+        ];
+        fro_args.extend(case.1.iter().cloned());
+
+        let mut system_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", system_output.display()),
+        ];
+        system_args.extend(case.1.iter().cloned());
+
+        let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
+        let system = run_system_dd(&system_args);
+
+        compare_outputs(
+            case.0,
+            "example",
+            &example,
+            &system,
+            &example_output,
+            &system_output,
+        );
+        compare_outputs(case.0, "fro dd", &fro, &system, &fro_output, &system_output);
+        assert!(!String::from_utf8_lossy(&fro.stderr).contains("bytes copied"));
+    }
+}
+
+#[test]
 fn dd_count_zero_seek_matches_system_dd_and_preserves_notrunc() {
     let tmp = unique_temp_dir("dd-count-zero-seek");
     let input = tmp.join("input.bin");
