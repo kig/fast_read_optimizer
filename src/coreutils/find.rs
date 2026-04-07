@@ -216,8 +216,16 @@ fn parallel_find_worker_count() -> usize {
 fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
     let mut roots = Vec::new();
     let mut index = 1;
+    let dashed_roots_allowed = args.get(index).is_some_and(|arg| arg == "--");
+    if dashed_roots_allowed {
+        index += 1;
+    }
     while let Some(arg) = args.get(index) {
-        if is_find_expression_token(arg) {
+        if if dashed_roots_allowed {
+            is_supported_find_expression_token(arg)
+        } else {
+            is_find_expression_token(arg)
+        } {
             break;
         }
         roots.push(arg.clone());
@@ -332,12 +340,20 @@ fn is_find_expression_token(arg: &str) -> bool {
     arg.starts_with('-') || matches!(arg, "!" | "(" | ")")
 }
 
+fn is_supported_find_expression_token(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-maxdepth" | "-type" | "-name" | "-path" | "-print" | "-print0" | "!" | "(" | ")"
+    )
+}
+
 fn print_find_help(program: &str) {
     println!(
-        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
+        "Usage: {program} [--] [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
     );
     println!("Walk directory trees and print matching paths.");
     println!();
+    println!("  --                 stop option parsing so roots beginning with '-' stay paths");
     println!("  -maxdepth N        descend at most N levels below each starting path");
     println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
     println!("  -name PATTERN      match the final path component using shell glob syntax");
@@ -413,5 +429,22 @@ mod tests {
 
         assert!(plan.should_descend(0));
         assert!(!plan.should_descend(1));
+    }
+
+    #[test]
+    fn parse_find_args_allows_dashed_roots_after_double_dash() {
+        let args = vec![
+            "find".to_string(),
+            "--".to_string(),
+            "-root".to_string(),
+            "-name".to_string(),
+            "*.txt".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+
+        assert_eq!(roots, vec!["-root".to_string()]);
+        assert!(plan.name_pattern.is_some());
+        assert_eq!(plan.output_delimiter, b'\n');
     }
 }

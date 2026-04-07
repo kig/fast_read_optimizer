@@ -221,9 +221,10 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "find" => Some(CommandHelp {
             name: "find",
-            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
+            usage: "find [--] [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
             summary: "Walk one or more directory trees and print matching paths.",
             notes: &[
+                "-- stops option parsing so roots beginning with '-' stay positional paths.",
                 "This correctness slice does not guarantee output ordering.",
                 "-maxdepth limits descent below each starting path while still printing matching roots.",
                 "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s.",
