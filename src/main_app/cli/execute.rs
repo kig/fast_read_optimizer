@@ -1,10 +1,13 @@
 use super::args::ParsedArgs;
 use super::*;
+use crate::io_util::{install_active_direct_io_tracker, DirectIoFallbackTracker};
 use crate::main_app::bench_tar_archive;
 use crate::main_app::copy_plan::{describe_copy_path, resolve_copy_execution};
 use crate::main_app::recursive::bench::{bench_recursive_read, bench_recursive_small_file_threads};
 use crate::main_app::recursive::paths::resolve_recursive_copy_root;
-use crate::main_app::recursive::{run_recursive_copy, run_split_manifest_recursive_copy};
+use crate::main_app::recursive::run_recursive_copy;
+use crate::main_app::recursive::split_manifest::run_split_manifest_recursive_copy;
+use std::sync::Arc;
 
 pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let ParsedArgs {
@@ -37,6 +40,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         cp_target_directory,
         cp_no_target_directory,
         cp_update,
+        cp_preserve,
         verbose,
         source,
         pattern,
@@ -93,7 +97,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let mode = mode;
     let filename = filename;
     let pattern = pattern;
-    let context_path = filename.as_str();
+    let context_path = config_target.as_deref().unwrap_or(filename.as_str());
 
     let mut config = config::load_config(config_path.as_deref());
     let config_mode = match mode.as_str() {
@@ -184,7 +188,16 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let params_direct_for_path = config.get_params_for_path(config_mode, true, context_path);
 
     let mode_callback = |p: &[u64]| {
-        if mode == "read" && to_memory {
+        let direct_fallback_tracker =
+            if io_mode == common::IOMode::Direct || io_mode_write == common::IOMode::Direct {
+                Some(Arc::new(DirectIoFallbackTracker::default()))
+            } else {
+                None
+            };
+        let _direct_fallback_guard = direct_fallback_tracker
+            .as_ref()
+            .map(|tracker| install_active_direct_io_tracker(Arc::clone(tracker)));
+        let result = if mode == "read" && to_memory {
             measure_file_load_to_memory(
                 &filename,
                 p[0],
@@ -469,6 +482,8 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             relative_copy_method: RelativeCopyMethod::CopyFileRange,
                             verbose: internal_verbose,
                             cp_compat,
+                            cp_no_clobber,
+                            preserve_timestamps: cp_preserve,
                         };
                         if mode == "split-manifest-recursive-copy-bench" {
                             run_split_manifest_recursive_copy(recursive_ctx, internal_verbose)?
@@ -705,6 +720,9 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 )?
                             };
                             guard.ensure_source_unchanged()?;
+                            if cp_preserve {
+                                recursive::preserve_file_timestamps(source_path, target_path)?;
+                            }
                             copied
                         }
                     };
@@ -755,7 +773,22 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 io::ErrorKind::InvalidInput,
                 format!("invalid mode {}", mode),
             ))
+        };
+        if result.is_ok() && !cp_compat {
+            if let Some(tracker) = direct_fallback_tracker.as_ref() {
+                let request_label = match mode.as_str() {
+                    "read" | "grep" => "forced --direct read",
+                    "write" => "forced --direct-write",
+                    "copy" | "split-manifest-recursive-copy-bench" => "forced direct I/O copy",
+                    "diff" | "dual-read-bench" => "forced --direct diff",
+                    _ => "forced direct I/O",
+                };
+                for line in tracker.take_warning_lines(request_label) {
+                    eprintln!("{line}");
+                }
+            }
         }
+        result
     };
 
     let effective_to_memory_mode = if mode == "read" && to_memory {
@@ -893,23 +926,4 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         return Ok(exit_code);
     }
     Ok(0)
-}
-
-fn skip_copy_destination(
-    source: &Path,
-    target: &Path,
-    update_only_if_newer: bool,
-) -> io::Result<bool> {
-    let target_meta = match fs::metadata(target) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-    if update_only_if_newer {
-        let source_meta = fs::metadata(source)?;
-        if source_meta.modified()? > target_meta.modified()? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }

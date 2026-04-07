@@ -166,6 +166,22 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
                     io::Error::new(io::ErrorKind::InvalidInput, format!("base64: {message}"))
                 })?;
             }
+            "--wrap" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("base64: option '--wrap' requires an argument");
+                    eprintln!("Try 'base64 --help' for more information.");
+                    return Ok(Err(1));
+                }
+                wrap_cols = parse_base64_wrap(&args[i]).map_err(|message| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("base64: {message}"))
+                })?;
+            }
+            other if other.starts_with("-w") && other.len() > 2 => {
+                wrap_cols = parse_base64_wrap(&other[2..]).map_err(|message| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("base64: {message}"))
+                })?;
+            }
             other if other.starts_with("--wrap=") => {
                 wrap_cols = parse_base64_wrap(&other["--wrap=".len()..]).map_err(|message| {
                     io::Error::new(io::ErrorKind::InvalidInput, format!("base64: {message}"))

@@ -1,6 +1,6 @@
 use super::*;
 use crate::main_app::recursive::openat::{copy_small_file_openat, open_dir_fd};
-use crate::main_app::recursive::recursive_read_file_worker_count;
+use crate::main_app::recursive::scheduling::recursive_read_file_worker_count;
 
 mod copy_bench;
 mod manifest;

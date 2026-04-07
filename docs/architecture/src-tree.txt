@@ -18,6 +18,9 @@ src/
     ops.rs
     tests.rs
   config/
+    tests/
+      device_probe.rs
+      precedence.rs
     device.rs
     mod.rs
     storage.rs
@@ -25,7 +28,9 @@ src/
   coreutils/
     base64/
       process/
+        bytes.rs
         decode_reorg.rs
+        wrapped.rs
       bench.rs
       kani_proofs.rs
       process.rs
@@ -76,6 +81,9 @@ src/
       move_dir.rs
       openat.rs
       paths.rs
+      scheduling.rs
+      split_manifest.rs
+      tests.rs
     copy_plan.rs
     file_list.rs
     help.rs
@@ -115,4 +123,5 @@ src/
   mincore.rs
   optimizer.rs
   stream.rs
+  test_sizing.rs
   verified_copy.rs

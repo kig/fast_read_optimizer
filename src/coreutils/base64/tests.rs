@@ -1,7 +1,8 @@
-use super::process::{
-    append_sanitized_base64_bytes, append_wrapped_base64_bytes,
-    decode_base64_bytes_with_detect_fallback,
+use super::process::bytes::{
+    append_sanitized_base64_bytes, decode_base64_bytes_with_detect_fallback,
+    encode_base64_bytes_via_wrapped_writer_for_test,
 };
+use super::process::wrapped::append_wrapped_base64_bytes;
 use super::*;
 
 #[test]
@@ -64,6 +65,18 @@ fn write_base64_encoded_vec_wraps_like_slice_path() {
     append_wrapped_base64_bytes(&mut out, b"ABCDEFGH", 5, &mut current_line_len);
     assert_eq!(out, b"ABC\nDEFGH\n");
     assert_eq!(current_line_len, 0);
+}
+
+#[test]
+fn wrapped_writer_batches_small_wrap_output_into_few_writes() {
+    let bytes = (0..(128 * 1024 + 7))
+        .map(|i| ((i * 13 + 3) % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected = super::process::bytes::encode_base64_bytes_via_wrapped_path(&bytes, 5).unwrap();
+    let (actual, writes) =
+        encode_base64_bytes_via_wrapped_writer_for_test(&bytes, 5, 32 * 1024).unwrap();
+    assert_eq!(actual, expected);
+    assert!(writes <= 4, "expected batched writes, saw {writes}");
 }
 
 #[test]
@@ -146,7 +159,7 @@ fn decode_detect_fallback_decodes_wrapped_input() {
     let bytes = (0..(12 * 1024))
         .map(|i| ((i * 19 + 11) % 251) as u8)
         .collect::<Vec<_>>();
-    let encoded = super::process::encode_base64_bytes_via_wrapped_path(&bytes, 76).unwrap();
+    let encoded = super::process::bytes::encode_base64_bytes_via_wrapped_path(&bytes, 76).unwrap();
     let decoded =
         decode_base64_bytes_with_detect_fallback(&encoded, false, Base64DecodeKernel::Auto)
             .unwrap();

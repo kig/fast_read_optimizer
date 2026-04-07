@@ -13,14 +13,14 @@ pub(crate) fn bench_base64_wrapped_encode(iterations: u64, wrap_cols: usize) -> 
         .map(|i| ((i * 29 + 7) % 251) as u8)
         .collect::<Vec<_>>();
     for _ in 0..1024 {
-        let out = process::encode_base64_bytes_via_wrapped_path(&input, wrap_cols)?;
+        let out = process::bytes::encode_base64_bytes_via_wrapped_path(&input, wrap_cols)?;
         black_box(out.len());
     }
 
     let start = Instant::now();
     let mut sink = 0_u64;
     for _ in 0..iterations {
-        let out = process::encode_base64_bytes_via_wrapped_path(&input, wrap_cols)?;
+        let out = process::bytes::encode_base64_bytes_via_wrapped_path(&input, wrap_cols)?;
         sink ^= u64::from(out[0]);
         sink ^= u64::from(out[out.len() - 1]);
     }
@@ -45,16 +45,16 @@ pub(crate) fn bench_base64_wrapped_decode(iterations: u64, ignore_garbage: bool)
     let decoded = (0..BASE64_BENCH_INPUT_SIZE)
         .map(|i| ((i * 29 + 7) % 251) as u8)
         .collect::<Vec<_>>();
-    let encoded = process::encode_base64_bytes_via_wrapped_path(&decoded, 76)?;
+    let encoded = process::bytes::encode_base64_bytes_via_wrapped_path(&decoded, 76)?;
     for _ in 0..1024 {
-        let out = process::decode_base64_bytes_via_reorg_path(&encoded, ignore_garbage)?;
+        let out = process::bytes::decode_base64_bytes_via_reorg_path(&encoded, ignore_garbage)?;
         black_box(out.len());
     }
 
     let start = Instant::now();
     let mut sink = 0_u64;
     for _ in 0..iterations {
-        let out = process::decode_base64_bytes_via_reorg_path(&encoded, ignore_garbage)?;
+        let out = process::bytes::decode_base64_bytes_via_reorg_path(&encoded, ignore_garbage)?;
         sink ^= u64::from(out[0]);
         sink ^= u64::from(out[out.len() - 1]);
     }
@@ -92,14 +92,14 @@ pub(crate) fn bench_base64_decode_detect_fallback(
     debug_assert_eq!(written, encoded.len());
 
     for _ in 0..1024 {
-        let out = process::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
+        let out = process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
         black_box(out.len());
     }
 
     let start = Instant::now();
     let mut sink = 0_u64;
     for _ in 0..iterations {
-        let out = process::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
+        let out = process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
         sink ^= u64::from(out[0]);
         sink ^= u64::from(out[out.len() - 1]);
     }

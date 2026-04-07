@@ -9,6 +9,83 @@ pub(crate) mod move_dir;
 pub(super) mod openat;
 pub(super) mod paths;
 
+#[derive(Clone, Copy)]
+pub(super) struct PreservedTimestamps {
+    atime_sec: i64,
+    atime_nsec: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+#[derive(Clone)]
+struct RecursiveDirectoryMetadataTask {
+    target_path: PathBuf,
+    timestamps: PreservedTimestamps,
+}
+
+pub(super) fn preserved_timestamps_from_metadata(metadata: &fs::Metadata) -> PreservedTimestamps {
+    PreservedTimestamps {
+        atime_sec: metadata.atime(),
+        atime_nsec: metadata.atime_nsec(),
+        mtime_sec: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+    }
+}
+
+fn set_path_timestamps(
+    path: &Path,
+    timestamps: PreservedTimestamps,
+    nofollow_symlink: bool,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL: {}", path.display()),
+        )
+    })?;
+    let times = [
+        libc::timespec {
+            tv_sec: timestamps.atime_sec,
+            tv_nsec: timestamps.atime_nsec,
+        },
+        libc::timespec {
+            tv_sec: timestamps.mtime_sec,
+            tv_nsec: timestamps.mtime_nsec,
+        },
+    ];
+    let flags = if nofollow_symlink {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
+}
+
+pub(super) fn preserve_file_timestamps(source_path: &Path, target_path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(source_path)?;
+    set_path_timestamps(
+        target_path,
+        preserved_timestamps_from_metadata(&metadata),
+        false,
+    )
+}
+
+fn finalize_directory_timestamps(tasks: &[RecursiveDirectoryMetadataTask]) -> io::Result<()> {
+    let mut sorted = tasks.to_vec();
+    sorted.sort_by_key(|task| std::cmp::Reverse(task.target_path.components().count()));
+    for task in sorted {
+        set_path_timestamps(&task.target_path, task.timestamps, false)?;
+    }
+    Ok(())
+}
+
 fn maybe_print_verbose_copy(
     verbose: bool,
     cp_compat: bool,
@@ -20,15 +97,20 @@ fn maybe_print_verbose_copy(
     }
 }
 
-pub(super) fn collect_recursive_copy_manifest(
+fn collect_recursive_copy_manifest(
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
     sample_counters: &ThroughputSampleCounters,
-) -> io::Result<(Vec<RecursiveSmallFileTask>, Vec<RecursiveFileTask>)> {
+) -> io::Result<(
+    Vec<RecursiveDirectoryMetadataTask>,
+    Vec<RecursiveSmallFileTask>,
+    Vec<RecursiveFileTask>,
+)> {
     let mut stack = vec![RecursiveDirectoryTask {
         source_dir: ctx.source_root.clone(),
         target_dir: ctx.target_root.clone(),
     }];
+    let mut dir_tasks = Vec::new();
     let mut small_tasks = Vec::new();
     let mut large_tasks = Vec::new();
     while let Some(task) = stack.pop() {
@@ -42,6 +124,12 @@ pub(super) fn collect_recursive_copy_manifest(
                 let metadata = entry.metadata()?;
                 let mode = metadata.permissions().mode();
                 create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
+                if ctx.preserve_timestamps {
+                    dir_tasks.push(RecursiveDirectoryMetadataTask {
+                        target_path: target_path.clone(),
+                        timestamps: preserved_timestamps_from_metadata(&metadata),
+                    });
+                }
                 child_dirs.push(RecursiveDirectoryTask {
                     source_dir: source_path,
                     target_dir: target_path,
@@ -49,7 +137,17 @@ pub(super) fn collect_recursive_copy_manifest(
                 continue;
             }
             if file_type.is_symlink() {
-                copy_symlink_entry(&source_path, &target_path, stats, false, false)?;
+                if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
+                    continue;
+                }
+                copy_symlink_entry(
+                    &source_path,
+                    &target_path,
+                    stats,
+                    false,
+                    false,
+                    ctx.preserve_timestamps,
+                )?;
                 continue;
             }
             if !file_type.is_file() {
@@ -64,12 +162,18 @@ pub(super) fn collect_recursive_copy_manifest(
             let metadata = entry.metadata()?;
             let source_len = metadata.len();
             let source_mode = metadata.permissions().mode();
+            let source_timestamps = preserved_timestamps_from_metadata(&metadata);
+            if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
+                continue;
+            }
             if recursive_copy_uses_small_file_range(ctx, source_len) {
                 small_tasks.push(RecursiveSmallFileTask {
                     source_path,
                     target_path,
                     source_len,
                     source_mode,
+                    source_timestamps,
+                    preserve_timestamps: ctx.preserve_timestamps,
                 });
             } else {
                 let resolved_copy =
@@ -78,6 +182,7 @@ pub(super) fn collect_recursive_copy_manifest(
                     source_path,
                     target_path,
                     source_mode,
+                    source_timestamps,
                     resolved_copy,
                     source_parent_dir: None,
                 });
@@ -86,7 +191,7 @@ pub(super) fn collect_recursive_copy_manifest(
         child_dirs.reverse();
         stack.extend(child_dirs);
     }
-    Ok((small_tasks, large_tasks))
+    Ok((dir_tasks, small_tasks, large_tasks))
 }
 
 impl<T> Default for RecursiveDirectoryQueue<T> {
@@ -149,14 +254,24 @@ impl<T> RecursiveDirectoryQueue<T> {
 }
 
 impl<T> RecursiveTaskQueue<T> {
-    pub(super) fn enqueue(&self, task: T) -> io::Result<()> {
+    pub(super) fn enqueue_batch(&self, tasks: impl IntoIterator<Item = T>) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return Err(io::Error::other("recursive copy queue closed"));
         }
-        state.queue.push_back(task);
-        self.ready.notify_one();
+        let mut added = false;
+        for task in tasks {
+            state.queue.push_back(task);
+            added = true;
+        }
+        if added {
+            self.ready.notify_all();
+        }
         Ok(())
+    }
+
+    pub(super) fn enqueue(&self, task: T) -> io::Result<()> {
+        self.enqueue_batch(std::iter::once(task))
     }
 
     pub(super) fn claim(&self, stop: &AtomicBool) -> Option<T> {
@@ -259,11 +374,20 @@ pub(super) fn copy_symlink_entry(
     stats: &RecursiveCopyStats,
     verbose: bool,
     cp_compat: bool,
+    preserve_timestamps: bool,
 ) -> io::Result<()> {
     ensure_parent_directory(target_path)?;
     ensure_removed_non_directory(target_path)?;
     let link_target = fs::read_link(source_path)?;
     symlink(&link_target, target_path)?;
+    if preserve_timestamps {
+        let metadata = fs::symlink_metadata(source_path)?;
+        set_path_timestamps(
+            target_path,
+            preserved_timestamps_from_metadata(&metadata),
+            true,
+        )?;
+    }
     maybe_print_verbose_copy(verbose, cp_compat, source_path, target_path);
     stats.symlinks_created.fetch_add(1, Ordering::Relaxed);
     stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -317,6 +441,9 @@ fn execute_recursive_file_copy(
         &task.target_path,
         fs::Permissions::from_mode(task.source_mode),
     )?;
+    if ctx.preserve_timestamps {
+        set_path_timestamps(&task.target_path, task.source_timestamps, false)?;
+    }
     maybe_print_verbose_copy(
         ctx.verbose,
         ctx.cp_compat,
@@ -333,139 +460,12 @@ fn execute_recursive_file_copy(
     Ok(())
 }
 
-fn recursive_copy_dir_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .max(1)
-}
-
-fn recursive_copy_large_worker_count() -> usize {
-    if let Ok(value) = std::env::var("FRO_RECURSIVE_COPY_LARGE_WORKERS") {
-        if let Ok(parsed) = value.parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
-    }
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(RECURSIVE_COPY_MAX_LARGE_WORKERS)
-        .max(1)
-}
-
-fn recursive_copy_small_worker_count() -> usize {
-    if let Ok(value) = std::env::var("FRO_RECURSIVE_COPY_SMALL_WORKERS") {
-        if let Ok(parsed) = value.parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
-    }
-    RECURSIVE_COPY_SMALL_WORKERS
-}
-
-pub(super) fn recursive_read_dir_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .max(1)
-}
-
-pub(super) fn recursive_read_file_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .max(1)
-}
-
-pub(super) fn recursive_read_file_worker_count_with_override(
-    override_threads: Option<u64>,
-) -> usize {
-    override_threads
-        .and_then(|threads| usize::try_from(threads).ok())
-        .filter(|threads| *threads > 0)
-        .unwrap_or_else(recursive_read_file_worker_count)
-}
-
-pub(super) fn recursive_small_file_worker_count_for_path(
-    config: &config::LoadedConfig,
-    path: &str,
-    override_threads: Option<u64>,
-) -> usize {
-    if let Some(threads) = override_threads {
-        return recursive_read_file_worker_count_with_override(Some(threads));
-    }
-    let tuned = config.get_recursive_small_file_threads_for_path(path);
-    let cache_state = if is_first_page_resident(path).unwrap_or(false) {
-        tuned.hot
-    } else {
-        tuned.cold
-    };
-    recursive_read_file_worker_count_with_override(Some(cache_state))
-}
-
-pub(super) fn recursive_copy_uses_small_file_range(
-    ctx: &RecursiveCopyContext,
-    source_len: u64,
-) -> bool {
-    let cutoff = std::env::var("FRO_RECURSIVE_COPY_SMALL_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(RECURSIVE_COPY_SMALL_FILE_THRESHOLD);
-    source_len < cutoff
-        && ctx.rewrite_mode == CopyRewriteMode::Auto
-        && !ctx.keep_target_size
-        && !matches!(
-            ctx.requested_strategy,
-            CopyStrategy::Threaded | CopyStrategy::Reflink
-        )
-        && ctx.io_mode_read != common::IOMode::Direct
-        && ctx.io_mode_write != common::IOMode::Direct
-}
-
-fn recursive_copy_uses_threaded_large_lane(ctx: &RecursiveCopyContext, source_len: u64) -> bool {
-    let cutoff = std::env::var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(RECURSIVE_COPY_THREADED_LANE_THRESHOLD);
-    source_len >= cutoff
-        || ctx.requested_strategy == CopyStrategy::Threaded
-        || ctx.requested_strategy == CopyStrategy::Reflink
-}
-
-pub(super) fn resolve_recursive_large_copy_execution(
-    ctx: &RecursiveCopyContext,
-    source_path: &Path,
-    target_path: &Path,
-) -> io::Result<ResolvedCopyExecution> {
-    let source_str = source_path.to_string_lossy();
-    let target_str = target_path.to_string_lossy();
-    let resolved = resolve_copy_execution(
-        &ctx.config,
-        &source_str,
-        &target_str,
-        ctx.requested_strategy,
-        ctx.rewrite_mode,
-        ctx.io_mode_read,
-        ctx.io_mode_write,
-    )?;
-    if ctx.requested_strategy == CopyStrategy::Auto {
-        return Ok(ResolvedCopyExecution {
-            copy_strategy: CopyStrategy::Threaded,
-            io_mode_read: resolved.io_mode_read,
-            io_mode_write: resolved.io_mode_write,
-            diff_overwrite: false,
-            full_rewrite: false,
-            path_label: "recursive large threaded",
-        });
-    }
-    Ok(resolved)
-}
+use scheduling::{
+    recursive_copy_dir_worker_count, recursive_copy_large_worker_count,
+    recursive_copy_small_worker_count, recursive_copy_uses_small_file_range,
+    recursive_copy_uses_threaded_large_lane, recursive_read_dir_worker_count,
+    recursive_small_file_worker_count_for_path, resolve_recursive_large_copy_execution,
+};
 
 fn execute_recursive_small_file_copy(
     task: &RecursiveSmallFileTask,
@@ -491,6 +491,9 @@ fn execute_recursive_small_file_copy(
         &task.target_path,
         fs::Permissions::from_mode(task.source_mode),
     )?;
+    if task.preserve_timestamps {
+        set_path_timestamps(&task.target_path, task.source_timestamps, false)?;
+    }
     stats.files_copied.fetch_add(1, Ordering::Relaxed);
     stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
     stats.items_completed.fetch_add(1, Ordering::Relaxed);
@@ -508,6 +511,7 @@ fn walk_recursive_copy_subtree(
     ctx: &RecursiveCopyContext,
     stats: &RecursiveCopyStats,
     sample_counters: &ThroughputSampleCounters,
+    dir_metadata_tasks: &Mutex<Vec<RecursiveDirectoryMetadataTask>>,
     #[cfg(feature = "read-phase-timing")] lane_counters: &RecursiveCopyLaneCounters,
     stop: &AtomicBool,
 ) -> io::Result<()> {
@@ -528,6 +532,15 @@ fn walk_recursive_copy_subtree(
                 let metadata = entry.metadata()?;
                 let mode = metadata.permissions().mode();
                 create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
+                if ctx.preserve_timestamps {
+                    dir_metadata_tasks
+                        .lock()
+                        .unwrap()
+                        .push(RecursiveDirectoryMetadataTask {
+                            target_path: target_path.clone(),
+                            timestamps: preserved_timestamps_from_metadata(&metadata),
+                        });
+                }
                 child_dirs.push(RecursiveDirectoryTask {
                     source_dir: source_path,
                     target_dir: target_path,
@@ -535,12 +548,16 @@ fn walk_recursive_copy_subtree(
                 continue;
             }
             if file_type.is_symlink() {
+                if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
+                    continue;
+                }
                 copy_symlink_entry(
                     &source_path,
                     &target_path,
                     stats,
                     ctx.verbose,
                     ctx.cp_compat,
+                    ctx.preserve_timestamps,
                 )?;
                 continue;
             }
@@ -556,6 +573,10 @@ fn walk_recursive_copy_subtree(
             let metadata = entry.metadata()?;
             let source_len = metadata.len();
             let source_mode = metadata.permissions().mode();
+            let source_timestamps = preserved_timestamps_from_metadata(&metadata);
+            if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
+                continue;
+            }
             let relative_path = source_path
                 .strip_prefix(&ctx.source_root)
                 .map_err(|_| io::Error::other("recursive copy path escaped source root"))?
@@ -569,6 +590,9 @@ fn walk_recursive_copy_subtree(
                     &target_root_fd,
                     ctx.relative_copy_method,
                 )?;
+                if ctx.preserve_timestamps {
+                    set_path_timestamps(&target_path, source_timestamps, false)?;
+                }
                 maybe_print_verbose_copy(ctx.verbose, ctx.cp_compat, &source_path, &target_path);
                 stats.files_copied.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
@@ -587,6 +611,7 @@ fn walk_recursive_copy_subtree(
                     source_path,
                     target_path,
                     source_mode,
+                    source_timestamps,
                     resolved_copy,
                     source_parent_dir: None,
                 })?;
@@ -601,6 +626,9 @@ fn walk_recursive_copy_subtree(
                     &target_root_fd,
                     ctx.relative_copy_method,
                 )?;
+                if ctx.preserve_timestamps {
+                    set_path_timestamps(&target_path, source_timestamps, false)?;
+                }
                 maybe_print_verbose_copy(ctx.verbose, ctx.cp_compat, &source_path, &target_path);
                 stats.files_copied.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
@@ -628,7 +656,20 @@ pub(super) fn walk_recursive_read_subtree(
     file_queue: &RecursiveTaskQueue<RecursiveReadFileTask>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
+    const RECURSIVE_READ_FILE_BATCH_SIZE: usize = 256;
+
+    fn flush_recursive_read_batch(
+        file_queue: &RecursiveTaskQueue<RecursiveReadFileTask>,
+        pending_files: &mut Vec<RecursiveReadFileTask>,
+    ) -> io::Result<()> {
+        if pending_files.is_empty() {
+            return Ok(());
+        }
+        file_queue.enqueue_batch(std::mem::take(pending_files))
+    }
+
     let mut stack = vec![start];
+    let mut pending_files = Vec::with_capacity(RECURSIVE_READ_FILE_BATCH_SIZE);
     while let Some(task) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -641,18 +682,26 @@ pub(super) fn walk_recursive_read_subtree(
             if file_type.is_dir() {
                 child_dirs.push(RecursiveReadDirectoryTask { source_dir: path });
             } else if file_type.is_file() {
-                file_queue.enqueue(RecursiveReadFileTask { source_path: path })?;
+                pending_files.push(RecursiveReadFileTask { source_path: path });
+                if pending_files.len() >= RECURSIVE_READ_FILE_BATCH_SIZE {
+                    flush_recursive_read_batch(file_queue, &mut pending_files)?;
+                }
             }
         }
+        flush_recursive_read_batch(file_queue, &mut pending_files)?;
         if let Some(local_dir) = child_dirs.pop() {
-            for task in child_dirs {
-                dir_queue.enqueue_one(task);
-            }
+            dir_queue.enqueue(child_dirs);
             stack.push(local_dir);
         }
     }
+    flush_recursive_read_batch(file_queue, &mut pending_files)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
+pub(crate) mod split_manifest;
+pub(crate) mod scheduling;
 
 pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
     let source_meta = fs::symlink_metadata(&ctx.source_root)?;
@@ -665,12 +714,22 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
     ensure_recursive_target_not_inside_source(&ctx.source_root, &ctx.target_root)?;
     let stats = Arc::new(RecursiveCopyStats::default());
     let sample_counters = Arc::new(ThroughputSampleCounters::default());
+    let directory_timestamps = Arc::new(Mutex::new(Vec::new()));
     create_directory_like(
         source_meta.permissions().mode(),
         &ctx.target_root,
         &stats,
         Some(sample_counters.as_ref()),
     )?;
+    if ctx.preserve_timestamps {
+        directory_timestamps
+            .lock()
+            .unwrap()
+            .push(RecursiveDirectoryMetadataTask {
+                target_path: ctx.target_root.clone(),
+                timestamps: preserved_timestamps_from_metadata(&source_meta),
+            });
+    }
     let source_mount = config::mount_info_for_path(&ctx.source_root.to_string_lossy());
     let target_mount = config::mount_info_for_path(&ctx.target_root.to_string_lossy());
     let relative_copy_method = match (source_mount.as_ref(), target_mount.as_ref()) {
@@ -716,6 +775,7 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
         let stats = stats.clone();
         let stop = stop.clone();
         let sample_counters = sample_counters.clone();
+        let directory_timestamps = directory_timestamps.clone();
         #[cfg(feature = "read-phase-timing")]
         let lane_counters = lane_counters.clone();
         walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
@@ -727,6 +787,7 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
                     &ctx,
                     &stats,
                     sample_counters.as_ref(),
+                    directory_timestamps.as_ref(),
                     #[cfg(feature = "read-phase-timing")]
                     lane_counters.as_ref(),
                     &stop,
@@ -800,6 +861,10 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
     if let Some(err) = first_error {
         return Err(err);
     }
+    if ctx.preserve_timestamps {
+        let tasks = directory_timestamps.lock().unwrap().clone();
+        finalize_directory_timestamps(&tasks)?;
+    }
     let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
     if verbose {
         eprintln!(
@@ -811,144 +876,6 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
         );
         #[cfg(feature = "read-phase-timing")]
         eprintln!("{}", lane_counters.snapshot_line());
-    }
-    Ok(bytes_copied)
-}
-
-pub(super) fn run_split_manifest_recursive_copy(
-    ctx: RecursiveCopyContext,
-    verbose: bool,
-) -> io::Result<u64> {
-    let source_meta = fs::symlink_metadata(&ctx.source_root)?;
-    if !source_meta.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "recursive copy requires a directory source",
-        ));
-    }
-    ensure_recursive_target_not_inside_source(&ctx.source_root, &ctx.target_root)?;
-    let stats = Arc::new(RecursiveCopyStats::default());
-    let sample_counters = Arc::new(ThroughputSampleCounters::default());
-    create_directory_like(
-        source_meta.permissions().mode(),
-        &ctx.target_root,
-        &stats,
-        Some(sample_counters.as_ref()),
-    )?;
-    let sampler = if verbose {
-        Some(ThroughputSampler::start(
-            "split-manifest-recursive-copy",
-            "items",
-            sample_counters.clone(),
-        ))
-    } else {
-        None
-    };
-
-    let (small_tasks, large_tasks) =
-        collect_recursive_copy_manifest(&ctx, stats.as_ref(), sample_counters.as_ref())?;
-
-    let small_queue = Arc::new(RecursiveTaskQueue::default());
-    let large_queue = Arc::new(RecursiveTaskQueue::default());
-    let stop = Arc::new(AtomicBool::new(false));
-    for task in small_tasks {
-        small_queue.enqueue(task)?;
-    }
-    for task in large_tasks {
-        large_queue.enqueue(task)?;
-    }
-    small_queue.close();
-    large_queue.close();
-
-    let small_worker_count = recursive_copy_small_worker_count();
-    let large_worker_count = recursive_copy_large_worker_count();
-
-    let mut small_threads = Vec::with_capacity(small_worker_count);
-    for _ in 0..small_worker_count {
-        let queue = small_queue.clone();
-        let large_queue = large_queue.clone();
-        let ctx = ctx.clone();
-        let stats = stats.clone();
-        let stop = stop.clone();
-        let sample_counters = sample_counters.clone();
-        small_threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(task) = queue.claim(&stop) {
-                if let Err(err) = execute_recursive_small_file_copy(
-                    &task,
-                    ctx.use_lock,
-                    &stats,
-                    Some(sample_counters.as_ref()),
-                ) {
-                    stop.store(true, Ordering::SeqCst);
-                    queue.wake_all();
-                    large_queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut large_threads = Vec::with_capacity(large_worker_count);
-    for _ in 0..large_worker_count {
-        let queue = large_queue.clone();
-        let small_queue = small_queue.clone();
-        let ctx = ctx.clone();
-        let stats = stats.clone();
-        let stop = stop.clone();
-        let sample_counters = sample_counters.clone();
-        large_threads.push(std::thread::spawn(move || -> io::Result<()> {
-            while let Some(task) = queue.claim(&stop) {
-                if let Err(err) =
-                    execute_recursive_file_copy(&task, &ctx, &stats, Some(sample_counters.as_ref()))
-                {
-                    stop.store(true, Ordering::SeqCst);
-                    small_queue.wake_all();
-                    queue.wake_all();
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    let mut first_error = None;
-    for thread in small_threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("split-manifest recursive copy small worker panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
-    for thread in large_threads {
-        match thread
-            .join()
-            .map_err(|_| io::Error::other("split-manifest recursive copy large worker panicked"))?
-        {
-            Ok(()) => {}
-            Err(err) if first_error.is_none() => first_error = Some(err),
-            Err(_) => {}
-        }
-    }
-
-    if let Some(sampler) = sampler {
-        sampler.finish()?;
-    }
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-    let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
-    if verbose {
-        eprintln!(
-            "split-manifest recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, bytes_copied={}",
-            stats.dirs_created.load(Ordering::Relaxed),
-            stats.files_copied.load(Ordering::Relaxed),
-            stats.symlinks_created.load(Ordering::Relaxed),
-            bytes_copied
-        );
     }
     Ok(bytes_copied)
 }
