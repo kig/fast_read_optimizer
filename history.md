@@ -2,6 +2,35 @@
 
 ## 2026-04-07
 
+### Archived from TODO: review-driven hardening and maintainability wave
+
+- Integrated a review-driven fix wave on top of `coreutils-multicall`, then validated it with the full test suite plus janitor in a clean integration worktree before advancing the branch.
+- `diff` now hardens resolved IO params so zero `num_threads` and `qd` clamp to safe minimums while zero `block_size` still errors, preventing false "equal" results from malformed config, with focused `diff_cli` regression coverage.
+- `find` now honors `--` as the end of options, so dashed roots and child paths are parsed as operands instead of unsupported expressions, with parity coverage in `tests/find_cli.rs`.
+- `encrypt` / `decrypt` now zeroize passphrases, PBKDF2 material, derived key/IV state, and per-chunk CTR IV buffers where feasible, and the help/tests make the unauthenticated AES-CTR caveat more explicit.
+- `wc` now has helper-selection assertions for its main execution paths:
+  - byte-only regular-file mode stays on the metadata fast path
+  - default / line / word counting on regular files stays on the mapped-block backend
+  - char-count and max-line-length modes stay on the fd-parallel path
+- Public Rust path APIs now document and enforce the current UTF-8-only contract consistently via a shared `io_util::utf8_path(...)` helper, with Unix non-UTF-8 rejection tests covering the bounded public surface.
+- Janitor-oriented maintainability cleanup landed again:
+  - `src/coreutils/hash/cksum.rs` now holds the `cksum`-specific CRC/combine logic extracted from `src/coreutils/hash.rs`
+  - `src/main_app/cli/execute/config_command.rs` now holds config-command dispatch extracted from `src/main_app/cli/execute.rs`
+  - the generated source-tree snapshot was refreshed and janitor file-size checks are green on the integrated branch
+
+### Archived from TODO: cp archive and transform-helper follow-up slices
+
+- `cp` gained a bounded GNU-style archive slice:
+  - `cp -a` / `--archive` now rewrites to recursive + preserve + no-dereference in the multicall compatibility layer
+  - regular-file archive copies now work correctly instead of being forced down the directory-only recursive error path
+  - preserve-on-copy for ordinary files now keeps mode bits together with timestamps
+  - focused parity coverage lives in `tests/coreutils_compat_matrix/cp_archive.rs`
+- Transform-style IO pairing advanced again:
+  - `stream::transform::resolve_regular_transform_input_path(...)` is now the shared helper for resolving redirected-stdin regular-file inputs
+  - `auto_select_transform_io_pairing(...)` and base64’s planning paths now reuse that helper instead of probing separately
+  - redirected-stdin / redirected-stdout base64 coverage now pins the shared transform pairing behavior
+  - `README.md` now points future transform-style tools at both helper layers explicitly
+
 ### Archived from TODO: focused throughput/parity slices and config layering follow-up
 
 - `cat` stdin/plain-copy handling now avoids creating the buffered stdout writer thread when every input can stay on the fast kernel-copy path, so redirected stdin stays near pathname-speed on the plain byte-copy case without changing mixed stdin/file semantics.

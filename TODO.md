@@ -46,15 +46,15 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [ ] `-L`, `--dereference`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-n`, `--no-clobber`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-P`, `--no-dereference`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-p`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-n`, `--no-clobber`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-P`, `--no-dereference`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-p`
+      - [x] equality test
+      - [x] implementation
     - [ ] `--preserve[=ATTR_LIST]`
       - [ ] equality test
       - [ ] implementation
@@ -88,15 +88,15 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [x] `-t`, `--target-directory=DIRECTORY`
       - [x] equality test
       - [x] implementation
-    - [ ] `-T`, `--no-target-directory`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-u`, `--update`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-v`, `--verbose`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-T`, `--no-target-directory`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-u`, `--update`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-v`, `--verbose`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-x`, `--one-file-system`
       - [ ] equality test
       - [ ] implementation
@@ -130,24 +130,24 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [ ] `-P`, `--perl-regexp`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-e`, `--regexp=PATTERNS`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-f`, `--file=FILE`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `-i`, `--ignore-case`
-      - [ ] equality test
-      - [ ] implementation
-    - [ ] `--no-ignore-case`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-e`, `--regexp=PATTERNS`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-f`, `--file=FILE`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-case`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--no-ignore-case`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-w`, `--word-regexp`
       - [ ] equality test
       - [ ] implementation
-    - [ ] `-x`, `--line-regexp`
-      - [ ] equality test
-      - [ ] implementation
+    - [x] `-x`, `--line-regexp`
+      - [x] equality test
+      - [x] implementation
     - [ ] `-z`, `--null-data`
       - [ ] equality test
       - [ ] implementation
