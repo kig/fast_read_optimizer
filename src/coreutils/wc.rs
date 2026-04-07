@@ -11,6 +11,13 @@ struct WcInputs {
     exit_code: i32,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WcExecutionPath {
+    MetadataTotals,
+    RegularFileBlocks,
+    FdParallel,
+}
+
 fn wc_os_error_message(err: &io::Error) -> String {
     err.raw_os_error()
         .map(|errno| {
@@ -110,16 +117,15 @@ fn wc_totals_for_input(
     config: &crate::config::LoadedConfig,
     io_mode: IOMode,
 ) -> io::Result<WcTotals> {
-    if let Some(totals) = wc_metadata_totals(input, options)? {
-        return Ok(totals);
-    }
-
-    match input {
-        StreamInput::File(file) if options.chars || options.max_line_length => {
-            let mut reader = std::fs::File::open(file)?;
-            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+    match wc_execution_path(input, options)? {
+        WcExecutionPath::MetadataTotals => {
+            Ok(wc_metadata_totals(input, options)?
+                .expect("metadata totals path must return a value"))
         }
-        StreamInput::File(file) if is_regular_input_path(file)? => {
+        WcExecutionPath::RegularFileBlocks => {
+            let StreamInput::File(file) = input else {
+                unreachable!("regular-file block path requires a file input");
+            };
             let count_options = WcCountOptions {
                 max_line_length: false,
                 ..options
@@ -133,13 +139,31 @@ fn wc_totals_for_input(
             )?;
             Ok(reduce_wc_counts(&blocks.blocks))
         }
-        StreamInput::File(file) => {
-            let mut reader = std::fs::File::open(file)?;
-            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+        WcExecutionPath::FdParallel => match input {
+            StreamInput::File(file) => {
+                let mut reader = std::fs::File::open(file)?;
+                wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+            }
+            StreamInput::Stdin { .. } => {
+                wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
+            }
+        },
+    }
+}
+
+fn wc_execution_path(input: &StreamInput, options: WcCountOptions) -> io::Result<WcExecutionPath> {
+    if wc_metadata_totals(input, options)?.is_some() {
+        return Ok(WcExecutionPath::MetadataTotals);
+    }
+
+    match input {
+        StreamInput::File(_) if options.chars || options.max_line_length => {
+            Ok(WcExecutionPath::FdParallel)
         }
-        StreamInput::Stdin { .. } => {
-            wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
+        StreamInput::File(file) if is_regular_input_path(file)? => {
+            Ok(WcExecutionPath::RegularFileBlocks)
         }
+        StreamInput::File(_) | StreamInput::Stdin { .. } => Ok(WcExecutionPath::FdParallel),
     }
 }
 
