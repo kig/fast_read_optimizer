@@ -617,34 +617,176 @@ const CKSUM_CRC32_TABLE: [u32; 256] = [
     0xafb010b1, 0xab710d06, 0xa6322bdf, 0xa2f33668, 0xbcb4666d, 0xb8757bda, 0xb5365d03, 0xb1f740b4,
 ];
 
-fn crc32_cksum_update(mut crc: u32, data: &[u8]) -> u32 {
+const fn crc32_cksum_update_byte(crc: u32, byte: u8) -> u32 {
+    let index = ((crc >> 24) as u8) ^ byte;
+    (crc << 8) ^ CKSUM_CRC32_TABLE[index as usize]
+}
+
+const fn build_cksum_crc32_slicing_table() -> [[u32; 256]; 8] {
+    let mut tables = [[0_u32; 256]; 8];
+    let mut index = 0;
+    while index < 256 {
+        tables[0][index] = CKSUM_CRC32_TABLE[index];
+        index += 1;
+    }
+
+    let mut table = 1;
+    while table < 8 {
+        let mut entry = 0;
+        while entry < 256 {
+            let crc = tables[table - 1][entry];
+            tables[table][entry] = (crc << 8) ^ CKSUM_CRC32_TABLE[((crc >> 24) & 0xff) as usize];
+            entry += 1;
+        }
+        table += 1;
+    }
+
+    tables
+}
+
+const fn build_cksum_zero_byte_matrix() -> [u32; 32] {
+    let mut matrix = [0_u32; 32];
+    let mut index = 0;
+    while index < 32 {
+        matrix[index] = crc32_cksum_update_byte(1_u32 << (31 - index), 0);
+        index += 1;
+    }
+    matrix
+}
+
+const CKSUM_CRC32_SLICING_TABLE: [[u32; 256]; 8] = build_cksum_crc32_slicing_table();
+const CKSUM_ZERO_BYTE_MATRIX: [u32; 32] = build_cksum_zero_byte_matrix();
+
+fn crc32_cksum_update(mut crc: u32, mut data: &[u8]) -> u32 {
+    while data.len() >= 8 {
+        let x = crc ^ u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        crc = CKSUM_CRC32_SLICING_TABLE[7][((x >> 24) & 0xff) as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[6][((x >> 16) & 0xff) as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[5][((x >> 8) & 0xff) as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[4][(x & 0xff) as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[3][data[4] as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[2][data[5] as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[1][data[6] as usize]
+            ^ CKSUM_CRC32_SLICING_TABLE[0][data[7] as usize];
+        data = &data[8..];
+    }
     for &byte in data {
-        let index = ((crc >> 24) as u8) ^ byte;
-        crc = (crc << 8) ^ CKSUM_CRC32_TABLE[index as usize];
+        crc = crc32_cksum_update_byte(crc, byte);
     }
     crc
+}
+
+fn crc32_cksum_gf2_matrix_times(matrix: &[u32; 32], vector: u32) -> u32 {
+    let mut product = 0_u32;
+    let mut index = 0;
+    while index < 32 {
+        if vector & (1_u32 << (31 - index)) != 0 {
+            product ^= matrix[index];
+        }
+        index += 1;
+    }
+    product
+}
+
+fn crc32_cksum_gf2_matrix_square(square: &mut [u32; 32], matrix: &[u32; 32]) {
+    let mut index = 0;
+    while index < 32 {
+        square[index] = crc32_cksum_gf2_matrix_times(matrix, matrix[index]);
+        index += 1;
+    }
+}
+
+fn checksum_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1 ^ crc2;
+    }
+
+    let mut shifted_crc = crc1;
+    let mut power = CKSUM_ZERO_BYTE_MATRIX;
+    let mut square = [0_u32; 32];
+    let mut remaining = len2;
+
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            shifted_crc = crc32_cksum_gf2_matrix_times(&power, shifted_crc);
+        }
+        remaining >>= 1;
+        if remaining == 0 {
+            break;
+        }
+        crc32_cksum_gf2_matrix_square(&mut square, &power);
+        power = square;
+    }
+
+    shifted_crc ^ crc2
+}
+
+fn crc32_cksum_finalize(mut crc: u32, bytes: u64) -> u32 {
+    let mut length = bytes;
+    while length != 0 {
+        crc = crc32_cksum_update_byte(crc, (length & 0xff) as u8);
+        length >>= 8;
+    }
+    !crc
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CksumChunk {
+    crc: u32,
+    len: u64,
+}
+
+fn cksum_stream_input(input: &StreamInput, io_mode: IOMode) -> io::Result<(u32, u64)> {
+    let mut crc = 0_u32;
+    let mut bytes = 0_u64;
+    visit_ordered_input(input, io_mode, |block| {
+        crc = crc32_cksum_update(crc, block);
+        bytes += block.len() as u64;
+        Ok(())
+    })?;
+    Ok((crc, bytes))
+}
+
+fn cksum_regular_path(path: &str, io_mode: IOMode) -> io::Result<(u32, u64)> {
+    let config = crate::config::load_config(None);
+    let file = crate::stream::ParallelFile::open(&config, "read", path, internal_io_mode(io_mode))?;
+    let block_size = file.block_size()?;
+    file.map_reduce_blocks(
+        block_size,
+        |_, data| {
+            Ok(CksumChunk {
+                crc: crc32_cksum_update(0, data),
+                len: data.len() as u64,
+            })
+        },
+        |chunks, report| {
+            let crc = chunks.into_iter().fold(0_u32, |acc, chunk| {
+                checksum_combine(acc, chunk.crc, chunk.len)
+            });
+            Ok((crc, report.file_size))
+        },
+    )
 }
 
 pub(super) fn run_cksum(args: &[String]) -> io::Result<()> {
     let (io_mode, files) = parse_io_mode(&args[1..])?;
     let inputs = parse_stream_inputs(files);
     for input in inputs {
-        let mut crc = 0_u32;
-        let mut bytes = 0_u64;
-        visit_ordered_input(&input, io_mode, |block| {
-            crc = crc32_cksum_update(crc, block);
-            bytes += block.len() as u64;
-            Ok(())
-        })?;
-        let mut length = bytes;
-        while length != 0 {
-            crc = crc32_cksum_update(crc, &[(length & 0xff) as u8]);
-            length >>= 8;
-        }
+        let (crc, bytes) = match &input {
+            StreamInput::File(file) if is_regular_input_path(file)? => {
+                cksum_regular_path(file, io_mode)?
+            }
+            StreamInput::Stdin { .. } => match regular_stdin_path()? {
+                Some(path) => cksum_regular_path(&path, io_mode)?,
+                None => cksum_stream_input(&input, io_mode)?,
+            },
+            _ => cksum_stream_input(&input, io_mode)?,
+        };
+        let crc = crc32_cksum_finalize(crc, bytes);
         match input {
-            StreamInput::File(file) => println!("{} {} {}", !crc, bytes, file),
-            StreamInput::Stdin { label: Some(label) } => println!("{} {} {}", !crc, bytes, label),
-            StreamInput::Stdin { label: None } => println!("{} {}", !crc, bytes),
+            StreamInput::File(file) => println!("{} {} {}", crc, bytes, file),
+            StreamInput::Stdin { label: Some(label) } => println!("{} {} {}", crc, bytes, label),
+            StreamInput::Stdin { label: None } => println!("{} {}", crc, bytes),
         }
     }
     Ok(())
@@ -874,23 +1016,67 @@ mod tests {
 
     #[test]
     fn crc32_cksum_update_matches_posix_cksum_examples() {
-        let mut crc = crc32_cksum_update(0, b"abc");
-        let mut len = 3_u64;
-        while len != 0 {
-            crc = crc32_cksum_update(crc, &[(len & 0xff) as u8]);
-            len >>= 8;
-        }
-        assert_eq!(!crc, 1_219_131_554);
+        let crc = crc32_cksum_finalize(crc32_cksum_update(0, b"abc"), 3);
+        assert_eq!(crc, 1_219_131_554);
 
         let mut crc = 0_u32;
         for chunk in [b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()] {
             crc = crc32_cksum_update(crc, chunk);
         }
-        let mut len = 14_u64;
-        while len != 0 {
-            crc = crc32_cksum_update(crc, &[(len & 0xff) as u8]);
-            len >>= 8;
+        assert_eq!(crc32_cksum_finalize(crc, 14), 2_318_676_478);
+    }
+
+    #[test]
+    fn checksum_combine_matches_sequential_crc() {
+        let chunks = [
+            b"alpha".as_slice(),
+            b"beta".as_slice(),
+            b"gamma".as_slice(),
+            b"delta".as_slice(),
+        ];
+        let combined = chunks.iter().fold(0_u32, |acc, chunk| {
+            checksum_combine(acc, crc32_cksum_update(0, chunk), chunk.len() as u64)
+        });
+        let mut sequential = 0_u32;
+        for chunk in chunks {
+            sequential = crc32_cksum_update(sequential, chunk);
         }
-        assert_eq!(!crc, 2_318_676_478);
+        assert_eq!(combined, sequential);
+    }
+
+    #[test]
+    fn cksum_regular_path_matches_stream_path() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(format!(
+            "fro-cksum-regular-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = (0..(3 * 1024 * 1024 + 517))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let regular = cksum_regular_path(path.to_str().unwrap(), IOMode::PageCache).unwrap();
+        let streamed = cksum_stream_input(
+            &StreamInput::File(path.to_string_lossy().into_owned()),
+            IOMode::PageCache,
+        )
+        .unwrap();
+
+        assert_eq!(regular, streamed);
+        assert_eq!(
+            crc32_cksum_finalize(regular.0, regular.1),
+            crc32_cksum_finalize(crc32_cksum_update(0, &bytes), bytes.len() as u64)
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

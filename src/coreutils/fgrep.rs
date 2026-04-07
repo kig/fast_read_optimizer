@@ -7,6 +7,7 @@ struct FgrepOptions {
     print_line_numbers: bool,
     line_regexp: bool,
     ignore_case: bool,
+    invert_match: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,14 @@ fn fgrep_line_matches_any(line: &[u8], patterns: &[FgrepPattern], options: Fgrep
                 .is_some()
         }
     })
+}
+
+fn fgrep_select_line(is_match: bool, options: FgrepOptions) -> bool {
+    if options.invert_match {
+        !is_match
+    } else {
+        is_match
+    }
 }
 
 fn parse_pattern_file_bytes(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -198,7 +207,10 @@ fn finish_pending_line<W: Write>(
     matched_any: &mut bool,
     match_count: &mut u64,
 ) -> io::Result<()> {
-    if fgrep_line_matches(pending_line, pattern, normalized_pattern, options) {
+    if fgrep_select_line(
+        fgrep_line_matches(pending_line, pattern, normalized_pattern, options),
+        options,
+    ) {
         *matched_any = true;
         *match_count += 1;
         if !options.count_only {
@@ -307,7 +319,7 @@ fn write_matching_stream_lines<W: Write>(
             }
             if pending_line.is_empty() {
                 let line = &block[line_start..line_end];
-                if pending_line_has_match {
+                if fgrep_select_line(pending_line_has_match, options) {
                     matched_any = true;
                     match_count += 1;
                     if !options.count_only {
@@ -316,7 +328,7 @@ fn write_matching_stream_lines<W: Write>(
                 }
             } else {
                 pending_line.extend_from_slice(&block[line_start..line_end]);
-                if pending_line_has_match {
+                if fgrep_select_line(pending_line_has_match, options) {
                     matched_any = true;
                     match_count += 1;
                     if !options.count_only {
@@ -352,7 +364,7 @@ fn write_matching_stream_lines<W: Write>(
         }
         Ok::<_, io::Error>(())
     })?;
-    if !pending_line.is_empty() && pending_line_has_match {
+    if !pending_line.is_empty() && fgrep_select_line(pending_line_has_match, options) {
         matched_any = true;
         match_count += 1;
         if !options.count_only {
@@ -383,7 +395,10 @@ fn write_matching_stream_lines_multi<W: Write>(
         for rel_end in memchr_iter(b'\n', block) {
             let line_end = rel_end + 1;
             pending_line.extend_from_slice(&block[line_start..line_end]);
-            if fgrep_line_matches_any(&pending_line, patterns, options) {
+            if fgrep_select_line(
+                fgrep_line_matches_any(&pending_line, patterns, options),
+                options,
+            ) {
                 matched_any = true;
                 match_count += 1;
                 if !options.count_only {
@@ -399,7 +414,12 @@ fn write_matching_stream_lines_multi<W: Write>(
         }
         Ok::<_, io::Error>(())
     })?;
-    if !pending_line.is_empty() && fgrep_line_matches_any(&pending_line, patterns, options) {
+    if !pending_line.is_empty()
+        && fgrep_select_line(
+            fgrep_line_matches_any(&pending_line, patterns, options),
+            options,
+        )
+    {
         matched_any = true;
         match_count += 1;
         if !options.count_only {
@@ -419,15 +439,13 @@ fn write_matching_lines<W: Write>(
     matches: &[u64],
     multi_file: bool,
     options: FgrepOptions,
-) -> io::Result<()> {
-    let count = count_matches_in_lines(data, matches);
-    if options.count_only {
-        return write_count_line(out, Some(file), count, multi_file);
-    }
+) -> io::Result<bool> {
     let bytes = data;
     let mut next_match = 0usize;
     let mut line_start = 0usize;
     let mut line_no = 1_u64;
+    let mut matched_any = false;
+    let mut match_count = 0_u64;
     while line_start < bytes.len() {
         let rel_end = bytes[line_start..]
             .iter()
@@ -442,46 +460,27 @@ fn write_matching_lines<W: Write>(
             }
             next_match += 1;
         }
-        if matched {
-            write_matching_line(
-                out,
-                Some(file),
-                &bytes[line_start..line_end],
-                line_no,
-                multi_file,
-                options,
-            )?;
+        if fgrep_select_line(matched, options) {
+            matched_any = true;
+            match_count += 1;
+            if !options.count_only {
+                write_matching_line(
+                    out,
+                    Some(file),
+                    &bytes[line_start..line_end],
+                    line_no,
+                    multi_file,
+                    options,
+                )?;
+            }
         }
         line_start = line_end;
         line_no += 1;
     }
-    Ok(())
-}
-
-fn count_matches_in_lines(data: &[u8], matches: &[u64]) -> u64 {
-    let mut count = 0_u64;
-    let mut next_match = 0usize;
-    let mut line_start = 0usize;
-    while line_start < data.len() {
-        let rel_end = data[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|pos| pos + 1)
-            .unwrap_or(data.len() - line_start);
-        let line_end = line_start + rel_end;
-        let mut matched = false;
-        while next_match < matches.len() && matches[next_match] < line_end as u64 {
-            if matches[next_match] >= line_start as u64 {
-                matched = true;
-            }
-            next_match += 1;
-        }
-        if matched {
-            count += 1;
-        }
-        line_start = line_end;
+    if options.count_only {
+        write_count_line(out, Some(file), match_count, multi_file)?;
     }
-    count
+    Ok(matched_any)
 }
 
 fn write_line_regexp_matches<W: Write>(
@@ -505,7 +504,10 @@ fn write_line_regexp_matches<W: Write>(
             .unwrap_or(data.len() - line_start);
         let line_end = line_start + rel_end;
         let line = &data[line_start..line_end];
-        if fgrep_line_matches(line, pattern, normalized_pattern, options) {
+        if fgrep_select_line(
+            fgrep_line_matches(line, pattern, normalized_pattern, options),
+            options,
+        ) {
             matched_any = true;
             match_count += 1;
             if !options.count_only {
@@ -542,7 +544,10 @@ fn write_filtered_lines<W: Write>(
             .unwrap_or(data.len() - line_start);
         let line_end = line_start + rel_end;
         let line = &data[line_start..line_end];
-        if fgrep_line_matches(line, pattern, normalized_pattern, options) {
+        if fgrep_select_line(
+            fgrep_line_matches(line, pattern, normalized_pattern, options),
+            options,
+        ) {
             matched_any = true;
             match_count += 1;
             if !options.count_only {
@@ -578,7 +583,7 @@ fn write_filtered_lines_multi<W: Write>(
             .unwrap_or(data.len() - line_start);
         let line_end = line_start + rel_end;
         let line = &data[line_start..line_end];
-        if fgrep_line_matches_any(line, patterns, options) {
+        if fgrep_select_line(fgrep_line_matches_any(line, patterns, options), options) {
             matched_any = true;
             match_count += 1;
             if !options.count_only {
@@ -601,6 +606,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
         print_line_numbers: false,
         line_regexp: false,
         ignore_case: false,
+        invert_match: false,
     };
     let mut pattern_sources = Vec::new();
     let mut positional_pattern = None::<String>;
@@ -628,6 +634,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
             "-i" => options.ignore_case = true,
             "--ignore-case" => options.ignore_case = true,
             "--no-ignore-case" => options.ignore_case = false,
+            "-v" => options.invert_match = true,
+            "--invert-match" => options.invert_match = true,
             "-e" => pattern_sources.push(PatternSource::Inline(parse_option_value(
                 args, &mut index, None, "-e",
             )?)),
@@ -756,14 +764,15 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         pattern.raw.as_slice(),
                     )?;
                     if matches.is_empty() {
-                        if options.count_only {
-                            write_count_line(&mut out, Some(file), 0, multi_file)?;
+                        if !options.invert_match {
+                            if options.count_only {
+                                write_count_line(&mut out, Some(file), 0, multi_file)?;
+                            }
+                            continue;
                         }
-                        continue;
                     }
-                    matched_any = true;
                     let data = load_file_bytes(file, io_mode, "read_to_memory")?;
-                    write_matching_lines(
+                    matched_any |= write_matching_lines(
                         &mut out,
                         file,
                         data.data.as_slice(),
@@ -830,7 +839,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        fgrep_line_matches, fgrep_line_number_prefix, fgrep_short_flag_effect, FgrepOptions,
+        fgrep_line_matches, fgrep_line_number_prefix, fgrep_select_line, fgrep_short_flag_effect,
+        FgrepOptions,
     };
 
     #[kani::proof]
@@ -865,6 +875,7 @@ mod kani_proofs {
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: false,
+            invert_match: false,
         };
         assert!(fgrep_line_matches(&payload, b"a", b"a", options));
         assert!(!fgrep_line_matches(&payload, b"a\n", b"a\n", options));
@@ -874,8 +885,8 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::{
-        fgrep_line_matches, fgrep_line_matches_any, fgrep_line_number_prefix,
-        fgrep_short_flag_effect, parse_pattern_file_bytes, FgrepOptions, FgrepPattern,
+        fgrep_line_matches, fgrep_line_matches_any, fgrep_short_flag_effect,
+        parse_pattern_file_bytes, FgrepOptions, FgrepPattern,
     };
 
     #[test]
@@ -885,18 +896,13 @@ mod tests {
     }
 
     #[test]
-    fn fgrep_line_number_prefix_matches_boolean_gate() {
-        assert_eq!(fgrep_line_number_prefix(false, 7), None);
-        assert_eq!(fgrep_line_number_prefix(true, 7), Some(7));
-    }
-
-    #[test]
     fn fgrep_line_matches_honors_line_regexp() {
         let options = FgrepOptions {
             count_only: false,
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: false,
+            invert_match: false,
         };
         assert!(fgrep_line_matches(b"alpha\n", b"alpha", b"alpha", options));
         assert!(fgrep_line_matches(b"alpha", b"alpha", b"alpha", options));
@@ -918,6 +924,7 @@ mod tests {
             print_line_numbers: false,
             line_regexp: false,
             ignore_case: true,
+            invert_match: false,
         };
         assert!(fgrep_line_matches(
             b"Alpha beta\n",
@@ -937,6 +944,7 @@ mod tests {
             print_line_numbers: false,
             line_regexp: true,
             ignore_case: true,
+            invert_match: false,
         };
         assert!(fgrep_line_matches(
             b"Alpha\n",
@@ -971,6 +979,7 @@ mod tests {
             print_line_numbers: false,
             line_regexp: false,
             ignore_case: true,
+            invert_match: false,
         };
         let patterns = vec![
             FgrepPattern {

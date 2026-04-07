@@ -57,6 +57,7 @@ fn cartesian_cmp_and_fgrep_match_system_output() {
         for grep_args in [
             vec!["needle", grep_a.to_str().unwrap()],
             vec!["-n", "needle", grep_a.to_str().unwrap()],
+            vec!["-v", "needle", grep_a.to_str().unwrap()],
             vec!["needle", grep_a.to_str().unwrap(), grep_b.to_str().unwrap()],
             vec!["missing", grep_a.to_str().unwrap()],
         ] {
