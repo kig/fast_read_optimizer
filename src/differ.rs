@@ -9,6 +9,50 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug)]
+struct ResolvedDiffParams {
+    num_threads: u64,
+    block_size: u64,
+    qd: usize,
+    use_direct: bool,
+}
+
+fn resolve_diff_params(
+    file1: &str,
+    file2: &str,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    io_mode: IOMode,
+) -> io::Result<ResolvedDiffParams> {
+    let file_cached =
+        Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
+    let use_direct = ((!file_cached) && io_mode == IOMode::Auto) || io_mode == IOMode::Direct;
+
+    let (num_threads, block_size, qd) = if use_direct {
+        (num_threads_d, block_size_d, qd_d)
+    } else {
+        (num_threads_p, block_size_p, qd_p)
+    };
+
+    if block_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "block_size must be greater than zero",
+        ));
+    }
+
+    Ok(ResolvedDiffParams {
+        num_threads: num_threads.max(1),
+        block_size,
+        qd: qd.max(1),
+        use_direct,
+    })
+}
+
 fn thread_differ(
     thread_id: u64,
     file1: (&File, &File),
@@ -287,21 +331,21 @@ pub fn diff_files_window(
     let mismatch = Arc::new(AtomicU64::new(0));
     let mut threads = vec![];
 
-    let file_cached =
-        Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
-    let use_direct = ((!file_cached) && io_mode == IOMode::Auto) || io_mode == IOMode::Direct;
-
-    let num_threads = if use_direct {
-        num_threads_d
-    } else {
-        num_threads_p
-    };
-    let block_size = if use_direct {
-        block_size_d
-    } else {
-        block_size_p
-    };
-    let qd = if use_direct { qd_d } else { qd_p };
+    let params = resolve_diff_params(
+        file1,
+        file2,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        io_mode,
+    )?;
+    let num_threads = params.num_threads;
+    let block_size = params.block_size;
+    let qd = params.qd;
+    let use_direct = params.use_direct;
 
     let s1 = std::fs::metadata(file1)?.len();
     let s2 = std::fs::metadata(file2)?.len();
