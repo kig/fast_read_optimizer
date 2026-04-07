@@ -501,6 +501,130 @@ fn cp_preserve_matches_system_for_recursive_timestamps() {
 }
 
 #[test]
+fn cp_no_dereference_matches_system_for_symlink_sources() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-no-dereference");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source_root = tmp.join(format!("symlink-src-{suffix}"));
+        let target_root = tmp.join(format!("symlink-target-{suffix}"));
+        fs::create_dir_all(source_root.join("dir")).unwrap();
+        fs::write(source_root.join("dir/file.txt"), b"linked-data").unwrap();
+        symlink("dir/file.txt", source_root.join("file-link")).unwrap();
+        symlink("dir", source_root.join("dir-link")).unwrap();
+        let file_link = source_root.join("file-link");
+        let dir_link = source_root.join("dir-link");
+
+        let fro_file_target = target_root.join("fro-file-link");
+        let sys_file_target = target_root.join("sys-file-link");
+        fs::create_dir_all(&target_root).unwrap();
+
+        let mut fro_file_args = flags.clone();
+        fro_file_args.extend([
+            "-P",
+            file_link.to_str().unwrap(),
+            fro_file_target.to_str().unwrap(),
+        ]);
+        let sys_file_args = [
+            "-P",
+            file_link.to_str().unwrap(),
+            sys_file_target.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_file_args),
+            run_system("cp", &sys_file_args),
+            &format!("cp -P file symlink {:?}", fro_file_args),
+        );
+        assert_eq!(
+            fs::read_link(&fro_file_target).unwrap(),
+            fs::read_link(&sys_file_target).unwrap()
+        );
+
+        let fro_dir_target = target_root.join("fro-dir-link");
+        let sys_dir_target = target_root.join("sys-dir-link");
+        let mut fro_dir_args = flags.clone();
+        fro_dir_args.extend([
+            "-P",
+            dir_link.to_str().unwrap(),
+            fro_dir_target.to_str().unwrap(),
+        ]);
+        let sys_dir_args = [
+            "-P",
+            dir_link.to_str().unwrap(),
+            sys_dir_target.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_dir_args),
+            run_system("cp", &sys_dir_args),
+            &format!("cp -P dir symlink {:?}", fro_dir_args),
+        );
+        assert_eq!(
+            fs::read_link(&fro_dir_target).unwrap(),
+            fs::read_link(&sys_dir_target).unwrap()
+        );
+
+        let fro_recursive_parent = target_root.join("fro-recursive");
+        let sys_recursive_parent = target_root.join("sys-recursive");
+        fs::create_dir_all(&fro_recursive_parent).unwrap();
+        fs::create_dir_all(&sys_recursive_parent).unwrap();
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-rP",
+            dir_link.to_str().unwrap(),
+            fro_recursive_parent.to_str().unwrap(),
+        ]);
+        let sys_recursive_args = [
+            "-rP",
+            dir_link.to_str().unwrap(),
+            sys_recursive_parent.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_args),
+            run_system("cp", &sys_recursive_args),
+            &format!("cp -rP dir symlink {:?}", fro_recursive_args),
+        );
+        assert_eq!(
+            snapshot_tree(&fro_recursive_parent),
+            snapshot_tree(&sys_recursive_parent),
+            "recursive -P tree mismatch for {:?}",
+            fro_recursive_args
+        );
+
+        let fro_recursive_file_parent = target_root.join("fro-recursive-file");
+        let sys_recursive_file_parent = target_root.join("sys-recursive-file");
+        fs::create_dir_all(&fro_recursive_file_parent).unwrap();
+        fs::create_dir_all(&sys_recursive_file_parent).unwrap();
+        let mut fro_recursive_file_args = flags.clone();
+        fro_recursive_file_args.extend([
+            "-RP",
+            file_link.to_str().unwrap(),
+            fro_recursive_file_parent.to_str().unwrap(),
+        ]);
+        let sys_recursive_file_args = [
+            "-RP",
+            file_link.to_str().unwrap(),
+            sys_recursive_file_parent.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_file_args),
+            run_system("cp", &sys_recursive_file_args),
+            &format!("cp -RP file symlink {:?}", fro_recursive_file_args),
+        );
+        assert_eq!(
+            snapshot_tree(&fro_recursive_file_parent),
+            snapshot_tree(&sys_recursive_file_parent),
+            "recursive file -P tree mismatch for {:?}",
+            fro_recursive_file_args
+        );
+    }
+}
+
+#[test]
 fn cp_verbose_matches_system_for_copy_and_skip_cases() {
     let tmp = unique_temp_dir("fro-coreutils-cp-verbose");
 

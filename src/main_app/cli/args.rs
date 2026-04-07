@@ -32,6 +32,7 @@ pub(super) struct ParsedArgs {
     pub(super) cp_no_target_directory: bool,
     pub(super) cp_update: bool,
     pub(super) cp_preserve: bool,
+    pub(super) cp_no_dereference: bool,
     pub(super) verbose: bool,
     pub(super) source: Option<String>,
     pub(super) pattern: String,
@@ -121,6 +122,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     let mut cp_no_target_directory = false;
     let mut cp_update = false;
     let mut cp_preserve = false;
+    let mut cp_no_dereference = false;
     let mut verbose = false;
     let mut source: Option<String> = None;
     let mut pattern = String::new();
@@ -370,6 +372,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 cp_update = true;
             } else if args[i] == "--cp-preserve" {
                 cp_preserve = true;
+            } else if args[i] == "--cp-no-dereference" {
+                cp_no_dereference = true;
             } else if args[i] == "-q" || args[i] == "--quiet" {
                 quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
@@ -573,6 +577,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
             cp_no_target_directory,
             cp_update,
             cp_preserve,
+            cp_no_dereference,
             verbose,
             source,
             pattern,
@@ -800,7 +805,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         || cp_target_directory.is_some()
         || cp_no_target_directory
         || cp_update
-        || cp_preserve)
+        || cp_preserve
+        || cp_no_dereference)
         && mode != "copy"
     {
         println!("cp compatibility flags are only supported for copy");
@@ -863,6 +869,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         cp_no_target_directory,
         cp_update,
         cp_preserve,
+        cp_no_dereference,
         verbose,
         source,
         pattern,
