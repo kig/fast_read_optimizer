@@ -18,20 +18,13 @@
   - `src/main_app/cli/execute/config_command.rs` now holds config-command dispatch extracted from `src/main_app/cli/execute.rs`
   - the generated source-tree snapshot was refreshed and janitor file-size checks are green on the integrated branch
 
-### Archived from TODO: cp archive and transform-helper follow-up slices
-
-- `cp` gained a bounded GNU-style archive slice:
-  - `cp -a` / `--archive` now rewrites to recursive + preserve + no-dereference in the multicall compatibility layer
-  - regular-file archive copies now work correctly instead of being forced down the directory-only recursive error path
-  - preserve-on-copy for ordinary files now keeps mode bits together with timestamps
-  - focused parity coverage lives in `tests/coreutils_compat_matrix/cp_archive.rs`
-- Transform-style IO pairing advanced again:
-  - `stream::transform::resolve_regular_transform_input_path(...)` is now the shared helper for resolving redirected-stdin regular-file inputs
-  - `auto_select_transform_io_pairing(...)` and base64’s planning paths now reuse that helper instead of probing separately
-  - redirected-stdin / redirected-stdout base64 coverage now pins the shared transform pairing behavior
-  - `README.md` now points future transform-style tools at both helper layers explicitly
-
 ### Archived from TODO: focused throughput/parity slices and config layering follow-up
+
+### Archived from TODO: config/optimizer cleanup after shipped work
+
+- `TODO.md` now drops the obsolete pre-April active-items block so the file has a single current backlog instead of duplicated planning sections.
+- Shipped config/optimizer items are now marked complete in the active backlog: composite `md`/`dm` signatures, device-db precedence layering, mount-override persistence for `fro-optimize --for`, deterministic test sizing, and direct-I/O fallback observability.
+- The active backlog stays focused on remaining validation, high-use parity, and tuning work instead of re-listing already-landed config foundations.
 
 - `cat` stdin/plain-copy handling now avoids creating the buffered stdout writer thread when every input can stay on the fast kernel-copy path, so redirected stdin stays near pathname-speed on the plain byte-copy case without changing mixed stdin/file semantics.
 - `wc` byte-counting advanced in a path-preserving way:
@@ -68,6 +61,7 @@
   - read-side compares `recursive-read-bench`, `file-list-read-bench`, and `fd`
   - copy-side compares `fro copy --recursive`, split/prebuilt-manifest recursive-copy variants, and `cp -r`
   - the slice reports `files/s` while keeping elapsed-time summaries, and the docs now point tree-work profiling toward this narrower benchmark family
+- `cksum` now uses the `crc-fast` SIMD CRC-32/CKSUM core instead of the old in-tree slicing-table implementation, while preserving the existing parallel file map/reduce shape and POSIX length-suffix finalize semantics through chunk-level `checksum_combine`.
 
 ## 2026-04-06
 

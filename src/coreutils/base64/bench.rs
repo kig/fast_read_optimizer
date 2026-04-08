@@ -92,14 +92,16 @@ pub(crate) fn bench_base64_decode_detect_fallback(
     debug_assert_eq!(written, encoded.len());
 
     for _ in 0..1024 {
-        let out = process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
+        let out =
+            process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
         black_box(out.len());
     }
 
     let start = Instant::now();
     let mut sink = 0_u64;
     for _ in 0..iterations {
-        let out = process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
+        let out =
+            process::bytes::decode_base64_bytes_with_detect_fallback(&encoded, false, kernel)?;
         sink ^= u64::from(out[0]);
         sink ^= u64::from(out[out.len() - 1]);
     }

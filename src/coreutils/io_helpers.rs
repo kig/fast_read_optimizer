@@ -37,6 +37,15 @@ pub(crate) fn parse_io_mode(args: &[String]) -> io::Result<(IOMode, Vec<String>)
     Ok((io_mode, files))
 }
 
+pub(crate) fn report_gbps(command: &str, bytes: u64, started_at: std::time::Instant) {
+    let elapsed = started_at.elapsed().as_secs_f64().max(1e-9);
+    eprintln!(
+        "{command} {bytes} bytes in {:.4} s, {:.1} GB/s",
+        elapsed,
+        bytes as f64 / elapsed / 1e9
+    );
+}
+
 pub(crate) fn ensure_files(
     program: &str,
     files: Vec<String>,
@@ -180,6 +189,24 @@ where
     }
 }
 
+pub(crate) fn visit_ordered_input_counted<F>(
+    input: &StreamInput,
+    io_mode: IOMode,
+    mut on_block: F,
+) -> io::Result<u64>
+where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    let mut total = 0_u64;
+    visit_ordered_input(input, io_mode, |block| {
+        total = total
+            .checked_add(block.len() as u64)
+            .ok_or_else(|| io::Error::other("input byte count overflow"))?;
+        on_block(block)
+    })?;
+    Ok(total)
+}
+
 pub(crate) fn loaded_or_stream_bytes(input: &StreamInput, io_mode: IOMode) -> io::Result<Vec<u8>> {
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
@@ -200,10 +227,11 @@ pub(crate) fn loaded_or_stream_bytes(input: &StreamInput, io_mode: IOMode) -> io
     }
 }
 
-pub(crate) fn copy_file_like_to_output<W: Write>(
+pub(crate) fn copy_file_like_to_output_counted<W: Write>(
     out: &mut W,
     input: &StreamInput,
-) -> io::Result<()> {
+) -> io::Result<u64> {
+    let mut total = 0_u64;
     match input {
         StreamInput::File(path) => {
             let mut reader = BufReader::new(std::fs::File::open(path)?);
@@ -211,9 +239,12 @@ pub(crate) fn copy_file_like_to_output<W: Write>(
             loop {
                 let read = reader.read(&mut buffer)?;
                 if read == 0 {
-                    return Ok(());
+                    return Ok(total);
                 }
                 out.write_all(&buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
             }
         }
         StreamInput::Stdin { .. } => {
@@ -222,9 +253,12 @@ pub(crate) fn copy_file_like_to_output<W: Write>(
             loop {
                 let read = reader.read(&mut buffer)?;
                 if read == 0 {
-                    return Ok(());
+                    return Ok(total);
                 }
                 out.write_all(&buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
             }
         }
     }
@@ -712,11 +746,6 @@ where
             Ok(None)
         }
     }
-}
-
-pub(crate) fn try_fast_cat_copy(input: &StreamInput, io_mode: IOMode) -> io::Result<bool> {
-    let mut noop = |_bytes: u64| Ok(());
-    Ok(try_fast_copy_to_stdout_counted(input, io_mode, &mut noop)?.is_some())
 }
 
 pub(crate) fn visit_ordered_blocks<F>(

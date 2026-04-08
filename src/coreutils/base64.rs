@@ -89,6 +89,7 @@ type M256i = std::arch::x86_64::__m256i;
 struct Base64Options {
     decode: bool,
     ignore_garbage: bool,
+    report_gbps: bool,
     wrap_cols: usize,
     io_mode: IOMode,
     input: StreamInput,
@@ -140,6 +141,7 @@ fn print_base64_help() {
 fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32>> {
     let mut decode = false;
     let mut ignore_garbage = false;
+    let mut report_gbps = false;
     let mut wrap_cols = BASE64_DEFAULT_WRAP;
     let mut io_mode = IOMode::Auto;
     let mut files = Vec::new();
@@ -153,6 +155,7 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            "--report-gbps" => report_gbps = true,
             "-d" | "--decode" => decode = true,
             "-i" | "--ignore-garbage" => ignore_garbage = true,
             "-w" => {
@@ -211,6 +214,7 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
     Ok(Ok(Base64Options {
         decode,
         ignore_garbage,
+        report_gbps,
         wrap_cols,
         io_mode,
         input,

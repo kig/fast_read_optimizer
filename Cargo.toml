@@ -11,6 +11,7 @@ read-phase-timing = []
 
 [dependencies]
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
+crc-fast = "1.10.0"
 io-uring = "0.7.11"
 iou = "0.3.3"
 libc = "0.2.137"

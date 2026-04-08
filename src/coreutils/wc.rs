@@ -11,13 +11,6 @@ struct WcInputs {
     exit_code: i32,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum WcExecutionPath {
-    MetadataTotals,
-    RegularFileBlocks,
-    FdParallel,
-}
-
 fn wc_os_error_message(err: &io::Error) -> String {
     err.raw_os_error()
         .map(|errno| {
@@ -117,15 +110,16 @@ fn wc_totals_for_input(
     config: &crate::config::LoadedConfig,
     io_mode: IOMode,
 ) -> io::Result<WcTotals> {
-    match wc_execution_path(input, options)? {
-        WcExecutionPath::MetadataTotals => {
-            Ok(wc_metadata_totals(input, options)?
-                .expect("metadata totals path must return a value"))
+    if let Some(totals) = wc_metadata_totals(input, options)? {
+        return Ok(totals);
+    }
+
+    match input {
+        StreamInput::File(file) if options.chars || options.max_line_length => {
+            let mut reader = std::fs::File::open(file)?;
+            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
         }
-        WcExecutionPath::RegularFileBlocks => {
-            let StreamInput::File(file) = input else {
-                unreachable!("regular-file block path requires a file input");
-            };
+        StreamInput::File(file) if is_regular_input_path(file)? => {
             let count_options = WcCountOptions {
                 max_line_length: false,
                 ..options
@@ -139,31 +133,13 @@ fn wc_totals_for_input(
             )?;
             Ok(reduce_wc_counts(&blocks.blocks))
         }
-        WcExecutionPath::FdParallel => match input {
-            StreamInput::File(file) => {
-                let mut reader = std::fs::File::open(file)?;
-                wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
-            }
-            StreamInput::Stdin { .. } => {
-                wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
-            }
-        },
-    }
-}
-
-fn wc_execution_path(input: &StreamInput, options: WcCountOptions) -> io::Result<WcExecutionPath> {
-    if wc_metadata_totals(input, options)?.is_some() {
-        return Ok(WcExecutionPath::MetadataTotals);
-    }
-
-    match input {
-        StreamInput::File(_) if options.chars || options.max_line_length => {
-            Ok(WcExecutionPath::FdParallel)
+        StreamInput::File(file) => {
+            let mut reader = std::fs::File::open(file)?;
+            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
         }
-        StreamInput::File(file) if is_regular_input_path(file)? => {
-            Ok(WcExecutionPath::RegularFileBlocks)
+        StreamInput::Stdin { .. } => {
+            wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
         }
-        StreamInput::File(_) | StreamInput::Stdin { .. } => Ok(WcExecutionPath::FdParallel),
     }
 }
 
@@ -214,6 +190,7 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
     let mut print_bytes = false;
     let mut print_max_line_length = false;
     let mut io_mode = IOMode::Auto;
+    let mut report_throughput = false;
     let mut files0_from = None::<String>;
     let mut files = Vec::new();
     let mut i = 1usize;
@@ -239,6 +216,7 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            "--report-gbps" => report_throughput = true,
             other
                 if apply_wc_short_flag_bundle(
                     other,
@@ -274,6 +252,7 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
         requested_count,
         mut exit_code,
     } = parsed_inputs;
+    let started_at = std::time::Instant::now();
     let config = load_config(None);
     let mut out = stdout_buf_writer()?;
     let mut grand_total = WcTotals {
@@ -330,6 +309,9 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
         )?;
     }
     out.into_inner()?;
+    if report_throughput {
+        report_gbps("wc", grand_total.bytes, started_at);
+    }
     Ok(exit_code)
 }
 

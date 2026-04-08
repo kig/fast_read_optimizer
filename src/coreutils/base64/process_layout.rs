@@ -1,7 +1,7 @@
 use super::*;
-use crate::stream::transform::{resolve_regular_transform_input_path, TransformInputSpec};
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RegularDecodeLayout {
@@ -56,7 +56,21 @@ pub(super) fn wrapped_decode_block_sizes(target_read: u64) -> (u64, usize) {
 }
 
 pub(super) fn regular_input_path(input: &StreamInput) -> io::Result<Option<String>> {
-    resolve_regular_transform_input_path(transform_input_spec(input))
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => Ok(Some(path.clone())),
+        StreamInput::Stdin { .. } => {
+            let stdin_fd = io::stdin().as_raw_fd();
+            if !is_regular_fd(stdin_fd) {
+                return Ok(None);
+            }
+            let read_path_buf = fs::read_link(format!("/proc/self/fd/{stdin_fd}"))?;
+            let read_path = read_path_buf.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
+            })?;
+            Ok(Some(read_path.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(super) fn detect_regular_decode_layout(path: &str) -> io::Result<RegularDecodeLayout> {
@@ -163,9 +177,21 @@ pub(super) fn read_decode_fast_path_probe(reader: &mut File) -> io::Result<(Vec<
 }
 
 pub(super) fn decode_input_can_use_fast_path(input: &StreamInput) -> io::Result<bool> {
-    match regular_input_path(input)? {
-        Some(path) => Ok(detect_regular_decode_layout(&path)? == RegularDecodeLayout::Clean),
-        None if matches!(input, StreamInput::Stdin { .. }) => Ok(true),
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            Ok(detect_regular_decode_layout(path)? == RegularDecodeLayout::Clean)
+        }
+        StreamInput::Stdin { .. } => {
+            let stdin_fd = io::stdin().as_raw_fd();
+            if !is_regular_fd(stdin_fd) {
+                return Ok(true);
+            }
+            let read_path_buf = fs::read_link(format!("/proc/self/fd/{stdin_fd}"))?;
+            let read_path = read_path_buf.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
+            })?;
+            Ok(detect_regular_decode_layout(read_path)? == RegularDecodeLayout::Clean)
+        }
         _ => Ok(false),
     }
 }
@@ -185,11 +211,4 @@ pub(super) fn encode_input_can_use_wrapped_fast_path(
         return Ok(false);
     }
     Ok(regular_input_path(input)?.is_some())
-}
-
-fn transform_input_spec(input: &StreamInput) -> TransformInputSpec<'_> {
-    match input {
-        StreamInput::File(path) => TransformInputSpec::Path(path),
-        StreamInput::Stdin { .. } => TransformInputSpec::Stdin,
-    }
 }

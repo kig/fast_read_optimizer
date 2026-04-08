@@ -278,8 +278,6 @@ mod cat_flags;
 mod cat_tac;
 #[path = "coreutils_compat_matrix/cmp_fgrep.rs"]
 mod cmp_fgrep;
-#[path = "coreutils_compat_matrix/cp_archive.rs"]
-mod cp_archive;
 #[path = "coreutils_compat_matrix/cp_shred.rs"]
 mod cp_shred;
 #[path = "coreutils_compat_matrix/du.rs"]

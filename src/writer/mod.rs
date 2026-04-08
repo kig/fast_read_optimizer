@@ -693,128 +693,102 @@ fn thread_writer(
     io_uring.submit_sqes().map_err(io::Error::other)?;
 
     while inflight > 0 {
-        let ready = wait_for_ready(io_uring)?;
-        let mut submitted = false;
+        let cq = io_uring.wait_for_cqe().map_err(io::Error::other)?;
+        let user_data = cq.user_data();
+        let idx = (user_data & 0xFFFFFFFF) as usize;
+        let state = (user_data >> 40) as u8;
+        let result = cq.result()?;
 
-        for (user_data, result) in ready {
-            let idx = (user_data & 0xFFFFFFFF) as usize;
-            let state = (user_data >> 40) as u8;
-
-            if state == 1 {
-                // Read finished
-                let len = result as u64;
-                let dst_offset = dest_base_offset + buffer_offsets[idx];
-                let is_aligned_write = (dst_offset % 4096 == 0) && (len % 4096 == 0);
-                if use_direct_write && !is_aligned_write {
-                    note_direct_unaligned_fallback("write", dst_offset, len as usize);
-                }
-                let fd = if use_direct_write && is_aligned_write {
-                    dest_file.0.as_raw_fd()
-                } else {
-                    dest_file.1.as_raw_fd()
-                };
-                // SAFETY: The buffer remains owned by `buffers[idx]` across
-                // submission/completion, and the write range corresponds to the completed read
-                // for this slot.
-                unsafe {
-                    let mut sqe = io_uring
-                        .prepare_sqe()
-                        .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
-                    sqe.prep_write(fd, &buffers[idx].as_slice()[..result as usize], dst_offset);
-                    sqe.set_user_data((idx as u64) | (2u64 << 40));
-                }
-                submitted = true;
-            } else {
-                // Write finished
-                write_count.fetch_add(result as u64, Ordering::SeqCst);
-                inflight -= 1;
-                if next_offset < total_size {
-                    buffer_offsets[idx] = next_offset;
-                    let len = (total_size - next_offset).min(block_size);
-
-                    let src_offset = source_base_offset + next_offset;
-                    let dst_offset = dest_base_offset + next_offset;
-                    let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
-                    if use_direct_read && !is_aligned_read {
-                        note_direct_unaligned_fallback("copy-read", src_offset, len as usize);
-                    }
-                    if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
-                        let fd = if use_direct_read && is_aligned_read {
-                            src_direct.as_raw_fd()
-                        } else {
-                            src_pagecache.as_raw_fd()
-                        };
-                        // SAFETY: `buffers[idx]` remains allocated for this slot, and the
-                        // direct-read path is only used when the offset/length satisfy the
-                        // required alignment.
-                        unsafe {
-                            let mut sqe = io_uring.prepare_sqe().ok_or_else(|| {
-                                io::Error::other("io_uring submission queue is full")
-                            })?;
-                            sqe.prep_read(
-                                fd,
-                                &mut buffers[idx].as_mut_slice()[..len as usize],
-                                src_offset,
-                            );
-                            sqe.set_user_data((idx as u64) | (1u64 << 40));
-                        }
-                    } else {
-                        fill_write_buffer(
-                            &mut buffers[idx].as_mut_slice()[..len as usize],
-                            source_buffer,
-                            random_block,
-                            source_base_offset,
-                            next_offset,
-                        )?;
-                        let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
-                        if use_direct_write && !is_aligned_write {
-                            note_direct_unaligned_fallback("write", dst_offset, len as usize);
-                        }
-                        let fd = if use_direct_write && is_aligned_write {
-                            dest_file.0.as_raw_fd()
-                        } else {
-                            dest_file.1.as_raw_fd()
-                        };
-                        // SAFETY: `buffers[idx]` stays alive until the corresponding CQE, and the
-                        // chosen fd matches the alignment checks above.
-                        unsafe {
-                            let mut sqe = io_uring.prepare_sqe().ok_or_else(|| {
-                                io::Error::other("io_uring submission queue is full")
-                            })?;
-                            sqe.prep_write(
-                                fd,
-                                &buffers[idx].as_slice()[..len as usize],
-                                dst_offset,
-                            );
-                            sqe.set_user_data((idx as u64) | (2u64 << 40));
-                        }
-                    }
-                    next_offset += num_threads * block_size;
-                    inflight += 1;
-                    submitted = true;
-                }
+        if state == 1 {
+            // Read finished
+            let len = result as u64;
+            let dst_offset = dest_base_offset + buffer_offsets[idx];
+            let is_aligned_write = (dst_offset % 4096 == 0) && (len % 4096 == 0);
+            if use_direct_write && !is_aligned_write {
+                note_direct_unaligned_fallback("write", dst_offset, len as usize);
             }
-        }
-
-        if submitted {
+            let fd = if use_direct_write && is_aligned_write {
+                dest_file.0.as_raw_fd()
+            } else {
+                dest_file.1.as_raw_fd()
+            };
+            // SAFETY: The buffer remains owned by `buffers[idx]` across submission/completion, and
+            // the write range corresponds to the completed read for this slot.
+            unsafe {
+                let mut sqe = io_uring
+                    .prepare_sqe()
+                    .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
+                sqe.prep_write(fd, &buffers[idx].as_slice()[..result as usize], dst_offset);
+                sqe.set_user_data((idx as u64) | (2u64 << 40));
+            }
             io_uring.submit_sqes().map_err(io::Error::other)?;
+        } else {
+            // Write finished
+            write_count.fetch_add(result as u64, Ordering::SeqCst);
+            inflight -= 1;
+            if next_offset < total_size {
+                buffer_offsets[idx] = next_offset;
+                let len = (total_size - next_offset).min(block_size);
+
+                let src_offset = source_base_offset + next_offset;
+                let dst_offset = dest_base_offset + next_offset;
+                let is_aligned_read = (src_offset % 4096 == 0) && (len == block_size);
+                if use_direct_read && !is_aligned_read {
+                    note_direct_unaligned_fallback("copy-read", src_offset, len as usize);
+                }
+                if let Some((src_direct, src_pagecache)) = source_file.as_ref() {
+                    let fd = if use_direct_read && is_aligned_read {
+                        src_direct.as_raw_fd()
+                    } else {
+                        src_pagecache.as_raw_fd()
+                    };
+                    // SAFETY: `buffers[idx]` remains allocated for this slot, and the direct-read
+                    // path is only used when the offset/length satisfy the required alignment.
+                    unsafe {
+                        let mut sqe = io_uring
+                            .prepare_sqe()
+                            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
+                        sqe.prep_read(
+                            fd,
+                            &mut buffers[idx].as_mut_slice()[..len as usize],
+                            src_offset,
+                        );
+                        sqe.set_user_data((idx as u64) | (1u64 << 40));
+                    }
+                } else {
+                    fill_write_buffer(
+                        &mut buffers[idx].as_mut_slice()[..len as usize],
+                        source_buffer,
+                        random_block,
+                        source_base_offset,
+                        next_offset,
+                    )?;
+                    let is_aligned_write = (dst_offset % 4096 == 0) && (len == block_size);
+                    if use_direct_write && !is_aligned_write {
+                        note_direct_unaligned_fallback("write", dst_offset, len as usize);
+                    }
+                    let fd = if use_direct_write && is_aligned_write {
+                        dest_file.0.as_raw_fd()
+                    } else {
+                        dest_file.1.as_raw_fd()
+                    };
+                    // SAFETY: `buffers[idx]` stays alive until the corresponding CQE, and the
+                    // chosen fd matches the alignment checks above.
+                    unsafe {
+                        let mut sqe = io_uring
+                            .prepare_sqe()
+                            .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
+                        sqe.prep_write(fd, &buffers[idx].as_slice()[..len as usize], dst_offset);
+                        sqe.set_user_data((idx as u64) | (2u64 << 40));
+                    }
+                }
+                io_uring.submit_sqes().map_err(io::Error::other)?;
+                next_offset += num_threads * block_size;
+                inflight += 1;
+            }
         }
     }
     Ok(())
-}
-
-fn wait_for_ready(io_uring: &mut IoUring) -> io::Result<Vec<(u64, u32)>> {
-    let cq = io_uring.wait_for_cqe().map_err(io::Error::other)?;
-    let mut ready = vec![(cq.user_data(), cq.result()?)];
-
-    while io_uring.cq_ready() > 0 {
-        let cq = io_uring.peek_for_cqe().ok_or_else(|| {
-            io::Error::other("completion queue reported ready but no CQE was available")
-        })?;
-        ready.push((cq.user_data(), cq.result()?));
-    }
-
-    Ok(ready)
 }
 
 fn fill_write_buffer(

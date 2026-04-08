@@ -104,9 +104,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "cat" => Some(CommandHelp {
             name: "cat",
-            usage: "cat [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "cat [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Print one or more files using fro's fast read path.",
-            notes: &["Useful as a compatibility wrapper over the same IO-mode flags as fro reads."],
+            notes: &[
+                "Useful as a compatibility wrapper over the same IO-mode flags as fro reads.",
+                "--report-gbps writes effective input throughput to stderr after the payload finishes.",
+            ],
             examples: &[("Print two files", "cat a.txt b.txt")],
         }),
         "rm" => Some(CommandHelp {
@@ -140,12 +143,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "base64" => Some(CommandHelp {
             name: "base64",
-            usage: "base64 [-d|--decode] [-i|--ignore-garbage] [-w cols|--wrap=cols] [--auto|--no-direct|--direct] [file]",
+            usage: "base64 [-d|--decode] [-i|--ignore-garbage] [-w cols|--wrap=cols] [--auto|--no-direct|--direct] [--report-gbps] [file]",
             summary: "Encode or decode one file or stdin using RFC 4648 base64.",
             notes: &[
                 "Without a file operand, or when the file is -, base64 reads standard input.",
                 "Encoding wraps at 76 columns by default; use -w 0 to disable wrapping.",
                 "--ignore-garbage only affects decode mode.",
+                "--report-gbps writes effective input throughput to stderr after processing.",
             ],
             examples: &[
                 ("Encode stdin without wrapping", "base64 -w 0 < input.bin"),
@@ -160,8 +164,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Regular-file inputs are processed in parallel 512 KiB blocks.",
                 "Only aes-256-ctr is supported, derived with PBKDF2-HMAC-SHA256 and the standard `Salted__` header.",
                 "No trailing b3sum is appended because extra bytes would break `openssl enc` compatibility.",
-                "aes-256-ctr is unauthenticated, so wrong-passphrase or tampered decrypts may return garbage rather than a hard error.",
-                "Verify decrypted output with an external MAC, signature, or hash before trusting it.",
+                "aes-256-ctr is unauthenticated, so wrong-passphrase decrypts may return garbage rather than a hard error.",
                 "Use -o/--output to write to a file; otherwise ciphertext is written to stdout.",
             ],
             examples: &[
@@ -183,8 +186,6 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Regular-file inputs are processed in parallel 512 KiB blocks.",
                 "Only aes-256-ctr with the OpenSSL `Salted__` header and PBKDF2-HMAC-SHA256 derivation is supported.",
                 "Ciphertext must match the bytes produced by `fro encrypt` or `openssl enc -aes-256-ctr -pbkdf2 -salt`.",
-                "aes-256-ctr is unauthenticated, so wrong-passphrase or tampered decrypts may still produce output bytes.",
-                "Verify decrypted output with an external MAC, signature, or hash before trusting it.",
             ],
             examples: &[
                 (
@@ -206,13 +207,14 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "fgrep" => Some(CommandHelp {
             name: "fgrep",
-            usage: "fgrep [-n] [-i] [-x] [-v] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [pattern] <file> [file ...]",
+            usage: "fgrep [-n] [-i] [-x] [-v] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]",
             summary: "Literal line-oriented grep on top of fro's fast substring scanner.",
             notes: &[
                 "Matches GNU grep -F visible behavior for the covered compatibility matrix.",
                 "-i/--ignore-case folds ASCII case for literal matching; --no-ignore-case turns it back off.",
                 "-v/--invert-match selects non-matching lines while keeping the same literal matcher.",
                 "-e/--regexp and -f/--file can be repeated; if neither is provided, the first positional argument is the pattern.",
+                "--report-gbps writes effective scanned-input throughput to stderr.",
             ],
             examples: &[
                 ("Print matching lines with numbers", "fgrep -n needle notes.txt"),
@@ -224,10 +226,9 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "find" => Some(CommandHelp {
             name: "find",
-            usage: "find [--] [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
+            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
             summary: "Walk one or more directory trees and print matching paths.",
             notes: &[
-                "-- stops option parsing so roots beginning with '-' stay positional paths.",
                 "This correctness slice does not guarantee output ordering.",
                 "-maxdepth limits descent below each starting path while still printing matching roots.",
                 "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s.",
@@ -298,12 +299,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "wc" => Some(CommandHelp {
             name: "wc",
-            usage: "wc [-l] [-w] [-m] [-c] [-L] [--lines] [--words] [--chars] [--bytes] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "wc [-l] [-w] [-m] [-c] [-L] [--lines] [--words] [--chars] [--bytes] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Count lines, words, characters, bytes, and max line length using fro block visitors.",
             notes: &[
                 "Without -l/-w/-m/-c/-L, prints lines, words, and bytes.",
                 "--lines/--words/--chars/--bytes match the GNU wc long count flags.",
                 "--files0-from=F reads NUL-delimited input names from F (or stdin when F is -).",
+                "--report-gbps writes effective processed-input throughput to stderr.",
             ],
             examples: &[
                 ("Count lines and words", "wc -l -w notes.txt"),
@@ -324,58 +326,61 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "cksum" => Some(CommandHelp {
             name: "cksum",
-            usage: "cksum [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "cksum [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "POSIX cksum compatibility wrapper on top of fro file reads.",
-            notes: &["Uses a table-driven POSIX CRC32 path while reusing the existing ordered input reader."],
+            notes: &[
+                "Uses a table-driven POSIX CRC32 path while reusing the existing ordered input reader.",
+                "--report-gbps writes effective hashed-input throughput to stderr.",
+            ],
             examples: &[("Print POSIX CRC32 and size", "cksum archive.tar")],
         }),
         "b3sum" => Some(CommandHelp {
             name: "b3sum",
-            usage: "b3sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "b3sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print BLAKE3 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
         }),
         "b2sum" => Some(CommandHelp {
             name: "b2sum",
-            usage: "b2sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "b2sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print BLAKE2b-512 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with BLAKE2b-512", "b2sum bigfile.dat")],
         }),
         "md5sum" => Some(CommandHelp {
             name: "md5sum",
-            usage: "md5sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "md5sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print MD5 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with MD5", "md5sum bigfile.dat")],
         }),
         "sha224sum" => Some(CommandHelp {
             name: "sha224sum",
-            usage: "sha224sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "sha224sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print SHA-224 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with SHA-224", "sha224sum bigfile.dat")],
         }),
         "sha256sum" => Some(CommandHelp {
             name: "sha256sum",
-            usage: "sha256sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "sha256sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print SHA-256 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with SHA-256", "sha256sum bigfile.dat")],
         }),
         "sha384sum" => Some(CommandHelp {
             name: "sha384sum",
-            usage: "sha384sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "sha384sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print SHA-384 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with SHA-384", "sha384sum bigfile.dat")],
         }),
         "sha512sum" => Some(CommandHelp {
             name: "sha512sum",
-            usage: "sha512sum [--auto|--no-direct|--direct] [--] <file> [file ...]",
+            usage: "sha512sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Print SHA-512 digests for one or more files.",
-            notes: &[],
+            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
             examples: &[("Hash one file with SHA-512", "sha512sum bigfile.dat")],
         }),
         "tar" => Some(CommandHelp {
@@ -439,7 +444,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
-                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and -p/--preserve compatibility flags; archive expands to recursive no-dereference plus preserve, and preserve currently keeps mode+timestamps but not ownership.",
+                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and -p/--preserve (mode+timestamps for recursive and regular copies; ownership is not preserved) compatibility flags.",
             ],
             examples: &[
                 (

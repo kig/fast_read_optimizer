@@ -68,12 +68,8 @@ fn set_path_timestamps(
     Err(io::Error::last_os_error())
 }
 
-pub(super) fn preserve_file_metadata(source_path: &Path, target_path: &Path) -> io::Result<()> {
+pub(super) fn preserve_file_timestamps(source_path: &Path, target_path: &Path) -> io::Result<()> {
     let metadata = fs::metadata(source_path)?;
-    fs::set_permissions(
-        target_path,
-        fs::Permissions::from_mode(metadata.permissions().mode()),
-    )?;
     set_path_timestamps(
         target_path,
         preserved_timestamps_from_metadata(&metadata),

@@ -13,8 +13,8 @@ use crate::stream::transform::{
 };
 mod decode_reorg;
 use decode_reorg::Base64DecodeReorg;
-pub(super) mod wrapped;
 pub(super) mod bytes;
+pub(super) mod wrapped;
 use wrapped::{
     decode_wrapped_block_into, encode_full_wrapped_lines_in_place, encode_wrapped_block_into,
     ordered_input_block_bound, wrap_encoded_bytes_into, wrapped_base64_output_capacity,
@@ -272,11 +272,11 @@ fn decode_base64_input<W: Write>(
     input: &StreamInput,
     io_mode: IOMode,
     ignore_garbage: bool,
-) -> io::Result<bool> {
+) -> io::Result<(bool, u64)> {
     let compacted_capacity = ordered_input_block_bound(input, io_mode)?.max(32 * 1024);
     let mut reorg = Base64DecodeReorg::new(compacted_capacity, ignore_garbage);
     let mut invalid = false;
-    visit_ordered_input(input, io_mode, |block| {
+    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
         if invalid {
             return Ok(());
         }
@@ -290,15 +290,15 @@ fn decode_base64_input<W: Write>(
         Ok(())
     })?;
     if invalid {
-        return Ok(true);
+        return Ok((true, bytes));
     }
     if let Err(err) = reorg.finish(out) {
         if err.kind() == io::ErrorKind::InvalidData {
-            return Ok(true);
+            return Ok((true, bytes));
         }
         return Err(err);
     }
-    Ok(false)
+    Ok((false, bytes))
 }
 
 fn decode_base64_from_reader<W: Write, R: Read>(
@@ -340,7 +340,7 @@ fn encode_base64_input<W: Write>(
     input: &StreamInput,
     io_mode: IOMode,
     wrap_cols: usize,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     if wrap_cols != 0 && wrap_cols % 4 == 0 {
         let line_input_bytes = (wrap_cols / 4) * 3;
         let block_bound = ordered_input_block_bound(input, io_mode)?;
@@ -357,7 +357,7 @@ fn encode_base64_input<W: Write>(
                 .saturating_add(line_buf.len())
                 .max(64 * 1024),
         );
-        visit_ordered_input(input, io_mode, |block| {
+        let bytes = visit_ordered_input_counted(input, io_mode, |block| {
             let mut start = 0usize;
 
             if carry_len != 0 {
@@ -406,7 +406,7 @@ fn encode_base64_input<W: Write>(
             batched_out.write_all(&line_buf[..encoded_len + 1])?;
         }
         batched_out.flush()?;
-        return Ok(());
+        return Ok(bytes);
     }
 
     let block_bound = ordered_input_block_bound(input, io_mode)?;
@@ -428,7 +428,7 @@ fn encode_base64_input<W: Write>(
         out,
         wrapped_slab.len().saturating_add(8).max(64 * 1024),
     );
-    visit_ordered_input(input, io_mode, |block| {
+    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
         let total_len = carry_len + block.len();
         let process_len = (total_len / 3) * 3;
         if process_len == 0 {
@@ -493,7 +493,7 @@ fn encode_base64_input<W: Write>(
         batched_out.push_byte(b'\n')?;
     }
     batched_out.flush()?;
-    Ok(())
+    Ok(bytes)
 }
 
 fn encode_process_plan() -> Base64ProcessPlan {
@@ -565,10 +565,11 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
         options.wrap_cols != 0
             && !encode_input_can_use_wrapped_fast_path(&options.input, options.wrap_cols)?
     };
+    let started_at = std::time::Instant::now();
 
     if requires_stateful_path {
         let mut out = stdout_buf_writer()?;
-        let invalid = if options.decode {
+        let (invalid, processed_bytes) = if options.decode {
             decode_base64_input(
                 &mut out,
                 &options.input,
@@ -576,10 +577,15 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
                 options.ignore_garbage,
             )?
         } else {
-            encode_base64_input(&mut out, &options.input, options.io_mode, options.wrap_cols)?;
-            false
+            (
+                false,
+                encode_base64_input(&mut out, &options.input, options.io_mode, options.wrap_cols)?,
+            )
         };
         out.into_inner()?;
+        if options.report_gbps {
+            report_gbps("base64", processed_bytes, started_at);
+        }
         if invalid {
             eprintln!("base64: invalid input");
             return Ok(1);
@@ -601,6 +607,11 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
         |_, mut output| process_pipe_to_file(&mut output, &options.input, &options, &plan),
         |_, mut output| process_pipe_to_pipe(&mut output, &options.input, &options, &plan),
     )?;
+    if options.report_gbps {
+        if let StreamInput::File(path) = &options.input {
+            report_gbps("base64", fs::metadata(path)?.len(), started_at);
+        }
+    }
 
     if invalid {
         eprintln!("base64: invalid input");

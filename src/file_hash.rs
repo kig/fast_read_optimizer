@@ -1,6 +1,6 @@
 use crate::block_hash::{hash_file_blocks, BlockHashAlgorithm};
 use crate::config::{load_config, IOParams};
-use crate::{hash_file_blake3, visit_blocks_with_mode, IOMode};
+use crate::{hash_file_blake3, hash_file_crc32, visit_blocks_with_mode, IOMode};
 use openssl::hash::{Hasher, MessageDigest};
 use std::collections::BTreeMap;
 use std::io;
@@ -15,6 +15,7 @@ pub enum HashAlgorithm {
     Sha384,
     Sha512,
     Blake3,
+    CRC32,
     FroBlockXxh3,
     FroBlockSha256,
 }
@@ -28,7 +29,7 @@ impl HashAlgorithm {
             Self::Sha256 => Some("SHA256"),
             Self::Sha384 => Some("SHA384"),
             Self::Sha512 => Some("SHA512"),
-            Self::Blake3 | Self::FroBlockXxh3 | Self::FroBlockSha256 => None,
+            Self::Blake3 | Self::CRC32 | Self::FroBlockXxh3 | Self::FroBlockSha256 => None,
         }
     }
 }
@@ -42,6 +43,7 @@ pub fn hash_file(path: &str, algorithm: HashAlgorithm, io_mode: IOMode) -> io::R
     }
     match algorithm {
         HashAlgorithm::Blake3 => Ok(hash_file_blake3(path, io_mode)?.as_bytes().to_vec()),
+        HashAlgorithm::CRC32 => Ok(hash_file_crc32(path, io_mode)?.to_be_bytes().to_vec()),
         HashAlgorithm::FroBlockXxh3 => {
             hash_file_block_digest(path, BlockHashAlgorithm::Xxh3, io_mode)
         }
@@ -148,6 +150,7 @@ mod tests {
     use crate::block_hash::{hash_file_blocks, BlockHashAlgorithm};
     use crate::config::IOParams;
     use crate::IOMode;
+    use crate::{cksum_crc_block, finalize_cksum_crc};
     use openssl::hash::{hash, MessageDigest};
     use std::fs;
     use std::path::PathBuf;
@@ -162,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_matches_openssl_for_sha256_md5_and_blake2b() {
+    fn hash_file_matches_known_digests() {
         let path = unique_temp_file("fro-hash-file");
         let bytes = (0..(512 * 1024 + 123))
             .map(|i| ((i * 31) % 251) as u8)
@@ -207,6 +210,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(blake3, blake3::hash(&bytes).as_bytes().to_vec());
+
+        let crc32 = hash_file(
+            path.to_str().unwrap(),
+            HashAlgorithm::CRC32,
+            IOMode::PageCache,
+        )
+        .unwrap();
+        assert_eq!(
+            crc32,
+            finalize_cksum_crc(cksum_crc_block(&bytes), bytes.len() as u64)
+                .to_be_bytes()
+                .to_vec()
+        );
 
         let page_cache = IOParams {
             num_threads: 2,

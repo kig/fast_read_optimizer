@@ -83,6 +83,52 @@ fn count_wc_block_counts_lines_words_and_bytes() {
 }
 
 #[test]
+fn wc_short_flag_bundles_enable_multiple_counts() {
+    let mut lines = false;
+    let mut words = false;
+    let mut chars = false;
+    let mut bytes = false;
+    let mut max_line_length = false;
+
+    assert!(apply_wc_short_flag_bundle(
+        "-lwc",
+        &mut lines,
+        &mut words,
+        &mut chars,
+        &mut bytes,
+        &mut max_line_length,
+    ));
+    assert!(lines);
+    assert!(words);
+    assert!(!chars);
+    assert!(bytes);
+    assert!(!max_line_length);
+}
+
+#[test]
+fn wc_short_flag_bundle_rejects_non_wc_flags() {
+    let mut lines = false;
+    let mut words = false;
+    let mut chars = false;
+    let mut bytes = false;
+    let mut max_line_length = false;
+
+    assert!(!apply_wc_short_flag_bundle(
+        "-lz",
+        &mut lines,
+        &mut words,
+        &mut chars,
+        &mut bytes,
+        &mut max_line_length,
+    ));
+    assert!(!lines);
+    assert!(!words);
+    assert!(!chars);
+    assert!(!bytes);
+    assert!(!max_line_length);
+}
+
+#[test]
 fn wc_parallel_totals_match_sequential_totals() {
     let bytes = b"alpha beta\ngamma\r\ndelta\x0bepsilon zeta".repeat(1024);
     let options = WcCountOptions {
@@ -161,104 +207,21 @@ fn wc_metadata_totals_only_applies_to_byte_only_regular_files() {
         wc_metadata_totals(&StreamInput::Stdin { label: None }, byte_only).unwrap(),
         None
     );
-
-    let _ = std::fs::remove_file(tmp);
-}
-
-#[test]
-fn wc_execution_path_keeps_byte_only_regular_files_on_metadata_fast_path() {
-    let tmp = wc_test_temp_file("fro-wc-path-bytes");
-    std::fs::write(&tmp, b"abcdef").unwrap();
-
-    let input = StreamInput::File(tmp.display().to_string());
-    let options = WcCountOptions {
+    let max_line_length = WcCountOptions {
         lines: false,
         words: false,
         chars: false,
         bytes: true,
-        max_line_length: false,
+        max_line_length: true,
     };
-
     assert_eq!(
-        wc_execution_path(&input, options).unwrap(),
-        WcExecutionPath::MetadataTotals
+        wc_metadata_totals(
+            &StreamInput::File(tmp.display().to_string()),
+            max_line_length
+        )
+        .unwrap(),
+        None
     );
-
-    let _ = std::fs::remove_file(tmp);
-}
-
-#[test]
-fn wc_execution_path_keeps_regular_line_and_word_counts_on_block_mapping() {
-    let tmp = wc_test_temp_file("fro-wc-path-blocks");
-    std::fs::write(&tmp, b"alpha beta\ngamma\n").unwrap();
-
-    let input = StreamInput::File(tmp.display().to_string());
-    for options in [
-        WcCountOptions {
-            lines: true,
-            words: false,
-            chars: false,
-            bytes: false,
-            max_line_length: false,
-        },
-        WcCountOptions {
-            lines: false,
-            words: true,
-            chars: false,
-            bytes: false,
-            max_line_length: false,
-        },
-        WcCountOptions {
-            lines: true,
-            words: true,
-            chars: false,
-            bytes: true,
-            max_line_length: false,
-        },
-    ] {
-        assert_eq!(
-            wc_execution_path(&input, options).unwrap(),
-            WcExecutionPath::RegularFileBlocks
-        );
-    }
-
-    let _ = std::fs::remove_file(tmp);
-}
-
-#[test]
-fn wc_execution_path_routes_char_and_max_line_modes_to_fd_parallel() {
-    let tmp = wc_test_temp_file("fro-wc-path-fd");
-    std::fs::write(&tmp, "aé🙂\nwide\tline\n".as_bytes()).unwrap();
-
-    let input = StreamInput::File(tmp.display().to_string());
-    for options in [
-        WcCountOptions {
-            lines: false,
-            words: false,
-            chars: true,
-            bytes: false,
-            max_line_length: false,
-        },
-        WcCountOptions {
-            lines: false,
-            words: false,
-            chars: false,
-            bytes: false,
-            max_line_length: true,
-        },
-        WcCountOptions {
-            lines: true,
-            words: false,
-            chars: true,
-            bytes: true,
-            max_line_length: false,
-        },
-    ] {
-        assert_eq!(
-            wc_execution_path(&input, options).unwrap(),
-            WcExecutionPath::FdParallel
-        );
-    }
 
     let _ = std::fs::remove_file(tmp);
 }

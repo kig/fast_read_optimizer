@@ -491,16 +491,20 @@ pub(super) fn main_impl() {
                 _ => None,
             };
             let summary = match t.kind {
-                CommandKind::Fro => parse_reported_summary(&combined),
+                CommandKind::Fro | CommandKind::FroDiscardStdout => {
+                    parse_reported_summary(&combined)
+                }
                 CommandKind::ExternalDiscardStdout => None,
             };
             let speed = match t.metric {
                 MetricKind::Gbps => match t.kind {
-                    CommandKind::Fro => summary.as_ref().map(|s| s.gbps).unwrap_or_else(|| {
-                        bytes_for_effective_speed
-                            .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
-                            .unwrap_or(0.0)
-                    }),
+                    CommandKind::Fro | CommandKind::FroDiscardStdout => {
+                        summary.as_ref().map(|s| s.gbps).unwrap_or_else(|| {
+                            bytes_for_effective_speed
+                                .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
+                                .unwrap_or(0.0)
+                        })
+                    }
                     CommandKind::ExternalDiscardStdout => bytes_for_effective_speed
                         .map(|bytes| bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9)
                         .unwrap_or(0.0),

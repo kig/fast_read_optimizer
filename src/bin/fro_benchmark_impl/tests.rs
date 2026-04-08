@@ -103,3 +103,26 @@ fn write_recursive_tree_manifest_lists_all_files_in_sorted_order() {
 
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn build_tests_includes_coreutils_big_file_cases() {
+    let tests = build_tests(
+        "source.bin".to_string(),
+        "target-direct.bin".to_string(),
+        "target-cache.bin".to_string(),
+        "tree".to_string(),
+        "tree.txt".to_string(),
+        "copy-out".to_string(),
+    );
+    let names = tests.iter().map(|test| test.name).collect::<Vec<_>>();
+    for expected in [
+        "coreutils cat (hot)",
+        "coreutils fgrep --count (hot)",
+        "coreutils wc -l (hot)",
+        "coreutils cksum (hot)",
+        "coreutils sha256sum (hot)",
+        "coreutils base64 encode (hot)",
+    ] {
+        assert!(names.contains(&expected), "missing benchmark {expected}");
+    }
+}

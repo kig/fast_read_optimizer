@@ -54,6 +54,7 @@ impl MetricKind {
 #[derive(Clone, Copy)]
 enum CommandKind {
     Fro,
+    FroDiscardStdout,
     ExternalDiscardStdout,
 }
 
@@ -97,11 +98,14 @@ fn run_test_command(
     test: &TestCase,
 ) -> std::io::Result<(std::process::Output, Duration)> {
     let mut command = match test.kind {
-        CommandKind::Fro => Command::new(fro_exe),
+        CommandKind::Fro | CommandKind::FroDiscardStdout => Command::new(fro_exe),
         CommandKind::ExternalDiscardStdout => Command::new(test.program),
     };
     command.args(&test.args);
-    if matches!(test.kind, CommandKind::ExternalDiscardStdout) {
+    if matches!(
+        test.kind,
+        CommandKind::FroDiscardStdout | CommandKind::ExternalDiscardStdout
+    ) {
         command.stdout(Stdio::null());
     }
     let start = Instant::now();

@@ -8,6 +8,7 @@ struct FgrepOptions {
     line_regexp: bool,
     ignore_case: bool,
     invert_match: bool,
+    report_gbps: bool,
 }
 
 #[derive(Clone)]
@@ -20,8 +21,6 @@ enum PatternSource {
     Inline(String),
     File(String),
 }
-
-const FGREP_STREAM_OUTPUT_BATCH_BYTES: usize = 1 << 20;
 
 pub(super) fn fgrep_short_flag_effect(flag: u8) -> Option<bool> {
     match flag {
@@ -197,84 +196,10 @@ fn write_count_line<W: Write>(
     Ok(())
 }
 
-struct BufferedMatchOutput {
-    bytes: Vec<u8>,
-}
-
-impl BufferedMatchOutput {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(FGREP_STREAM_OUTPUT_BATCH_BYTES),
-        }
-    }
-
-    fn flush<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
-        if self.bytes.is_empty() {
-            return Ok(());
-        }
-        out.write_all(&self.bytes)?;
-        self.bytes.clear();
-        Ok(())
-    }
-
-    fn write_matching_line<W: Write>(
-        &mut self,
-        out: &mut W,
-        label: Option<&str>,
-        line: &[u8],
-        line_no: u64,
-        multi_file: bool,
-        options: FgrepOptions,
-    ) -> io::Result<()> {
-        if self.bytes.len() >= FGREP_STREAM_OUTPUT_BATCH_BYTES {
-            self.flush(out)?;
-        }
-        if multi_file {
-            if let Some(label) = label {
-                write!(&mut self.bytes, "{label}:")?;
-            }
-        }
-        if let Some(number) = fgrep_line_number_prefix(options.print_line_numbers, line_no) {
-            write!(&mut self.bytes, "{number}:")?;
-        }
-        self.bytes.extend_from_slice(line);
-        if !line.ends_with(b"\n") {
-            self.bytes.push(b'\n');
-        }
-        if self.bytes.len() >= FGREP_STREAM_OUTPUT_BATCH_BYTES {
-            self.flush(out)?;
-        }
-        Ok(())
-    }
-
-    fn write_count_line<W: Write>(
-        &mut self,
-        out: &mut W,
-        label: Option<&str>,
-        count: u64,
-        multi_file: bool,
-    ) -> io::Result<()> {
-        if self.bytes.len() >= FGREP_STREAM_OUTPUT_BATCH_BYTES {
-            self.flush(out)?;
-        }
-        if multi_file {
-            if let Some(label) = label {
-                write!(&mut self.bytes, "{label}:")?;
-            }
-        }
-        writeln!(&mut self.bytes, "{count}")?;
-        if self.bytes.len() >= FGREP_STREAM_OUTPUT_BATCH_BYTES {
-            self.flush(out)?;
-        }
-        Ok(())
-    }
-}
-
 fn finish_pending_line<W: Write>(
     out: &mut W,
     label: Option<&str>,
     pending_line: &mut Vec<u8>,
-    buffered_output: &mut BufferedMatchOutput,
     pattern: &[u8],
     normalized_pattern: &[u8],
     line_no: u64,
@@ -290,14 +215,7 @@ fn finish_pending_line<W: Write>(
         *matched_any = true;
         *match_count += 1;
         if !options.count_only {
-            buffered_output.write_matching_line(
-                out,
-                label,
-                pending_line,
-                line_no,
-                multi_file,
-                options,
-            )?;
+            write_matching_line(out, label, pending_line, line_no, multi_file, options)?;
         }
     }
     pending_line.clear();
@@ -313,14 +231,13 @@ fn write_matching_stream_lines<W: Write>(
     normalized_pattern: &[u8],
     multi_file: bool,
     options: FgrepOptions,
-) -> io::Result<bool> {
+) -> io::Result<(bool, u64)> {
     if options.line_regexp {
         let mut matched_any = false;
         let mut match_count = 0_u64;
         let mut pending_line = Vec::new();
-        let mut buffered_output = BufferedMatchOutput::new();
         let mut line_no = 1_u64;
-        visit_ordered_input(input, io_mode, |block| {
+        let bytes = visit_ordered_input_counted(input, io_mode, |block| {
             let mut line_start = 0usize;
             for rel_end in memchr_iter(b'\n', block) {
                 let line_end = rel_end + 1;
@@ -329,7 +246,6 @@ fn write_matching_stream_lines<W: Write>(
                     out,
                     label,
                     &mut pending_line,
-                    &mut buffered_output,
                     pattern,
                     normalized_pattern,
                     line_no,
@@ -351,7 +267,6 @@ fn write_matching_stream_lines<W: Write>(
                 out,
                 label,
                 &mut pending_line,
-                &mut buffered_output,
                 pattern,
                 normalized_pattern,
                 line_no,
@@ -362,21 +277,19 @@ fn write_matching_stream_lines<W: Write>(
             )?;
         }
         if options.count_only {
-            buffered_output.write_count_line(out, label, match_count, multi_file)?;
+            write_count_line(out, label, match_count, multi_file)?;
         }
-        buffered_output.flush(out)?;
-        return Ok(matched_any);
+        return Ok((matched_any, bytes));
     }
 
     let finder = Finder::new(normalized_pattern);
     let mut matched_any = false;
     let mut match_count = 0_u64;
     let mut pending_line = Vec::new();
-    let mut buffered_output = BufferedMatchOutput::new();
     let mut pending_line_has_match = pattern.is_empty();
     let mut boundary_tail = Vec::new();
     let mut line_no = 1_u64;
-    visit_ordered_input(input, io_mode, |block| {
+    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
         let normalized_block = normalize_case(block, options.ignore_case);
         let search_block = normalized_block.as_ref();
         let block_matches = if pattern.is_empty() {
@@ -411,8 +324,7 @@ fn write_matching_stream_lines<W: Write>(
                     matched_any = true;
                     match_count += 1;
                     if !options.count_only {
-                        buffered_output
-                            .write_matching_line(out, label, line, line_no, multi_file, options)?;
+                        write_matching_line(out, label, line, line_no, multi_file, options)?;
                     }
                 }
             } else {
@@ -421,7 +333,7 @@ fn write_matching_stream_lines<W: Write>(
                     matched_any = true;
                     match_count += 1;
                     if !options.count_only {
-                        buffered_output.write_matching_line(
+                        write_matching_line(
                             out,
                             label,
                             &pending_line,
@@ -457,21 +369,13 @@ fn write_matching_stream_lines<W: Write>(
         matched_any = true;
         match_count += 1;
         if !options.count_only {
-            buffered_output.write_matching_line(
-                out,
-                label,
-                &pending_line,
-                line_no,
-                multi_file,
-                options,
-            )?;
+            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
         }
     }
     if options.count_only {
-        buffered_output.write_count_line(out, label, match_count, multi_file)?;
+        write_count_line(out, label, match_count, multi_file)?;
     }
-    buffered_output.flush(out)?;
-    Ok(matched_any)
+    Ok((matched_any, bytes))
 }
 
 fn write_matching_stream_lines_multi<W: Write>(
@@ -482,13 +386,12 @@ fn write_matching_stream_lines_multi<W: Write>(
     patterns: &[FgrepPattern],
     multi_file: bool,
     options: FgrepOptions,
-) -> io::Result<bool> {
+) -> io::Result<(bool, u64)> {
     let mut matched_any = false;
     let mut match_count = 0_u64;
     let mut pending_line = Vec::new();
-    let mut buffered_output = BufferedMatchOutput::new();
     let mut line_no = 1_u64;
-    visit_ordered_input(input, io_mode, |block| {
+    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
         let mut line_start = 0usize;
         for rel_end in memchr_iter(b'\n', block) {
             let line_end = rel_end + 1;
@@ -500,14 +403,7 @@ fn write_matching_stream_lines_multi<W: Write>(
                 matched_any = true;
                 match_count += 1;
                 if !options.count_only {
-                    buffered_output.write_matching_line(
-                        out,
-                        label,
-                        &pending_line,
-                        line_no,
-                        multi_file,
-                        options,
-                    )?;
+                    write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
                 }
             }
             pending_line.clear();
@@ -528,21 +424,13 @@ fn write_matching_stream_lines_multi<W: Write>(
         matched_any = true;
         match_count += 1;
         if !options.count_only {
-            buffered_output.write_matching_line(
-                out,
-                label,
-                &pending_line,
-                line_no,
-                multi_file,
-                options,
-            )?;
+            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
         }
     }
     if options.count_only {
-        buffered_output.write_count_line(out, label, match_count, multi_file)?;
+        write_count_line(out, label, match_count, multi_file)?;
     }
-    buffered_output.flush(out)?;
-    Ok(matched_any)
+    Ok((matched_any, bytes))
 }
 
 fn write_matching_lines<W: Write>(
@@ -720,6 +608,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
         line_regexp: false,
         ignore_case: false,
         invert_match: false,
+        report_gbps: false,
     };
     let mut pattern_sources = Vec::new();
     let mut positional_pattern = None::<String>;
@@ -749,6 +638,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
             "--no-ignore-case" => options.ignore_case = false,
             "-v" => options.invert_match = true,
             "--invert-match" => options.invert_match = true,
+            "--report-gbps" => options.report_gbps = true,
             "-e" => pattern_sources.push(PatternSource::Inline(parse_option_value(
                 args, &mut index, None, "-e",
             )?)),
@@ -829,6 +719,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let pattern = &patterns[0];
     let mut out = stdout_buf_writer()?;
     let mut matched_any = false;
+    let started_at = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
     let multi_file = inputs.len() > 1;
     let config = load_config(None);
     for input in inputs {
@@ -836,6 +728,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
             StreamInput::File(file) if is_regular_input_path(file)? => {
                 if options.line_regexp || options.ignore_case || !use_single_pattern_fast_path {
                     let data = load_file_bytes(file, io_mode, "read_to_memory")?;
+                    total_bytes += data.data.len() as u64;
                     matched_any |= if use_single_pattern_fast_path {
                         if options.line_regexp {
                             write_line_regexp_matches(
@@ -869,6 +762,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         )?
                     };
                 } else {
+                    total_bytes += fs::metadata(file)?.len();
                     let (matches, _) = grep_match_offsets_for_mode(
                         &config,
                         "grep",
@@ -896,7 +790,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 }
             }
             StreamInput::File(file) => {
-                matched_any |= if use_single_pattern_fast_path {
+                let (matched, bytes) = if use_single_pattern_fast_path {
                     write_matching_stream_lines(
                         &mut out,
                         Some(file),
@@ -918,9 +812,11 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         options,
                     )?
                 };
+                total_bytes += bytes;
+                matched_any |= matched;
             }
             StreamInput::Stdin { label } => {
-                matched_any |= if use_single_pattern_fast_path {
+                let (matched, bytes) = if use_single_pattern_fast_path {
                     write_matching_stream_lines(
                         &mut out,
                         label.as_deref(),
@@ -942,10 +838,15 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         options,
                     )?
                 };
+                total_bytes += bytes;
+                matched_any |= matched;
             }
         }
     }
     out.into_inner()?;
+    if options.report_gbps {
+        report_gbps("fgrep", total_bytes, started_at);
+    }
     Ok(if matched_any { 0 } else { 1 })
 }
 
@@ -989,6 +890,7 @@ mod kani_proofs {
             line_regexp: true,
             ignore_case: false,
             invert_match: false,
+            report_gbps: false,
         };
         assert!(fgrep_line_matches(&payload, b"a", b"a", options));
         assert!(!fgrep_line_matches(&payload, b"a\n", b"a\n", options));
@@ -999,27 +901,8 @@ mod kani_proofs {
 mod tests {
     use super::{
         fgrep_line_matches, fgrep_line_matches_any, fgrep_short_flag_effect,
-        parse_pattern_file_bytes, BufferedMatchOutput, FgrepOptions, FgrepPattern,
+        parse_pattern_file_bytes, FgrepOptions, FgrepPattern,
     };
-    use std::io::{self, Write};
-
-    #[derive(Default)]
-    struct CountingWriter {
-        writes: usize,
-        bytes: Vec<u8>,
-    }
-
-    impl Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.writes += 1;
-            self.bytes.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
 
     #[test]
     fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
@@ -1035,6 +918,7 @@ mod tests {
             line_regexp: true,
             ignore_case: false,
             invert_match: false,
+            report_gbps: false,
         };
         assert!(fgrep_line_matches(b"alpha\n", b"alpha", b"alpha", options));
         assert!(fgrep_line_matches(b"alpha", b"alpha", b"alpha", options));
@@ -1057,6 +941,7 @@ mod tests {
             line_regexp: false,
             ignore_case: true,
             invert_match: false,
+            report_gbps: false,
         };
         assert!(fgrep_line_matches(
             b"Alpha beta\n",
@@ -1077,6 +962,7 @@ mod tests {
             line_regexp: true,
             ignore_case: true,
             invert_match: false,
+            report_gbps: false,
         };
         assert!(fgrep_line_matches(
             b"Alpha\n",
@@ -1112,6 +998,7 @@ mod tests {
             line_regexp: false,
             ignore_case: true,
             invert_match: false,
+            report_gbps: false,
         };
         let patterns = vec![
             FgrepPattern {
@@ -1126,52 +1013,5 @@ mod tests {
         assert!(fgrep_line_matches_any(b"OMEGA\n", &patterns, options));
         assert!(fgrep_line_matches_any(b"needle beta\n", &patterns, options));
         assert!(!fgrep_line_matches_any(b"alpha\n", &patterns, options));
-    }
-
-    #[test]
-    fn buffered_match_output_batches_multiple_lines_into_one_write() {
-        let options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: false,
-            ignore_case: false,
-            invert_match: false,
-        };
-        let mut writer = CountingWriter::default();
-        let mut buffered = BufferedMatchOutput::new();
-
-        buffered
-            .write_matching_line(&mut writer, None, b"alpha\n", 1, false, options)
-            .unwrap();
-        buffered
-            .write_matching_line(&mut writer, None, b"beta", 2, false, options)
-            .unwrap();
-        buffered.flush(&mut writer).unwrap();
-
-        assert_eq!(writer.writes, 1);
-        assert_eq!(writer.bytes, b"alpha\nbeta\n");
-    }
-
-    #[test]
-    fn buffered_match_output_preserves_prefixes_in_batched_output() {
-        let options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: true,
-            line_regexp: false,
-            ignore_case: false,
-            invert_match: false,
-        };
-        let mut writer = CountingWriter::default();
-        let mut buffered = BufferedMatchOutput::new();
-
-        buffered
-            .write_matching_line(&mut writer, Some("stdin"), b"alpha\n", 7, true, options)
-            .unwrap();
-        buffered
-            .write_count_line(&mut writer, Some("stdin"), 1, true)
-            .unwrap();
-        buffered.flush(&mut writer).unwrap();
-
-        assert_eq!(writer.bytes, b"stdin:7:alpha\nstdin:1\n");
     }
 }

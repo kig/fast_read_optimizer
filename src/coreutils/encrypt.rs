@@ -39,67 +39,6 @@ enum OutputTarget {
     Stream(File),
 }
 
-struct SensitiveBytes(Vec<u8>);
-
-impl SensitiveBytes {
-    fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
-
-    fn trim_trailing_newlines(&mut self) {
-        while matches!(self.0.last(), Some(b'\n' | b'\r')) {
-            if let Some(last) = self.0.last_mut() {
-                *last = 0;
-            }
-            self.0.pop();
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn zeroize(&mut self) {
-        self.0.fill(0);
-    }
-}
-
-impl Drop for SensitiveBytes {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-struct SensitiveKeyMaterial {
-    key: Vec<u8>,
-    iv: Vec<u8>,
-}
-
-impl SensitiveKeyMaterial {
-    fn key(&self) -> &[u8] {
-        &self.key
-    }
-
-    fn iv_seed(&self) -> &[u8] {
-        &self.iv
-    }
-}
-
-impl Drop for SensitiveKeyMaterial {
-    fn drop(&mut self) {
-        self.key.fill(0);
-        self.iv.fill(0);
-    }
-}
-
 pub(super) fn run_encrypt(args: &[String]) -> io::Result<i32> {
     let options = match parse_encrypt_options(args, false)? {
         Ok(options) => options,
@@ -137,12 +76,7 @@ fn print_encrypt_help(decrypt: bool) {
     println!("  - fro derives the OpenSSL key/IV with PBKDF2-HMAC-SHA256 (10,000 iterations).");
     println!("  - Output begins with the standard `Salted__` header plus the 8-byte salt.");
     println!("  - No trailing b3sum is emitted: appending bytes would change the ciphertext and break `openssl enc` compatibility.");
-    println!(
-        "  - aes-256-ctr is unauthenticated, so wrong-passphrase or tampered decrypts may return garbage rather than a hard error."
-    );
-    println!(
-        "  - Verify decrypted output with an external MAC, signature, or hash before trusting it."
-    );
+    println!("  - aes-256-ctr is unauthenticated, so a wrong passphrase may yield garbage plaintext without an explicit error.");
     println!("  - Input defaults to standard input when INPUT is omitted or is -.");
 }
 
@@ -249,7 +183,7 @@ fn run_encrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
                 &input_path,
                 OutputTarget::Regular(output),
                 cipher,
-                passphrase.as_slice(),
+                &passphrase,
                 salt,
                 header,
             )?;
@@ -259,7 +193,7 @@ fn run_encrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
                 &input_path,
                 OutputTarget::Stream(output),
                 cipher,
-                passphrase.as_slice(),
+                &passphrase,
                 salt,
                 header,
             )?;
@@ -273,14 +207,7 @@ fn run_encrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
             mut output,
         } => {
             output.write_all(&header)?;
-            encrypt_reader(
-                &mut input,
-                &mut output,
-                cipher,
-                passphrase.as_slice(),
-                salt,
-                0,
-            )?;
+            encrypt_reader(&mut input, &mut output, cipher, &passphrase, salt, 0)?;
             output.flush()?;
         }
     }
@@ -301,7 +228,7 @@ fn run_decrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
                 &input_path,
                 OutputTarget::Regular(output),
                 cipher,
-                passphrase.as_slice(),
+                &passphrase,
             )?;
         }
         TransformIoPairing::FileToStream { input_path, output } => {
@@ -309,7 +236,7 @@ fn run_decrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
                 &input_path,
                 OutputTarget::Stream(output),
                 cipher,
-                passphrase.as_slice(),
+                &passphrase,
             )?;
         }
         TransformIoPairing::StreamToFile {
@@ -321,14 +248,7 @@ fn run_decrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
             mut output,
         } => {
             let salt = read_openssl_header(&mut input)?;
-            decrypt_reader(
-                &mut input,
-                &mut output,
-                cipher,
-                passphrase.as_slice(),
-                salt,
-                0,
-            )?;
+            decrypt_reader(&mut input, &mut output, cipher, &passphrase, salt, 0)?;
             output.flush()?;
         }
     }
@@ -380,9 +300,11 @@ fn parse_openssl_header(header: &[u8; OPENSSL_HEADER_LEN]) -> io::Result<[u8; OP
     Ok(salt)
 }
 
-fn load_passphrase(path: &str) -> io::Result<SensitiveBytes> {
-    let mut passphrase = SensitiveBytes::new(fs::read(path)?);
-    passphrase.trim_trailing_newlines();
+fn load_passphrase(path: &str) -> io::Result<Vec<u8>> {
+    let mut passphrase = fs::read(path)?;
+    while matches!(passphrase.last(), Some(b'\n' | b'\r')) {
+        passphrase.pop();
+    }
     if passphrase.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -410,7 +332,7 @@ fn derive_key_iv(
     cipher: CipherSpec,
     passphrase: &[u8],
     salt: &[u8; OPENSSL_SALT_LEN],
-) -> io::Result<SensitiveKeyMaterial> {
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let key_len = cipher.cipher.key_len();
     let iv_len = cipher.cipher.iv_len().ok_or_else(|| {
         io::Error::new(
@@ -421,21 +343,16 @@ fn derive_key_iv(
             ),
         )
     })?;
-    let mut material = SensitiveBytes::new(vec![0u8; key_len + iv_len]);
+    let mut material = vec![0u8; key_len + iv_len];
     pbkdf2_hmac(
         passphrase,
         salt,
         PBKDF2_ITERATIONS,
         openssl::hash::MessageDigest::sha256(),
-        material.as_mut_slice(),
+        &mut material,
     )
     .map_err(io::Error::other)?;
-    let derived = SensitiveKeyMaterial {
-        key: material.as_slice()[..key_len].to_vec(),
-        iv: material.as_slice()[key_len..].to_vec(),
-    };
-    material.zeroize();
-    Ok(derived)
+    Ok((material[..key_len].to_vec(), material[key_len..].to_vec()))
 }
 
 fn encrypt_regular_path(
@@ -638,7 +555,7 @@ fn process_reader_stream<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     cipher: CipherSpec,
-    material: &SensitiveKeyMaterial,
+    material: &(Vec<u8>, Vec<u8>),
     mode: Mode,
     starting_block_index: usize,
 ) -> io::Result<()> {
@@ -671,17 +588,15 @@ fn read_chunk<'a, R: Read>(reader: &mut R, buffer: &'a mut [u8]) -> io::Result<&
 fn crypt_parallel_chunk(
     cipher: CipherSpec,
     mode: Mode,
-    material: &SensitiveKeyMaterial,
+    material: &(Vec<u8>, Vec<u8>),
     chunk_index: usize,
     input: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let mut iv = ctr_iv_for_chunk(material.iv_seed(), chunk_index, ENCRYPT_BLOCK_SIZE)?;
-    let result = crypt_block(cipher, mode, material.key(), &iv, input);
-    iv.fill(0);
-    result
+    let iv = ctr_iv_for_chunk(&material.1, chunk_index, ENCRYPT_BLOCK_SIZE)?;
+    crypt_block(cipher, mode, &material.0, &iv, input)
 }
 
-fn ctr_iv_for_chunk(iv_seed: &[u8], chunk_index: usize, chunk_size: usize) -> io::Result<[u8; 16]> {
+fn ctr_iv_for_chunk(iv_seed: &[u8], chunk_index: usize, chunk_size: usize) -> io::Result<Vec<u8>> {
     if iv_seed.len() != 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -693,7 +608,7 @@ fn ctr_iv_for_chunk(iv_seed: &[u8], chunk_index: usize, chunk_size: usize) -> io
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ctr block index overflow"))?;
     let base = u128::from_be_bytes(iv_seed.try_into().unwrap());
     let counter = base.wrapping_add(block_advance);
-    Ok(counter.to_be_bytes())
+    Ok(counter.to_be_bytes().to_vec())
 }
 
 fn crypt_block(

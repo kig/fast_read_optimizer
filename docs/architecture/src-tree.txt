@@ -36,8 +36,6 @@ src/
       process.rs
       process_layout.rs
       tests.rs
-    hash/
-      cksum.rs
     wc/
       count.rs
       tests.rs
@@ -63,8 +61,6 @@ src/
     work_queue.rs
   main_app/
     cli/
-      execute/
-        config_command.rs
       args.rs
       execute.rs
       mod.rs

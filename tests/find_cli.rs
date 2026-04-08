@@ -428,44 +428,14 @@ fn find_print0_matches_system_for_regular_files_ignoring_order() {
 }
 
 #[test]
-fn find_double_dash_matches_system_for_dashed_root_and_children() {
-    let tmp = unique_temp_dir("fro-find-double-dash");
-    let root = tmp.join("-root");
-    let nested = root.join("-nested");
-    fs::create_dir_all(&nested).unwrap();
-    fs::write(root.join("-top.txt"), b"top").unwrap();
-    fs::write(nested.join("-leaf.txt"), b"leaf").unwrap();
-    fs::write(nested.join("plain.log"), b"log").unwrap();
-
-    let fro = assert_success(run_fro(&[
-        "find",
-        "--",
-        root.to_str().unwrap(),
-        "-name",
-        "*.txt",
-    ]));
-    let system = assert_success(run_system(&[
-        "--",
-        root.to_str().unwrap(),
-        "-name",
-        "*.txt",
-    ]));
-
-    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
-    assert_eq!(fro.stderr, system.stderr);
-}
-
-#[test]
 fn find_help_mentions_type_and_print0_surface() {
     let output = run_fro(&["find", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout.contains("find - Walk one or more directory trees and print matching paths."));
     assert!(stdout.contains(
-        "[--] [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
+        "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
     ));
-    assert!(stdout
-        .contains("-- stops option parsing so roots beginning with '-' stay positional paths."));
     assert!(stdout.contains("-maxdepth limits descent below each starting path"));
     assert!(stdout.contains("-type supports the common GNU/POSIX letters"));
     assert!(stdout.contains("-name matches only the final path component"));

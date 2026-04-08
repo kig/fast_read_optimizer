@@ -135,11 +135,6 @@ fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
             continue;
         }
         match arg.as_str() {
-            "-a" | "--archive" => {
-                rewritten.push("-R".to_string());
-                rewritten.push("--cp-preserve".to_string());
-                rewritten.push("--cp-no-dereference".to_string());
-            }
             "-t" | "--target-directory" => {
                 if let Some(value) = command_args.get(index + 1) {
                     rewritten.push("--cp-target-directory".to_string());
@@ -189,11 +184,6 @@ fn rewrite_cp_short_flag_cluster(
     let mut consumed_next = false;
     while let Some(ch) = chars.next() {
         match ch {
-            'a' => {
-                rewritten.push("-R".to_string());
-                rewritten.push("--cp-preserve".to_string());
-                rewritten.push("--cp-no-dereference".to_string());
-            }
             'n' => rewritten.push("--cp-no-clobber".to_string()),
             'T' => rewritten.push("--cp-no-target-directory".to_string()),
             'u' => rewritten.push("--cp-update".to_string()),

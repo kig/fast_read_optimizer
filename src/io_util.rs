@@ -7,18 +7,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub(crate) fn utf8_path(path: &Path) -> io::Result<&str> {
-    path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "path is not valid UTF-8; fro path APIs currently require UTF-8 paths: {}",
-                path.display()
-            ),
-        )
-    })
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct DirectIoFallbackTracker {

@@ -1,10 +1,6 @@
-//! Public path-taking helpers accept `AsRef<Path>` for ergonomic call sites, but
-//! the current optimized implementation resolves config and worker paths through
-//! UTF-8 `&str` values. On Unix, non-UTF-8 paths are therefore rejected with
-//! `io::ErrorKind::InvalidInput` instead of being lossily converted.
-
 mod api;
 mod blake3_hash;
+mod cksum_hash;
 mod common;
 pub mod dd_tool;
 mod file_hash;
@@ -31,12 +27,12 @@ pub use api::{
     PageCacheLiftBenchmarkReport,
 };
 pub use blake3_hash::hash_file_blake3;
+pub use cksum_hash::{cksum_crc_block, cksum_crc_combine, finalize_cksum_crc, hash_file_crc32};
 pub use common::{CopyAutoMode, CopyStrategy, IOMode};
 pub use file_hash::{hash_file, hash_file_sha256, HashAlgorithm};
 pub use reader::{BufReader, MappedReadBuffer};
 pub use stream::transform::{
-    auto_select_transform_io_pairing, grow_pipe_capacity_best_effort,
-    resolve_regular_transform_input_path, run_file_transform_to_file,
+    auto_select_transform_io_pairing, grow_pipe_capacity_best_effort, run_file_transform_to_file,
     run_file_transform_to_pipe_with_owned_output, run_reader_transform_to_file,
     run_reader_transform_to_pipe, run_transform_io_pairing, run_transform_with_specs,
     PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec, TransformIoPairing,

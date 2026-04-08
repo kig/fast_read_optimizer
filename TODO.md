@@ -13,9 +13,9 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [ ] If this section gets unwieldy, split compatibility work by utility family into separate source files/tests while keeping this TODO as the index.
   - [ ] `cmp`
   - [ ] `cp` / `fro copy`
-    - [x] `-a`, `--archive`
-      - [x] equality test
-      - [x] implementation
+    - [ ] `-a`, `--archive`
+      - [ ] equality test
+      - [ ] implementation
     - [ ] `--attributes-only`
       - [ ] equality test
       - [ ] implementation
@@ -46,15 +46,15 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [ ] `-L`, `--dereference`
       - [ ] equality test
       - [ ] implementation
-    - [x] `-n`, `--no-clobber`
-      - [x] equality test
-      - [x] implementation
-    - [x] `-P`, `--no-dereference`
-      - [x] equality test
-      - [x] implementation
-    - [x] `-p`
-      - [x] equality test
-      - [x] implementation
+    - [ ] `-n`, `--no-clobber`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-P`, `--no-dereference`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-p`
+      - [ ] equality test
+      - [ ] implementation
     - [ ] `--preserve[=ATTR_LIST]`
       - [ ] equality test
       - [ ] implementation
@@ -88,15 +88,15 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [x] `-t`, `--target-directory=DIRECTORY`
       - [x] equality test
       - [x] implementation
-    - [x] `-T`, `--no-target-directory`
-      - [x] equality test
-      - [x] implementation
-    - [x] `-u`, `--update`
-      - [x] equality test
-      - [x] implementation
-    - [x] `-v`, `--verbose`
-      - [x] equality test
-      - [x] implementation
+    - [ ] `-T`, `--no-target-directory`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-u`, `--update`
+      - [ ] equality test
+      - [ ] implementation
+    - [ ] `-v`, `--verbose`
+      - [ ] equality test
+      - [ ] implementation
     - [ ] `-x`, `--one-file-system`
       - [ ] equality test
       - [ ] implementation
@@ -352,7 +352,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
     - [ ] `-w`, `--words`
       - [ ] equality test
       - [ ] implementation
-  - [ ] replace `cksum`'s CRC32 core with a fast-crc32-grade implementation (e.g. corsix/fast-crc32 approach)
+  - [x] replace `cksum`'s CRC32 core with a fast-crc32-grade implementation (e.g. corsix/fast-crc32 approach)
   - [ ] beat system `head -n` consistently on the small-cutoff pipe case
 - [ ] tail
   - [ ] share the same range/offset library primitives as `head`
@@ -368,10 +368,11 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [ ] same-fs fast path
   - [ ] cross-fs path built on optimized recursive copy
 - [ ] parallel zstd that produces archives that can be decompressed by zstd
+  - See zstd.md for zstd frame setup, each thread would produce a frame and land it at the right position, then write an index in a skip frame
 - [ ] tar
-  - [ ] uncompressed dirtree to file optimized as `fallocate(file, tar_size(du_result))` + parallel
-        `file.write(offset, tar_header(file_stat)); file.copy_file_range_into(offset+header_len, file_stat);`
+  - [x] uncompressed dirtree to file optimized as `fallocate(file, tar_size(du_result))` + parallel `file.write(offset, tar_header(file_stat)); file.copy_file_range_into(offset+header_len, file_stat);`
   - [ ] compressing version that builds ~8MB compressed chunks in parallel in RAM, then writes them out in order
+    - See zstd above: for files above 64kB, compress each file + tar headers as a zstd frame (for larger, multiple frames is ok too)in parallel, add index at the end. Bundle small files into a single zstd frame. Sort of like parallel_map((fn) => if small(fn) { add_to_bundle(fn) } else { add_as_frame(compress(tar(fn))) })
 - [ ] file encryption
   - [ ] fast file encryption/decryption on the optimized IO paths
 - [ ] grep
@@ -454,6 +455,8 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani) for arithmetic and partition helpers. Targeted Miri-safe tests now cover `common::AlignedBuffer` page-backed storage and `reader` destination-slice construction; executing them still requires a nightly toolchain with the `miri` component installed. Current Kani slices prove `io_util::expected_read_len()` matches its `min(file_size - offset, block_size)` contract, rejects offsets past EOF, and is monotonic in offset, and also prove the `find`/`du` permission-classification and `du` node-completion helpers used by the dirwalk error-handling path.
 - [ ] Build a real-world compatibility matrix over file kind, access surface, and permission mode; run the meaningful Cartesian-product cases and assert documented success/failure behavior for each. The first automated slice now covers local `read_file`, `write_file`, and `copy_file` API behavior for regular files, directories, symlinks, and permission-gated paths on ordinary local temp-directory filesystems.
 - [ ] Build a manual validation matrix for single NVMe, md RAID0, dm-crypt, tmpfs, and network filesystems.
+- [ ] Extend performance-path verification beyond `wc` so `fgrep`, `cp`, and `cat` path-preserving flag slices each have at least one helper/backend-selection assertion.
+- [ ] Decide whether the public Rust API should stay explicitly UTF-8-only long-term or grow raw `Path`/`OsStr` support deeper than the current documented contract.
 
 ### P2: targeted utility parity, not parity sprawl
 
@@ -471,6 +474,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] file encryption
   - [ ] fast file encryption/decryption with the optimized IO paths, producing OpenSSL-compatible aes-256-ctr output via the OpenSSL library, 512 KiB blocks, `ParallelStream` mappers, and `num_cpus` worker parallelism
   - [ ] add the right automatic input/output pairing helper for this mapper-style workload (regular-file ↔ regular-file, stream ↔ stream, mixed cases) and document that future transform-style tools should reuse it instead of open-coding path selection
+  - [ ] add an authenticated integrity/MAC story around the current unauthenticated AES-256-CTR-compatible format without breaking the OpenSSL-compatible path
 
 ### Parked / explicitly lower-priority for now
 

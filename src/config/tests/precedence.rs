@@ -607,4 +607,3 @@ fn legacy_config_promotes_to_bundle_for_mount_override() {
         strategy
     );
 }
-

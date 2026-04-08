@@ -1,7 +1,7 @@
 use super::*;
+use crc_fast::{CrcAlgorithm as FastCrcAlgorithm, Digest as CrcDigest};
+use fro::finalize_cksum_crc;
 use openssl::hash::Hasher;
-
-mod cksum;
 
 fn hash_sum_needs_escape(label: &str) -> bool {
     label.bytes().any(|byte| matches!(byte, b'\\' | b'\n'))
@@ -64,7 +64,7 @@ fn hash_stream_input(
     input: &StreamInput,
     algorithm: HashAlgorithm,
     io_mode: IOMode,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<(Vec<u8>, u64)> {
     match algorithm {
         HashAlgorithm::Md5
         | HashAlgorithm::Blake2b512
@@ -76,21 +76,30 @@ fn hash_stream_input(
                 io::Error::new(io::ErrorKind::InvalidInput, "unsupported digest")
             })?)
             .map_err(io::Error::other)?;
-            visit_ordered_input(input, io_mode, |block| {
+            let bytes = visit_ordered_input_counted(input, io_mode, |block| {
                 hasher.update(block).map_err(io::Error::other)
             })?;
             hasher
                 .finish()
                 .map_err(io::Error::other)
-                .map(|d| d.to_vec())
+                .map(|d| (d.to_vec(), bytes))
         }
         HashAlgorithm::Blake3 => {
             let mut hasher = blake3::Hasher::new();
-            visit_ordered_input(input, io_mode, |block| {
+            let bytes = visit_ordered_input_counted(input, io_mode, |block| {
                 hasher.update(block);
                 Ok(())
             })?;
-            Ok(hasher.finalize().as_bytes().to_vec())
+            Ok((hasher.finalize().as_bytes().to_vec(), bytes))
+        }
+        HashAlgorithm::CRC32 => {
+            let mut digest = CrcDigest::new(FastCrcAlgorithm::Crc32Cksum);
+            let bytes = visit_ordered_input_counted(input, io_mode, |block| {
+                digest.update(block);
+                Ok(())
+            })?;
+            let finalized = finalize_cksum_crc(digest.finalize(), bytes);
+            Ok((finalized.to_be_bytes().to_vec(), bytes))
         }
         HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -116,6 +125,7 @@ pub(super) enum HashCheckLineKind {
 
 struct HashSumOptions {
     io_mode: IOMode,
+    report_gbps: bool,
     format: HashSumFormat,
     zero_terminated: bool,
     check: bool,
@@ -130,6 +140,7 @@ struct HashSumOptions {
 
 fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
     let mut io_mode = IOMode::Auto;
+    let mut report_gbps = false;
     let mut format = HashSumFormat::Default;
     let mut zero_terminated = false;
     let mut check = false;
@@ -149,6 +160,10 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                 }
                 "--no-direct" => {
                     io_mode = IOMode::PageCache;
+                    continue;
+                }
+                "--report-gbps" => {
+                    report_gbps = true;
                     continue;
                 }
                 "-b" | "--binary" => {
@@ -194,6 +209,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
     }
     Ok(HashSumOptions {
         io_mode,
+        report_gbps,
         format,
         zero_terminated,
         check,
@@ -217,7 +233,10 @@ fn hash_sum_tag_name(algorithm: HashAlgorithm) -> Option<&'static str> {
         HashAlgorithm::Sha256 => Some("SHA256"),
         HashAlgorithm::Sha384 => Some("SHA384"),
         HashAlgorithm::Sha512 => Some("SHA512"),
-        HashAlgorithm::Blake3 | HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => None,
+        HashAlgorithm::Blake3
+        | HashAlgorithm::CRC32
+        | HashAlgorithm::FroBlockXxh3
+        | HashAlgorithm::FroBlockSha256 => None,
     }
 }
 
@@ -230,6 +249,7 @@ fn hash_sum_program_name(algorithm: HashAlgorithm) -> &'static str {
         HashAlgorithm::Sha384 => "sha384sum",
         HashAlgorithm::Sha512 => "sha512sum",
         HashAlgorithm::Blake3 => "b3sum",
+        HashAlgorithm::CRC32 => "cksum",
         HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => "hash",
     }
 }
@@ -546,22 +566,31 @@ pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Res
     if options.check {
         return run_hash_sum_check(&options, algorithm);
     }
+    let started_at = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
     let mut out = stdout_buf_writer()?;
     for input in options.inputs {
         let label = match &input {
             StreamInput::File(file) => Some(file.as_str()),
             StreamInput::Stdin { label } => Some(label.as_deref().unwrap_or("-")),
         };
-        let digest = match &input {
-            StreamInput::File(file) if is_regular_input_path(file)? => {
-                hash_file(file, algorithm, options.io_mode)?
-            }
+        let (digest, bytes) = match &input {
+            StreamInput::File(file) if is_regular_input_path(file)? => (
+                hash_file(file, algorithm, options.io_mode)?,
+                fs::metadata(file)?.len(),
+            ),
             StreamInput::Stdin { .. } => match regular_stdin_path()? {
-                Some(path) => hash_file(&path, algorithm, options.io_mode)?,
+                Some(path) => (
+                    hash_file(&path, algorithm, options.io_mode)?,
+                    fs::metadata(path)?.len(),
+                ),
                 None => hash_stream_input(&input, algorithm, options.io_mode)?,
             },
             _ => hash_stream_input(&input, algorithm, options.io_mode)?,
         };
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("hash byte count overflow"))?;
         if let Some(label) = label {
             write_hash_sum_line(
                 &mut out,
@@ -581,11 +610,77 @@ pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Res
         }
     }
     out.into_inner()?;
+    if options.report_gbps {
+        report_gbps(hash_sum_program_name(algorithm), total_bytes, started_at);
+    }
     Ok(0)
 }
 
+fn cksum_stream_input(input: &StreamInput, io_mode: IOMode) -> io::Result<(u32, u64)> {
+    let (digest, bytes) = hash_stream_input(input, HashAlgorithm::CRC32, io_mode)?;
+    let crc = u32::from_be_bytes(digest.as_slice().try_into().map_err(|_| {
+        io::Error::other(format!(
+            "unexpected CRC32 digest length: {} bytes",
+            digest.len()
+        ))
+    })?);
+    Ok((crc, bytes))
+}
+
 pub(super) fn run_cksum(args: &[String]) -> io::Result<()> {
-    cksum::run_cksum(args)
+    let mut io_mode = IOMode::Auto;
+    let mut report_throughput = false;
+    let mut files = Vec::new();
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--auto" => io_mode = IOMode::Auto,
+            "--direct" => io_mode = IOMode::Direct,
+            "--no-direct" => io_mode = IOMode::PageCache,
+            "--report-gbps" => report_throughput = true,
+            other => files.push(other.to_string()),
+        }
+    }
+    let inputs = parse_stream_inputs(files);
+    let started_at = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
+    for input in inputs {
+        let (crc, bytes) = match &input {
+            StreamInput::File(file) if is_regular_input_path(file)? => (
+                u32::from_be_bytes(
+                    hash_file(file, HashAlgorithm::CRC32, io_mode)?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| io::Error::other("unexpected CRC32 digest length"))?,
+                ),
+                fs::metadata(file)?.len(),
+            ),
+            StreamInput::Stdin { .. } => match regular_stdin_path()? {
+                Some(path) => (
+                    u32::from_be_bytes(
+                        hash_file(&path, HashAlgorithm::CRC32, io_mode)?
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| io::Error::other("unexpected CRC32 digest length"))?,
+                    ),
+                    fs::metadata(path)?.len(),
+                ),
+                None => cksum_stream_input(&input, io_mode)?,
+            },
+            _ => cksum_stream_input(&input, io_mode)?,
+        };
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("cksum byte count overflow"))?;
+        match input {
+            StreamInput::File(file) => println!("{} {} {}", crc, bytes, file),
+            StreamInput::Stdin { label: Some(label) } => println!("{} {} {}", crc, bytes, label),
+            StreamInput::Stdin { label: None } => println!("{} {}", crc, bytes),
+        }
+    }
+    if report_throughput {
+        report_gbps("cksum", total_bytes, started_at);
+    }
+    Ok(())
 }
 
 fn ordered_digest(algorithm: HashAlgorithm) -> Option<openssl::hash::MessageDigest> {
@@ -596,7 +691,10 @@ fn ordered_digest(algorithm: HashAlgorithm) -> Option<openssl::hash::MessageDige
         HashAlgorithm::Sha256 => Some(openssl::hash::MessageDigest::sha256()),
         HashAlgorithm::Sha384 => Some(openssl::hash::MessageDigest::sha384()),
         HashAlgorithm::Sha512 => Some(openssl::hash::MessageDigest::sha512()),
-        HashAlgorithm::Blake3 | HashAlgorithm::FroBlockXxh3 | HashAlgorithm::FroBlockSha256 => None,
+        HashAlgorithm::Blake3
+        | HashAlgorithm::CRC32
+        | HashAlgorithm::FroBlockXxh3
+        | HashAlgorithm::FroBlockSha256 => None,
     }
 }
 
@@ -642,6 +740,7 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fro::cksum_crc_block;
 
     #[test]
     fn hash_check_line_kind_classifies_supported_layouts() {
@@ -798,7 +897,7 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
         let stream_input = StreamInput::File(path.to_string_lossy().into_owned());
-        let streamed =
+        let (streamed, streamed_bytes) =
             hash_stream_input(&stream_input, HashAlgorithm::Sha256, IOMode::PageCache).unwrap();
         let file = hash_file(
             path.to_str().unwrap(),
@@ -806,7 +905,55 @@ mod tests {
             IOMode::PageCache,
         )
         .unwrap();
+        assert_eq!(streamed_bytes, bytes.len() as u64);
         assert_eq!(streamed, file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cksum_stream_input_matches_hash_file_crc32() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join(format!(
+            "fro-cksum-regular-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = (0..(3 * 1024 * 1024 + 517))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let regular = u32::from_be_bytes(
+            hash_file(
+                path.to_str().unwrap(),
+                HashAlgorithm::CRC32,
+                IOMode::PageCache,
+            )
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        );
+        let streamed = cksum_stream_input(
+            &StreamInput::File(path.to_string_lossy().into_owned()),
+            IOMode::PageCache,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.1, bytes.len() as u64);
+        assert_eq!(
+            streamed.0,
+            finalize_cksum_crc(cksum_crc_block(&bytes), bytes.len() as u64)
+        );
+        assert_eq!(regular, streamed.0);
+
         let _ = std::fs::remove_file(path);
     }
 }

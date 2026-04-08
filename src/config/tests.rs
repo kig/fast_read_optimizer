@@ -327,5 +327,5 @@ fn bundle_mount_overrides_roundtrip_recursive_small_file_threads() {
     );
 }
 
-mod precedence;
 mod device_probe;
+mod precedence;

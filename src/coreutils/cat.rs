@@ -4,6 +4,7 @@ use memchr::memchr_iter;
 #[derive(Clone)]
 struct CatArgs {
     io_mode: IOMode,
+    report_gbps: bool,
     number: bool,
     number_nonblank: bool,
     show_ends: bool,
@@ -47,6 +48,7 @@ fn parse_short_cat_flags(arg: &str, parsed: &mut CatArgs) -> io::Result<bool> {
 fn parse_cat_args(args: &[String]) -> io::Result<CatArgs> {
     let mut parsed = CatArgs {
         io_mode: IOMode::Auto,
+        report_gbps: false,
         number: false,
         number_nonblank: false,
         show_ends: false,
@@ -62,6 +64,7 @@ fn parse_cat_args(args: &[String]) -> io::Result<CatArgs> {
             "--auto" if !end_flags => parsed.io_mode = IOMode::Auto,
             "--direct" if !end_flags => parsed.io_mode = IOMode::Direct,
             "--no-direct" if !end_flags => parsed.io_mode = IOMode::PageCache,
+            "--report-gbps" if !end_flags => parsed.report_gbps = true,
             "-n" | "--number" if !end_flags => parsed.number = true,
             "-b" | "--number-nonblank" if !end_flags => parsed.number_nonblank = true,
             "-E" | "--show-ends" if !end_flags => parsed.show_ends = true,
@@ -311,6 +314,7 @@ fn cat_write_transformed_line<W: Write>(
 pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let parsed = parse_cat_args(args)?;
     let io_mode = parsed.io_mode;
+    let report_throughput = parsed.report_gbps;
     let number = parsed.number;
     let number_nonblank = parsed.number_nonblank;
     let show_ends = parsed.show_ends;
@@ -319,6 +323,8 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let squeeze_blank = parsed.squeeze_blank;
     let files = parsed.files;
     let inputs = parse_stream_inputs(files);
+    let started_at = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
     if cat_uses_transform_path(
         number,
         number_nonblank,
@@ -332,7 +338,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
         let mut previous_blank_line = false;
         let mut pending_line = Vec::new();
         for input in inputs {
-            visit_ordered_input(&input, io_mode, |block| {
+            total_bytes += visit_ordered_input_counted(&input, io_mode, |block| {
                 let mut line_start = 0usize;
                 for newline_offset in memchr_iter(b'\n', block) {
                     pending_line.extend_from_slice(&block[line_start..=newline_offset]);
@@ -371,20 +377,35 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
                 &mut previous_blank_line,
             )?;
         }
-        return out.into_inner();
+        out.into_inner()?;
+        if report_throughput {
+            report_gbps("cat", total_bytes, started_at);
+        }
+        return Ok(());
     }
     let mut out = None;
     for input in inputs {
-        if try_fast_cat_copy(&input, io_mode)? {
+        let mut copied = 0_u64;
+        if try_fast_copy_to_stdout_counted(&input, io_mode, &mut |bytes| {
+            copied = bytes;
+            Ok(())
+        })?
+        .is_some()
+        {
+            total_bytes += copied;
             continue;
         }
         let out = out.get_or_insert(stdout_buf_writer()?);
-        copy_file_like_to_output(out, &input)?;
+        total_bytes += copy_file_like_to_output_counted(out, &input)?;
     }
     match out {
-        Some(out) => out.into_inner(),
-        None => Ok(()),
+        Some(out) => out.into_inner()?,
+        None => {}
     }
+    if report_throughput {
+        report_gbps("cat", total_bytes, started_at);
+    }
+    Ok(())
 }
 
 #[cfg(kani)]
@@ -700,6 +721,7 @@ mod tests {
     fn parse_short_cat_flags_supports_combined_common_flags() {
         let mut parsed = CatArgs {
             io_mode: super::IOMode::Auto,
+            report_gbps: false,
             number: false,
             number_nonblank: false,
             show_ends: false,
@@ -721,6 +743,7 @@ mod tests {
     fn parse_short_cat_flags_rejects_unknown_combined_flags() {
         let mut parsed = CatArgs {
             io_mode: super::IOMode::Auto,
+            report_gbps: false,
             number: false,
             number_nonblank: false,
             show_ends: false,
