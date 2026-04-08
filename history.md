@@ -2,6 +2,7 @@
 
 ## 2026-04-08
 
+- `cksum` now uses a fixed-function cached `CRC-32/CKSUM` combine operator instead of calling the generic `crc-fast` matrix-building combine path for every mapped block merge, keeping the file-side CRC math aligned with the same polynomial while removing repeated GF(2) setup work.
 - `base64` decode reorg now caches its chosen decode kernel per stream and keeps the AVX2 sanitize/compact path active for `--ignore-garbage` inputs until padding, with focused coverage for both large dirty-input success and valid-bytes-after-padding rejection.
 - `split-manifest-recursive-copy-bench` now reports manifest-build vs copy-phase timing plus dir/symlink/small/large task counts, and focused regression coverage pins both the benchmark registration and the helper's reported phase/task counters.
 - `fro-benchmark` now accepts `-c` / `--config` and forwards that config path to fixture setup plus benchmarked `fro` subprocesses, so benchmark runs can use the same tuned config file as `fro-optimize`.

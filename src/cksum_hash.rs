@@ -1,13 +1,18 @@
 use crate::{open_with_mode, IOMode};
-use crc_fast::{
-    checksum as crc_fast_checksum, checksum_combine as crc_fast_checksum_combine,
-    CrcAlgorithm as FastCrcAlgorithm,
-};
+use crc_fast::{checksum as crc_fast_checksum, CrcAlgorithm as FastCrcAlgorithm};
 use std::io;
+use std::mem::size_of;
+use std::sync::OnceLock;
+
+const CKSUM_WIDTH: usize = 32;
+const CKSUM_POLY: u32 = 0x04c11db7;
+const CKSUM_COMBINE_INPUT_XOR: u32 = 0xffff_ffff;
+
+type CksumOperatorMatrix = [u32; CKSUM_WIDTH];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CksumChunk {
-    crc: u64,
+    crc: u32,
     len: u64,
 }
 
@@ -15,8 +20,70 @@ pub fn cksum_crc_block(data: &[u8]) -> u64 {
     crc_fast_checksum(FastCrcAlgorithm::Crc32Cksum, data)
 }
 
+fn cksum_matrix_times(mat: &CksumOperatorMatrix, mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut idx = 0usize;
+    while vec != 0 {
+        if vec & 1 != 0 {
+            sum ^= mat[idx];
+        }
+        vec >>= 1;
+        idx += 1;
+    }
+    sum
+}
+
+fn cksum_matrix_square(mat: &CksumOperatorMatrix) -> CksumOperatorMatrix {
+    let mut square = [0u32; CKSUM_WIDTH];
+    for (index, slot) in square.iter_mut().enumerate() {
+        *slot = cksum_matrix_times(mat, mat[index]);
+    }
+    square
+}
+
+fn cksum_zero_byte_operators() -> &'static [CksumOperatorMatrix; u64::BITS as usize] {
+    static OPERATORS: OnceLock<[CksumOperatorMatrix; u64::BITS as usize]> = OnceLock::new();
+    OPERATORS.get_or_init(|| {
+        let mut one_zero_bit = [0u32; CKSUM_WIDTH];
+        let mut col = 2u32;
+        for slot in one_zero_bit.iter_mut().take(CKSUM_WIDTH - 1) {
+            *slot = col;
+            col <<= 1;
+        }
+        one_zero_bit[CKSUM_WIDTH - 1] = CKSUM_POLY;
+
+        let two_zero_bits = cksum_matrix_square(&one_zero_bit);
+        let four_zero_bits = cksum_matrix_square(&two_zero_bits);
+        let one_zero_byte = cksum_matrix_square(&four_zero_bits);
+
+        let mut operators = [[0u32; CKSUM_WIDTH]; u64::BITS as usize];
+        operators[0] = one_zero_byte;
+        for index in 1..operators.len() {
+            operators[index] = cksum_matrix_square(&operators[index - 1]);
+        }
+        operators
+    })
+}
+
+fn cksum_apply_zero_bytes(mut crc: u32, mut len: u64) -> u32 {
+    let operators = cksum_zero_byte_operators();
+    let mut index = 0usize;
+    while len != 0 {
+        if len & 1 != 0 {
+            crc = cksum_matrix_times(&operators[index], crc);
+        }
+        len >>= 1;
+        index += 1;
+    }
+    crc
+}
+
+fn cksum_crc_combine_u32(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    cksum_apply_zero_bytes(crc1 ^ CKSUM_COMBINE_INPUT_XOR, len2) ^ crc2
+}
+
 pub fn cksum_crc_combine(crc1: u64, crc2: u64, len2: u64) -> u64 {
-    crc_fast_checksum_combine(FastCrcAlgorithm::Crc32Cksum, crc1, crc2, len2)
+    cksum_crc_combine_u32(crc1 as u32, crc2 as u32, len2) as u64
 }
 
 fn cksum_length_suffix(bytes: u64) -> ([u8; size_of::<u64>()], usize) {
@@ -31,25 +98,26 @@ fn cksum_length_suffix(bytes: u64) -> ([u8; size_of::<u64>()], usize) {
     (suffix, len)
 }
 
-pub fn finalize_cksum_crc(mut crc: u64, bytes: u64) -> u32 {
+pub fn finalize_cksum_crc(crc: u64, bytes: u64) -> u32 {
+    let mut crc = crc as u32;
     let (suffix, suffix_len) = cksum_length_suffix(bytes);
     if suffix_len != 0 {
-        crc = cksum_crc_combine(
+        crc = cksum_crc_combine_u32(
             crc,
-            cksum_crc_block(&suffix[..suffix_len]),
+            cksum_crc_block(&suffix[..suffix_len]) as u32,
             suffix_len as u64,
         );
     }
-    crc.try_into().unwrap()
+    crc
 }
 
-fn reduce_cksum_chunks(chunks: Vec<CksumChunk>) -> u64 {
+fn reduce_cksum_chunks(chunks: Vec<CksumChunk>) -> u32 {
     let mut chunks = chunks.into_iter();
     match chunks.next() {
         Some(first) => chunks.fold(first.crc, |acc, chunk| {
-            cksum_crc_combine(acc, chunk.crc, chunk.len)
+            cksum_crc_combine_u32(acc, chunk.crc, chunk.len)
         }),
-        None => cksum_crc_block(&[]),
+        None => cksum_crc_block(&[]) as u32,
     }
 }
 
@@ -60,13 +128,13 @@ pub fn hash_file_crc32(path: &str, io_mode: IOMode) -> io::Result<u32> {
         block_size,
         |_, data| {
             Ok(CksumChunk {
-                crc: cksum_crc_block(data),
+                crc: cksum_crc_block(data) as u32,
                 len: data.len() as u64,
             })
         },
         |chunks, report| {
             Ok(finalize_cksum_crc(
-                reduce_cksum_chunks(chunks),
+                reduce_cksum_chunks(chunks) as u64,
                 report.file_size,
             ))
         },
@@ -76,6 +144,7 @@ pub fn hash_file_crc32(path: &str, io_mode: IOMode) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crc_fast::checksum_combine as crc_fast_checksum_combine;
 
     #[test]
     fn crc32_cksum_update_matches_posix_cksum_examples() {
@@ -106,6 +175,27 @@ mod tests {
         }
         let sequential = cksum_crc_block(&chunks.concat());
         assert_eq!(combined, sequential);
+    }
+
+    #[test]
+    fn cached_cksum_combine_matches_crc_fast_reference() {
+        let first = (0..(256 * 1024 + 17))
+            .map(|i| ((i * 13 + 5) % 251) as u8)
+            .collect::<Vec<_>>();
+        let second = (0..(768 * 1024 + 29))
+            .map(|i| ((i * 29 + 17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let first_crc = cksum_crc_block(&first);
+        let second_crc = cksum_crc_block(&second);
+        assert_eq!(
+            cksum_crc_combine(first_crc, second_crc, second.len() as u64),
+            crc_fast_checksum_combine(
+                FastCrcAlgorithm::Crc32Cksum,
+                first_crc,
+                second_crc,
+                second.len() as u64
+            )
+        );
     }
 
     #[test]
