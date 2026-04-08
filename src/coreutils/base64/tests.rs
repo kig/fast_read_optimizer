@@ -1,6 +1,6 @@
 use super::process::bytes::{
-    append_sanitized_base64_bytes, decode_base64_bytes_with_detect_fallback,
-    encode_base64_bytes_via_wrapped_writer_for_test,
+    append_sanitized_base64_bytes, decode_base64_bytes_via_reorg_path,
+    decode_base64_bytes_with_detect_fallback, encode_base64_bytes_via_wrapped_writer_for_test,
 };
 use super::process::wrapped::append_wrapped_base64_bytes;
 use super::*;
@@ -170,5 +170,33 @@ fn decode_detect_fallback_decodes_wrapped_input() {
 fn decode_detect_fallback_rejects_invalid_input() {
     let err = decode_base64_bytes_with_detect_fallback(b"Zm9v!!", false, Base64DecodeKernel::Auto)
         .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn decode_reorg_ignore_garbage_decodes_large_dirty_wrapped_input() {
+    let bytes = (0..(96 * 1024 + 19))
+        .map(|i| ((i * 23 + 17) % 251) as u8)
+        .collect::<Vec<_>>();
+    let encoded = super::process::bytes::encode_base64_bytes_via_wrapped_path(&bytes, 76).unwrap();
+    let mut dirty = Vec::with_capacity(encoded.len() + (encoded.len() / 11) * 3 + 16);
+    dirty.extend_from_slice(b"!?");
+    for (index, &byte) in encoded.iter().enumerate() {
+        dirty.push(byte);
+        if index % 11 == 3 {
+            dirty.extend_from_slice(b"!?\t");
+        }
+    }
+    dirty.extend_from_slice(b"\n#%");
+    let decoded = decode_base64_bytes_via_reorg_path(&dirty, true).unwrap();
+    assert_eq!(decoded, bytes);
+}
+
+#[test]
+fn decode_reorg_ignore_garbage_rejects_valid_bytes_after_padding() {
+    let mut dirty =
+        super::process::bytes::encode_base64_bytes_via_wrapped_path(b"hello world", 76).unwrap();
+    dirty.extend_from_slice(b"!?\nYQ==");
+    let err = decode_base64_bytes_via_reorg_path(&dirty, true).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }

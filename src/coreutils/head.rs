@@ -28,6 +28,7 @@ enum HeaderMode {
 }
 
 const HEAD_LINE_PREFIX_SCAN_BLOCK_SIZE: usize = 256 << 10;
+const HEAD_SMALL_STREAM_RAW_READ_BLOCK_SIZE: usize = 64 << 10;
 const HEAD_SMALL_STREAM_LINE_CUTOFF: u64 = 64;
 const OBSOLETE_HEAD_BLOCK_MULTIPLIER: u64 = 512;
 
@@ -404,6 +405,44 @@ fn write_head_lines_reader<W: Write, R: Read>(
     }
 }
 
+fn read_raw_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if read >= 0 {
+            return Ok(read as usize);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => continue,
+            _ => return Err(err),
+        }
+    }
+}
+
+fn write_head_lines_small_stdin_fast(remaining_lines: u64) -> io::Result<()> {
+    if remaining_lines == 0 {
+        return Ok(());
+    }
+    grow_pipe_best_effort(libc::STDIN_FILENO)?;
+    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+    let mut buffer = [0_u8; HEAD_SMALL_STREAM_RAW_READ_BLOCK_SIZE];
+    let mut remaining_lines = remaining_lines;
+    loop {
+        let read = read_raw_fd(libc::STDIN_FILENO, &mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        let block = &buffer[..read];
+        for newline_offset in memchr_iter(b'\n', block) {
+            remaining_lines -= 1;
+            if remaining_lines == 0 {
+                return write_raw_fd_all(libc::STDOUT_FILENO, &block[..=newline_offset]);
+            }
+        }
+        write_raw_fd_all(libc::STDOUT_FILENO, block)?;
+    }
+}
+
 fn tail_line_start_offset(
     total_len: u64,
     lines: u64,
@@ -529,17 +568,13 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
         HeaderMode::Never => false,
     };
     if should_use_small_stream_stdout_fast_path(&inputs, mode, show_headers)? {
-        let [input] = inputs.as_slice() else {
+        let [StreamInput::Stdin { .. }] = inputs.as_slice() else {
             unreachable!("small stream fast path requires a single stdin input");
         };
         let HeadMode::Lines(HeadCount::FromStart(lines)) = mode else {
             unreachable!("small stream fast path only supports line prefixes");
         };
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        write_head_lines_from_start(&mut out, input, lines)?;
-        out.flush()?;
-        return Ok(());
+        return write_head_lines_small_stdin_fast(lines);
     }
     let mut out = stdout_buf_writer()?;
     for (index, input) in inputs.iter().enumerate() {

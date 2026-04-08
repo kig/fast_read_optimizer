@@ -280,6 +280,24 @@ fn find_name_combines_with_type_and_print0_like_system_find() {
 }
 
 #[test]
+fn find_iname_matches_system_for_case_insensitive_basename_globs_ignoring_order() {
+    let tmp = unique_temp_dir("fro-find-iname");
+    let root = tmp.join("root");
+    let nested = root.join("NeStEd");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(root.join("main.rs"), b"main").unwrap();
+    fs::write(root.join("MAIN.TXT"), b"txt").unwrap();
+    fs::write(nested.join("lib.RS"), b"lib").unwrap();
+    fs::write(nested.join("note.md"), b"md").unwrap();
+
+    let fro = assert_success(run_fro(&["find", root.to_str().unwrap(), "-iname", "*.rs"]));
+    let system = assert_success(run_system(&[root.to_str().unwrap(), "-iname", "*.rs"]));
+
+    assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
 fn find_path_matches_system_for_emitted_path_globs_ignoring_order() {
     let tmp = unique_temp_dir("fro-find-path");
     let root = tmp.join("root");
@@ -301,6 +319,44 @@ fn find_path_matches_system_for_emitted_path_globs_ignoring_order() {
     let system = assert_success(run_system(&[root.to_str().unwrap(), "-path", &pattern]));
 
     assert_eq!(sorted_lines(&fro.stdout), sorted_lines(&system.stdout));
+    assert_eq!(fro.stderr, system.stderr);
+}
+
+#[test]
+fn find_ipath_combines_with_type_and_print0_like_system_find() {
+    let tmp = unique_temp_dir("fro-find-ipath-print0");
+    let root = tmp.join("root");
+    let nested = root.join("NeStEd");
+    let deeper = nested.join("DeEpEr");
+    fs::create_dir_all(&deeper).unwrap();
+    fs::write(root.join("top.rs"), b"top").unwrap();
+    fs::write(nested.join("mid.RS"), b"mid").unwrap();
+    fs::write(deeper.join("leaf.txt"), b"leaf").unwrap();
+    fs::write(deeper.join("Leaf.Rs"), b"leaf-rs").unwrap();
+
+    let pattern = format!("{}/*/*/*.rs", root.display());
+    let fro = assert_success(run_fro(&[
+        "find",
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-ipath",
+        &pattern,
+        "-print0",
+    ]));
+    let system = assert_success(run_system(&[
+        root.to_str().unwrap(),
+        "-type",
+        "f",
+        "-ipath",
+        &pattern,
+        "-print0",
+    ]));
+
+    assert_eq!(
+        sorted_nul_fields(&fro.stdout),
+        sorted_nul_fields(&system.stdout)
+    );
     assert_eq!(fro.stderr, system.stderr);
 }
 
@@ -434,12 +490,14 @@ fn find_help_mentions_type_and_print0_surface() {
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout.contains("find - Walk one or more directory trees and print matching paths."));
     assert!(stdout.contains(
-        "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
+        "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
     ));
     assert!(stdout.contains("-maxdepth limits descent below each starting path"));
     assert!(stdout.contains("-type supports the common GNU/POSIX letters"));
     assert!(stdout.contains("-name matches only the final path component"));
+    assert!(stdout.contains("-iname matches basenames case-insensitively"));
     assert!(stdout.contains("-path matches the whole emitted path"));
+    assert!(stdout.contains("-ipath matches whole emitted paths case-insensitively"));
     assert!(stdout.contains("-print0 emits NUL-delimited paths"));
     assert!(output.stderr.is_empty());
 }

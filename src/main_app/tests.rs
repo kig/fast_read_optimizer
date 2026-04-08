@@ -1,5 +1,6 @@
 use crate::common::{CopyStrategy, IOMode};
 use crate::config;
+use crate::main_app::cli;
 use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
     choose_nonredundant_full_copy_plan, describe_copy_path, parse_zpool_status_leaves,
@@ -12,9 +13,14 @@ use crate::main_app::tuning::{
     active_optimizer_param_mask, apply_manual_read_overrides, ManualReadOverrides,
 };
 use crate::main_app::{RecursiveCopyContext, RelativeCopyMethod};
+use crate::writer::{self, RecordedCopyBackend};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static COPY_PATH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn heuristic_plan(
     source_cached: bool,
@@ -322,13 +328,176 @@ fn describe_copy_path_reports_via_memory_path() {
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("target");
+    path.push("test-tmp");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     path.push(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+    fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn set_env_var(key: &str, value: Option<&str>) -> Option<String> {
+    let old = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    old
+}
+
+fn restore_env_var(key: &str, old: Option<String>) {
+    match old {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+fn set_path_mtime(path: &std::path::Path, seconds: i64) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "failed to set timestamps for {}", path.display());
+}
+
+#[test]
+fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    struct Case {
+        name: &'static str,
+        configure: fn(&mut cli::TestCopyRunOptions, &std::path::Path, &std::path::Path),
+    }
+
+    let cases = [
+        Case {
+            name: "plain",
+            configure: |_args, _source, _target| {},
+        },
+        Case {
+            name: "verbose",
+            configure: |args, _source, _target| args.verbose = true,
+        },
+        Case {
+            name: "preserve",
+            configure: |args, source, _target| {
+                args.cp_preserve = true;
+                set_path_mtime(source, 1_234_567_890);
+            },
+        },
+        Case {
+            name: "no-clobber-copy",
+            configure: |args, _source, _target| args.cp_no_clobber = true,
+        },
+        Case {
+            name: "update-copy",
+            configure: |args, source, target| {
+                args.cp_update = true;
+                fs::write(target, b"stale").unwrap();
+                set_path_mtime(target, 1_234_567_880);
+                set_path_mtime(source, 1_234_567_890);
+            },
+        },
+        Case {
+            name: "no-target-directory",
+            configure: |args, _source, _target| args.cp_no_target_directory = true,
+        },
+    ];
+
+    for case in cases {
+        let root = unique_temp_dir(&format!("fro-copy-path-single-{}", case.name));
+        let source = root.join("source.txt");
+        let target = root.join("target.txt");
+        fs::write(&source, format!("payload-{}", case.name)).unwrap();
+
+        let mut args = cli::TestCopyRunOptions {
+            source: source.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+            recursive: false,
+            verbose: false,
+            cp_no_clobber: false,
+            cp_no_target_directory: false,
+            cp_update: false,
+            cp_preserve: false,
+        };
+        (case.configure)(&mut args, &source, &target);
+
+        writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+        let exit_code = cli::run_test_copy(args).unwrap();
+        let backends = writer::finish_copy_backend_trace();
+
+        assert_eq!(exit_code, 0, "case {}", case.name);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            fs::read(&source).unwrap(),
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            backends,
+            vec![RecordedCopyBackend::Threaded],
+            "case {}",
+            case.name
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn cp_recursive_preserve_and_verbose_keep_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive");
+    let source_root = root.join("source");
+    let source_dir = source_root.join("dir");
+    let target_root = root.join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("payload.bin");
+    fs::write(&source_file, b"recursive-copy-payload").unwrap();
+    set_path_mtime(&source_file, 1_234_567_890);
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: true,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve: true,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    let copied = target_root.join("dir/payload.bin");
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source_file).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+
+    let source_mtime = fs::metadata(&source_file).unwrap().mtime();
+    let copied_mtime = fs::metadata(&copied).unwrap().mtime();
+    assert_eq!(copied_mtime, source_mtime);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

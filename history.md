@@ -1,5 +1,15 @@
 # History
 
+## 2026-04-08
+
+- `base64` decode reorg now caches its chosen decode kernel per stream and keeps the AVX2 sanitize/compact path active for `--ignore-garbage` inputs until padding, with focused coverage for both large dirty-input success and valid-bytes-after-padding rejection.
+- `split-manifest-recursive-copy-bench` now reports manifest-build vs copy-phase timing plus dir/symlink/small/large task counts, and focused regression coverage pins both the benchmark registration and the helper's reported phase/task counters.
+- `fro-benchmark` now accepts `-c` / `--config` and forwards that config path to fixture setup plus benchmarked `fro` subprocesses, so benchmark runs can use the same tuned config file as `fro-optimize`.
+- `du` gained a bounded common slice: `-S` / `--separate-dirs` now excludes child-directory totals from parent directory totals while keeping the existing parallel dirwalk and descendant emission behavior intact, with focused parity coverage plus a small rollup-helper proof.
+- `src/stream/transform.rs` now exposes mapper-style transform dispatch helpers that preserve automatic regular-file vs stream pairing while still telling callers whether the output side is a regular file or a stream.
+- `encrypt` / `decrypt` now use that shared mapper helper instead of open-coding their four-way pairing match, and focused transform + encrypt tests cover the intended dispatch surface.
+- `cat` path verification now pins backend selection: plain / `-u` / `--no-direct` regular-file cases stay on the fast copy path, representative formatting flags switch to ordered transform, and plain `--direct` stays on the buffered-copy path.
+
 ## 2026-04-07
 
 ### Archived from TODO: review-driven hardening and maintainability wave
@@ -7,7 +17,10 @@
 - Integrated a review-driven fix wave on top of `coreutils-multicall`, then validated it with the full test suite plus janitor in a clean integration worktree before advancing the branch.
 - `diff` now hardens resolved IO params so zero `num_threads` and `qd` clamp to safe minimums while zero `block_size` still errors, preventing false "equal" results from malformed config, with focused `diff_cli` regression coverage.
 - `find` now honors `--` as the end of options, so dashed roots and child paths are parsed as operands instead of unsupported expressions, with parity coverage in `tests/find_cli.rs`.
+- `find` now supports GNU-style `-iname` / `-ipath` case-insensitive glob predicates as emission-time filters, preserving the existing parallel traversal scheduler while broadening common replacement coverage.
 - `encrypt` / `decrypt` now zeroize passphrases, PBKDF2 material, derived key/IV state, and per-chunk CTR IV buffers where feasible, and the help/tests make the unauthenticated AES-CTR caveat more explicit.
+- `sort` now has a bounded first multicall/coreutils slice for locale-independent bytewise ascending sorting of newline-delimited records, with explicit help for unsupported GNU modes and focused CLI/multicall coverage.
+- `mv` same-filesystem rename health now has focused inode-preservation regression coverage for file overwrite and directory-parent moves, so the rename-only fast path is pinned separately from cross-filesystem copy+remove behavior.
 - `wc` now has helper-selection assertions for its main execution paths:
   - byte-only regular-file mode stays on the metadata fast path
   - default / line / word counting on regular files stays on the mapped-block backend
@@ -57,11 +70,19 @@
   - one scoped stderr warning is emitted when `O_DIRECT` open is unsupported
   - one scoped stderr warning is emitted when forced direct requests hit unaligned tail/range fallbacks
   - read-path CLI coverage and tracker unit tests now pin this behavior without breaking `cp` compatibility stderr parity
+- `cp` path verification now proves that real-copy executions for path-preserving flags (`-v`, `-p`, `-n`, `-u`, `-T`, plus recursive `-p -v`) stay on the threaded copy backend, using test-only backend tracing rather than changing production copy selection.
 - `fro-benchmark` gained a focused `tree compare:` slice for recursive/tree-walk work:
   - read-side compares `recursive-read-bench`, `file-list-read-bench`, and `fd`
   - copy-side compares `fro copy --recursive`, split/prebuilt-manifest recursive-copy variants, and `cp -r`
   - the slice reports `files/s` while keeping elapsed-time summaries, and the docs now point tree-work profiling toward this narrower benchmark family
 - `cksum` now uses the `crc-fast` SIMD CRC-32/CKSUM core instead of the old in-tree slicing-table implementation, while preserving the existing parallel file map/reduce shape and POSIX length-suffix finalize semantics through chunk-level `checksum_combine`.
+
+### Archived from TODO: completed slices pruned from stale backlog
+
+- The stale duplicated active-backlog section was removed from `TODO.md` so the newer priority-based backlog is the only active planning surface again.
+- `cp -t` / `--target-directory` is now treated as shipped compatibility work rather than an active checkbox.
+- `fgrep -v` / `--invert-match` is now treated as shipped compatibility work rather than an active checkbox.
+- The uncompressed dirtree-to-file tar path is now treated as shipped foundation work rather than an active checkbox.
 
 ## 2026-04-06
 

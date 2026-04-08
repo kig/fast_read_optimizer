@@ -519,8 +519,15 @@ fro-benchmark --skip-build --no-fail --iters 5 --test-size 64MiB 'read (forced p
 
 This runs a smaller targeted benchmark without rebuilding and without failing the process on regression.
 
+```bash
+fro-benchmark -c /path/to/fro.json --skip-build --test-size 64MiB 'read (forced page cache, hot)'
+```
+
+Use `-c/--config` when you want the benchmark run to exercise the same config file you just tuned.
+
 Useful options:
 
+- `-c <config.json>`
 - `--plan`
 - `--skip-build`
 - `--no-fail`
@@ -534,7 +541,7 @@ Focused tree-comparison slice:
 - `fro-benchmark --skip-build --no-fail --iters 1 --test-size 64MiB 'tree compare:'`
 - This runs a narrow recursive/tree-walk comparison set:
   - `recursive-read-bench` vs `file-list-read-bench` vs `fd`
-  - `fro copy --recursive` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
+  - `fro copy --recursive` vs `fro copy --recursive --threaded-copy` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
 - The tree slice reports `files/s` so future dirwalk and recursive-copy work can compare traversal-heavy designs without pretending tiny-file trees are primarily about bulk GB/s.
 
 Wear note:

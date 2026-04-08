@@ -33,10 +33,11 @@ pub use file_hash::{hash_file, hash_file_sha256, HashAlgorithm};
 pub use reader::{BufReader, MappedReadBuffer};
 pub use stream::transform::{
     auto_select_transform_io_pairing, grow_pipe_capacity_best_effort, run_file_transform_to_file,
-    run_file_transform_to_pipe_with_owned_output, run_reader_transform_to_file,
-    run_reader_transform_to_pipe, run_transform_io_pairing, run_transform_with_specs,
-    PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec, TransformIoPairing,
-    TransformIoPairingKind, TransformOutputSpec,
+    run_file_transform_to_pipe_with_owned_output, run_mapper_transform_io_pairing,
+    run_mapper_transform_with_specs, run_reader_transform_to_file, run_reader_transform_to_pipe,
+    run_transform_io_pairing, run_transform_with_specs, MapperTransformOutput,
+    MapperTransformOutputKind, PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec,
+    TransformIoPairing, TransformIoPairingKind, TransformOutputSpec,
 };
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,

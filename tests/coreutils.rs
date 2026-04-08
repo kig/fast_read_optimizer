@@ -120,5 +120,7 @@ mod encrypt;
 mod fgrep;
 #[path = "coreutils/head.rs"]
 mod head;
+#[path = "coreutils/sort.rs"]
+mod sort;
 #[path = "coreutils/tail.rs"]
 mod tail;

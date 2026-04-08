@@ -2,7 +2,7 @@ use super::*;
 use crate::common::IOMode;
 use crate::config::load_config;
 use crate::stream::transform::{
-    auto_select_transform_io_pairing, TransformInputSpec, TransformIoPairing, TransformOutputSpec,
+    run_mapper_transform_with_specs, MapperTransformOutput, TransformInputSpec, TransformOutputSpec,
 };
 use crate::stream::{ParallelFile, ParallelWriter};
 use openssl::pkcs5::pbkdf2_hmac;
@@ -32,11 +32,6 @@ struct EncryptOptions {
 struct CipherSpec {
     cipher: Cipher,
     name: &'static str,
-}
-
-enum OutputTarget {
-    Regular(File),
-    Stream(File),
 }
 
 pub(super) fn run_encrypt(args: &[String]) -> io::Result<i32> {
@@ -173,86 +168,48 @@ fn run_encrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
     let salt = random_salt()?;
     let header = openssl_header(&salt);
 
-    let pairing = auto_select_transform_io_pairing(
+    run_mapper_transform_with_specs(
         transform_input_spec(&options.input),
         transform_output_spec(options.output.as_deref()),
-    )?;
-    match pairing {
-        TransformIoPairing::FileToFile { input_path, output } => {
-            encrypt_regular_path(
-                &input_path,
-                OutputTarget::Regular(output),
+        |input_path, output| {
+            encrypt_regular_path(&input_path, output, cipher, &passphrase, salt, header)
+        },
+        |mut input, mut output| {
+            output.as_file_mut().write_all(&header)?;
+            encrypt_reader(
+                &mut input,
+                output.as_file_mut(),
                 cipher,
                 &passphrase,
                 salt,
-                header,
+                0,
             )?;
-        }
-        TransformIoPairing::FileToStream { input_path, output } => {
-            encrypt_regular_path(
-                &input_path,
-                OutputTarget::Stream(output),
-                cipher,
-                &passphrase,
-                salt,
-                header,
-            )?;
-        }
-        TransformIoPairing::StreamToFile {
-            mut input,
-            mut output,
-        }
-        | TransformIoPairing::StreamToStream {
-            mut input,
-            mut output,
-        } => {
-            output.write_all(&header)?;
-            encrypt_reader(&mut input, &mut output, cipher, &passphrase, salt, 0)?;
-            output.flush()?;
-        }
-    }
-    Ok(())
+            output.as_file_mut().flush()
+        },
+    )
 }
 
 fn run_decrypt_in_process(options: &EncryptOptions) -> io::Result<()> {
     let cipher = resolve_cipher_spec(&options.cipher)?;
     let passphrase = load_passphrase(&options.passphrase_file)?;
 
-    let pairing = auto_select_transform_io_pairing(
+    run_mapper_transform_with_specs(
         transform_input_spec(&options.input),
         transform_output_spec(options.output.as_deref()),
-    )?;
-    match pairing {
-        TransformIoPairing::FileToFile { input_path, output } => {
-            decrypt_regular_path(
-                &input_path,
-                OutputTarget::Regular(output),
-                cipher,
-                &passphrase,
-            )?;
-        }
-        TransformIoPairing::FileToStream { input_path, output } => {
-            decrypt_regular_path(
-                &input_path,
-                OutputTarget::Stream(output),
-                cipher,
-                &passphrase,
-            )?;
-        }
-        TransformIoPairing::StreamToFile {
-            mut input,
-            mut output,
-        }
-        | TransformIoPairing::StreamToStream {
-            mut input,
-            mut output,
-        } => {
+        |input_path, output| decrypt_regular_path(&input_path, output, cipher, &passphrase),
+        |mut input, mut output| {
             let salt = read_openssl_header(&mut input)?;
-            decrypt_reader(&mut input, &mut output, cipher, &passphrase, salt, 0)?;
-            output.flush()?;
-        }
-    }
-    Ok(())
+            decrypt_reader(
+                &mut input,
+                output.as_file_mut(),
+                cipher,
+                &passphrase,
+                salt,
+                0,
+            )?;
+            output.as_file_mut().flush()
+        },
+    )
 }
 
 fn resolve_cipher_spec(name: &str) -> io::Result<CipherSpec> {
@@ -275,10 +232,10 @@ fn random_salt() -> io::Result<[u8; OPENSSL_SALT_LEN]> {
     Ok(salt)
 }
 
-fn openssl_header(salt: &[u8; OPENSSL_SALT_LEN]) -> Vec<u8> {
-    let mut header = Vec::with_capacity(OPENSSL_HEADER_LEN);
-    header.extend_from_slice(OPENSSL_MAGIC);
-    header.extend_from_slice(salt);
+fn openssl_header(salt: &[u8; OPENSSL_SALT_LEN]) -> [u8; OPENSSL_HEADER_LEN] {
+    let mut header = [0u8; OPENSSL_HEADER_LEN];
+    header[..OPENSSL_MAGIC.len()].copy_from_slice(OPENSSL_MAGIC);
+    header[OPENSSL_MAGIC.len()..].copy_from_slice(salt);
     header
 }
 
@@ -357,11 +314,11 @@ fn derive_key_iv(
 
 fn encrypt_regular_path(
     path: &str,
-    output: OutputTarget,
+    output: MapperTransformOutput,
     cipher: CipherSpec,
     passphrase: &[u8],
     salt: [u8; OPENSSL_SALT_LEN],
-    header: Vec<u8>,
+    header: [u8; OPENSSL_HEADER_LEN],
 ) -> io::Result<()> {
     let config = parallel_config_for_path(path);
     let input = ParallelFile::open(&config, "compute", path, IOMode::Auto)?;
@@ -372,10 +329,10 @@ fn encrypt_regular_path(
     let material = Arc::new(derive_key_iv(cipher, passphrase, &salt)?);
 
     match output {
-        OutputTarget::Regular(file) => {
+        MapperTransformOutput::RegularFile(file) => {
             let writer =
                 ParallelWriter::indexed_file(&config, "write", &file, IOMode::Auto, total_blocks)?;
-            writer.write_at_index(0, header)?;
+            writer.write_at_index(0, header.to_vec())?;
             let writer_for_blocks = writer.clone();
             let material_for_blocks = Arc::clone(&material);
             let read_result = input.foreach_block_parallel(
@@ -395,13 +352,13 @@ fn encrypt_regular_path(
             read_result?;
             finish_result?;
         }
-        OutputTarget::Stream(file) => {
+        MapperTransformOutput::Stream(file) => {
             let writer = ParallelWriter::indexed_pipe(
                 file.as_raw_fd(),
                 total_blocks,
                 ENCRYPT_BLOCK_SIZE as u64,
             )?;
-            writer.write_at_index(0, header)?;
+            writer.write_at_index(0, header.to_vec())?;
             let writer_for_blocks = writer.clone();
             let material_for_blocks = Arc::clone(&material);
             let read_result = input.foreach_block_parallel(
@@ -427,7 +384,7 @@ fn encrypt_regular_path(
 
 fn decrypt_regular_path(
     path: &str,
-    output: OutputTarget,
+    output: MapperTransformOutput,
     cipher: CipherSpec,
     passphrase: &[u8],
 ) -> io::Result<()> {
@@ -445,7 +402,7 @@ fn decrypt_regular_path(
     let material = Arc::new(derive_key_iv(cipher, passphrase, &salt)?);
 
     match output {
-        OutputTarget::Regular(file) => {
+        MapperTransformOutput::RegularFile(file) => {
             let writer =
                 ParallelWriter::indexed_file(&config, "write", &file, IOMode::Auto, block_count)?;
             let writer_for_blocks = writer.clone();
@@ -468,7 +425,7 @@ fn decrypt_regular_path(
             read_result?;
             finish_result?;
         }
-        OutputTarget::Stream(file) => {
+        MapperTransformOutput::Stream(file) => {
             let writer = ParallelWriter::indexed_pipe(
                 file.as_raw_fd(),
                 block_count,

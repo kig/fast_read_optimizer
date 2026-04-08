@@ -1,5 +1,56 @@
 use super::*;
 use crate::io_util::checked_posix_fallocate;
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedCopyBackend {
+    Threaded,
+    CopyFileRange,
+    CopyFileRangeSingle,
+    Reflink,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CopyBackendTrace {
+    path_prefix: String,
+    events: Vec<RecordedCopyBackend>,
+}
+
+#[cfg(test)]
+static COPY_BACKEND_TRACE: Mutex<Option<CopyBackendTrace>> = Mutex::new(None);
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn begin_copy_backend_trace(path_prefix: impl Into<String>) {
+    *COPY_BACKEND_TRACE.lock().unwrap() = Some(CopyBackendTrace {
+        path_prefix: path_prefix.into(),
+        events: Vec::new(),
+    });
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn finish_copy_backend_trace() -> Vec<RecordedCopyBackend> {
+    COPY_BACKEND_TRACE
+        .lock()
+        .unwrap()
+        .take()
+        .map(|trace| trace.events)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_copy_backend(source: &str, filename: &str, backend: RecordedCopyBackend) {
+    let mut trace = COPY_BACKEND_TRACE.lock().unwrap();
+    if let Some(trace) = trace.as_mut() {
+        if source.starts_with(&trace.path_prefix) || filename.starts_with(&trace.path_prefix) {
+            trace.events.push(backend);
+        }
+    }
+}
 
 pub(super) fn prepare_copy_destination(
     filename: &str,
@@ -835,55 +886,71 @@ pub fn copy_file_range_with_strategy(
     copy_strategy: CopyStrategy,
 ) -> io::Result<u64> {
     match copy_strategy {
-        CopyStrategy::Auto | CopyStrategy::Threaded => copy_file_range_threaded(
-            source,
-            filename,
-            source_offset,
-            dest_offset,
-            copy_size,
-            truncate_target,
-            num_threads_p,
-            block_size_p,
-            qd_p,
-            num_threads_d,
-            block_size_d,
-            qd_d,
-            io_mode_read,
-            io_mode_write,
-        ),
-        CopyStrategy::CopyFileRange => copy_file_range_chunked(
-            source,
-            filename,
-            source_offset,
-            dest_offset,
-            copy_size,
-            truncate_target,
-            copy_range_threads,
-            copy_range_block_size,
-            copy_range_qd,
-            io_mode_read,
-            io_mode_write,
-        ),
-        CopyStrategy::CopyFileRangeSingle => copy_file_range_syscall(
-            source,
-            filename,
-            source_offset,
-            dest_offset,
-            copy_size,
-            truncate_target,
-            io_mode_read,
-            io_mode_write,
-        ),
-        CopyStrategy::Reflink => copy_file_reflink(
-            source,
-            filename,
-            source_offset,
-            dest_offset,
-            copy_size,
-            truncate_target,
-            io_mode_read,
-            io_mode_write,
-        ),
+        CopyStrategy::Auto | CopyStrategy::Threaded => {
+            #[cfg(test)]
+            record_copy_backend(source, filename, RecordedCopyBackend::Threaded);
+            copy_file_range_threaded(
+                source,
+                filename,
+                source_offset,
+                dest_offset,
+                copy_size,
+                truncate_target,
+                num_threads_p,
+                block_size_p,
+                qd_p,
+                num_threads_d,
+                block_size_d,
+                qd_d,
+                io_mode_read,
+                io_mode_write,
+            )
+        }
+        CopyStrategy::CopyFileRange => {
+            #[cfg(test)]
+            record_copy_backend(source, filename, RecordedCopyBackend::CopyFileRange);
+            copy_file_range_chunked(
+                source,
+                filename,
+                source_offset,
+                dest_offset,
+                copy_size,
+                truncate_target,
+                copy_range_threads,
+                copy_range_block_size,
+                copy_range_qd,
+                io_mode_read,
+                io_mode_write,
+            )
+        }
+        CopyStrategy::CopyFileRangeSingle => {
+            #[cfg(test)]
+            record_copy_backend(source, filename, RecordedCopyBackend::CopyFileRangeSingle);
+            copy_file_range_syscall(
+                source,
+                filename,
+                source_offset,
+                dest_offset,
+                copy_size,
+                truncate_target,
+                io_mode_read,
+                io_mode_write,
+            )
+        }
+        CopyStrategy::Reflink => {
+            #[cfg(test)]
+            record_copy_backend(source, filename, RecordedCopyBackend::Reflink);
+            copy_file_reflink(
+                source,
+                filename,
+                source_offset,
+                dest_offset,
+                copy_size,
+                truncate_target,
+                io_mode_read,
+                io_mode_write,
+            )
+        }
     }
 }
 

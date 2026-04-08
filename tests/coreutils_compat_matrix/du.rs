@@ -42,6 +42,32 @@ fn du_hcs_matches_system_output() {
 }
 
 #[test]
+fn du_separate_dirs_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-separate-dirs");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested/deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(tree.join("nested/child.txt"), vec![0x22; 8192]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 16384]).unwrap();
+
+    for du_args in [
+        vec!["-S", tree.to_str().unwrap()],
+        vec!["--separate-dirs", tree.to_str().unwrap()],
+        vec!["-aS", tree.to_str().unwrap()],
+        vec!["-sS", tree.to_str().unwrap()],
+        vec!["-cS", tree.to_str().unwrap()],
+        vec!["-S", "--max-depth=1", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du separate-dirs {:?}", du_args),
+        );
+    }
+}
+
+#[test]
 fn du_max_depth_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-du-max-depth");
     let tree = tmp.join("tree");

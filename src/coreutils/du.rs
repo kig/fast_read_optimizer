@@ -33,6 +33,14 @@ fn du_depth_included(depth: usize, max_depth: Option<usize>) -> bool {
     max_depth.is_none_or(|limit| depth <= limit)
 }
 
+fn du_display_total_kib(separate_dirs: bool, exclusive_kib: u64, subtree_total_kib: u64) -> u64 {
+    if separate_dirs {
+        exclusive_kib
+    } else {
+        subtree_total_kib
+    }
+}
+
 fn parse_du_max_depth(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
@@ -54,13 +62,15 @@ fn du_apply_short_flag(
     all: bool,
     human_readable: bool,
     total: bool,
+    separate_dirs: bool,
     flag: u8,
-) -> io::Result<(bool, bool, bool, bool)> {
+) -> io::Result<(bool, bool, bool, bool, bool)> {
     match flag {
-        b's' => Ok((true, all, human_readable, total)),
-        b'a' => Ok((summarize, true, human_readable, total)),
-        b'h' => Ok((summarize, all, true, total)),
-        b'c' => Ok((summarize, all, human_readable, true)),
+        b's' => Ok((true, all, human_readable, total, separate_dirs)),
+        b'a' => Ok((summarize, true, human_readable, total, separate_dirs)),
+        b'h' => Ok((summarize, all, true, total, separate_dirs)),
+        b'c' => Ok((summarize, all, human_readable, true, separate_dirs)),
+        b'S' => Ok((summarize, all, human_readable, total, true)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported du flag: -{}", other as char),
@@ -77,6 +87,7 @@ struct DuLine {
 struct DuNode {
     path: PathBuf,
     total_kib: u64,
+    exclusive_kib: u64,
     parent: Option<usize>,
     pending_children: usize,
     pending_file_stats: usize,
@@ -201,7 +212,7 @@ fn du_node_ready(
     scanned && own_stat_done && pending_children == 0 && pending_file_stats == 0 && !completed
 }
 
-fn finish_du_node(node_id: usize, state: &DuSharedState) {
+fn finish_du_node(node_id: usize, state: &DuSharedState, separate_dirs: bool) {
     let mut current = Some(node_id);
     let mut completed_lines = Vec::new();
     while let Some(id) = current {
@@ -218,10 +229,12 @@ fn finish_du_node(node_id: usize, state: &DuSharedState) {
                 break;
             }
             let total_kib = nodes[id].total_kib;
+            let display_kib =
+                du_display_total_kib(separate_dirs, nodes[id].exclusive_kib, total_kib);
             if nodes[id].emit {
                 completed_lines.push(DuLine {
                     path: nodes[id].path.clone(),
-                    kib: total_kib,
+                    kib: display_kib,
                 });
             }
             nodes[id].completed = true;
@@ -255,6 +268,7 @@ fn walk_du_subtree(
     had_warnings: &AtomicBool,
     summarize: bool,
     all: bool,
+    separate_dirs: bool,
     max_depth: Option<usize>,
 ) -> io::Result<()> {
     let mut stack = vec![start];
@@ -271,7 +285,7 @@ fn walk_du_subtree(
                     let mut nodes = state.nodes.lock().unwrap();
                     nodes[task.node_id].scanned = true;
                 }
-                finish_du_node(task.node_id, state);
+                finish_du_node(task.node_id, state, separate_dirs);
                 continue;
             }
             Err(err) => return Err(err),
@@ -310,6 +324,7 @@ fn walk_du_subtree(
                     nodes.push(DuNode {
                         path: child_path.clone(),
                         total_kib: kib,
+                        exclusive_kib: kib,
                         parent: Some(task.node_id),
                         pending_children: 0,
                         pending_file_stats: 0,
@@ -339,6 +354,7 @@ fn walk_du_subtree(
             let mut nodes = state.nodes.lock().unwrap();
             nodes[task.node_id].pending_children += child_dirs.len();
             nodes[task.node_id].total_kib += file_total_kib;
+            nodes[task.node_id].exclusive_kib += file_total_kib;
             nodes[task.node_id].scanned = true;
         }
         if !file_lines.is_empty() {
@@ -348,7 +364,7 @@ fn walk_du_subtree(
             dir_queue.enqueue(child_dirs);
             stack.push(local_dir);
         }
-        finish_du_node(task.node_id, state);
+        finish_du_node(task.node_id, state, separate_dirs);
     }
     Ok(())
 }
@@ -365,6 +381,7 @@ fn append_du_output(
     path: &Path,
     summarize: bool,
     all: bool,
+    separate_dirs: bool,
     max_depth: Option<usize>,
     human_readable: bool,
     output: &mut Vec<u8>,
@@ -383,6 +400,7 @@ fn append_du_output(
         nodes: Mutex::new(vec![DuNode {
             path: path.to_path_buf(),
             total_kib: root_kib,
+            exclusive_kib: root_kib,
             parent: None,
             pending_children: 0,
             pending_file_stats: 0,
@@ -410,6 +428,7 @@ fn append_du_output(
                 &had_warnings,
                 summarize,
                 all,
+                separate_dirs,
                 max_depth,
             )
         }
@@ -463,10 +482,16 @@ mod du_tests {
 
     #[test]
     fn du_apply_short_flag_accepts_combined_supported_flags() {
-        let h = du_apply_short_flag(false, false, false, false, b'h').unwrap();
-        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, b'c').unwrap();
-        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, b's').unwrap();
-        assert_eq!(hcs, (true, false, true, true));
+        let h = du_apply_short_flag(false, false, false, false, false, b'h').unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, b'c').unwrap();
+        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, b's').unwrap();
+        assert_eq!(hcs, (true, false, true, true, false));
+    }
+
+    #[test]
+    fn du_display_total_kib_respects_separate_dirs() {
+        assert_eq!(du_display_total_kib(false, 2, 9), 9);
+        assert_eq!(du_display_total_kib(true, 2, 9), 2);
     }
 
     #[test]
@@ -522,7 +547,9 @@ mod kani_proofs {
     use super::super::hash::{
         hash_check_should_print_result, hash_check_untagged_kind, HashCheckLineKind,
     };
-    use super::{du_apply_short_flag, du_node_ready, permission_denied_components};
+    use super::{
+        du_apply_short_flag, du_display_total_kib, du_node_ready, permission_denied_components,
+    };
     use std::io;
 
     #[kani::proof]
@@ -590,13 +617,29 @@ mod kani_proofs {
 
     #[kani::proof]
     fn du_short_flag_hcs_sets_expected_state() {
-        let h = du_apply_short_flag(false, false, false, false, b'h').unwrap();
-        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, b'c').unwrap();
-        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, b's').unwrap();
+        let h = du_apply_short_flag(false, false, false, false, false, b'h').unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, b'c').unwrap();
+        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, b's').unwrap();
         assert!(hcs.0);
         assert!(!hcs.1);
         assert!(hcs.2);
         assert!(hcs.3);
+        assert!(!hcs.4);
+    }
+
+    #[kani::proof]
+    fn du_display_total_kib_matches_flag_formula() {
+        let separate_dirs: bool = kani::any();
+        let exclusive_kib: u64 = kani::any();
+        let subtree_total_kib: u64 = kani::any();
+        assert_eq!(
+            du_display_total_kib(separate_dirs, exclusive_kib, subtree_total_kib),
+            if separate_dirs {
+                exclusive_kib
+            } else {
+                subtree_total_kib
+            }
+        );
     }
 
     #[kani::proof]
@@ -632,6 +675,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
     let mut all = false;
     let mut human_readable = false;
     let mut total = false;
+    let mut separate_dirs = false;
     let mut max_depth = None;
     let mut end_of_options = false;
     let mut paths = Vec::new();
@@ -649,6 +693,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             "-a" | "--all" => all = true,
             "-h" | "--human-readable" => human_readable = true,
             "-c" | "--total" => total = true,
+            "-S" | "--separate-dirs" => separate_dirs = true,
             "--max-depth" | "-d" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -705,8 +750,14 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
                         }
                         break;
                     }
-                    (summarize, all, human_readable, total) =
-                        du_apply_short_flag(summarize, all, human_readable, total, flag)?;
+                    (summarize, all, human_readable, total, separate_dirs) = du_apply_short_flag(
+                        summarize,
+                        all,
+                        human_readable,
+                        total,
+                        separate_dirs,
+                        flag,
+                    )?;
                     short_index += 1;
                 }
             }
@@ -753,6 +804,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             Path::new(&path),
             summarize,
             all,
+            separate_dirs,
             max_depth,
             human_readable,
             &mut chunk,

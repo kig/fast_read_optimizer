@@ -1,9 +1,42 @@
 use super::*;
 
+pub(super) struct SplitManifestRecursiveCopyBenchmarkResult {
+    pub(super) bytes_copied: u64,
+    pub(super) files_copied: u64,
+    pub(super) dirs_created: u64,
+    pub(super) symlinks_created: u64,
+    pub(super) small_file_tasks: usize,
+    pub(super) large_file_tasks: usize,
+    pub(super) manifest_phase_secs: f64,
+    pub(super) copy_phase_secs: f64,
+    pub(super) total_secs: f64,
+}
+
 pub(crate) fn run_split_manifest_recursive_copy(
     ctx: RecursiveCopyContext,
     verbose: bool,
 ) -> io::Result<u64> {
+    let result = run_split_manifest_recursive_copy_with_result(ctx, verbose)?;
+    println!(
+        "split-manifest-recursive-copy {} bytes across {} files: dirs={} symlinks={} small={} large={} manifest_phase={:.4}s copy_phase={:.4}s total={:.4}s file_gbps={:.3}",
+        result.bytes_copied,
+        result.files_copied,
+        result.dirs_created,
+        result.symlinks_created,
+        result.small_file_tasks,
+        result.large_file_tasks,
+        result.manifest_phase_secs,
+        result.copy_phase_secs,
+        result.total_secs,
+        result.bytes_copied as f64 / result.copy_phase_secs.max(1e-9) / 1e9
+    );
+    Ok(result.bytes_copied)
+}
+
+pub(super) fn run_split_manifest_recursive_copy_with_result(
+    ctx: RecursiveCopyContext,
+    verbose: bool,
+) -> io::Result<SplitManifestRecursiveCopyBenchmarkResult> {
     let source_meta = fs::symlink_metadata(&ctx.source_root)?;
     if !source_meta.file_type().is_dir() {
         return Err(io::Error::new(
@@ -37,10 +70,15 @@ pub(crate) fn run_split_manifest_recursive_copy(
         None
     };
 
+    let overall_start = std::time::Instant::now();
+    let manifest_start = std::time::Instant::now();
     let (mut dir_tasks, small_tasks, large_tasks) =
         collect_recursive_copy_manifest(&ctx, stats.as_ref(), sample_counters.as_ref())?;
+    let manifest_elapsed = manifest_start.elapsed();
     root_dir_tasks.append(&mut dir_tasks);
 
+    let small_file_tasks = small_tasks.len();
+    let large_file_tasks = large_tasks.len();
     let small_queue = Arc::new(RecursiveTaskQueue::default());
     let large_queue = Arc::new(RecursiveTaskQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -56,6 +94,7 @@ pub(crate) fn run_split_manifest_recursive_copy(
     let small_worker_count = recursive_copy_small_worker_count();
     let large_worker_count = recursive_copy_large_worker_count();
 
+    let copy_start = std::time::Instant::now();
     let mut small_threads = Vec::with_capacity(small_worker_count);
     for _ in 0..small_worker_count {
         let queue = small_queue.clone();
@@ -137,14 +176,30 @@ pub(crate) fn run_split_manifest_recursive_copy(
         finalize_directory_timestamps(&root_dir_tasks)?;
     }
     let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
+    let copy_elapsed = copy_start.elapsed();
+    let result = SplitManifestRecursiveCopyBenchmarkResult {
+        bytes_copied,
+        files_copied: stats.files_copied.load(Ordering::Relaxed),
+        dirs_created: stats.dirs_created.load(Ordering::Relaxed),
+        symlinks_created: stats.symlinks_created.load(Ordering::Relaxed),
+        small_file_tasks,
+        large_file_tasks,
+        manifest_phase_secs: manifest_elapsed.as_secs_f64(),
+        copy_phase_secs: copy_elapsed.as_secs_f64(),
+        total_secs: overall_start.elapsed().as_secs_f64(),
+    };
     if verbose {
         eprintln!(
-            "split-manifest recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, bytes_copied={}",
-            stats.dirs_created.load(Ordering::Relaxed),
-            stats.files_copied.load(Ordering::Relaxed),
-            stats.symlinks_created.load(Ordering::Relaxed),
-            bytes_copied
+            "split-manifest recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, small_tasks={}, large_tasks={}, bytes_copied={}, manifest_phase={:.4}s, copy_phase={:.4}s",
+            result.dirs_created,
+            result.files_copied,
+            result.symlinks_created,
+            result.small_file_tasks,
+            result.large_file_tasks,
+            result.bytes_copied,
+            result.manifest_phase_secs,
+            result.copy_phase_secs
         );
     }
-    Ok(bytes_copied)
+    Ok(result)
 }

@@ -14,6 +14,13 @@ struct CatArgs {
     files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatExecutionBackend {
+    OrderedTransform,
+    FastCopyToStdout,
+    BufferedCopy,
+}
+
 fn parse_short_cat_flags(arg: &str, parsed: &mut CatArgs) -> io::Result<bool> {
     if !arg.starts_with('-') || arg.len() <= 1 || arg.starts_with("--") {
         return Ok(false);
@@ -179,6 +186,42 @@ pub(super) fn cat_uses_transform_path(
     number || number_nonblank || show_ends || show_tabs || show_nonprinting || squeeze_blank
 }
 
+fn cat_execution_backend(input: &StreamInput, args: &CatArgs) -> io::Result<CatExecutionBackend> {
+    if cat_uses_transform_path(
+        args.number,
+        args.number_nonblank,
+        args.show_ends,
+        args.show_tabs,
+        args.show_nonprinting,
+        args.squeeze_blank,
+    ) {
+        return Ok(CatExecutionBackend::OrderedTransform);
+    }
+    if args.io_mode == IOMode::Direct {
+        return Ok(CatExecutionBackend::BufferedCopy);
+    }
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            Ok(CatExecutionBackend::FastCopyToStdout)
+        }
+        StreamInput::Stdin { .. } => {
+            if fd_is_regular(libc::STDIN_FILENO)? || fd_is_fifo(libc::STDIN_FILENO)? {
+                Ok(CatExecutionBackend::FastCopyToStdout)
+            } else {
+                Ok(CatExecutionBackend::BufferedCopy)
+            }
+        }
+        StreamInput::File(path) => {
+            let file_type = fs::metadata(path)?.file_type();
+            if file_type.is_fifo() {
+                Ok(CatExecutionBackend::FastCopyToStdout)
+            } else {
+                Ok(CatExecutionBackend::BufferedCopy)
+            }
+        }
+    }
+}
+
 pub(super) fn cat_short_visual_flag_effect(flag: u8) -> Option<(bool, bool, bool)> {
     match flag {
         b'E' => Some((true, false, false)),
@@ -312,7 +355,7 @@ fn cat_write_transformed_line<W: Write>(
 }
 
 pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
-    let parsed = parse_cat_args(args)?;
+    let mut parsed = parse_cat_args(args)?;
     let io_mode = parsed.io_mode;
     let report_throughput = parsed.report_gbps;
     let number = parsed.number;
@@ -321,8 +364,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     let show_tabs = parsed.show_tabs;
     let show_nonprinting = parsed.show_nonprinting;
     let squeeze_blank = parsed.squeeze_blank;
-    let files = parsed.files;
-    let inputs = parse_stream_inputs(files);
+    let inputs = parse_stream_inputs(std::mem::take(&mut parsed.files));
     let started_at = std::time::Instant::now();
     let mut total_bytes = 0_u64;
     if cat_uses_transform_path(
@@ -385,12 +427,15 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
     }
     let mut out = None;
     for input in inputs {
+        let backend = cat_execution_backend(&input, &parsed)?;
+        debug_assert_ne!(backend, CatExecutionBackend::OrderedTransform);
         let mut copied = 0_u64;
-        if try_fast_copy_to_stdout_counted(&input, io_mode, &mut |bytes| {
-            copied = bytes;
-            Ok(())
-        })?
-        .is_some()
+        if backend == CatExecutionBackend::FastCopyToStdout
+            && try_fast_copy_to_stdout_counted(&input, io_mode, &mut |bytes| {
+                copied = bytes;
+                Ok(())
+            })?
+            .is_some()
         {
             total_bytes += copied;
             continue;
@@ -586,12 +631,27 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::{
-        cat_numbering_step, cat_short_visual_flag_effect, cat_should_number_line,
-        cat_show_ends_rendered_len, cat_show_tabs_rendered_len, cat_squeeze_blank_step,
-        cat_uses_transform_path, cat_visible_byte_rendered_len, parse_cat_args,
-        parse_short_cat_flags, CatArgs,
+        cat_execution_backend, cat_numbering_step, cat_short_visual_flag_effect,
+        cat_should_number_line, cat_show_ends_rendered_len, cat_show_tabs_rendered_len,
+        cat_squeeze_blank_step, cat_uses_transform_path, cat_visible_byte_rendered_len,
+        parse_cat_args, parse_short_cat_flags, CatArgs, CatExecutionBackend, StreamInput,
     };
     use std::io;
+
+    fn cat_test_temp_file(name: &str) -> std::path::PathBuf {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        std::fs::create_dir_all(&base).unwrap();
+        base.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn cat_numbering_step_numbers_only_at_line_starts() {
@@ -715,6 +775,69 @@ mod tests {
     #[test]
     fn cat_short_visual_flag_effect_maps_show_all_to_all_visual_bits() {
         assert_eq!(cat_short_visual_flag_effect(b'A'), Some((true, true, true)));
+    }
+
+    #[test]
+    fn plain_and_unbuffered_cat_keep_regular_files_on_fast_copy_backend() {
+        let tmp = cat_test_temp_file("fro-cat-fast-backend");
+        std::fs::write(&tmp, b"plain cat backend selection\n").unwrap();
+        let file = tmp.display().to_string();
+        let input = StreamInput::File(file.clone());
+
+        for args in [
+            vec!["cat".to_string(), file.clone()],
+            vec!["cat".to_string(), "-u".to_string(), file.clone()],
+            vec!["cat".to_string(), "--no-direct".to_string(), file.clone()],
+        ] {
+            let parsed = parse_cat_args(&args).unwrap();
+            assert_eq!(
+                cat_execution_backend(&input, &parsed).unwrap(),
+                CatExecutionBackend::FastCopyToStdout,
+                "args {args:?} should stay on the fast copy backend"
+            );
+        }
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn formatting_flags_intentionally_leave_the_fast_copy_backend() {
+        let tmp = cat_test_temp_file("fro-cat-transform-backend");
+        std::fs::write(&tmp, b"alpha\nbeta\n").unwrap();
+        let file = tmp.display().to_string();
+        let input = StreamInput::File(file.clone());
+
+        for args in [
+            vec!["cat".to_string(), "-n".to_string(), file.clone()],
+            vec!["cat".to_string(), "-A".to_string(), file.clone()],
+            vec!["cat".to_string(), "--show-tabs".to_string(), file.clone()],
+        ] {
+            let parsed = parse_cat_args(&args).unwrap();
+            assert_eq!(
+                cat_execution_backend(&input, &parsed).unwrap(),
+                CatExecutionBackend::OrderedTransform,
+                "args {args:?} should leave the fast copy backend"
+            );
+        }
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn direct_mode_plain_cat_uses_buffered_copy_backend() {
+        let tmp = cat_test_temp_file("fro-cat-direct-backend");
+        std::fs::write(&tmp, b"direct backend selection\n").unwrap();
+        let file = tmp.display().to_string();
+        let input = StreamInput::File(file.clone());
+        let args = vec!["cat".to_string(), "--direct".to_string(), file];
+        let parsed = parse_cat_args(&args).unwrap();
+
+        assert_eq!(
+            cat_execution_backend(&input, &parsed).unwrap(),
+            CatExecutionBackend::BufferedCopy
+        );
+
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]

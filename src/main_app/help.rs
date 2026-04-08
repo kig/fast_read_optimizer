@@ -248,17 +248,19 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "du" => Some(CommandHelp {
             name: "du",
-            usage: "du [-s] [-a] [-d depth|--max-depth=depth] [--] [path ...]",
+            usage: "du [-s] [-a] [-S] [-d depth|--max-depth=depth] [--] [path ...]",
             summary: "Report disk usage from filesystem block counts for files and directories.",
             notes: &[
                 "Without -s, directory arguments print descendant directory totals plus the root total.",
                 "-a includes non-directory entries in the output.",
+                "-S/--separate-dirs excludes subdirectory totals from parent directory totals while keeping descendants visible.",
                 "-d/--max-depth limits which descendant depths are printed while preserving full subtree totals.",
                 "-- stops option parsing so paths beginning with '-' are treated as operands.",
             ],
             examples: &[
                 ("Summarize one tree", "du -s ."),
                 ("Print all entries in src", "du -a src"),
+                ("Exclude child directory totals from each parent", "du -S ."),
                 ("Show only top-level directory totals", "du --max-depth=1 ."),
             ],
         }),
@@ -274,6 +276,21 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             examples: &[
                 ("Print the first ten lines", "head notes.txt"),
                 ("Print all but the last 4 KiB", "head -c -4KiB disk.log"),
+            ],
+        }),
+        "sort" => Some(CommandHelp {
+            name: "sort",
+            usage: "sort [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
+            summary: "Sort newline-delimited records in locale-independent ascending byte order.",
+            notes: &[
+                "This bounded first slice implements only the default bytewise newline-delimited case.",
+                "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
+                "Unsupported GNU sort features currently return an error, including reverse/unique/numeric modes, keys, merge/check modes, zero-terminated records, output/temp-file controls, and locale collation.",
+                "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
+            ],
+            examples: &[
+                ("Sort one file to stdout", "sort names.txt"),
+                ("Sort one file with page-cache reads forced", "sort --no-direct names.txt"),
             ],
         }),
         "tac" => Some(CommandHelp {
@@ -866,6 +883,10 @@ pub(super) fn print_general_help(program: &str) {
             "print config JSON or explain config selection for a path",
         ),
         ("head", "print the first lines or bytes of each input"),
+        (
+            "sort",
+            "sort newline-delimited records in ascending byte order",
+        ),
         ("tac", "print files in reverse line order"),
         ("tail", "print the last lines or bytes of each input"),
         (
@@ -965,7 +986,7 @@ pub(super) fn print_general_help(program: &str) {
     println!();
     println!("Coreutils compatibility names:");
     println!(
-        "  cp cmp dd fgrep find du rm mv tar cat base64 encrypt decrypt head tac tail wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
+        "  cp cmp dd fgrep find du rm mv sort tar cat base64 encrypt decrypt head tac tail wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
     println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
     println!();

@@ -104,6 +104,17 @@ fn stdin_buf_reader() -> io::Result<BufReader<Cursor<Vec<u8>>>> {
     Ok(BufReader::new(Cursor::new(bytes)))
 }
 
+fn grow_pipe_best_effort(_fd: libc::c_int) -> io::Result<()> {
+    Ok(())
+}
+
+fn write_raw_fd_all(fd: libc::c_int, buf: &[u8]) -> io::Result<()> {
+    if fd == libc::STDOUT_FILENO {
+        CAPTURED_STDOUT.with(|captured| captured.borrow_mut().extend_from_slice(buf));
+    }
+    Ok(())
+}
+
 #[path = "../src/coreutils/head.rs"]
 mod head;
 

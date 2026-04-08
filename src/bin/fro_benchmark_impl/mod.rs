@@ -96,12 +96,9 @@ fn parse_reported_summary(text: &str) -> Option<FroRunSummary> {
 fn run_test_command(
     fro_exe: &std::path::Path,
     test: &TestCase,
+    config_path: Option<&str>,
 ) -> std::io::Result<(std::process::Output, Duration)> {
-    let mut command = match test.kind {
-        CommandKind::Fro | CommandKind::FroDiscardStdout => Command::new(fro_exe),
-        CommandKind::ExternalDiscardStdout => Command::new(test.program),
-    };
-    command.args(&test.args);
+    let mut command = build_test_command(fro_exe, test, config_path);
     if matches!(
         test.kind,
         CommandKind::FroDiscardStdout | CommandKind::ExternalDiscardStdout
@@ -111,6 +108,41 @@ fn run_test_command(
     let start = Instant::now();
     let output = command.output()?;
     Ok((output, start.elapsed()))
+}
+
+fn build_test_command(
+    fro_exe: &std::path::Path,
+    test: &TestCase,
+    config_path: Option<&str>,
+) -> Command {
+    let mut command = match test.kind {
+        CommandKind::Fro | CommandKind::FroDiscardStdout => {
+            let Some((mode, rest)) = test.args.split_first() else {
+                return Command::new(fro_exe);
+            };
+            let mut command = fro_subcommand_command(fro_exe, mode, config_path);
+            command.args(rest);
+            command
+        }
+        CommandKind::ExternalDiscardStdout => Command::new(test.program),
+    };
+    if matches!(test.kind, CommandKind::ExternalDiscardStdout) {
+        command.args(&test.args);
+    }
+    command
+}
+
+fn fro_subcommand_command(
+    fro_exe: &std::path::Path,
+    mode: &str,
+    config_path: Option<&str>,
+) -> Command {
+    let mut command = Command::new(fro_exe);
+    command.arg(mode);
+    if let Some(path) = config_path {
+        command.args(["-c", path]);
+    }
+    command
 }
 
 fn evict_cache(path: &str) {

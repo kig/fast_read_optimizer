@@ -208,12 +208,12 @@ pub(in crate::main_app) fn bench_recursive_read(
                 stats.files_read.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
                 sample_counters.units.fetch_add(1, Ordering::Relaxed);
-                if bytes_read == 0 {
+                if bytes_read == 0 && fs::metadata(&task.source_path)?.len() != 0 {
                     stop.store(true, Ordering::SeqCst);
                     dir_queue.wake_all();
                     file_queue.wake_all();
                     return Err(io::Error::other(format!(
-                        "recursive-read-bench observed zero bytes for file {}",
+                        "recursive-read-bench observed zero bytes for non-empty file {}",
                         task.source_path.display()
                     )));
                 }

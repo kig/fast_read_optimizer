@@ -463,6 +463,28 @@ fn multicall_head_line_prefix_matches_system_for_large_stdin_text() {
 }
 
 #[test]
+fn multicall_head_small_line_cutoffs_match_system_across_large_stdin_blocks() {
+    let mut bytes = Vec::new();
+    for idx in 0..80 {
+        bytes.extend(std::iter::repeat_n(b'a' + (idx % 23) as u8, 9 * 1024 + idx));
+        bytes.push(b'\n');
+    }
+
+    for args in [vec![], vec!["-n", "64"]] {
+        let fro = assert_success(run_fro_with_stdin("head", &args, &bytes));
+        let system = run_system_with_stdin("head", &args, &bytes);
+        assert!(
+            system.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&system.stdout),
+            String::from_utf8_lossy(&system.stderr)
+        );
+        assert_eq!(fro.stdout, system.stdout, "stdout mismatch for {:?}", args);
+        assert_eq!(fro.stderr, system.stderr, "stderr mismatch for {:?}", args);
+    }
+}
+
+#[test]
 fn multicall_wc_supports_character_counts_on_stdin() {
     let bytes = "aé🙂\n".as_bytes();
 

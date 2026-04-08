@@ -48,6 +48,32 @@ pub enum TransformIoPairing {
     StreamToStream { input: File, output: File },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapperTransformOutputKind {
+    RegularFile,
+    Stream,
+}
+
+pub enum MapperTransformOutput {
+    RegularFile(File),
+    Stream(File),
+}
+
+impl MapperTransformOutput {
+    pub fn kind(&self) -> MapperTransformOutputKind {
+        match self {
+            Self::RegularFile(_) => MapperTransformOutputKind::RegularFile,
+            Self::Stream(_) => MapperTransformOutputKind::Stream,
+        }
+    }
+
+    pub fn as_file_mut(&mut self) -> &mut File {
+        match self {
+            Self::RegularFile(file) | Self::Stream(file) => file,
+        }
+    }
+}
+
 impl TransformIoPairing {
     pub fn kind(&self) -> TransformIoPairingKind {
         match self {
@@ -125,6 +151,37 @@ where
     }
 }
 
+/// Dispatch a transform pairing for mapper-style workloads.
+///
+/// Callers that only need to distinguish between regular-file input and stream
+/// input should prefer this helper over open-coding the four-way pairing match.
+/// The output target still carries whether the destination is a regular file or
+/// a stream so mixed cases can preserve their specialized write path.
+pub fn run_mapper_transform_io_pairing<T, RI, SI>(
+    pairing: TransformIoPairing,
+    regular_input: RI,
+    stream_input: SI,
+) -> io::Result<T>
+where
+    RI: FnOnce(String, MapperTransformOutput) -> io::Result<T>,
+    SI: FnOnce(File, MapperTransformOutput) -> io::Result<T>,
+{
+    match pairing {
+        TransformIoPairing::FileToFile { input_path, output } => {
+            regular_input(input_path, MapperTransformOutput::RegularFile(output))
+        }
+        TransformIoPairing::FileToStream { input_path, output } => {
+            regular_input(input_path, MapperTransformOutput::Stream(output))
+        }
+        TransformIoPairing::StreamToFile { input, output } => {
+            stream_input(input, MapperTransformOutput::RegularFile(output))
+        }
+        TransformIoPairing::StreamToStream { input, output } => {
+            stream_input(input, MapperTransformOutput::Stream(output))
+        }
+    }
+}
+
 pub fn run_transform_with_specs<T, FF2F, FF2S, SF2F, SF2S>(
     input: TransformInputSpec<'_>,
     output: TransformOutputSpec<'_>,
@@ -145,6 +202,25 @@ where
         file_to_stream,
         stream_to_file,
         stream_to_stream,
+    )
+}
+
+/// Resolve stdin/stdout-or-path specs and dispatch them through the mapper-style
+/// transform helper so callers do not need to duplicate pairing selection.
+pub fn run_mapper_transform_with_specs<T, RI, SI>(
+    input: TransformInputSpec<'_>,
+    output: TransformOutputSpec<'_>,
+    regular_input: RI,
+    stream_input: SI,
+) -> io::Result<T>
+where
+    RI: FnOnce(String, MapperTransformOutput) -> io::Result<T>,
+    SI: FnOnce(File, MapperTransformOutput) -> io::Result<T>,
+{
+    run_mapper_transform_io_pairing(
+        auto_select_transform_io_pairing(input, output)?,
+        regular_input,
+        stream_input,
     )
 }
 
@@ -462,8 +538,8 @@ pub fn run_reader_transform_to_pipe<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_transform_io_pairing, run_transform_io_pairing, TransformIoPairing,
-        TransformIoPairingKind,
+        classify_transform_io_pairing, run_mapper_transform_io_pairing, run_transform_io_pairing,
+        TransformIoPairing, TransformIoPairingKind,
     };
     use std::fs::File;
 
@@ -542,6 +618,55 @@ mod tests {
         )
         .expect("dispatch stream to stream");
         assert_eq!(stream_to_stream, "stream-stream");
+    }
+
+    #[test]
+    fn run_mapper_transform_io_pairing_groups_by_input_shape_and_output_kind() {
+        let file = || File::open("/dev/null").expect("open /dev/null");
+
+        let file_to_file = run_mapper_transform_io_pairing(
+            TransformIoPairing::FileToFile {
+                input_path: "in".to_string(),
+                output: file(),
+            },
+            |input_path, output| Ok(format!("regular:{input_path}:{:?}", output.kind())),
+            |_, _| unreachable!("wrong branch"),
+        )
+        .expect("dispatch file to file mapper");
+        assert_eq!(file_to_file, "regular:in:RegularFile");
+
+        let file_to_stream = run_mapper_transform_io_pairing(
+            TransformIoPairing::FileToStream {
+                input_path: "in".to_string(),
+                output: file(),
+            },
+            |input_path, output| Ok(format!("regular:{input_path}:{:?}", output.kind())),
+            |_, _| unreachable!("wrong branch"),
+        )
+        .expect("dispatch file to stream mapper");
+        assert_eq!(file_to_stream, "regular:in:Stream");
+
+        let stream_to_file = run_mapper_transform_io_pairing(
+            TransformIoPairing::StreamToFile {
+                input: file(),
+                output: file(),
+            },
+            |_, _| unreachable!("wrong branch"),
+            |_, output| Ok(format!("stream:{:?}", output.kind())),
+        )
+        .expect("dispatch stream to file mapper");
+        assert_eq!(stream_to_file, "stream:RegularFile");
+
+        let stream_to_stream = run_mapper_transform_io_pairing(
+            TransformIoPairing::StreamToStream {
+                input: file(),
+                output: file(),
+            },
+            |_, _| unreachable!("wrong branch"),
+            |_, output| Ok(format!("stream:{:?}", output.kind())),
+        )
+        .expect("dispatch stream to stream mapper");
+        assert_eq!(stream_to_stream, "stream:Stream");
     }
 }
 

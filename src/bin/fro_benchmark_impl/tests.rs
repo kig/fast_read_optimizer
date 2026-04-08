@@ -67,6 +67,58 @@ fn parse_reported_summary_extracts_speed_and_params() {
 }
 
 #[test]
+fn build_test_command_injects_config_for_fro_runs() {
+    let test = TestCase {
+        name: "read",
+        program: "fro",
+        args: vec!["read".into(), "input.bin".into()],
+        target: 0.0,
+        cache_state: CacheState::None,
+        files_to_prep: Vec::new(),
+        bytes_hint: BytesHint::None,
+        metric: MetricKind::Gbps,
+        kind: CommandKind::Fro,
+    };
+
+    let command = build_test_command(
+        std::path::Path::new("/fake/fro"),
+        &test,
+        Some("bench-config.json"),
+    );
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(args, vec!["read", "-c", "bench-config.json", "input.bin"]);
+}
+
+#[test]
+fn build_test_command_leaves_external_runs_untouched() {
+    let test = TestCase {
+        name: "cat",
+        program: "cat",
+        args: vec!["input.bin".into()],
+        target: 0.0,
+        cache_state: CacheState::None,
+        files_to_prep: Vec::new(),
+        bytes_hint: BytesHint::None,
+        metric: MetricKind::Gbps,
+        kind: CommandKind::ExternalDiscardStdout,
+    };
+
+    let command = build_test_command(
+        std::path::Path::new("/fake/fro"),
+        &test,
+        Some("bench-config.json"),
+    );
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(args, vec!["input.bin"]);
+}
+
+#[test]
 fn write_recursive_tree_manifest_lists_all_files_in_sorted_order() {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -122,6 +174,45 @@ fn build_tests_includes_coreutils_big_file_cases() {
         "coreutils cksum (hot)",
         "coreutils sha256sum (hot)",
         "coreutils base64 encode (hot)",
+    ] {
+        assert!(names.contains(&expected), "missing benchmark {expected}");
+    }
+}
+
+#[test]
+fn build_tests_includes_recursive_copy_tree_compare_variants() {
+    let tests = build_tests(
+        "source.bin".to_string(),
+        "target-direct.bin".to_string(),
+        "target-cache.bin".to_string(),
+        "tree".to_string(),
+        "tree.txt".to_string(),
+        "copy-out".to_string(),
+    );
+    let names = tests.iter().map(|test| test.name).collect::<Vec<_>>();
+    for expected in [
+        "tree compare: copy --recursive (hot)",
+        "tree compare: copy --recursive --threaded-copy (hot)",
+    ] {
+        assert!(names.contains(&expected), "missing benchmark {expected}");
+    }
+}
+
+#[test]
+fn build_tests_include_split_manifest_tree_compare_variants() {
+    let tests = build_tests(
+        "source.bin".to_string(),
+        "target-direct.bin".to_string(),
+        "target-cache.bin".to_string(),
+        "tree".to_string(),
+        "tree.txt".to_string(),
+        "copy-out".to_string(),
+    );
+    let names = tests.iter().map(|test| test.name).collect::<Vec<_>>();
+    for expected in [
+        "tree compare: copy --recursive (hot)",
+        "tree compare: split-manifest-recursive-copy-bench (hot)",
+        "tree compare: manifest-recursive-copy-bench (hot)",
     ] {
         assert!(names.contains(&expected), "missing benchmark {expected}");
     }

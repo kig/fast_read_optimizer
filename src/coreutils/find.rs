@@ -44,10 +44,43 @@ impl FindFileType {
 }
 
 #[derive(Clone)]
+struct FindGlobPattern {
+    pattern: CString,
+    fnmatch_flags: libc::c_int,
+}
+
+impl FindGlobPattern {
+    fn parse(flag: &str, value: &str, fnmatch_flags: libc::c_int) -> io::Result<Self> {
+        Ok(Self {
+            pattern: CString::new(value.as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("find {flag} pattern cannot contain NUL"),
+                )
+            })?,
+            fnmatch_flags,
+        })
+    }
+
+    fn matches(&self, candidate: &[u8]) -> bool {
+        let Ok(candidate) = CString::new(candidate) else {
+            return false;
+        };
+        unsafe {
+            libc::fnmatch(
+                self.pattern.as_ptr(),
+                candidate.as_ptr(),
+                self.fnmatch_flags,
+            ) == 0
+        }
+    }
+}
+
+#[derive(Clone)]
 struct FindPlan {
     type_filter: Option<FindFileType>,
-    name_pattern: Option<CString>,
-    path_pattern: Option<CString>,
+    name_pattern: Option<FindGlobPattern>,
+    path_pattern: Option<FindGlobPattern>,
     max_depth: Option<usize>,
     output_delimiter: u8,
 }
@@ -262,12 +295,17 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
                         "missing argument to find -name",
                     )
                 })?;
-                name_pattern = Some(CString::new(value.as_bytes()).map_err(|_| {
+                name_pattern = Some(FindGlobPattern::parse("-name", value, 0)?);
+                index += 2;
+            }
+            "-iname" => {
+                let value = args.get(index + 1).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "find -name pattern cannot contain NUL",
+                        "missing argument to find -iname",
                     )
-                })?);
+                })?;
+                name_pattern = Some(FindGlobPattern::parse("-iname", value, libc::FNM_CASEFOLD)?);
                 index += 2;
             }
             "-path" => {
@@ -277,12 +315,17 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
                         "missing argument to find -path",
                     )
                 })?;
-                path_pattern = Some(CString::new(value.as_bytes()).map_err(|_| {
+                path_pattern = Some(FindGlobPattern::parse("-path", value, 0)?);
+                index += 2;
+            }
+            "-ipath" => {
+                let value = args.get(index + 1).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "find -path pattern cannot contain NUL",
+                        "missing argument to find -ipath",
                     )
-                })?);
+                })?;
+                path_pattern = Some(FindGlobPattern::parse("-ipath", value, libc::FNM_CASEFOLD)?);
                 index += 2;
             }
             "-print" => {
@@ -334,14 +377,16 @@ fn is_find_expression_token(arg: &str) -> bool {
 
 fn print_find_help(program: &str) {
     println!(
-        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]"
+        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
     );
     println!("Walk directory trees and print matching paths.");
     println!();
     println!("  -maxdepth N        descend at most N levels below each starting path");
     println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
     println!("  -name PATTERN      match the final path component using shell glob syntax");
+    println!("  -iname PATTERN     like -name, but match ASCII case-insensitively");
     println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
+    println!("  -ipath PATTERN     like -path, but match ASCII case-insensitively");
     println!("  -print             print each matching path followed by a newline (default)");
     println!("  -print0            print each matching path followed by NUL");
     println!("  -h, --help         display this help and exit");
@@ -358,20 +403,13 @@ fn append_find_path(chunk: &mut Vec<u8>, path: &Path, output_delimiter: u8) {
     chunk.push(output_delimiter);
 }
 
-fn find_name_matches(pattern: &CStr, path: &Path) -> bool {
+fn find_name_matches(pattern: &FindGlobPattern, path: &Path) -> bool {
     let name = path.file_name().unwrap_or(path.as_os_str());
-    find_glob_matches(pattern, name.as_bytes())
+    pattern.matches(name.as_bytes())
 }
 
-fn find_path_matches(pattern: &CStr, path: &Path) -> bool {
-    find_glob_matches(pattern, path.as_os_str().as_bytes())
-}
-
-fn find_glob_matches(pattern: &CStr, candidate: &[u8]) -> bool {
-    let Ok(candidate) = CString::new(candidate) else {
-        return false;
-    };
-    unsafe { libc::fnmatch(pattern.as_ptr(), candidate.as_ptr(), 0) == 0 }
+fn find_path_matches(pattern: &FindGlobPattern, path: &Path) -> bool {
+    pattern.matches(path.as_os_str().as_bytes())
 }
 
 fn parse_find_max_depth(value: &str) -> io::Result<usize> {

@@ -24,7 +24,10 @@ pub fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
         let flags = fcntl(fd, F_GETFL);
-        return Ok(flags);
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(flags)
     }
 }
 
@@ -32,7 +35,10 @@ pub fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> 
     let fd = file.as_raw_fd();
     unsafe {
         let flags = fcntl(fd, F_SETFL, flags);
-        return Ok(flags);
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(flags)
     }
 }
 

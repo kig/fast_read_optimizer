@@ -6,17 +6,27 @@ pub(super) struct Base64DecodeReorg {
     decoded: Vec<u8>,
     saw_padding: bool,
     ignore_garbage: bool,
+    decode_kernel: Base64DecodeKernel,
+    use_avx2_compact: bool,
 }
 
 impl Base64DecodeReorg {
     pub(super) fn new(compacted_capacity: usize, ignore_garbage: bool) -> Self {
         let compacted_capacity = compacted_capacity.max(4) + 4;
+        let decode_kernel =
+            decode_base64_kernel_for_block(compacted_capacity, Base64DecodeKernel::Auto);
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let use_avx2_compact = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let use_avx2_compact = false;
         Self {
             pending_encoded: vec![0u8; compacted_capacity],
             pending_len: 0,
             decoded: vec![0u8; (compacted_capacity / 4) * 3],
             saw_padding: false,
             ignore_garbage,
+            decode_kernel,
+            use_avx2_compact,
         }
     }
 
@@ -32,7 +42,7 @@ impl Base64DecodeReorg {
         let written = decode_base64_block_into_with_kernel(
             &self.pending_encoded[..flush_len],
             &mut self.decoded[..(flush_len / 4) * 3],
-            Base64DecodeKernel::Auto,
+            self.decode_kernel,
         )?;
         out.write_all(&self.decoded[..written])?;
         let remainder = self.pending_len - flush_len;
@@ -97,6 +107,7 @@ impl Base64DecodeReorg {
         dst: &mut [u8],
         mut write: usize,
         raw: &[u8],
+        ignore_garbage: bool,
         saw_padding: &mut bool,
     ) -> io::Result<(usize, usize)> {
         #[cfg(target_arch = "x86")]
@@ -141,10 +152,15 @@ impl Base64DecodeReorg {
                 _mm256_or_si256(is_digit, _mm256_or_si256(is_plus, is_slash)),
             );
             let ignored = _mm256_or_si256(is_lf, is_cr);
-            let acceptable = _mm256_or_si256(valid, _mm256_or_si256(is_pad, ignored));
-            let acceptable_mask = _mm256_movemask_epi8(acceptable) as u32;
-            if acceptable_mask != u32::MAX {
-                break;
+            if !ignore_garbage {
+                let acceptable = _mm256_or_si256(valid, _mm256_or_si256(is_pad, ignored));
+                let acceptable_mask = _mm256_movemask_epi8(acceptable) as u32;
+                if acceptable_mask != u32::MAX {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid base64 quartet",
+                    ));
+                }
             }
             if (_mm256_movemask_epi8(is_pad) as u32) != 0 {
                 break;
@@ -175,12 +191,13 @@ impl Base64DecodeReorg {
         let mut write = self.pending_len;
         let mut consumed = 0usize;
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if !self.ignore_garbage && raw.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        if self.use_avx2_compact && raw.len() >= 32 {
             let (next_write, next_consumed) = unsafe {
                 Self::compact_from_raw_avx2(
                     &mut self.pending_encoded,
                     write,
                     raw,
+                    self.ignore_garbage,
                     &mut self.saw_padding,
                 )?
             };

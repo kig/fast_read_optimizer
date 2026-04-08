@@ -153,6 +153,60 @@ fn encrypt_file_to_stdout_and_decrypt_stdin_to_file_roundtrip() {
 }
 
 #[test]
+fn encrypt_and_decrypt_empty_file_roundtrip() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-empty");
+    let plaintext = tmp.join("plain.bin");
+    let ciphertext = tmp.join("cipher.bin");
+    let decrypted = tmp.join("plain.out");
+    let passphrase = tmp.join("pass.txt");
+    fs::write(&plaintext, []).unwrap();
+    fs::write(&passphrase, b"empty-secret\n").unwrap();
+
+    let encrypt = run_fro(
+        "encrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            ciphertext.to_str().unwrap(),
+            plaintext.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        encrypt.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&encrypt.stdout),
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    assert!(encrypt.stdout.is_empty());
+    assert!(encrypt.stderr.is_empty());
+
+    let ciphertext_bytes = fs::read(&ciphertext).unwrap();
+    assert_eq!(ciphertext_bytes.len(), OPENSSL_HEADER_LEN);
+    assert_eq!(&openssl_header(&ciphertext_bytes)[..8], b"Salted__");
+
+    let decrypt = run_fro(
+        "decrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            decrypted.to_str().unwrap(),
+            ciphertext.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        decrypt.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&decrypt.stdout),
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert!(decrypt.stdout.is_empty());
+    assert!(decrypt.stderr.is_empty());
+    assert!(fs::read(&decrypted).unwrap().is_empty());
+}
+
+#[test]
 fn encrypt_uses_random_salt_with_openssl_header() {
     let tmp = unique_temp_dir("fro-coreutils-encrypt-salt");
     let plaintext = tmp.join("plain.bin");
@@ -307,6 +361,201 @@ fn decrypt_rejects_non_openssl_header() {
     assert!(decrypt.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&decrypt.stderr);
     assert!(stderr.contains("unsupported ciphertext format"));
+}
+
+#[test]
+fn decrypt_rejects_empty_and_truncated_ciphertext_before_header() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-short");
+    let passphrase = tmp.join("pass.txt");
+    fs::write(&passphrase, b"short-secret\n").unwrap();
+
+    for (name, bytes) in [
+        ("empty", Vec::new()),
+        ("truncated", b"Salted__abc".to_vec()),
+    ] {
+        let ciphertext = tmp.join(format!("{name}.bin"));
+        fs::write(&ciphertext, bytes).unwrap();
+
+        let decrypt = run_fro(
+            "decrypt",
+            &[
+                "--passphrase-file",
+                passphrase.to_str().unwrap(),
+                ciphertext.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !decrypt.status.success(),
+            "{name} ciphertext unexpectedly decrypted"
+        );
+        assert!(
+            decrypt.stdout.is_empty(),
+            "{name} stderr should stay on stderr"
+        );
+        let stderr = String::from_utf8_lossy(&decrypt.stderr);
+        assert!(
+            stderr.contains("failed to fill whole buffer"),
+            "{name} stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn decrypt_truncated_payload_returns_plaintext_prefix_without_error() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-truncated-payload");
+    let plaintext = tmp.join("plain.bin");
+    let ciphertext = tmp.join("cipher.bin");
+    let truncated = tmp.join("cipher.truncated.bin");
+    let passphrase = tmp.join("pass.txt");
+    let bytes = (0..(131_072 + 29))
+        .map(|i| ((i * 37 + 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&plaintext, &bytes).unwrap();
+    fs::write(&passphrase, b"truncate-secret\n").unwrap();
+
+    let encrypt = run_fro(
+        "encrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            ciphertext.to_str().unwrap(),
+            plaintext.to_str().unwrap(),
+        ],
+    );
+    assert!(encrypt.status.success());
+
+    let ciphertext_bytes = fs::read(&ciphertext).unwrap();
+    let truncated_payload_len = 8193;
+    fs::write(
+        &truncated,
+        &ciphertext_bytes[..OPENSSL_HEADER_LEN + truncated_payload_len],
+    )
+    .unwrap();
+
+    let decrypt = run_fro(
+        "decrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            truncated.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        decrypt.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&decrypt.stdout),
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert!(decrypt.stderr.is_empty());
+    assert_eq!(decrypt.stdout, bytes[..truncated_payload_len]);
+}
+
+#[test]
+fn decrypt_corrupted_payload_returns_corrupted_plaintext_without_error() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-corrupt-payload");
+    let plaintext = tmp.join("plain.bin");
+    let ciphertext = tmp.join("cipher.bin");
+    let corrupted = tmp.join("cipher.corrupted.bin");
+    let passphrase = tmp.join("pass.txt");
+    let bytes = (0..(65_536 + 17))
+        .map(|i| ((i * 31 + 1) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&plaintext, &bytes).unwrap();
+    fs::write(&passphrase, b"corrupt-secret\n").unwrap();
+
+    let encrypt = run_fro(
+        "encrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            ciphertext.to_str().unwrap(),
+            plaintext.to_str().unwrap(),
+        ],
+    );
+    assert!(encrypt.status.success());
+
+    let mut ciphertext_bytes = fs::read(&ciphertext).unwrap();
+    let corrupted_index = OPENSSL_HEADER_LEN + 4097;
+    ciphertext_bytes[corrupted_index] ^= 0x5a;
+    fs::write(&corrupted, &ciphertext_bytes).unwrap();
+
+    let decrypt = run_fro(
+        "decrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            corrupted.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        decrypt.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&decrypt.stdout),
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert!(decrypt.stderr.is_empty());
+    let plaintext_index = corrupted_index - OPENSSL_HEADER_LEN;
+    assert_eq!(
+        &decrypt.stdout[..plaintext_index],
+        &bytes[..plaintext_index],
+        "payload corruption should not affect earlier bytes"
+    );
+    assert_ne!(decrypt.stdout[plaintext_index], bytes[plaintext_index]);
+    assert_eq!(
+        &decrypt.stdout[plaintext_index + 1..],
+        &bytes[plaintext_index + 1..],
+        "aes-256-ctr corruption should stay localized to the changed byte"
+    );
+}
+
+#[test]
+fn decrypt_corrupted_salt_returns_nonmatching_plaintext_without_error() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-corrupt-salt");
+    let plaintext = tmp.join("plain.bin");
+    let ciphertext = tmp.join("cipher.bin");
+    let corrupted = tmp.join("cipher.corrupted.bin");
+    let passphrase = tmp.join("pass.txt");
+    let bytes = (0..(32 * 1024 + 9))
+        .map(|i| ((i * 43 + 15) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&plaintext, &bytes).unwrap();
+    fs::write(&passphrase, b"salt-corrupt-secret\n").unwrap();
+
+    let encrypt = run_fro(
+        "encrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            ciphertext.to_str().unwrap(),
+            plaintext.to_str().unwrap(),
+        ],
+    );
+    assert!(encrypt.status.success());
+
+    let mut ciphertext_bytes = fs::read(&ciphertext).unwrap();
+    ciphertext_bytes[b"Salted__".len()] ^= 0x01;
+    fs::write(&corrupted, &ciphertext_bytes).unwrap();
+
+    let decrypt = run_fro(
+        "decrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            corrupted.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        decrypt.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&decrypt.stdout),
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert!(decrypt.stderr.is_empty());
+    assert_eq!(decrypt.stdout.len(), bytes.len());
+    assert_ne!(decrypt.stdout, bytes);
 }
 
 #[test]

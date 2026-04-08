@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -153,4 +154,25 @@ fn page_cache_lift_benchmark_reports_ordered_checkpoints() {
     let report = fro::benchmark_page_cache_lift(&path).unwrap();
     assert_eq!(report.bytes_read, bytes.len() as u64);
     assert!(report.checkpoint_2 >= report.checkpoint_1);
+}
+
+#[test]
+fn stream_flag_helpers_report_closed_fd_errors() {
+    let tmp = unique_temp_dir("fro-public-api-stream-flags");
+    fs::create_dir_all(&tmp).unwrap();
+    let path = tmp.join("source.bin");
+    fs::write(&path, b"flags").unwrap();
+
+    let file = fs::File::open(&path).unwrap();
+    let fd = file.as_raw_fd();
+    let close_rc = unsafe { libc::close(fd) };
+    assert_eq!(close_rc, 0);
+
+    let get_err = fro::stream::get_file_flags(&file).unwrap_err();
+    assert_eq!(get_err.raw_os_error(), Some(libc::EBADF));
+
+    let set_err = fro::stream::set_file_flags(&file, libc::O_NONBLOCK).unwrap_err();
+    assert_eq!(set_err.raw_os_error(), Some(libc::EBADF));
+
+    std::mem::forget(file);
 }

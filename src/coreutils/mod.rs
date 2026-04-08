@@ -35,6 +35,7 @@ mod mv;
 mod pv;
 mod rm;
 mod shred;
+mod sort;
 mod tac;
 mod tail;
 mod tar;
@@ -78,6 +79,7 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "tar"
             | "pv"
             | "shred"
+            | "sort"
     )
 }
 
@@ -311,6 +313,7 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         "mv" => mv::run_mv(args)?,
         "tar" => tar::run_tar(args)?,
         "shred" => shred::run_shred(args)?,
+        "sort" => sort::run_sort(args)?,
         _ => return Ok(None),
     };
     Ok(Some(code))

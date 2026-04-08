@@ -1,5 +1,24 @@
 use super::*;
 
+fn resets_recursive_copy_target(test: &TestCase, recursive_copy_target: &str) -> bool {
+    matches!(test.bytes_hint, BytesHint::RecursiveTree)
+        && test.args.last().map(String::as_str) == Some(recursive_copy_target)
+}
+
+fn resets_recursive_tree_fixture(test: &TestCase, recursive_tree: &str) -> bool {
+    if !matches!(test.bytes_hint, BytesHint::RecursiveTree) {
+        return false;
+    }
+    if test.args.last().map(String::as_str) != Some(recursive_tree) {
+        return false;
+    }
+    match test.program {
+        "fro" => test.args.first().map(String::as_str) == Some("rm"),
+        "rm" => true,
+        _ => false,
+    }
+}
+
 pub(super) fn main_impl() {
     let args: Vec<String> = env::args().collect();
     let mut patterns = vec![];
@@ -8,16 +27,17 @@ pub(super) fn main_impl() {
 
     if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
         println!(
-            "USAGE: {} [--plan] [--skip-build] [--no-fail] [--iters <n>] [--repeat <n>] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
+            "USAGE: {} [--plan] [--skip-build] [--no-fail] [-c config.json] [--iters <n>] [--repeat <n>] [--test-dir path] [--test-size <size>] [--max-drive-writes <fraction>] <test_prefix ...>",
             args[0]
         );
         println!(
             "\nAuto sizing (default): chooses a temp file size based on free space and a wear budget.\n\
               - --plan                  (print suggested test size + write load and exit)\n\
-             - --test-size 1GiB         (force fixed size)\n\
+              - --test-size 1GiB         (force fixed size)\n\
               - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)\n\
               - --iters 5               (override internal -n for fro invocations; useful for quick runs/tests)\n\
               - --repeat 3              (run each benchmark multiple times; report min/max and judge by best steady-state run)\n\
+              - -c, --config cfg.json   (pass the same config to every fro subprocess in the benchmark run)\n\
               - --skip-build            (do not run `cargo build --release`; assume binaries already built)\n\
               - --no-fail               (do not exit nonzero on regressions; still prints PASS/REGRESSION)"
         );
@@ -33,6 +53,7 @@ pub(super) fn main_impl() {
     let mut repeat_count: usize = 3;
     let mut skip_build = false;
     let mut fail_on_regressions = true;
+    let mut config_path: Option<&str> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -40,6 +61,9 @@ pub(super) fn main_impl() {
         i += 1;
         if arg == "--test-dir" {
             test_dir = &args[i];
+            i += 1;
+        } else if arg == "-c" || arg == "--config" {
+            config_path = Some(args[i].as_str());
             i += 1;
         } else if arg == "--test-size" {
             let v = &args[i];
@@ -156,6 +180,8 @@ pub(super) fn main_impl() {
         "recursive-read-bench (hot)",
         "copy (recursive, hot)",
         "tree compare:",
+        "rm (recursive, hot)",
+        "tree compare: rm -r (hot)",
     ]
     .iter()
     .any(|pattern| matches_any_pattern(pattern, &patterns));
@@ -377,8 +403,9 @@ pub(super) fn main_impl() {
             .unwrap_or_else(|e| panic!("Could not create test file {} {}", source_file, e));
         file.set_len(size)
             .unwrap_or_else(|e| panic!("Could not set file length for {} {}", source_file, e));
-        Command::new(&fro_exe)
-            .args(["write", &source_file.clone()])
+        let mut command = fro_subcommand_command(&fro_exe, "write", config_path);
+        command
+            .arg(&source_file.clone())
             .output()
             .unwrap_or_else(|e| panic!("Failed to write test file {} {}", source_file, e));
     }
@@ -391,8 +418,10 @@ pub(super) fn main_impl() {
             .unwrap_or_else(|e| panic!("Could not create test file {} {}", target_file_dir, e));
         let _ = file.set_len(size);
         if need_target_dir_matching {
-            Command::new(&fro_exe)
-                .args(["copy", &source_file.clone(), &target_file_dir.clone()])
+            let mut command = fro_subcommand_command(&fro_exe, "copy", config_path);
+            command
+                .arg(&source_file.clone())
+                .arg(&target_file_dir.clone())
                 .output()
                 .unwrap_or_else(|e| panic!("Failed to create test file {} {}", target_file_dir, e));
         }
@@ -406,8 +435,10 @@ pub(super) fn main_impl() {
             .unwrap_or_else(|e| panic!("Could not create test file {} {}", target_file_cache, e));
         let _ = file.set_len(size);
         if need_target_cache_matching {
-            Command::new(&fro_exe)
-                .args(["copy", &source_file.clone(), &target_file_cache.clone()])
+            let mut command = fro_subcommand_command(&fro_exe, "copy", config_path);
+            command
+                .arg(&source_file.clone())
+                .arg(&target_file_cache.clone())
                 .output()
                 .unwrap_or_else(|e| {
                     panic!("Failed to create test file {} {}", target_file_cache, e)
@@ -448,14 +479,15 @@ pub(super) fn main_impl() {
         let mut run_summaries: Vec<Option<FroRunSummary>> = Vec::with_capacity(repeat_count);
 
         for _ in 0..repeat_count {
-            if matches!(t.bytes_hint, BytesHint::RecursiveTree)
-                && t.args.last().map(String::as_str) == Some(recursive_copy_target.as_str())
-            {
+            if resets_recursive_copy_target(&t, &recursive_copy_target) {
                 if let Some(target) = t.args.last() {
                     let target_path = std::path::Path::new(target);
                     let _ = std::fs::remove_dir_all(target_path);
                     let _ = std::fs::remove_file(target_path);
                 }
+            }
+            if resets_recursive_tree_fixture(&t, &recursive_tree_str) {
+                create_recursive_tree_fixture(&recursive_tree, size);
             }
             match t.cache_state {
                 CacheState::Cold => {
@@ -471,7 +503,7 @@ pub(super) fn main_impl() {
                 CacheState::None => {}
             }
 
-            let (output, elapsed) = run_test_command(&fro_exe, &t)
+            let (output, elapsed) = run_test_command(&fro_exe, &t, config_path)
                 .unwrap_or_else(|e| panic!("Failed to execute process for {}: {}", t.name, e));
 
             let out_str = String::from_utf8_lossy(&output.stdout);

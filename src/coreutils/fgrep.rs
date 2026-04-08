@@ -1,7 +1,7 @@
 use super::*;
 use std::borrow::Cow;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FgrepOptions {
     count_only: bool,
     print_line_numbers: bool,
@@ -20,6 +20,20 @@ struct FgrepPattern {
 enum PatternSource {
     Inline(String),
     File(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FgrepRegularFilePath {
+    LiteralSearchOffsets,
+    LineFilterSinglePattern,
+    LineFilterMultiPattern,
+}
+
+struct ParsedFgrepArgs {
+    io_mode: IOMode,
+    options: FgrepOptions,
+    pattern_sources: Vec<PatternSource>,
+    files: Vec<String>,
 }
 
 pub(super) fn fgrep_short_flag_effect(flag: u8) -> Option<bool> {
@@ -156,6 +170,20 @@ fn parse_option_value(
             format!("fgrep: option '{option_name}' requires an argument"),
         )
     })
+}
+
+fn fgrep_regular_file_path(options: FgrepOptions, pattern_count: usize) -> FgrepRegularFilePath {
+    if options.line_regexp || options.ignore_case {
+        if pattern_count == 1 {
+            FgrepRegularFilePath::LineFilterSinglePattern
+        } else {
+            FgrepRegularFilePath::LineFilterMultiPattern
+        }
+    } else if pattern_count == 1 {
+        FgrepRegularFilePath::LiteralSearchOffsets
+    } else {
+        FgrepRegularFilePath::LineFilterMultiPattern
+    }
 }
 
 fn write_matching_line<W: Write>(
@@ -600,7 +628,7 @@ fn write_filtered_lines_multi<W: Write>(
     Ok(matched_any)
 }
 
-pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
+fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
     let mut io_mode = IOMode::Auto;
     let mut options = FgrepOptions {
         count_only: false,
@@ -705,8 +733,23 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
             "fgrep requires a search pattern",
         ));
     }
+    Ok(ParsedFgrepArgs {
+        io_mode,
+        options,
+        pattern_sources,
+        files,
+    })
+}
+
+pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
+    let ParsedFgrepArgs {
+        io_mode,
+        options,
+        pattern_sources,
+        files,
+    } = parse_fgrep_args(args)?;
     let patterns = compile_patterns(pattern_sources, options.ignore_case)?;
-    let use_single_pattern_fast_path = patterns.len() == 1;
+    let regular_file_path = fgrep_regular_file_path(options, patterns.len());
     let inputs = parse_stream_inputs(files);
     if patterns.is_empty() {
         for input in &inputs {
@@ -725,43 +768,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let config = load_config(None);
     for input in inputs {
         match &input {
-            StreamInput::File(file) if is_regular_input_path(file)? => {
-                if options.line_regexp || options.ignore_case || !use_single_pattern_fast_path {
-                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
-                    total_bytes += data.data.len() as u64;
-                    matched_any |= if use_single_pattern_fast_path {
-                        if options.line_regexp {
-                            write_line_regexp_matches(
-                                &mut out,
-                                file,
-                                data.data.as_slice(),
-                                pattern.raw.as_slice(),
-                                pattern.normalized.as_slice(),
-                                multi_file,
-                                options,
-                            )?
-                        } else {
-                            write_filtered_lines(
-                                &mut out,
-                                file,
-                                data.data.as_slice(),
-                                pattern.raw.as_slice(),
-                                pattern.normalized.as_slice(),
-                                multi_file,
-                                options,
-                            )?
-                        }
-                    } else {
-                        write_filtered_lines_multi(
-                            &mut out,
-                            file,
-                            data.data.as_slice(),
-                            &patterns,
-                            multi_file,
-                            options,
-                        )?
-                    };
-                } else {
+            StreamInput::File(file) if is_regular_input_path(file)? => match regular_file_path {
+                FgrepRegularFilePath::LiteralSearchOffsets => {
                     total_bytes += fs::metadata(file)?.len();
                     let (matches, _) = grep_match_offsets_for_mode(
                         &config,
@@ -788,9 +796,46 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                         options,
                     )?;
                 }
-            }
+                FgrepRegularFilePath::LineFilterSinglePattern => {
+                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
+                    total_bytes += data.data.len() as u64;
+                    matched_any |= if options.line_regexp {
+                        write_line_regexp_matches(
+                            &mut out,
+                            file,
+                            data.data.as_slice(),
+                            pattern.raw.as_slice(),
+                            pattern.normalized.as_slice(),
+                            multi_file,
+                            options,
+                        )?
+                    } else {
+                        write_filtered_lines(
+                            &mut out,
+                            file,
+                            data.data.as_slice(),
+                            pattern.raw.as_slice(),
+                            pattern.normalized.as_slice(),
+                            multi_file,
+                            options,
+                        )?
+                    };
+                }
+                FgrepRegularFilePath::LineFilterMultiPattern => {
+                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
+                    total_bytes += data.data.len() as u64;
+                    matched_any |= write_filtered_lines_multi(
+                        &mut out,
+                        file,
+                        data.data.as_slice(),
+                        &patterns,
+                        multi_file,
+                        options,
+                    )?;
+                }
+            },
             StreamInput::File(file) => {
-                let (matched, bytes) = if use_single_pattern_fast_path {
+                let (matched, bytes) = if patterns.len() == 1 {
                     write_matching_stream_lines(
                         &mut out,
                         Some(file),
@@ -816,7 +861,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 matched_any |= matched;
             }
             StreamInput::Stdin { label } => {
-                let (matched, bytes) = if use_single_pattern_fast_path {
+                let (matched, bytes) = if patterns.len() == 1 {
                     write_matching_stream_lines(
                         &mut out,
                         label.as_deref(),
@@ -898,120 +943,4 @@ mod kani_proofs {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        fgrep_line_matches, fgrep_line_matches_any, fgrep_short_flag_effect,
-        parse_pattern_file_bytes, FgrepOptions, FgrepPattern,
-    };
-
-    #[test]
-    fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
-        assert_eq!(fgrep_short_flag_effect(b'F'), Some(true));
-        assert_eq!(fgrep_short_flag_effect(b'n'), None);
-    }
-
-    #[test]
-    fn fgrep_line_matches_honors_line_regexp() {
-        let options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: true,
-            ignore_case: false,
-            invert_match: false,
-            report_gbps: false,
-        };
-        assert!(fgrep_line_matches(b"alpha\n", b"alpha", b"alpha", options));
-        assert!(fgrep_line_matches(b"alpha", b"alpha", b"alpha", options));
-        assert!(!fgrep_line_matches(
-            b"alpha beta\n",
-            b"alpha",
-            b"alpha",
-            options
-        ));
-        assert!(!fgrep_line_matches(
-            b"alpha\n", b"alpha\n", b"alpha\n", options
-        ));
-    }
-
-    #[test]
-    fn fgrep_line_matches_honors_ignore_case() {
-        let contains_options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: false,
-            ignore_case: true,
-            invert_match: false,
-            report_gbps: false,
-        };
-        assert!(fgrep_line_matches(
-            b"Alpha beta\n",
-            b"alpha",
-            b"alpha",
-            contains_options
-        ));
-        assert!(!fgrep_line_matches(
-            b"beta\n",
-            b"alpha",
-            b"alpha",
-            contains_options
-        ));
-
-        let line_options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: true,
-            ignore_case: true,
-            invert_match: false,
-            report_gbps: false,
-        };
-        assert!(fgrep_line_matches(
-            b"Alpha\n",
-            b"alpha",
-            b"alpha",
-            line_options
-        ));
-        assert!(!fgrep_line_matches(
-            b"Alpha beta\n",
-            b"alpha",
-            b"alpha",
-            line_options
-        ));
-    }
-
-    #[test]
-    fn parse_pattern_file_bytes_ignores_trailing_newline() {
-        assert_eq!(
-            parse_pattern_file_bytes(b"alpha\nbeta\n"),
-            vec![b"alpha".to_vec(), b"beta".to_vec()]
-        );
-        assert_eq!(
-            parse_pattern_file_bytes(b"\nalpha\n\n"),
-            vec![Vec::new(), b"alpha".to_vec(), Vec::new()]
-        );
-    }
-
-    #[test]
-    fn fgrep_line_matches_any_checks_all_patterns() {
-        let options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: false,
-            ignore_case: true,
-            invert_match: false,
-            report_gbps: false,
-        };
-        let patterns = vec![
-            FgrepPattern {
-                raw: b"needle".to_vec(),
-                normalized: b"needle".to_vec(),
-            },
-            FgrepPattern {
-                raw: b"omega".to_vec(),
-                normalized: b"omega".to_vec(),
-            },
-        ];
-        assert!(fgrep_line_matches_any(b"OMEGA\n", &patterns, options));
-        assert!(fgrep_line_matches_any(b"needle beta\n", &patterns, options));
-        assert!(!fgrep_line_matches_any(b"alpha\n", &patterns, options));
-    }
-}
+mod tests;

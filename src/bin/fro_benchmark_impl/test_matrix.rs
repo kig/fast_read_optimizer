@@ -1,4 +1,5 @@
 use super::*;
+mod recursive_tree_cases;
 
 pub(super) fn build_tests(
     source_file: String,
@@ -8,7 +9,7 @@ pub(super) fn build_tests(
     recursive_tree_manifest: String,
     recursive_copy_target: String,
 ) -> Vec<TestCase> {
-    vec![
+    let mut tests = vec![
         TestCase {
             name: "bench-diff (memory)",
             program: "fro",
@@ -341,126 +342,13 @@ pub(super) fn build_tests(
             metric: MetricKind::Gbps,
             kind: CommandKind::ExternalDiscardStdout,
         },
-        TestCase {
-            name: "copy (recursive, hot)",
-            program: "fro",
-            args: vec![
-                "copy".into(),
-                "--recursive".into(),
-                "-v".into(),
-                "-n".into(),
-                "1".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::Gbps,
-            kind: CommandKind::Fro,
-        },
-        TestCase {
-            name: "tree compare: copy --recursive (hot)",
-            program: "fro",
-            args: vec![
-                "copy".into(),
-                "--recursive".into(),
-                "-v".into(),
-                "-n".into(),
-                "1".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::FilesPerSecond,
-            kind: CommandKind::Fro,
-        },
-        TestCase {
-            name: "tree compare: split-manifest-recursive-copy-bench (hot)",
-            program: "fro",
-            args: vec![
-                "split-manifest-recursive-copy-bench".into(),
-                "-v".into(),
-                "-n".into(),
-                "1".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::FilesPerSecond,
-            kind: CommandKind::Fro,
-        },
-        TestCase {
-            name: "tree compare: manifest-recursive-copy-bench (hot)",
-            program: "fro",
-            args: vec![
-                "manifest-recursive-copy-bench".into(),
-                "-v".into(),
-                "-n".into(),
-                "1".into(),
-                recursive_tree_manifest.clone(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::FilesPerSecond,
-            kind: CommandKind::Fro,
-        },
-        TestCase {
-            name: "cp -r (recursive, hot)",
-            program: "cp",
-            args: vec![
-                "-r".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::Gbps,
-            kind: CommandKind::ExternalDiscardStdout,
-        },
-        TestCase {
-            name: "tree compare: cp -r (hot)",
-            program: "cp",
-            args: vec![
-                "-r".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::FilesPerSecond,
-            kind: CommandKind::ExternalDiscardStdout,
-        },
-        TestCase {
-            name: "rsync (recursive, hot)",
-            program: "rsync",
-            args: vec![
-                "-a".into(),
-                recursive_tree_str.clone(),
-                recursive_copy_target.clone(),
-            ],
-            target: 0.0,
-            cache_state: CacheState::Hot,
-            files_to_prep: vec![recursive_tree_str.clone()],
-            bytes_hint: BytesHint::RecursiveTree,
-            metric: MetricKind::Gbps,
-            kind: CommandKind::ExternalDiscardStdout,
-        },
+    ];
+    tests.extend(recursive_tree_cases::recursive_tree_tests(
+        &recursive_tree_str,
+        &recursive_tree_manifest,
+        &recursive_copy_target,
+    ));
+    tests.extend(vec![
         TestCase {
             name: "copy (direct)",
             program: "fro",
@@ -1039,5 +927,6 @@ pub(super) fn build_tests(
             metric: MetricKind::Gbps,
             kind: CommandKind::Fro,
         },
-    ]
+    ]);
+    tests
 }
