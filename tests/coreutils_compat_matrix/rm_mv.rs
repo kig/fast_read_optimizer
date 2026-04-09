@@ -548,6 +548,151 @@ fn mv_target_directory_matches_system_for_files_and_directories() {
 }
 
 #[test]
+fn mv_no_clobber_and_update_match_system_for_existing_destinations() {
+    let tmp = unique_temp_dir("fro-coreutils-mv-no-clobber-update");
+
+    for (label, flags, source_mtime, target_mtime, expect_source_exists, expected_target) in [
+        (
+            "no-clobber skip",
+            vec!["-n"],
+            1_700_000_100,
+            1_700_000_000,
+            true,
+            b"keep-target".as_slice(),
+        ),
+        (
+            "update skip newer destination",
+            vec!["--update"],
+            1_700_000_000,
+            1_700_000_100,
+            true,
+            b"keep-target".as_slice(),
+        ),
+        (
+            "update move older destination",
+            vec!["-u"],
+            1_700_000_100,
+            1_700_000_000,
+            false,
+            b"fresh-source".as_slice(),
+        ),
+    ] {
+        let suffix = label.replace(' ', "-");
+        let fro_source = tmp.join(format!("mv-policy-fro-src-{suffix}.txt"));
+        let sys_source = tmp.join(format!("mv-policy-sys-src-{suffix}.txt"));
+        let fro_target = tmp.join(format!("mv-policy-fro-dst-{suffix}.txt"));
+        let sys_target = tmp.join(format!("mv-policy-sys-dst-{suffix}.txt"));
+        fs::write(&fro_source, b"fresh-source").unwrap();
+        fs::write(&sys_source, b"fresh-source").unwrap();
+        fs::write(&fro_target, b"keep-target").unwrap();
+        fs::write(&sys_target, b"keep-target").unwrap();
+        set_file_mtime(&fro_source, source_mtime);
+        set_file_mtime(&sys_source, source_mtime);
+        set_file_mtime(&fro_target, target_mtime);
+        set_file_mtime(&sys_target, target_mtime);
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([fro_source.to_str().unwrap(), fro_target.to_str().unwrap()]);
+        let mut sys_args = flags.clone();
+        sys_args.extend([sys_source.to_str().unwrap(), sys_target.to_str().unwrap()]);
+        assert_same_result(run_fro("mv", &fro_args), run_system("mv", &sys_args), label);
+        assert_eq!(
+            fro_source.exists(),
+            expect_source_exists,
+            "{label}: unexpected fro source state"
+        );
+        assert_eq!(
+            fro_source.exists(),
+            sys_source.exists(),
+            "{label}: source existence mismatch"
+        );
+        assert_eq!(
+            fs::read(&fro_target).unwrap(),
+            fs::read(&sys_target).unwrap(),
+            "{label}: target contents mismatch"
+        );
+        assert_eq!(
+            fs::read(&fro_target).unwrap(),
+            expected_target,
+            "{label}: unexpected target contents"
+        );
+    }
+
+    for (label, flags, source_mtime, child_mtime, expect_source_exists, expected_child) in [
+        (
+            "target-directory no-clobber skip",
+            vec!["--no-clobber"],
+            1_700_000_100,
+            1_700_000_000,
+            true,
+            b"keep-child".as_slice(),
+        ),
+        (
+            "target-directory update move",
+            vec!["--update"],
+            1_700_000_100,
+            1_700_000_000,
+            false,
+            b"fresh-child".as_slice(),
+        ),
+    ] {
+        let suffix = label.replace(' ', "-");
+        let fro_root = tmp.join(format!("mv-target-policy-fro-{suffix}"));
+        let sys_root = tmp.join(format!("mv-target-policy-sys-{suffix}"));
+        let fro_dest = fro_root.join("dest");
+        let sys_dest = sys_root.join("dest");
+        fs::create_dir_all(&fro_dest).unwrap();
+        fs::create_dir_all(&sys_dest).unwrap();
+        let fro_source = fro_root.join("entry.txt");
+        let sys_source = sys_root.join("entry.txt");
+        let fro_child = fro_dest.join("entry.txt");
+        let sys_child = sys_dest.join("entry.txt");
+        fs::write(&fro_source, b"fresh-child").unwrap();
+        fs::write(&sys_source, b"fresh-child").unwrap();
+        fs::write(&fro_child, b"keep-child").unwrap();
+        fs::write(&sys_child, b"keep-child").unwrap();
+        set_file_mtime(&fro_source, source_mtime);
+        set_file_mtime(&sys_source, source_mtime);
+        set_file_mtime(&fro_child, child_mtime);
+        set_file_mtime(&sys_child, child_mtime);
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "-t",
+            fro_dest.to_str().unwrap(),
+            fro_source.to_str().unwrap(),
+        ]);
+        let mut sys_args = flags.clone();
+        sys_args.extend([
+            "-t",
+            sys_dest.to_str().unwrap(),
+            sys_source.to_str().unwrap(),
+        ]);
+        assert_same_result(run_fro("mv", &fro_args), run_system("mv", &sys_args), label);
+        assert_eq!(
+            fro_source.exists(),
+            expect_source_exists,
+            "{label}: unexpected fro source state"
+        );
+        assert_eq!(
+            fro_source.exists(),
+            sys_source.exists(),
+            "{label}: source existence mismatch"
+        );
+        assert_eq!(
+            snapshot_tree(&fro_dest),
+            snapshot_tree(&sys_dest),
+            "{label}: target-directory tree mismatch"
+        );
+        assert_eq!(
+            fs::read(&fro_child).unwrap(),
+            expected_child,
+            "{label}: unexpected moved child contents"
+        );
+    }
+}
+
+#[test]
 fn mv_no_target_directory_matches_system_for_common_cases() {
     let tmp = unique_temp_dir("fro-coreutils-mv-no-target-directory");
 

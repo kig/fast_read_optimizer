@@ -28,6 +28,22 @@ enum HeaderMode {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecordTerminator {
+    #[default]
+    Newline,
+    Nul,
+}
+
+impl RecordTerminator {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Newline => b'\n',
+            Self::Nul => b'\0',
+        }
+    }
+}
+
 const TAIL_SCAN_BLOCK_SIZE: usize = 1 << 20;
 const TAIL_PIPE_WINDOW_SIZE: usize = 1 << 20;
 const TAIL_PIPE_WINDOW_MIN_CAPACITY: usize = 64 << 10;
@@ -99,9 +115,17 @@ fn parse_tail_count(value: &str, flag: &str) -> io::Result<TailCount> {
 
 fn parse_tail_options(
     args: &[String],
-) -> io::Result<(IOMode, TailMode, HeaderMode, bool, Vec<String>)> {
+) -> io::Result<(
+    IOMode,
+    TailMode,
+    RecordTerminator,
+    HeaderMode,
+    bool,
+    Vec<String>,
+)> {
     let mut io_mode = IOMode::Auto;
     let mut mode = TailMode::Lines(TailCount::FromEnd(10));
+    let mut terminator = RecordTerminator::Newline;
     let mut header_mode = HeaderMode::Auto;
     let mut report_gbps = false;
     let mut files = Vec::new();
@@ -114,6 +138,7 @@ fn parse_tail_options(
             "--report-gbps" => report_gbps = true,
             "-q" => header_mode = HeaderMode::Never,
             "-v" => header_mode = HeaderMode::Always,
+            "-z" | "--zero-terminated" => terminator = RecordTerminator::Nul,
             "-n" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -139,6 +164,7 @@ fn parse_tail_options(
                     match flag {
                         'q' => header_mode = HeaderMode::Never,
                         'v' => header_mode = HeaderMode::Always,
+                        'z' => terminator = RecordTerminator::Nul,
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -152,7 +178,7 @@ fn parse_tail_options(
         }
         i += 1;
     }
-    Ok((io_mode, mode, header_mode, report_gbps, files))
+    Ok((io_mode, mode, terminator, header_mode, report_gbps, files))
 }
 
 fn write_regular_range<W: Write>(out: &mut W, path: &str, range: ByteRange) -> io::Result<()> {
@@ -163,7 +189,11 @@ fn write_regular_range<W: Write>(out: &mut W, path: &str, range: ByteRange) -> i
     Ok(())
 }
 
-fn regular_tail_line_start(path: &str, lines: u64) -> io::Result<u64> {
+fn regular_tail_line_start(
+    path: &str,
+    lines: u64,
+    terminator: RecordTerminator,
+) -> io::Result<u64> {
     let total_len = std::fs::metadata(path)?.len();
     if lines == 0 {
         return Ok(total_len);
@@ -181,7 +211,7 @@ fn regular_tail_line_start(path: &str, lines: u64) -> io::Result<u64> {
         let chunk_len = (position - chunk_start) as usize;
         file.seek(SeekFrom::Start(chunk_start))?;
         file.read_exact(&mut buffer[..chunk_len])?;
-        for rel_offset in memrchr_iter(b'\n', &buffer[..chunk_len]) {
+        for rel_offset in memrchr_iter(terminator.byte(), &buffer[..chunk_len]) {
             let newline_offset = chunk_start + rel_offset as u64;
             if newline_offset.saturating_add(1) >= total_len {
                 continue;
@@ -196,7 +226,11 @@ fn regular_tail_line_start(path: &str, lines: u64) -> io::Result<u64> {
     Ok(0)
 }
 
-fn regular_line_start(path: &str, start_line: u64) -> io::Result<u64> {
+fn regular_line_start(
+    path: &str,
+    start_line: u64,
+    terminator: RecordTerminator,
+) -> io::Result<u64> {
     let total_len = std::fs::metadata(path)?.len();
     if total_len == 0 || start_line <= 1 {
         return Ok(0);
@@ -204,7 +238,7 @@ fn regular_line_start(path: &str, start_line: u64) -> io::Result<u64> {
     let mut remaining = start_line.saturating_sub(1);
     let mut start_offset = total_len;
     visit_path_range_ordered(path, ByteRange::default(), |block_offset, block| {
-        for newline_offset in memchr_iter(b'\n', block) {
+        for newline_offset in memchr_iter(terminator.byte(), block) {
             remaining = remaining.saturating_sub(1);
             if remaining == 0 {
                 start_offset = (block_offset + newline_offset as u64 + 1).min(total_len);
@@ -216,13 +250,19 @@ fn regular_line_start(path: &str, start_line: u64) -> io::Result<u64> {
     Ok(start_offset)
 }
 
-fn regular_tail_start_offset(path: &str, mode: TailMode) -> io::Result<u64> {
+fn regular_tail_start_offset(
+    path: &str,
+    mode: TailMode,
+    terminator: RecordTerminator,
+) -> io::Result<u64> {
     let total_len = std::fs::metadata(path)?.len();
     match mode {
         TailMode::Bytes(TailCount::FromEnd(bytes)) => Ok(total_len.saturating_sub(bytes)),
         TailMode::Bytes(TailCount::FromStart(bytes)) => Ok(total_len.min(bytes.saturating_sub(1))),
-        TailMode::Lines(TailCount::FromEnd(lines)) => regular_tail_line_start(path, lines),
-        TailMode::Lines(TailCount::FromStart(lines)) => regular_line_start(path, lines),
+        TailMode::Lines(TailCount::FromEnd(lines)) => {
+            regular_tail_line_start(path, lines, terminator)
+        }
+        TailMode::Lines(TailCount::FromStart(lines)) => regular_line_start(path, lines, terminator),
     }
 }
 
@@ -580,6 +620,7 @@ fn write_tail_from_start<W: Write>(
     input: &StreamInput,
     io_mode: IOMode,
     mode: TailMode,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     match mode {
         TailMode::Bytes(TailCount::FromStart(count)) => {
@@ -600,7 +641,7 @@ fn write_tail_from_start<W: Write>(
                 if remaining == 0 {
                     return out.write_all(block);
                 }
-                for newline_offset in memchr_iter(b'\n', block) {
+                for newline_offset in memchr_iter(terminator.byte(), block) {
                     remaining -= 1;
                     if remaining == 0 {
                         return out.write_all(&block[newline_offset + 1..]);
@@ -618,6 +659,7 @@ fn write_tail_windowed<W: Write>(
     input: &StreamInput,
     io_mode: IOMode,
     mode: TailMode,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     let mut window = TailWindow::default();
     match mode {
@@ -643,7 +685,7 @@ fn write_tail_windowed<W: Write>(
             visit_ordered_input(input, io_mode, |block| {
                 let block_start = window.total_len;
                 window.push_block(block);
-                for newline_offset in memchr_iter(b'\n', block) {
+                for newline_offset in memchr_iter(terminator.byte(), block) {
                     line_starts.push_back(block_start + newline_offset as u64 + 1);
                     if line_starts.len() > keep_starts {
                         line_starts.pop_front();
@@ -668,7 +710,8 @@ fn write_tail_windowed<W: Write>(
 }
 
 pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
-    let (io_mode, mode, header_mode, report_throughput, files) = parse_tail_options(args)?;
+    let (io_mode, mode, terminator, header_mode, report_throughput, files) =
+        parse_tail_options(args)?;
     let inputs = parse_stream_inputs(files);
     let show_headers = match header_mode {
         HeaderMode::Auto => inputs.len() > 1,
@@ -692,7 +735,7 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
         }
         let emitted_bytes = match input {
             StreamInput::File(path) if is_regular_input_path(path)? => {
-                let start_offset = regular_tail_start_offset(path, mode)?;
+                let start_offset = regular_tail_start_offset(path, mode, terminator)?;
                 if let Some(out) = out.as_mut() {
                     out.flush()?;
                 }
@@ -707,7 +750,7 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
             }
             StreamInput::Stdin { .. } => {
                 if let Some(path) = regular_stdin_path()? {
-                    let start_offset = regular_tail_start_offset(path, mode)?;
+                    let start_offset = regular_tail_start_offset(path, mode, terminator)?;
                     if let Some(out) = out.as_mut() {
                         out.flush()?;
                     }
@@ -734,18 +777,18 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                     } else {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
                     }
                 } else if matches!(mode, TailMode::Lines(TailCount::FromEnd(_))) {
                     let out = out.get_or_insert(stdout_buf_writer()?);
                     let mut counted = CountingWrite::new(out);
-                    write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                    write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
                     counted.bytes_written()
                 } else {
                     let out = out.get_or_insert(stdout_buf_writer()?);
                     let mut counted = CountingWrite::new(out);
-                    write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                    write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
                     counted.bytes_written()
                 }
             }
@@ -758,13 +801,13 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                         }
                         if !try_write_tail_pipe_bytes_fast(input, count)? {
                             let out = out.get_or_insert(stdout_buf_writer()?);
-                            write_tail_windowed(out, input, io_mode, mode)?;
+                            write_tail_windowed(out, input, io_mode, mode, terminator)?;
                         }
                         count
                     } else if file_type.is_fifo() {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
                     } else if matches!(
                         mode,
@@ -773,18 +816,18 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                     ) {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
                     } else {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
-                        write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                        write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
                     }
                 } else {
                     let out = out.get_or_insert(stdout_buf_writer()?);
                     let mut counted = CountingWrite::new(out);
-                    write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                    write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
                     counted.bytes_written()
                 }
             }
@@ -818,11 +861,11 @@ mod tests {
         std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
 
         assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 1).unwrap(),
+            regular_tail_line_start(path.to_str().unwrap(), 1, RecordTerminator::Newline).unwrap(),
             11
         );
         assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 2).unwrap(),
+            regular_tail_line_start(path.to_str().unwrap(), 2, RecordTerminator::Newline).unwrap(),
             6
         );
     }
@@ -838,11 +881,11 @@ mod tests {
         std::fs::write(&path, b"alpha\nbeta\ngamma").unwrap();
 
         assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 1).unwrap(),
+            regular_tail_line_start(path.to_str().unwrap(), 1, RecordTerminator::Newline).unwrap(),
             11
         );
         assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 2).unwrap(),
+            regular_tail_line_start(path.to_str().unwrap(), 2, RecordTerminator::Newline).unwrap(),
             6
         );
     }
@@ -897,6 +940,7 @@ mod tests {
             &input,
             IOMode::PageCache,
             TailMode::Lines(TailCount::FromEnd(2)),
+            RecordTerminator::Newline,
         )
         .unwrap();
         assert_eq!(out, b"beta\ngamma");

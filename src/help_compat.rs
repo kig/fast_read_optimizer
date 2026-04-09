@@ -180,6 +180,7 @@ pub const ROWS: &[CoverageRow] = &[
         covered: &[
             "-n/--lines",
             "-c/--bytes",
+            "-z/--zero-terminated",
             "-q/--quiet/--silent",
             "-v/--verbose",
         ],
@@ -259,7 +260,7 @@ pub const ROWS: &[CoverageRow] = &[
     },
     CoverageRow {
         name: "tail",
-        covered: &["-n", "-c", "-q", "-v"],
+        covered: &["-n", "-c", "-z/--zero-terminated", "-q", "-v"],
         remaining: &[],
     },
     CoverageRow {

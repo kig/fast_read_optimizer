@@ -348,3 +348,55 @@ fn tail_matches_system_for_large_stream_windows() {
         );
     }
 }
+
+#[test]
+fn head_and_tail_zero_terminated_match_system_across_stream_surfaces() {
+    let fixture = CoreutilsParityFixture::new("fro-head-tail-zero-terminated");
+    let input = b"zero\0one\0two\0three".to_vec();
+    let file = fixture.root.join("records.bin");
+    fs::write(&file, &input).unwrap();
+    let path = file.to_str().unwrap();
+
+    for args in [
+        vec!["-z", "-n", "2", path],
+        vec!["--zero-terminated", "-n", "-1", path],
+    ] {
+        assert_same_result(
+            run_fro("head", &args),
+            run_system("head", &args),
+            &format!("head zero-terminated path {:?}", args),
+        );
+    }
+
+    for args in [
+        vec!["-z", "-n", "2", path],
+        vec!["--zero-terminated", "-n", "+2", path],
+    ] {
+        assert_same_result(
+            run_fro("tail", &args),
+            run_system("tail", &args),
+            &format!("tail zero-terminated path {:?}", args),
+        );
+    }
+
+    for surface in stream_surfaces() {
+        for args in [vec!["-z", "-n", "2"], vec!["--zero-terminated", "-n", "-1"]] {
+            let fro_args = surface.args(&args);
+            let sys_args = surface.args(&args);
+            assert_same_result(
+                run_fro_with_stdin("head", &fro_args, &input),
+                run_system_with_stdin("head", &sys_args, &input),
+                &format!("head zero-terminated {} {:?}", surface.label(), fro_args),
+            );
+        }
+        for args in [vec!["-z", "-n", "2"], vec!["--zero-terminated", "-n", "+2"]] {
+            let fro_args = surface.args(&args);
+            let sys_args = surface.args(&args);
+            assert_same_result(
+                run_fro_with_stdin("tail", &fro_args, &input),
+                run_system_with_stdin("tail", &sys_args, &input),
+                &format!("tail zero-terminated {} {:?}", surface.label(), fro_args),
+            );
+        }
+    }
+}

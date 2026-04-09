@@ -149,7 +149,37 @@ fn move_directory_cross_fs(source: &Path, target: &Path, verbose: bool) -> io::R
     Ok(())
 }
 
-fn move_path(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
+fn should_skip_target(
+    source_meta: &fs::Metadata,
+    target: &Path,
+    no_clobber: bool,
+    update: bool,
+) -> io::Result<bool> {
+    let target_meta = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if no_clobber {
+        return Ok(true);
+    }
+    if update {
+        return Ok(source_meta.modified()? <= target_meta.modified()?);
+    }
+    Ok(false)
+}
+
+fn move_path(
+    source: &Path,
+    source_meta: &fs::Metadata,
+    target: &Path,
+    verbose: bool,
+    no_clobber: bool,
+    update: bool,
+) -> io::Result<()> {
+    if should_skip_target(source_meta, target, no_clobber, update)? {
+        return Ok(());
+    }
     match fs::rename(source, target) {
         Ok(()) => {
             if verbose {
@@ -185,6 +215,8 @@ fn move_path(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
 pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut verbose = false;
+    let mut no_clobber = false;
+    let mut update = false;
     let mut explicit_target_directory: Option<PathBuf> = None;
     let mut no_target_directory = false;
     let mut paths = Vec::new();
@@ -200,6 +232,8 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         }
         match arg.as_str() {
             "--verbose" => verbose = true,
+            "-n" | "--no-clobber" => no_clobber = true,
+            "-u" | "--update" => update = true,
             "-T" | "--no-target-directory" => no_target_directory = true,
             "-t" | "--target-directory" => {
                 let value = args.get(index + 1).ok_or_else(|| {
@@ -222,11 +256,15 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
                 let mut chars = other[1..].chars().peekable();
                 while let Some(ch) = chars.next() {
                     match ch {
-                        'v' | 'f' | 'T' => {
+                        'v' | 'f' | 'T' | 'n' | 'u' => {
                             if ch == 'v' {
                                 verbose = true;
                             } else if ch == 'T' {
                                 no_target_directory = true;
+                            } else if ch == 'n' {
+                                no_clobber = true;
+                            } else if ch == 'u' {
+                                update = true;
                             }
                         }
                         't' => {
@@ -267,7 +305,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     let (destination, source_paths) = if let Some(target_directory) = explicit_target_directory {
         if paths.is_empty() {
             eprintln!(
-                "Usage: {} [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
+                "Usage: {} [-f] [-n] [-u] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
             return Err(io::Error::new(
@@ -287,7 +325,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         }
         if paths.len() < 2 {
             eprintln!(
-                "Usage: {} [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
+                "Usage: {} [-f] [-n] [-u] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
             return Err(io::Error::new(
@@ -344,7 +382,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         } else {
             destination.clone()
         };
-        if let Err(err) = move_path(&source, &target, verbose) {
+        if let Err(err) = move_path(&source, &source_meta, &target, verbose, no_clobber, update) {
             write_warning_line("mv", &source, &err, "cannot move");
             exit_code = 1;
         }
@@ -470,5 +508,77 @@ mod tests {
             PathBuf::from("new-destination")
         );
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn skip_target_obeys_no_clobber_and_update() {
+        let tmp = unique_temp_dir("fro-mv-skip-target");
+        let source = tmp.join("source.txt");
+        let target = tmp.join("target.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&target, b"target").unwrap();
+
+        let source_meta = fs::symlink_metadata(&source).unwrap();
+        assert!(should_skip_target(&source_meta, &target, true, false).unwrap());
+        assert!(should_skip_target(&source_meta, &target, true, true).unwrap());
+
+        let newer_target = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let older_source = newer_target - 5;
+        let times = [
+            libc::timespec {
+                tv_sec: older_source,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: older_source,
+                tv_nsec: 0,
+            },
+        ];
+        let source_c = std::ffi::CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+        let target_times = [
+            libc::timespec {
+                tv_sec: newer_target,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: newer_target,
+                tv_nsec: 0,
+            },
+        ];
+        let target_c = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+        let source_rc =
+            unsafe { libc::utimensat(libc::AT_FDCWD, source_c.as_ptr(), times.as_ptr(), 0) };
+        let target_rc =
+            unsafe { libc::utimensat(libc::AT_FDCWD, target_c.as_ptr(), target_times.as_ptr(), 0) };
+        assert_eq!(source_rc, 0, "source utimensat failed");
+        assert_eq!(target_rc, 0, "target utimensat failed");
+
+        let older_source_meta = fs::symlink_metadata(&source).unwrap();
+        assert!(should_skip_target(&older_source_meta, &target, false, true).unwrap());
+
+        let newer_source_times = [
+            libc::timespec {
+                tv_sec: newer_target + 5,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: newer_target + 5,
+                tv_nsec: 0,
+            },
+        ];
+        let source_rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                source_c.as_ptr(),
+                newer_source_times.as_ptr(),
+                0,
+            )
+        };
+        assert_eq!(source_rc, 0, "source utimensat failed");
+        let newer_source_meta = fs::symlink_metadata(&source).unwrap();
+        assert!(!should_skip_target(&newer_source_meta, &target, false, true).unwrap());
     }
 }

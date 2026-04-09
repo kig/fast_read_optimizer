@@ -131,7 +131,7 @@ dd        14/14 100%  remaining: none  help: ok
 du         6/6  100%  remaining: none  help: ok
 fgrep      9/9  100%  remaining: none  help: ok
 find       9/9  100%  remaining: none  help: ok
-head       4/4  100%  remaining: none  help: ok
+head       5/5  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
 mv         3/3  100%  remaining: none  help: ok
 rm         7/7  100%  remaining: none  help: ok
@@ -142,7 +142,7 @@ sha512sum 11/11 100%  remaining: none  help: ok
 shred      6/6  100%  remaining: none  help: ok
 sort       9/12  75%  remaining: -M, -V, -k  help: ok
 tac        2/2  100%  remaining: none  help: ok
-tail       4/4  100%  remaining: none  help: ok
+tail       5/5  100%  remaining: none  help: ok
 tar        5/5  100%  remaining: none  help: ok
 wc         6/6  100%  remaining: none  help: ok
 ";

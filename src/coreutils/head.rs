@@ -27,6 +27,22 @@ enum HeaderMode {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RecordTerminator {
+    #[default]
+    Newline,
+    Nul,
+}
+
+impl RecordTerminator {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Newline => b'\n',
+            Self::Nul => b'\0',
+        }
+    }
+}
+
 const HEAD_LINE_PREFIX_SCAN_BLOCK_SIZE: usize = 256 << 10;
 const HEAD_SMALL_STREAM_RAW_READ_BLOCK_SIZE: usize = 64 << 10;
 const HEAD_SMALL_STREAM_LINE_CUTOFF: u64 = 64;
@@ -95,7 +111,9 @@ fn parse_head_count(value: &str, flag: &str) -> io::Result<HeadCount> {
     })
 }
 
-fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<HeaderMode>)>> {
+fn parse_obsolete_head_arg(
+    arg: &str,
+) -> io::Result<Option<(HeadMode, Option<HeaderMode>, Option<RecordTerminator>)>> {
     let Some(rest) = arg.strip_prefix('-') else {
         return Ok(None);
     };
@@ -115,6 +133,7 @@ fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<Hea
 
     let mut mode = HeadMode::Lines(HeadCount::FromStart(count));
     let mut header_mode = None;
+    let mut terminator = None;
     for flag in rest[digit_end..].chars() {
         match flag.to_ascii_lowercase() {
             'c' => mode = HeadMode::Bytes(HeadCount::FromStart(count)),
@@ -152,6 +171,7 @@ fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<Hea
             }
             'q' => header_mode = Some(HeaderMode::Never),
             'v' => header_mode = Some(HeaderMode::Always),
+            'z' => terminator = Some(RecordTerminator::Nul),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -161,14 +181,22 @@ fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<Hea
         }
     }
 
-    Ok(Some((mode, header_mode)))
+    Ok(Some((mode, header_mode, terminator)))
 }
 
 fn parse_head_options(
     args: &[String],
-) -> io::Result<(IOMode, HeadMode, HeaderMode, bool, Vec<String>)> {
+) -> io::Result<(
+    IOMode,
+    HeadMode,
+    RecordTerminator,
+    HeaderMode,
+    bool,
+    Vec<String>,
+)> {
     let mut io_mode = IOMode::Auto;
     let mut mode = HeadMode::Lines(HeadCount::FromStart(10));
+    let mut terminator = RecordTerminator::Newline;
     let mut header_mode = HeaderMode::Auto;
     let mut report_gbps = false;
     let mut files = Vec::new();
@@ -181,6 +209,7 @@ fn parse_head_options(
             "--report-gbps" => report_gbps = true,
             "--quiet" | "--silent" => header_mode = HeaderMode::Never,
             "--verbose" => header_mode = HeaderMode::Always,
+            "-z" | "--zero-terminated" => terminator = RecordTerminator::Nul,
             "--lines" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -224,17 +253,22 @@ fn parse_head_options(
                 mode = HeadMode::Bytes(parse_head_count(&other["--bytes=".len()..], "--bytes")?);
             }
             other => {
-                if let Some((obsolete_mode, obsolete_header_mode)) = parse_obsolete_head_arg(other)?
+                if let Some((obsolete_mode, obsolete_header_mode, obsolete_terminator)) =
+                    parse_obsolete_head_arg(other)?
                 {
                     mode = obsolete_mode;
                     if let Some(header) = obsolete_header_mode {
                         header_mode = header;
+                    }
+                    if let Some(terminator_override) = obsolete_terminator {
+                        terminator = terminator_override;
                     }
                 } else if other.starts_with('-') && other != "-" {
                     for flag in other[1..].chars() {
                         match flag {
                             'q' => header_mode = HeaderMode::Never,
                             'v' => header_mode = HeaderMode::Always,
+                            'z' => terminator = RecordTerminator::Nul,
                             _ => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
@@ -250,7 +284,7 @@ fn parse_head_options(
         }
         i += 1;
     }
-    Ok((io_mode, mode, header_mode, report_gbps, files))
+    Ok((io_mode, mode, terminator, header_mode, report_gbps, files))
 }
 
 fn write_head_bytes_from_start<W: Write>(
@@ -378,15 +412,17 @@ fn write_head_lines_regular_input<W: Write>(
     out: &mut W,
     path: &str,
     remaining_lines: u64,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     let mut file = std::fs::File::open(path)?;
-    write_head_lines_reader(out, &mut file, remaining_lines)
+    write_head_lines_reader(out, &mut file, remaining_lines, terminator)
 }
 
 fn write_head_lines_reader<W: Write, R: Read>(
     out: &mut W,
     reader: &mut R,
     mut remaining_lines: u64,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     if remaining_lines == 0 {
         return Ok(());
@@ -398,7 +434,7 @@ fn write_head_lines_reader<W: Write, R: Read>(
             return Ok(());
         }
         let block = &buffer[..read];
-        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines) {
+        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines, terminator) {
             out.write_all(&block[..prefix_len])?;
             out.flush()?;
             return Ok(());
@@ -421,7 +457,10 @@ fn read_raw_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn write_head_lines_small_stdin_fast(remaining_lines: u64) -> io::Result<()> {
+fn write_head_lines_small_stdin_fast(
+    remaining_lines: u64,
+    terminator: RecordTerminator,
+) -> io::Result<()> {
     if remaining_lines == 0 {
         return Ok(());
     }
@@ -434,7 +473,7 @@ fn write_head_lines_small_stdin_fast(remaining_lines: u64) -> io::Result<()> {
             return Ok(());
         }
         let block = &buffer[..read];
-        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines) {
+        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines, terminator) {
             return write_raw_fd_all(libc::STDOUT_FILENO, &block[..prefix_len]);
         }
         write_raw_fd_all(libc::STDOUT_FILENO, block)?;
@@ -446,8 +485,12 @@ fn write_head_lines_small_stdin_fast(remaining_lines: u64) -> io::Result<()> {
     }
 }
 
-fn head_line_prefix_len(block: &[u8], remaining_lines: &mut u64) -> Option<usize> {
-    for newline_offset in memchr_iter(b'\n', block) {
+fn head_line_prefix_len(
+    block: &[u8],
+    remaining_lines: &mut u64,
+    terminator: RecordTerminator,
+) -> Option<usize> {
+    for newline_offset in memchr_iter(terminator.byte(), block) {
         *remaining_lines -= 1;
         if *remaining_lines == 0 {
             return Some(newline_offset + 1);
@@ -484,12 +527,14 @@ fn write_head_lines_all_but_last_regular_input<W: Write>(
     out: &mut W,
     path: &str,
     trim_lines: u64,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     let total_len = std::fs::metadata(path)?.len();
     let mut newline_offsets = Vec::new();
     visit_path_range_ordered(path, ByteRange::default(), |block_offset, block| {
-        newline_offsets
-            .extend(memchr_iter(b'\n', block).map(|offset| block_offset + offset as u64));
+        newline_offsets.extend(
+            memchr_iter(terminator.byte(), block).map(|offset| block_offset + offset as u64),
+        );
         Ok(OrderedVisitDecision::Continue)
     })?;
     let end = tail_line_start_offset(total_len, trim_lines, newline_offsets);
@@ -507,15 +552,16 @@ fn write_head_lines_from_start<W: Write>(
     out: &mut W,
     input: &StreamInput,
     remaining_lines: u64,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     match input {
         StreamInput::File(path) => {
             let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-            write_head_lines_reader(out, &mut reader, remaining_lines)
+            write_head_lines_reader(out, &mut reader, remaining_lines, terminator)
         }
         StreamInput::Stdin { .. } => {
             let mut reader = stdin_buf_reader()?;
-            write_head_lines_reader(out, &mut reader, remaining_lines)
+            write_head_lines_reader(out, &mut reader, remaining_lines, terminator)
         }
     }
 }
@@ -525,14 +571,17 @@ fn write_head_lines_all_but_last<W: Write>(
     input: &StreamInput,
     io_mode: IOMode,
     trim_lines: u64,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
-            return write_head_lines_all_but_last_regular_input(out, path, trim_lines);
+            return write_head_lines_all_but_last_regular_input(out, path, trim_lines, terminator);
         }
         StreamInput::Stdin { .. } => {
             if let Some(path) = regular_stdin_path()? {
-                return write_head_lines_all_but_last_regular_input(out, path, trim_lines);
+                return write_head_lines_all_but_last_regular_input(
+                    out, path, trim_lines, terminator,
+                );
             }
         }
         _ => {}
@@ -541,7 +590,7 @@ fn write_head_lines_all_but_last<W: Write>(
     let newline_offsets = bytes
         .iter()
         .enumerate()
-        .filter_map(|(offset, byte)| (*byte == b'\n').then_some(offset as u64));
+        .filter_map(|(offset, byte)| (*byte == terminator.byte()).then_some(offset as u64));
     let end = tail_line_start_offset(bytes.len() as u64, trim_lines, newline_offsets) as usize;
     out.write_all(&bytes[..end])
 }
@@ -549,9 +598,13 @@ fn write_head_lines_all_but_last<W: Write>(
 fn should_use_small_stream_stdout_fast_path(
     inputs: &[StreamInput],
     mode: HeadMode,
+    terminator: RecordTerminator,
     show_headers: bool,
 ) -> io::Result<bool> {
     if cfg!(test) {
+        return Ok(false);
+    }
+    if terminator != RecordTerminator::Newline {
         return Ok(false);
     }
     if show_headers {
@@ -573,14 +626,16 @@ fn should_use_small_stream_stdout_fast_path(
 }
 
 pub(super) fn run_head(args: &[String]) -> io::Result<()> {
-    let (io_mode, mode, header_mode, report_throughput, files) = parse_head_options(args)?;
+    let (io_mode, mode, terminator, header_mode, report_throughput, files) =
+        parse_head_options(args)?;
     let inputs = parse_stream_inputs(files);
     let show_headers = match header_mode {
         HeaderMode::Auto => inputs.len() > 1,
         HeaderMode::Always => true,
         HeaderMode::Never => false,
     };
-    if !report_throughput && should_use_small_stream_stdout_fast_path(&inputs, mode, show_headers)?
+    if !report_throughput
+        && should_use_small_stream_stdout_fast_path(&inputs, mode, terminator, show_headers)?
     {
         let [StreamInput::Stdin { .. }] = inputs.as_slice() else {
             unreachable!("small stream fast path requires a single stdin input");
@@ -588,7 +643,7 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
         let HeadMode::Lines(HeadCount::FromStart(lines)) = mode else {
             unreachable!("small stream fast path only supports line prefixes");
         };
-        return write_head_lines_small_stdin_fast(lines);
+        return write_head_lines_small_stdin_fast(lines, terminator);
     }
     let started_at = report_throughput.then(std::time::Instant::now);
     let mut total_output_bytes = 0_u64;
@@ -609,29 +664,29 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
                 HeadCount::FromStart(lines) => match input {
                     StreamInput::File(path) if is_regular_input_path(path)? => {
                         let mut counted = CountingWrite::new(&mut out);
-                        write_head_lines_regular_input(&mut counted, path, lines)?;
+                        write_head_lines_regular_input(&mut counted, path, lines, terminator)?;
                         counted.bytes_written()
                     }
                     StreamInput::Stdin { .. } => {
                         if let Some(path) = regular_stdin_path()? {
                             let mut counted = CountingWrite::new(&mut out);
-                            write_head_lines_regular_input(&mut counted, path, lines)?;
+                            write_head_lines_regular_input(&mut counted, path, lines, terminator)?;
                             counted.bytes_written()
                         } else {
                             let mut counted = CountingWrite::new(&mut out);
-                            write_head_lines_from_start(&mut counted, input, lines)?;
+                            write_head_lines_from_start(&mut counted, input, lines, terminator)?;
                             counted.bytes_written()
                         }
                     }
                     _ => {
                         let mut counted = CountingWrite::new(&mut out);
-                        write_head_lines_from_start(&mut counted, input, lines)?;
+                        write_head_lines_from_start(&mut counted, input, lines, terminator)?;
                         counted.bytes_written()
                     }
                 },
                 HeadCount::AllButLast(lines) => {
                     let mut counted = CountingWrite::new(&mut out);
-                    write_head_lines_all_but_last(&mut counted, input, io_mode, lines)?;
+                    write_head_lines_all_but_last(&mut counted, input, io_mode, lines, terminator)?;
                     counted.bytes_written()
                 }
             },
