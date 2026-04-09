@@ -11,6 +11,7 @@ use iou::sqe::SpliceFlags;
 use iou::IoUring;
 use memchr::{memchr_iter, memmem::Finder};
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,6 +30,7 @@ mod du;
 mod encrypt;
 mod fgrep;
 mod find;
+mod gzip;
 mod hash;
 mod head;
 mod io_helpers;
@@ -49,6 +51,8 @@ pub(crate) use base64::{
     parse_base64_decode_kernel, parse_base64_encode_kernel, Base64DecodeKernel, Base64EncodeKernel,
 };
 const FRO_VERSION: &str = env!("CARGO_PKG_VERSION");
+const NO_FALLBACK_FLAG: &str = "--no-fallback";
+const FALLBACK_LOG_ENV: &str = "FRO_LOG_FALLBACKS";
 const STREAM_WINDOW_BLOCK_SIZE: usize = 1 << 20;
 
 pub fn is_coreutils_command(name: &str) -> bool {
@@ -63,6 +67,9 @@ pub fn is_coreutils_command(name: &str) -> bool {
             | "fgrep"
             | "find"
             | "du"
+            | "gzip"
+            | "gunzip"
+            | "zcat"
             | "tac"
             | "wc"
             | "cksum"
@@ -140,6 +147,32 @@ fn multicall_short_help_is_real_flag(invoked: &str, arg: Option<&String>) -> boo
     invoked == "sort" && matches!(arg.map(String::as_str), Some("-h"))
 }
 
+pub(crate) fn args_request_no_fallback(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == NO_FALLBACK_FLAG)
+}
+
+fn strip_wrapper_only_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != NO_FALLBACK_FLAG)
+        .cloned()
+        .collect()
+}
+
+fn fallback_logging_enabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        !normalized.is_empty()
+            && normalized != "0"
+            && normalized != "false"
+            && normalized != "no"
+            && normalized != "off"
+    })
+}
+
+fn fallback_logging_enabled() -> bool {
+    fallback_logging_enabled_from_value(env::var(FALLBACK_LOG_ENV).ok().as_deref())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalFallbackCommand {
     Ripgrep,
@@ -166,9 +199,21 @@ impl ExternalFallbackCommand {
                 command_args.extend(forwarded);
                 ("coreutils".to_string(), command_args)
             }
-            ExternalFallbackCommand::SystemCommand => (invoked.to_string(), forwarded),
+            ExternalFallbackCommand::SystemCommand => {
+                (resolve_system_command_path(invoked), forwarded)
+            }
         }
     }
+}
+
+fn resolve_system_command_path(invoked: &str) -> String {
+    for prefix in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let candidate = Path::new(prefix).join(invoked);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    invoked.to_string()
 }
 
 fn fallback_candidates(invoked: &str) -> &'static [ExternalFallbackCommand] {
@@ -178,9 +223,9 @@ fn fallback_candidates(invoked: &str) -> &'static [ExternalFallbackCommand] {
             ExternalFallbackCommand::UutilsCoreutils,
             ExternalFallbackCommand::SystemCommand,
         ],
-        "cat" | "base64" | "cmp" | "dd" | "du" | "find" | "tac" | "wc" | "cksum" | "b2sum"
-        | "md5sum" | "sha224sum" | "sha256sum" | "sha384sum" | "sha512sum" | "head" | "tail"
-        | "rm" | "mv" | "tar" | "shred" | "sort" | "cp" => &[
+        "cat" | "base64" | "cmp" | "dd" | "du" | "find" | "gzip" | "gunzip" | "zcat" | "tac"
+        | "wc" | "cksum" | "b2sum" | "md5sum" | "sha224sum" | "sha256sum" | "sha384sum"
+        | "sha512sum" | "head" | "tail" | "rm" | "mv" | "tar" | "shred" | "sort" | "cp" => &[
             ExternalFallbackCommand::UutilsCoreutils,
             ExternalFallbackCommand::SystemCommand,
         ],
@@ -212,10 +257,14 @@ fn stderr_indicates_option_parse_failure(stderr: &[u8]) -> bool {
         || lowered.contains("unrecognized subcommand")
 }
 
-fn run_external_fallback(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
+fn run_external_fallback(
+    invoked: &str,
+    args: &[String],
+    failure_reason: Option<&str>,
+) -> io::Result<Option<i32>> {
     for candidate in fallback_candidates(invoked) {
         let (program, command_args) = candidate.build(invoked, args);
-        let child = match Command::new(program)
+        let child = match Command::new(&program)
             .args(&command_args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
@@ -232,6 +281,18 @@ fn run_external_fallback(invoked: &str, args: &[String]) -> io::Result<Option<i3
         {
             continue;
         }
+        if fallback_logging_enabled() {
+            match failure_reason {
+                Some(reason) => eprintln!(
+                    "fro: fallback {} -> {} {:?} ({})",
+                    invoked, program, command_args, reason
+                ),
+                None => eprintln!(
+                    "fro: fallback {} -> {} {:?}",
+                    invoked, program, command_args
+                ),
+            }
+        }
         io::stdout().write_all(&output.stdout)?;
         io::stderr().write_all(&output.stderr)?;
         return Ok(Some(output.status.code().unwrap_or(1)));
@@ -243,7 +304,11 @@ pub(crate) fn try_external_command_fallback(
     invoked: &str,
     args: &[String],
 ) -> io::Result<Option<i32>> {
-    run_external_fallback(invoked, args)
+    if args_request_no_fallback(args) {
+        return Ok(None);
+    }
+    let sanitized_args = strip_wrapper_only_args(args);
+    run_external_fallback(invoked, &sanitized_args, None)
 }
 
 fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
@@ -363,17 +428,19 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
     let Some(invoked) = invoked_name(args.first().map(String::as_str).unwrap_or_default()) else {
         return Ok(None);
     };
+    let allow_fallback = !args_request_no_fallback(args);
+    let sanitized_args = strip_wrapper_only_args(args);
     if let Some(help_name) = multicall_help_command(&invoked) {
-        if is_multicall_help_flag(args.get(1)) {
+        if is_multicall_help_flag(sanitized_args.get(1)) {
             crate::main_app::print_direct_command_help(&invoked, help_name);
             return Ok(Some(0));
         }
-        if is_multicall_version_flag(args.get(1)) {
+        if is_multicall_version_flag(sanitized_args.get(1)) {
             print_coreutils_version(&invoked);
             return Ok(Some(0));
         }
     }
-    run_named_command(&invoked, args)
+    run_named_command(&invoked, &sanitized_args, allow_fallback)
 }
 
 #[cfg(test)]
@@ -443,6 +510,36 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn strip_wrapper_only_args_removes_no_fallback() {
+        assert_eq!(
+            strip_wrapper_only_args(&[
+                "fro sort".to_string(),
+                "--no-fallback".to_string(),
+                "-k".to_string(),
+                "1,1".to_string(),
+            ]),
+            vec!["fro sort".to_string(), "-k".to_string(), "1,1".to_string()]
+        );
+    }
+
+    #[test]
+    fn fallback_logging_truthy_values_are_opt_in() {
+        assert!(fallback_logging_enabled_from_value(Some("1")));
+        assert!(fallback_logging_enabled_from_value(Some("yes")));
+        assert!(!fallback_logging_enabled_from_value(Some("0")));
+        assert!(!fallback_logging_enabled_from_value(Some("false")));
+        assert!(!fallback_logging_enabled_from_value(None));
+    }
+
+    #[test]
+    fn resolve_system_command_path_leaves_unknown_names_unchanged() {
+        assert_eq!(
+            resolve_system_command_path("__fro_missing_coreutil__"),
+            "__fro_missing_coreutil__"
+        );
+    }
 }
 
 pub fn try_run_subcommand(
@@ -453,10 +550,12 @@ pub fn try_run_subcommand(
     if !is_coreutils_command(command) {
         return Ok(None);
     }
-    let mut args = Vec::with_capacity(command_args.len() + 1);
+    let allow_fallback = !args_request_no_fallback(command_args);
+    let sanitized_command_args = strip_wrapper_only_args(command_args);
+    let mut args = Vec::with_capacity(sanitized_command_args.len() + 1);
     args.push(format!("{program} {command}"));
-    args.extend(command_args.iter().cloned());
-    run_named_command(command, &args)
+    args.extend(sanitized_command_args);
+    run_named_command(command, &args, allow_fallback)
 }
 
 pub(crate) fn bench_base64_encode(iterations: u64, kernel: Base64EncodeKernel) -> io::Result<()> {
@@ -482,7 +581,11 @@ pub(crate) fn bench_base64_wrapped_decode(iterations: u64, ignore_garbage: bool)
     base64::bench_base64_wrapped_decode(iterations, ignore_garbage)
 }
 
-fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
+fn run_named_command(
+    invoked: &str,
+    args: &[String],
+    allow_fallback: bool,
+) -> io::Result<Option<i32>> {
     if !is_coreutils_command(invoked) {
         return Ok(None);
     }
@@ -512,6 +615,7 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         "fgrep" => fgrep::run_fgrep(args),
         "find" => find::run_find(args),
         "du" => du::run_du(args),
+        "gzip" | "gunzip" | "zcat" => gzip::run_gzip(invoked, args),
         "tac" => {
             tac::run_tac(args)?;
             Ok(0)
@@ -546,8 +650,8 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
     };
     match result {
         Ok(code) => Ok(Some(code)),
-        Err(err) if should_try_external_fallback(&err) => {
-            if let Some(code) = run_external_fallback(invoked, args)? {
+        Err(err) if allow_fallback && should_try_external_fallback(&err) => {
+            if let Some(code) = run_external_fallback(invoked, args, Some(&err.to_string()))? {
                 Ok(Some(code))
             } else {
                 Err(err)

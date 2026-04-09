@@ -164,12 +164,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "gzip" => Some(CommandHelp {
             name: "gzip",
             usage: "gzip [-d] [-c] [-k] [-f] [-1..-9] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file]",
-            summary: "Experimental gzip-compatible compressor/decompressor using mgzip output and rapidgzip decode.",
+            summary: "Experimental gzip-compatible compressor/decompressor using mgzip output and an mgzip-aware fast decode path.",
             notes: &[
                 "This bounded slice focuses on one input at a time, fast file decompression, and basic gzip/gunzip/zcat flows instead of full GNU gzip parity.",
-                "Compression writes mgzip-compatible gzip members via gzp; decompression uses rapidgzip when the rapidgzip-backend feature is enabled, otherwise it falls back to a standard multi-member gzip reader.",
+                "Compression writes mgzip-compatible gzip members via gzp; decompression uses gzp's parallel mgzip reader for mgzip streams and falls back to the standard multi-member gzip reader for generic gzip inputs.",
                 "Regular-file compression inputs use fro's ordered block visitor; regular-file decompression outputs use fro's buffered file writer.",
-                "--auto/--no-direct/--direct control fro's compression-side input reads; on rapidgzip decompression they map to native auto/sequential/pread compressed-input modes rather than true O_DIRECT.",
+                "--auto/--no-direct/--direct currently affect the compression-side fro input path only; decompression does not yet route compressed-input reads through fro's direct/page-cache selectors.",
                 "Without -c/--stdout or -o/--output, gzip writes FILE.gz, gunzip writes FILE with a .gz suffix stripped, and default in-place conversions remove the source unless -k is used.",
                 "--report-gbps reports compression throughput in uncompressed input bytes/s and decompression throughput in emitted output bytes/s.",
             ],
@@ -183,11 +183,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "gunzip" => Some(CommandHelp {
             name: "gunzip",
             usage: "gunzip [-c] [-k] [-f] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
-            summary: "Experimental gzip-compatible decompressor alias backed by rapidgzip when enabled.",
+            summary: "Experimental gzip-compatible decompressor alias with an mgzip-aware fast path.",
             notes: &[
                 "gunzip is the same bounded experimental implementation as gzip -d.",
-                "Regular-file outputs use fro's buffered writer; regular-file inputs use rapidgzip's native file reader when available.",
-                "--auto/--no-direct/--direct map to rapidgzip auto/sequential/pread compressed-input modes instead of true O_DIRECT.",
+                "Regular-file outputs use fro's buffered writer; mgzip streams use gzp's parallel mgzip decompressor, while generic gzip streams fall back to the standard reader.",
+                "--auto/--no-direct/--direct are currently compression-side flags and do not retune decompression input reads.",
             ],
             examples: &[
                 ("Decompress one archive in place", "gunzip payload.bin.gz"),
@@ -197,7 +197,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "zcat" => Some(CommandHelp {
             name: "zcat",
             usage: "zcat [--threads N] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
-            summary: "Experimental gzip-compatible stdout decompressor alias backed by rapidgzip when enabled.",
+            summary: "Experimental gzip-compatible stdout decompressor alias with an mgzip-aware fast path.",
             notes: &[
                 "zcat is equivalent to the bounded experimental gzip -dc path.",
                 "It keeps the input file and always writes decompressed bytes to stdout.",

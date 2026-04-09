@@ -294,7 +294,9 @@ pub const ROWS: &[CoverageRow] = &[
     },
 ];
 
-pub const EXCLUDED_CUSTOM_MULTICALLS: &[&str] = &["b3sum", "decrypt", "encrypt", "pv"];
+pub const EXCLUDED_CUSTOM_MULTICALLS: &[&str] = &[
+    "b3sum", "decrypt", "encrypt", "gzip", "gunzip", "pv", "zcat",
+];
 
 pub fn row_for(name: &str) -> Option<&'static CoverageRow> {
     let canonical = match name {
