@@ -18,7 +18,10 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 ### P0: high-use utility families where I/O + parallelism can move the needle
 
 - [ ] `cat` / `read` / `head` / `tail`: keep the plain byte-copy and range fast paths hot; for the small-cutoff streamed-stdin `head -n` case, the remaining gap is currently diagnosed as process-startup/runtime-init dominated rather than a `head` helper issue, so avoid speculative path rewrites unless a shared startup reduction lands.
+  - [x] The `coreutils-flags.txt`-driven alias-help slice landed: multicall aliases now handle `bin/* --help` / `--version` consistently and print the utility name instead of internal names like `copy` or `bin/find`.
+  - [ ] Re-evaluate bounded `head` / `tail` `-z` support after the alias-help surface is fixed, since the dump currently mixes real `-z` feature gaps with broken `--help` dispatch.
 - [ ] `rm` / recursive delete: make large-tree deletion a first-class perf target alongside correctness/parity coverage, since it is heavily used and shares traversal/scheduling machinery with other tree tools.
+  - [x] A bounded GNU interactive slice landed for `rm -i`, `rm -I`, and `rm --interactive[=WHEN]`, bringing the tracked `rm` row to `7/7` while keeping non-interactive flows on the existing fast path.
 - [ ] `find` / `du`: keep pushing the directory-walk scheduler and metadata batching, because traversal wins compound into multiple multicall tools.
   - [ ] Fast traversal of every byte in a directory tree.
   - [ ] Revisit `io_uring` dirwalk once the environment exposes `IORING_OP_GETDENTS` / usable Rust bindings.
@@ -28,7 +31,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] `cp` / `mv` / `dd`: keep investing in the shared copy/write pipeline and finish the highest-value compatibility slices that preserve the optimized backend instead of exploding the long-tail flag matrix.
   - [ ] `cp`/`fro copy`: prioritize `--archive` / preserve-metadata flows, dereference/no-dereference choices, and other path-preserving behavior that matters for real recursive copies.
   - [ ] `mv`: keep the same-fs fast path and cross-fs copy+remove path healthy; treat the observed ZFS-specific anomaly as background investigation, not active front-of-queue work.
-- [ ] `sort`: try a bounded newline-delimited `sort` slice with a fast radix path for bytewise/default cases, and benchmark it against system `sort` before expanding semantics.
+- [ ] `sort`: keep extending the bounded newline/NUL-delimited sort backend one compare mode at a time instead of jumping to full GNU semantics; the tracked row is now `9/12`, with `-M`, `-V`, and `-k` remaining after landing `-z` plus `-g/-h`.
 - [ ] `wc` / checksum family: prioritize the common byte/line/word/count and `md5sum`-style integrity flows that directly reuse fast read/hash primitives; long-tail digest-CLI parity can wait behind those wins.
 
 ### P1: tuning, config selection, and benchmark safety
@@ -50,6 +53,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] Add fuzz targets for config/manifest parsing plus model-based fuzzing of read/write/copy/hash orchestration on small files.
 - [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani) for arithmetic and partition helpers. Targeted Miri-safe tests now cover `common::AlignedBuffer` page-backed storage and `reader` destination-slice construction; executing them still requires a nightly toolchain with the `miri` component installed. Current Kani slices prove `io_util::expected_read_len()` matches its `min(file_size - offset, block_size)` contract, rejects offsets past EOF, and is monotonic in offset, and also prove the `find`/`du` permission-classification and `du` node-completion helpers used by the dirwalk error-handling path.
 - [ ] Build a real-world compatibility matrix over file kind, access surface, and permission mode; run the meaningful Cartesian-product cases and assert documented success/failure behavior for each. The first automated slice now covers local `read_file`, `write_file`, and `copy_file` API behavior for regular files, directories, symlinks, and permission-gated paths on ordinary local temp-directory filesystems.
+- [x] Keep a tracked flag/help regression in place for implemented multicall utilities. `tests/compat_coverage_report.rs` now checks the tracked compatibility snapshot, compares `fro <util> --help` against system `--help` for the tracked GNU/coreutils slice, and requires `FIXME:` notes for current incompatibilities; use `coreutils-flags.txt` dumps to prioritize the next bounded slices outside that tracked surface.
 - [ ] Build a manual validation matrix for single NVMe, md RAID0, dm-crypt, tmpfs, and network filesystems.
 - [ ] Extend performance-path verification beyond `wc` so `fgrep`, `cp`, and `cat` path-preserving flag slices each have at least one helper/backend-selection assertion.
 - [ ] Decide whether the public Rust API should stay explicitly UTF-8-only long-term or grow raw `Path`/`OsStr` support deeper than the current documented contract.
@@ -59,9 +63,11 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] For each implemented high-use utility, only grow flag compatibility when the flag preserves or clearly composes with the optimized backend; pair behavior-parity coverage with at least one performance-path verification step whenever that should be true.
 - [ ] `find`: prioritize the common traversal / predicate / action slices needed for real tree-walk replacement before exotic expression coverage.
 - [ ] `cp`: prioritize archive/preserve/dereference semantics used in real recursive-copy workflows before low-frequency compatibility corners.
+- [ ] `mv`: prioritize path-preserving common GNU slices from the flag dump (`-n/--no-clobber`, `-u/--update`) before backup/context long-tail options.
 - [ ] `wc`: prioritize `--bytes`, `--lines`, and `--words` because they align with the existing fast scan path and observed usage.
 - [ ] `md5sum` / shared digest UX: keep the ordinary output/check flows polished before spending time on long-tail `b2sum` / `b3sum` flags.
 - [ ] `grep` / `fgrep`: keep moving toward a more complete high-performance literal-search tool, using `rg` libraries where practical, but do not let it crowd out the higher-use file-movement and tree-walk work above.
+- [ ] `sort`: the next bounded gaps exposed by both compat coverage and the help dump are now `-M`, `-V`, and `-k`; prefer compare-mode-friendly semantics before key extraction, and keep `fro sort -h` reserved for human-numeric sort while `fro sort --help` remains the explicit help path.
 
 ### P2: transform-style helpers and lower-frequency but strategic work
 
