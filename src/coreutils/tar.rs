@@ -7,6 +7,18 @@ enum TarMode {
     Extract,
 }
 
+fn infer_tar_compression(archive: &str, gzip_requested: bool) -> crate::main_app::TarCompression {
+    if gzip_requested {
+        return crate::main_app::TarCompression::Gzip;
+    }
+    let archive = archive.to_ascii_lowercase();
+    if archive.ends_with(".tar.gz") || archive.ends_with(".tgz") {
+        crate::main_app::TarCompression::Gzip
+    } else {
+        crate::main_app::TarCompression::None
+    }
+}
+
 fn set_tar_mode(mode: &mut Option<TarMode>, next: TarMode) -> io::Result<()> {
     match mode {
         Some(current) if *current != next => Err(io::Error::new(
@@ -26,6 +38,7 @@ fn parse_short_tar_flags(
     index: &mut usize,
     mode: &mut Option<TarMode>,
     verbose: &mut bool,
+    gzip: &mut bool,
     archive: &mut Option<String>,
     extract_dir: &mut Option<String>,
 ) -> io::Result<()> {
@@ -37,6 +50,7 @@ fn parse_short_tar_flags(
             't' => set_tar_mode(mode, TarMode::List)?,
             'x' => set_tar_mode(mode, TarMode::Extract)?,
             'v' => *verbose = true,
+            'z' => *gzip = true,
             'f' => {
                 if pos + 1 < chars.len() {
                     *archive = Some(chars[pos + 1..].iter().collect());
@@ -83,6 +97,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut mode = None;
     let mut verbose = false;
+    let mut gzip = false;
     let mut archive: Option<String> = None;
     let mut extract_dir: Option<String> = None;
     let mut paths = Vec::new();
@@ -101,6 +116,8 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             set_tar_mode(&mut mode, TarMode::Extract)?;
         } else if !end_flags && arg == "--verbose" {
             verbose = true;
+        } else if !end_flags && matches!(arg.as_str(), "--gzip" | "--gunzip" | "--ungzip") {
+            gzip = true;
         } else if !end_flags && arg == "--file" {
             i += 1;
             archive = Some(
@@ -128,6 +145,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
                 &mut i,
                 &mut mode,
                 &mut verbose,
+                &mut gzip,
                 &mut archive,
                 &mut extract_dir,
             )?;
@@ -141,10 +159,11 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "Usage: {program} (-cf <archive.tar> <source> | -tf[v] <archive.tar> | -xf[v] <archive.tar> [-C <dir>])"
+                "Usage: {program} (-c[fz] <archive.tar[.gz]> <source> | -t[fvz] <archive.tar[.gz]> | -x[fvz] <archive.tar[.gz]> [-C <dir>])"
             ),
         )
     })?;
+    let compression = infer_tar_compression(&archive, gzip);
 
     if extract_dir.is_some() && !matches!(mode, Some(TarMode::Extract)) {
         return Err(io::Error::new(
@@ -158,13 +177,14 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             if paths.len() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Usage: {program} -cf <archive.tar> <source>"),
+                    format!("Usage: {program} -c[fz] <archive.tar[.gz]> <source>"),
                 ));
             }
             crate::main_app::create_tar_archive(
                 Path::new(&paths[0]),
                 Path::new(&archive),
                 verbose,
+                compression,
             )?;
         }
         Some(TarMode::List) => {
@@ -174,7 +194,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
                     "tar list mode currently supports only whole-archive listing",
                 ));
             }
-            crate::main_app::list_tar_archive(Path::new(&archive), verbose)?;
+            crate::main_app::list_tar_archive(Path::new(&archive), verbose, compression)?;
         }
         Some(TarMode::Extract) => {
             if !paths.is_empty() {
@@ -187,6 +207,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
                 Path::new(&archive),
                 extract_dir.as_deref().map(Path::new),
                 verbose,
+                compression,
             )?;
         }
         None => {

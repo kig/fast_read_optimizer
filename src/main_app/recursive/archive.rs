@@ -2,7 +2,10 @@ use super::*;
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::{self, IOParams};
 use crate::io_util::{sync_parent_directory, sync_path};
+use crate::main_app::TarCompression;
 use crate::writer::{copy_file_range_threaded, OffsetWriter};
+use flate2::read::MultiGzDecoder;
+use gzp::{deflate::Mgzip, ZBuilder};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -247,8 +250,102 @@ pub(crate) fn create_uncompressed_tar(
     Ok(total_size)
 }
 
+fn gzip_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().saturating_sub(1).min(8))
+        .unwrap_or(0)
+}
+
+fn gzp_error(err: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("mgzip error: {err}"))
+}
+
+#[cfg(feature = "rapidgzip-backend")]
+fn open_gzip_archive(path: &Path) -> io::Result<Box<dyn Read>> {
+    Ok(Box::new(rapidgzip::Reader::open(path)?))
+}
+
+#[cfg(not(feature = "rapidgzip-backend"))]
+fn open_gzip_archive(path: &Path) -> io::Result<Box<dyn Read>> {
+    Ok(Box::new(MultiGzDecoder::new(fs::File::open(path)?)))
+}
+
+fn write_tar_stream<W: Write + ?Sized>(entries: &[TarEntry], writer: &mut W) -> io::Result<u64> {
+    let mut total_bytes = 0_u64;
+    let mut copy_buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
+    let zero_block = [0u8; TAR_BLOCK_SIZE as usize];
+    for entry in entries {
+        let header = tar_header_bytes(entry)?;
+        writer.write_all(&header)?;
+        total_bytes = total_bytes.saturating_add(TAR_BLOCK_SIZE);
+        if let TarEntryKind::RegularFile { size, source_path } = &entry.kind {
+            let mut source = fs::File::open(source_path)?;
+            let mut remaining = *size;
+            while remaining > 0 {
+                let chunk = remaining.min(copy_buffer.len() as u64) as usize;
+                let read = source.read(&mut copy_buffer[..chunk])?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "short tar source read after {} of {} bytes from {}",
+                            size.saturating_sub(remaining),
+                            size,
+                            source_path.display()
+                        ),
+                    ));
+                }
+                writer.write_all(&copy_buffer[..read])?;
+                remaining = remaining.saturating_sub(read as u64);
+                total_bytes = total_bytes.saturating_add(read as u64);
+            }
+            let padding = align_up(*size, TAR_BLOCK_SIZE).saturating_sub(*size);
+            if padding > 0 {
+                writer.write_all(&zero_block[..padding as usize])?;
+                total_bytes = total_bytes.saturating_add(padding);
+            }
+        }
+    }
+    let eof_blocks = [0u8; TAR_EOF_BLOCKS as usize];
+    writer.write_all(&eof_blocks)?;
+    Ok(total_bytes.saturating_add(TAR_EOF_BLOCKS))
+}
+
+pub(crate) fn create_gzip_tar(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
+    let (entries, logical_size) = collect_tar_manifest(source, output)?;
+    let output_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output)?;
+    let mut writer = ZBuilder::<Mgzip, fs::File>::new()
+        .num_threads(gzip_threads())
+        .from_writer(output_file);
+    let tar_bytes = write_tar_stream(&entries, &mut *writer)?;
+    let output_file = writer.finish().map_err(gzp_error)?;
+    output_file.sync_all()?;
+    sync_path(output)?;
+    sync_parent_directory(output)?;
+    let archive_bytes = output_file.metadata()?.len();
+    if verbose {
+        eprintln!(
+            "tar create (gzip): entries={}, tar_bytes={}, archive_bytes={}, manifest_total={}",
+            entries.len(),
+            tar_bytes,
+            archive_bytes,
+            logical_size
+        );
+    }
+    Ok(archive_bytes)
+}
+
 pub(crate) fn list_uncompressed_tar(path: &Path, verbose: bool) -> io::Result<()> {
     reader::list_tar_archive(path, verbose)
+}
+
+pub(crate) fn list_gzip_tar(path: &Path, verbose: bool) -> io::Result<()> {
+    let mut reader = open_gzip_archive(path)?;
+    reader::list_tar_archive_reader(&mut reader, path, verbose)
 }
 
 pub(crate) fn extract_uncompressed_tar(
@@ -257,4 +354,48 @@ pub(crate) fn extract_uncompressed_tar(
     verbose: bool,
 ) -> io::Result<()> {
     reader::extract_tar_archive(path, destination, verbose)
+}
+
+pub(crate) fn extract_gzip_tar(
+    path: &Path,
+    destination: Option<&Path>,
+    verbose: bool,
+) -> io::Result<()> {
+    let mut reader = open_gzip_archive(path)?;
+    reader::extract_tar_archive_reader(&mut reader, path, destination, verbose)
+}
+
+pub(crate) fn create_tar_archive(
+    source: &Path,
+    output: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<u64> {
+    match compression {
+        TarCompression::None => create_uncompressed_tar(source, output, verbose),
+        TarCompression::Gzip => create_gzip_tar(source, output, verbose),
+    }
+}
+
+pub(crate) fn list_tar_archive(
+    path: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<()> {
+    match compression {
+        TarCompression::None => list_uncompressed_tar(path, verbose),
+        TarCompression::Gzip => list_gzip_tar(path, verbose),
+    }
+}
+
+pub(crate) fn extract_tar_archive(
+    path: &Path,
+    destination: Option<&Path>,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<()> {
+    match compression {
+        TarCompression::None => extract_uncompressed_tar(path, destination, verbose),
+        TarCompression::Gzip => extract_gzip_tar(path, destination, verbose),
+    }
 }

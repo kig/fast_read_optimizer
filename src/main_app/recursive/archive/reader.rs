@@ -250,19 +250,36 @@ fn write_verbose_entry(stdout: &mut dyn Write, entry: &TarArchiveEntry) -> io::R
     stdout.write_all(b"\n")
 }
 
-pub(super) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
-    let mut file = fs::File::open(path)?;
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+fn discard_reader_bytes<R: Read + ?Sized>(reader: &mut R, remaining: u64) -> io::Result<()> {
+    let mut remaining = remaining;
+    let mut buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated tar payload while discarding bytes",
+            ));
+        }
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    Ok(())
+}
 
+fn visit_tar_archive<R, F>(reader: &mut R, archive_path: &Path, mut visit: F) -> io::Result<()>
+where
+    R: Read + ?Sized,
+    F: FnMut(&TarArchiveEntry, &mut R) -> io::Result<u64>,
+{
     loop {
         let mut header = [0u8; 512];
-        match file.read_exact(&mut header) {
+        match reader.read_exact(&mut header) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("truncated tar header in {}", path.display()),
+                    format!("truncated tar header in {}", archive_path.display()),
                 ))
             }
             Err(err) => return Err(err),
@@ -272,22 +289,73 @@ pub(super) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
             break;
         }
 
-        let data_offset = file.stream_position()?;
-        let entry = parse_tar_header(&header, data_offset)?;
+        let entry = parse_tar_header(&header, 0)?;
+        let consumed = visit(&entry, reader)?;
+        if consumed > entry.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tar visitor consumed more payload bytes than the entry contains",
+            ));
+        }
+        let to_discard = align_up(entry.size, TAR_BLOCK_SIZE).saturating_sub(consumed);
+        discard_reader_bytes(reader, to_discard)?;
+    }
+
+    Ok(())
+}
+
+fn copy_reader_member_to_file<R: Read + ?Sized>(
+    reader: &mut R,
+    destination_path: &Path,
+    size: u64,
+) -> io::Result<()> {
+    if let Some(parent) = destination_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut destination = fs::File::create(destination_path)?;
+    let mut remaining = size;
+    let mut buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "truncated tar payload while extracting {}",
+                    destination_path.display()
+                ),
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    Ok(())
+}
+
+pub(super) fn list_tar_archive_reader<R: Read + ?Sized>(
+    reader: &mut R,
+    archive_path: &Path,
+    verbose: bool,
+) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    visit_tar_archive(reader, archive_path, |entry, _reader| {
         if verbose {
             write_verbose_entry(&mut stdout, &entry)?;
         } else {
             write_plain_entry(&mut stdout, &entry)?;
         }
+        Ok(0)
+    })
+}
 
-        let skip = align_up(entry.size, TAR_BLOCK_SIZE);
-        let next_offset = file.stream_position()?.checked_add(skip).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "tar entry offset overflow")
-        })?;
-        file.seek(SeekFrom::Start(next_offset))?;
-    }
-
-    Ok(())
+pub(super) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
+    let mut file = fs::File::open(path)?;
+    list_tar_archive_reader(&mut file, path, verbose)
 }
 
 fn sanitized_tar_path(path: &[u8]) -> io::Result<PathBuf> {
@@ -535,5 +603,102 @@ pub(super) fn extract_tar_archive(
         apply_directory_metadata(&path, mode, mtime)?;
     }
 
+    Ok(())
+}
+
+pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
+    reader: &mut R,
+    archive_path: &Path,
+    destination: Option<&Path>,
+    verbose: bool,
+) -> io::Result<()> {
+    let destination_root = destination.unwrap_or_else(|| Path::new("."));
+    let destination_meta = fs::metadata(destination_root).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "tar extract destination {} is not accessible: {err}",
+                destination_root.display()
+            ),
+        )
+    })?;
+    if !destination_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tar extract destination must be a directory: {}",
+                destination_root.display()
+            ),
+        ));
+    }
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    let mut directory_entries = Vec::new();
+    visit_tar_archive(reader, archive_path, |entry, reader| {
+        let relative_path = sanitized_tar_path(&entry.path)?;
+        let target_path = destination_root.join(&relative_path);
+        let consumed = match entry.typeflag {
+            0 | b'0' => {
+                if relative_path.as_os_str().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tar regular-file entry resolved to an empty extraction path",
+                    ));
+                }
+                copy_reader_member_to_file(reader, &target_path, entry.size)?;
+                apply_regular_file_metadata(&target_path, entry)?;
+                entry.size
+            }
+            b'5' => {
+                if !relative_path.as_os_str().is_empty() {
+                    fs::create_dir_all(&target_path)?;
+                    directory_entries.push((target_path.clone(), entry.mode, entry.mtime));
+                }
+                0
+            }
+            b'2' => {
+                if relative_path.as_os_str().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tar symlink entry resolved to an empty extraction path",
+                    ));
+                }
+                if let Some(parent) = target_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                let link_target = std::ffi::OsString::from_vec(entry.link_target.clone());
+                if fs::symlink_metadata(&target_path).is_ok() {
+                    fs::remove_file(&target_path)?;
+                }
+                symlink(&link_target, &target_path)?;
+                set_extracted_mtime(&target_path, entry.mtime, true)?;
+                0
+            }
+            typeflag => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "tar extract currently supports only regular files, directories, and symlinks; found typeflag {:?} for {}",
+                        typeflag as char,
+                        String::from_utf8_lossy(&entry.path)
+                    ),
+                ))
+            }
+        };
+
+        if verbose {
+            stdout.write_all(&entry.path)?;
+            stdout.write_all(b"\n")?;
+        }
+        Ok(consumed)
+    })?;
+
+    directory_entries.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
+    for (path, mode, mtime) in directory_entries {
+        apply_directory_metadata(&path, mode, mtime)?;
+    }
     Ok(())
 }

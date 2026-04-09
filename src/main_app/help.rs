@@ -161,6 +161,49 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Decode one file", "base64 -d payload.b64"),
             ],
         }),
+        "gzip" => Some(CommandHelp {
+            name: "gzip",
+            usage: "gzip [-d] [-c] [-k] [-f] [-1..-9] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file]",
+            summary: "Experimental gzip-compatible compressor/decompressor using mgzip output and rapidgzip decode.",
+            notes: &[
+                "This bounded slice focuses on one input at a time, fast file decompression, and basic gzip/gunzip/zcat flows instead of full GNU gzip parity.",
+                "Compression writes mgzip-compatible gzip members via gzp; decompression uses rapidgzip when the rapidgzip-backend feature is enabled, otherwise it falls back to a standard multi-member gzip reader.",
+                "Regular-file compression inputs use fro's ordered block visitor; regular-file decompression outputs use fro's buffered file writer.",
+                "--auto/--no-direct/--direct control fro's compression-side input reads; on rapidgzip decompression they map to native auto/sequential/pread compressed-input modes rather than true O_DIRECT.",
+                "Without -c/--stdout or -o/--output, gzip writes FILE.gz, gunzip writes FILE with a .gz suffix stripped, and default in-place conversions remove the source unless -k is used.",
+                "--report-gbps reports compression throughput in uncompressed input bytes/s and decompression throughput in emitted output bytes/s.",
+            ],
+            examples: &[
+                ("Compress one file in place", "gzip payload.bin"),
+                ("Keep the source and write an explicit archive", "gzip -k -o payload.bin.gz payload.bin"),
+                ("Decompress one archive into a named file", "gzip -d -k -o payload.bin payload.bin.gz"),
+                ("Stream decompressed output to stdout", "gzip -dc payload.bin.gz"),
+            ],
+        }),
+        "gunzip" => Some(CommandHelp {
+            name: "gunzip",
+            usage: "gunzip [-c] [-k] [-f] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
+            summary: "Experimental gzip-compatible decompressor alias backed by rapidgzip when enabled.",
+            notes: &[
+                "gunzip is the same bounded experimental implementation as gzip -d.",
+                "Regular-file outputs use fro's buffered writer; regular-file inputs use rapidgzip's native file reader when available.",
+                "--auto/--no-direct/--direct map to rapidgzip auto/sequential/pread compressed-input modes instead of true O_DIRECT.",
+            ],
+            examples: &[
+                ("Decompress one archive in place", "gunzip payload.bin.gz"),
+                ("Keep the source and write to stdout", "gunzip -ck payload.bin.gz"),
+            ],
+        }),
+        "zcat" => Some(CommandHelp {
+            name: "zcat",
+            usage: "zcat [--threads N] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
+            summary: "Experimental gzip-compatible stdout decompressor alias backed by rapidgzip when enabled.",
+            notes: &[
+                "zcat is equivalent to the bounded experimental gzip -dc path.",
+                "It keeps the input file and always writes decompressed bytes to stdout.",
+            ],
+            examples: &[("Print one archive", "zcat payload.bin.gz")],
+        }),
         "encrypt" => Some(CommandHelp {
             name: "encrypt",
             usage: "encrypt --passphrase-file PATH [--cipher NAME] [-o file] [input]",
@@ -380,18 +423,21 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tar" => Some(CommandHelp {
             name: "tar",
-            usage: "tar (-cf <archive.tar> [-v] <source> | -tf[v] <archive.tar> | -xf[v] <archive.tar> [-C dir])",
-            summary: "Create, list, or extract an uncompressed ustar archive.",
+            usage: "tar (-c[fz] <archive.tar[.gz]> [-v] <source> | -t[fvz] <archive.tar[.gz]> | -x[fvz] <archive.tar[.gz]> [-C dir])",
+            summary: "Create, list, or extract ustar archives; .tar.gz/.tgz is experimental.",
             notes: &[
                 "Supported compatibility slice: create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) with -f/--file.",
+                "Experimental gzip support accepts -z/--gzip/--gunzip/--ungzip or auto-detects .tar.gz/.tgz archives; decompression uses rapidgzip and create uses mgzip-compatible output via gzp.",
                 "-v/--verbose keeps create-side progress reporting, enables GNU-style verbose output for listing, and prints extracted member names during extract.",
-                "FIXME: Extract currently targets uncompressed regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
-                "FIXME: Compression, stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
+                "FIXME: Extract currently targets regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
+                "FIXME: Compression is currently limited to gzip, uses a sequential tar writer on create, and does not yet preserve the uncompressed fast-path copy engine through compressed extraction.",
+                "FIXME: stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
             ],
             examples: &[
                 ("Archive one directory", "tar -cf tree.tar mytree"),
+                ("Archive one directory as gzip", "tar -czf tree.tar.gz mytree"),
                 ("List one archive verbosely", "tar -tvf tree.tar"),
-                ("Extract one archive into a directory", "tar -xf tree.tar -C out"),
+                ("Extract one gzip archive into a directory", "tar -xzf tree.tar.gz -C out"),
             ],
         }),
         "shred" => Some(CommandHelp {
@@ -909,6 +955,10 @@ pub(super) fn print_general_help(program: &str) {
         ("cat", "print files using the fro read path"),
         ("base64", "encode or decode base64 data"),
         (
+            "gzip",
+            "experimental mgzip/rapidgzip gzip compatibility slice",
+        ),
+        (
             "encrypt",
             "encrypt data via the in-process OpenSSL library path",
         ),
@@ -1023,6 +1073,7 @@ pub(super) fn print_general_help(program: &str) {
     println!("Common flags:");
     println!("  --auto | --no-direct | --direct");
     println!("  --auto-write | --no-direct-write | --direct-write");
+    println!("  --no-fallback     disable external fallback for unsupported multicall flags");
     println!("  -n <iterations>    use -n 1 for one measured run with current tuned params");
     println!("  -s, --save         save tuned params when forcing --direct or --no-direct");
     println!("  -c, --config PATH  override config path");
@@ -1040,5 +1091,8 @@ pub(super) fn print_general_help(program: &str) {
     println!();
     println!(
         "Config resolution (when -c is not provided): $FRO_CONFIG, then ~/.fro/fro.json, then /etc/fro.json"
+    );
+    println!(
+        "Fallback logging: set $FRO_LOG_FALLBACKS=1 to log each external delegation on stderr"
     );
 }

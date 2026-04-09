@@ -8,16 +8,21 @@ edition = "2021"
 [features]
 default = []
 read-phase-timing = []
+rapidgzip-backend = ["dep:rapidgzip"]
 
 [dependencies]
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
+bytemuck = { version = "1.21", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 crc-fast = "1.10.0"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+gzp = { version = "2.0.2", default-features = false, features = ["deflate_rust"] }
 io-uring = "0.7.11"
 iou = "0.3.3"
 libc = "0.2.137"
 memchr = "2.5"
 openssl = "0.10"
 rand = "0.10.0"
+rapidgzip = { version = "1.2.1", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
@@ -25,7 +30,6 @@ stringzilla = "4.6.0"
 unicode-width = "0.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zstd = "0.13"
-bytemuck = { version = "1.21", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 
 [dev-dependencies]
 proptest = "1"

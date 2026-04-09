@@ -64,6 +64,12 @@ const RECURSIVE_COPY_MAX_LARGE_WORKERS: usize = 4;
 const RECURSIVE_COPY_SMALL_WORKERS: usize = 32;
 const THROUGHPUT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TarCompression {
+    None,
+    Gzip,
+}
+
 #[derive(Clone)]
 struct RecursiveCopyContext {
     config: config::LoadedConfig,
@@ -434,20 +440,30 @@ pub(crate) fn move_directory_cross_filesystem(
     recursive::move_dir::run_recursive_move(recursive_ctx, verbose)
 }
 
-pub(crate) fn create_tar_archive(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
-    recursive::archive::create_uncompressed_tar(source, output, verbose)
+pub(crate) fn create_tar_archive(
+    source: &Path,
+    output: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<u64> {
+    recursive::archive::create_tar_archive(source, output, verbose, compression)
 }
 
-pub(crate) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
-    recursive::archive::list_uncompressed_tar(path, verbose)
+pub(crate) fn list_tar_archive(
+    path: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<()> {
+    recursive::archive::list_tar_archive(path, verbose, compression)
 }
 
 pub(crate) fn extract_tar_archive(
     path: &Path,
     destination: Option<&Path>,
     verbose: bool,
+    compression: TarCompression,
 ) -> io::Result<()> {
-    recursive::archive::extract_uncompressed_tar(path, destination, verbose)
+    recursive::archive::extract_tar_archive(path, destination, verbose, compression)
 }
 
 pub(crate) fn bench_tar_archive(
