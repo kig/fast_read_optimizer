@@ -155,10 +155,11 @@ fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
                 rewritten.push("--cp-no-target-directory".to_string())
             }
             "-u" | "--update" => rewritten.push("--cp-update".to_string()),
-            "-p" | "--preserve" | "--preserve=mode,ownership,timestamps" => {
+            "-p" | "--preserve" => rewritten.push("--cp-preserve".to_string()),
+            "-P" | "--no-dereference" => rewritten.push("--cp-no-dereference".to_string()),
+            long if cp_preserve_attr_list_supported(long) => {
                 rewritten.push("--cp-preserve".to_string())
             }
-            "-P" | "--no-dereference" => rewritten.push("--cp-no-dereference".to_string()),
             short if short.starts_with('-') && !short.starts_with("--") && short.len() > 2 => {
                 if let Some((expanded, consumed_next)) =
                     rewrite_cp_short_flag_cluster(short, command_args.get(index + 1))
@@ -175,6 +176,24 @@ fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
         index += 1;
     }
     rewritten
+}
+
+fn cp_preserve_attr_list_supported(arg: &str) -> bool {
+    let Some(attrs) = arg.strip_prefix("--preserve=") else {
+        return false;
+    };
+    if attrs.is_empty() {
+        return false;
+    }
+    let mut saw_timestamps = false;
+    for attr in attrs.split(',') {
+        match attr {
+            "timestamps" => saw_timestamps = true,
+            "mode" | "ownership" => {}
+            _ => return false,
+        }
+    }
+    saw_timestamps
 }
 
 fn rewrite_cp_short_flag_cluster(
@@ -218,6 +237,51 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
         return Ok(None);
     };
     run_named_command(&invoked, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_cp_supports_timestamp_preserve_attr_lists() {
+        let rewritten = rewrite_cp_command_args(&[
+            "--preserve=timestamps".to_string(),
+            "--preserve=mode,timestamps".to_string(),
+            "--preserve=timestamps,ownership".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "--cp-preserve".to_string(),
+                "--cp-preserve".to_string(),
+                "--cp-preserve".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_cp_leaves_unsupported_preserve_attr_lists_untouched() {
+        let rewritten = rewrite_cp_command_args(&[
+            "--preserve=mode".to_string(),
+            "--preserve=context".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "--preserve=mode".to_string(),
+                "--preserve=context".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
 }
 
 pub fn try_run_subcommand(

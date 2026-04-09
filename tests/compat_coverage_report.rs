@@ -107,6 +107,7 @@ const ROWS: &[CoverageRow] = &[
             "-T/--no-target-directory",
             "-t/--target-directory",
             "-p/--preserve",
+            "--preserve=timestamps",
             "-P/--no-dereference",
             "-v/--verbose",
         ],
@@ -346,7 +347,7 @@ b2sum     11/11 100%  remaining: none
 cat       10/10 100%  remaining: none
 cksum      7/7  100%  remaining: none
 cmp        5/5  100%  remaining: none
-cp         9/9  100%  remaining: none
+cp        10/10 100%  remaining: none
 dd        14/14 100%  remaining: none
 du         6/6  100%  remaining: none
 fgrep      9/9  100%  remaining: none

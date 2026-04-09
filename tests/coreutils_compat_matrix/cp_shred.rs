@@ -491,6 +491,123 @@ fn cp_preserve_matches_system_for_recursive_timestamps() {
 }
 
 #[test]
+fn cp_preserve_timestamps_attr_list_matches_system() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = unique_temp_dir("fro-coreutils-cp-preserve-timestamps");
+
+    for flags in io_flag_sets() {
+        let suffix = if flags.is_empty() {
+            "auto".to_string()
+        } else {
+            flags.join("_").replace("--", "")
+        };
+
+        let source = tmp.join(format!("timestamps-source-{suffix}.txt"));
+        let fro_target = tmp.join(format!("timestamps-fro-{suffix}.txt"));
+        let sys_target = tmp.join(format!("timestamps-sys-{suffix}.txt"));
+        fs::write(&source, b"preserve-timestamps").unwrap();
+        set_file_mtime(&source, 1_700_215_000);
+
+        let mut fro_args = flags.clone();
+        fro_args.extend([
+            "--preserve=timestamps",
+            source.to_str().unwrap(),
+            fro_target.to_str().unwrap(),
+        ]);
+        let sys_args = [
+            "--preserve=timestamps",
+            source.to_str().unwrap(),
+            sys_target.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_args),
+            run_system("cp", &sys_args),
+            &format!("cp preserve timestamps {:?}", fro_args),
+        );
+        assert_eq!(
+            fs::read(&fro_target).unwrap(),
+            fs::read(&sys_target).unwrap()
+        );
+        let fro_meta = fs::metadata(&fro_target).unwrap();
+        let sys_meta = fs::metadata(&sys_target).unwrap();
+        assert_eq!(fro_meta.mtime(), sys_meta.mtime());
+        assert_eq!(fro_meta.mtime_nsec(), sys_meta.mtime_nsec());
+
+        let source_root = tmp.join(format!("timestamps-tree-src-{suffix}"));
+        let fro_dest_parent = tmp.join(format!("timestamps-tree-fro-{suffix}"));
+        let sys_dest_parent = tmp.join(format!("timestamps-tree-sys-{suffix}"));
+        let nested = source_root.join("nested/deeper");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&fro_dest_parent).unwrap();
+        fs::create_dir_all(&sys_dest_parent).unwrap();
+
+        let file = source_root.join("small.txt");
+        let nested_dir = source_root.join("nested");
+        let link = nested_dir.join("link-small");
+        fs::write(&file, b"alpha\nbeta\n").unwrap();
+        fs::write(nested.join("large.bin"), b"payload").unwrap();
+        symlink("../small.txt", &link).unwrap();
+
+        set_file_mtime(&file, 1_700_215_010);
+        set_file_mtime(&nested.join("large.bin"), 1_700_215_020);
+        set_file_mtime(&nested_dir, 1_700_215_030);
+        set_file_mtime(&source_root, 1_700_215_040);
+        set_symlink_mtime(&link, 1_700_215_050);
+
+        let mut fro_recursive_args = flags.clone();
+        fro_recursive_args.extend([
+            "-rP",
+            "--preserve=mode,timestamps",
+            source_root.to_str().unwrap(),
+            fro_dest_parent.to_str().unwrap(),
+        ]);
+        let sys_recursive_args = [
+            "-rP",
+            "--preserve=mode,timestamps",
+            source_root.to_str().unwrap(),
+            sys_dest_parent.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("cp", &fro_recursive_args),
+            run_system("cp", &sys_recursive_args),
+            &format!("cp preserve attr-list recursive {:?}", fro_recursive_args),
+        );
+
+        let copied_name = source_root.file_name().unwrap();
+        let fro_root = fro_dest_parent.join(copied_name);
+        let sys_root = sys_dest_parent.join(copied_name);
+        assert_eq!(snapshot_tree(&fro_root), snapshot_tree(&sys_root));
+
+        for rel in [
+            std::path::Path::new("small.txt"),
+            std::path::Path::new("nested"),
+            std::path::Path::new("nested/deeper/large.bin"),
+        ] {
+            let fro_meta = fs::metadata(fro_root.join(rel)).unwrap();
+            let sys_meta = fs::metadata(sys_root.join(rel)).unwrap();
+            assert_eq!(
+                fro_meta.mtime(),
+                sys_meta.mtime(),
+                "mtime mismatch for {:?}",
+                rel
+            );
+            assert_eq!(
+                fro_meta.mtime_nsec(),
+                sys_meta.mtime_nsec(),
+                "mtime_nsec mismatch for {:?}",
+                rel
+            );
+        }
+
+        let fro_link_meta = fs::symlink_metadata(fro_root.join("nested/link-small")).unwrap();
+        let sys_link_meta = fs::symlink_metadata(sys_root.join("nested/link-small")).unwrap();
+        assert_eq!(fro_link_meta.mtime(), sys_link_meta.mtime());
+        assert_eq!(fro_link_meta.mtime_nsec(), sys_link_meta.mtime_nsec());
+    }
+}
+
+#[test]
 fn cp_archive_matches_system_for_recursive_timestamps() {
     use std::os::unix::fs::MetadataExt;
 

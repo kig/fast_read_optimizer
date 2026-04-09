@@ -393,7 +393,7 @@ fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
             configure: |args, _source, _target| args.verbose = true,
         },
         Case {
-            name: "preserve",
+            name: "preserve-timestamps",
             configure: |args, source, _target| {
                 args.cp_preserve = true;
                 set_path_mtime(source, 1_234_567_890);

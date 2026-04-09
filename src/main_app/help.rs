@@ -433,7 +433,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
-                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and -p/--preserve (mode+timestamps for recursive and regular copies; ownership is not preserved) compatibility flags.",
+                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and preserve compatibility flags: -p/--preserve plus timestamp-bearing --preserve=... attr lists such as --preserve=timestamps or --preserve=mode,timestamps (ownership is not preserved).",
             ],
             examples: &[
                 (
