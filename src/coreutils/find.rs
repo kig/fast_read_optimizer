@@ -1,6 +1,39 @@
 use super::*;
+use std::sync::Mutex;
 
 const FIND_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
+const FIND_STDOUT_BUFFER_BYTES: usize = 2 << 20;
+
+struct FindOutput {
+    inner: Mutex<std::io::BufWriter<std::io::Stdout>>,
+}
+
+impl FindOutput {
+    fn stdout() -> Self {
+        Self {
+            inner: Mutex::new(std::io::BufWriter::with_capacity(
+                FIND_STDOUT_BUFFER_BYTES,
+                std::io::stdout(),
+            )),
+        }
+    }
+
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("find output writer lock poisoned"))?;
+        inner.write_all(bytes)
+    }
+
+    fn flush(self) -> io::Result<()> {
+        let mut inner = self
+            .inner
+            .into_inner()
+            .map_err(|_| io::Error::other("find output writer lock poisoned"))?;
+        inner.flush()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum FindFileType {
@@ -122,13 +155,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
     }
     let (roots, plan) = parse_find_args(args)?;
     let worker_count = parallel_find_worker_count();
-    let config = load_config(None);
-    let write_params = config.get_params("write", false);
-    let output = Arc::new(BufWriter::stdout(
-        write_params.qd,
-        write_params.block_size,
-        worker_count.saturating_mul(2),
-    )?);
+    let output = Arc::new(FindOutput::stdout());
     let queue = Arc::new(WorkQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
     let had_warnings = Arc::new(AtomicBool::new(false));
@@ -164,7 +191,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
     })?;
     let output = Arc::into_inner(output)
         .ok_or_else(|| io::Error::other("find output writer still has active references"))?;
-    output.into_inner()?;
+    output.flush()?;
     Ok(if had_warnings.load(Ordering::SeqCst) {
         1
     } else {
@@ -175,7 +202,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
 fn walk_find_subtree(
     start_dir: FindTask,
     queue: &WorkQueue<FindTask>,
-    output: &BufWriter,
+    output: &FindOutput,
     stop: &AtomicBool,
     had_warnings: &AtomicBool,
     plan: &FindPlan,
@@ -392,7 +419,7 @@ fn print_find_help(program: &str) {
     println!("  -h, --help         display this help and exit");
 }
 
-fn write_find_path(output: &BufWriter, path: &Path, output_delimiter: u8) -> io::Result<()> {
+fn write_find_path(output: &FindOutput, path: &Path, output_delimiter: u8) -> io::Result<()> {
     let mut chunk = Vec::with_capacity(path.as_os_str().as_bytes().len() + 1);
     append_find_path(&mut chunk, path, output_delimiter);
     output.write_all(&chunk)
