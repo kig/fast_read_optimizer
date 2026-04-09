@@ -3,6 +3,7 @@ mod common;
 mod config;
 mod coreutils;
 mod differ;
+mod help_compat;
 mod io_util;
 mod main_app;
 mod mincore;

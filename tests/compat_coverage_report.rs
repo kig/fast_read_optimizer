@@ -1,289 +1,14 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
+use std::process::Command;
 
-#[derive(Clone, Copy)]
-struct CoverageRow {
-    name: &'static str,
-    covered: &'static [&'static str],
-    remaining: &'static [&'static str],
-}
+#[path = "../src/help_compat.rs"]
+mod help_compat;
 
-impl CoverageRow {
-    fn total(self) -> usize {
-        self.covered.len() + self.remaining.len()
-    }
-
-    fn percent(self) -> usize {
-        let total = self.total();
-        if total == 0 {
-            100
-        } else {
-            (self.covered.len() * 100 + total / 2) / total
-        }
-    }
-
-    fn remaining_text(self) -> String {
-        if self.remaining.is_empty() {
-            "none".to_string()
-        } else {
-            self.remaining.join(", ")
-        }
-    }
-}
-
-const DIGEST_COVERED: &[&str] = &[
-    "(default)",
-    "-b/--binary",
-    "-t/--text",
-    "--tag",
-    "-z/--zero",
-    "-c/--check",
-    "--quiet",
-    "--status",
-    "-w/--warn",
-    "--strict",
-    "--ignore-missing",
-];
-
-const ROWS: &[CoverageRow] = &[
-    CoverageRow {
-        name: "base64",
-        covered: &["-d/--decode", "-i/--ignore-garbage", "-w/--wrap"],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "b2sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "cat",
-        covered: &[
-            "-n/--number",
-            "-b/--number-nonblank",
-            "-s/--squeeze-blank",
-            "-E/--show-ends",
-            "-T/--show-tabs",
-            "-v/--show-nonprinting",
-            "-A/--show-all",
-            "-e",
-            "-t",
-            "-u",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "cksum",
-        covered: &[
-            "(default)",
-            "-c/--check",
-            "--quiet",
-            "--status",
-            "-w/--warn",
-            "--strict",
-            "--ignore-missing",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "cmp",
-        covered: &[
-            "-s/--quiet/--silent",
-            "-l/--verbose",
-            "-b/--print-bytes",
-            "-n/--bytes",
-            "-i/--ignore-initial",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "cp",
-        covered: &[
-            "-a/--archive",
-            "-r/-R",
-            "-n/--no-clobber",
-            "-u/--update",
-            "-T/--no-target-directory",
-            "-t/--target-directory",
-            "-p/--preserve",
-            "--preserve=timestamps",
-            "-P/--no-dereference",
-            "-v/--verbose",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "dd",
-        covered: &[
-            "bs=",
-            "count=",
-            "skip=",
-            "seek=",
-            "iflag=count_bytes",
-            "iflag=skip_bytes",
-            "oflag=seek_bytes",
-            "conv=notrunc",
-            "conv=fsync",
-            "iflag=direct",
-            "oflag=direct",
-            "status=none",
-            "status=noxfer",
-            "status=progress",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "du",
-        covered: &[
-            "-s/--summarize",
-            "-a/--all",
-            "-h/--human-readable",
-            "-c/--total",
-            "-S/--separate-dirs",
-            "-d/--max-depth",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "fgrep",
-        covered: &[
-            "-F/--fixed-strings",
-            "-n/--line-number",
-            "-x/--line-regexp",
-            "-i/--ignore-case",
-            "--no-ignore-case",
-            "-c/--count",
-            "-v/--invert-match",
-            "-e/--regexp",
-            "-f/--file",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "find",
-        covered: &[
-            "(default)",
-            "-maxdepth",
-            "-type",
-            "-name",
-            "-iname",
-            "-path",
-            "-ipath",
-            "-print",
-            "-print0",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "head",
-        covered: &[
-            "-n/--lines",
-            "-c/--bytes",
-            "-q/--quiet/--silent",
-            "-v/--verbose",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "md5sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "mv",
-        covered: &[
-            "-v/--verbose",
-            "-t/--target-directory",
-            "-T/--no-target-directory",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "rm",
-        covered: &[
-            "-d/--dir",
-            "-f/--force",
-            "-r/-R/--recursive",
-            "-v/--verbose",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "sha224sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "sha256sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "sha384sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "sha512sum",
-        covered: DIGEST_COVERED,
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "shred",
-        covered: &["-n", "-s/--size", "-z", "-u", "-f/--force", "-v/--verbose"],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "sort",
-        covered: &[
-            "(default bytewise ascending)",
-            "-m/-c",
-            "-n/--numeric-sort",
-            "-r/--reverse",
-            "-u/--unique",
-            "-z/--zero-terminated",
-            "-o/--output",
-            "-T/--temporary-directory",
-        ],
-        remaining: &["-g/-h", "-M", "-V", "-k"],
-    },
-    CoverageRow {
-        name: "tac",
-        covered: &["(default)", "--"],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "tail",
-        covered: &["-n", "-c", "-q", "-v"],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "tar",
-        covered: &[
-            "-c/--create",
-            "-f/--file",
-            "-t/--list",
-            "-v/--verbose",
-            "-x/--extract",
-        ],
-        remaining: &[],
-    },
-    CoverageRow {
-        name: "wc",
-        covered: &[
-            "-l/--lines",
-            "-w/--words",
-            "-m/--chars",
-            "-c/--bytes",
-            "-L/--max-line-length",
-            "--files0-from",
-        ],
-        remaining: &[],
-    },
-];
-
-const EXCLUDED_CUSTOM_MULTICALLS: &[&str] = &["b3sum", "decrypt", "encrypt", "pv"];
+use help_compat::{
+    parse_help_flag_tokens, tracked_help_tokens, CoverageRow, EXCLUDED_CUSTOM_MULTICALLS, ROWS,
+};
 
 fn render_report() -> String {
     let mut out = String::from(
@@ -291,15 +16,68 @@ fn render_report() -> String {
     );
     for row in ROWS {
         out.push_str(&format!(
-            "{:<9} {:>2}/{:<2} {:>3}%  remaining: {}\n",
+            "{:<9} {:>2}/{:<2} {:>3}%  remaining: {}  help: {}\n",
             row.name,
             row.covered.len(),
             row.total(),
             row.percent(),
-            row.remaining_text()
+            row.remaining_text(),
+            help_superset_status(*row)
         ));
     }
     out
+}
+
+fn help_superset_status(row: CoverageRow) -> String {
+    let missing = missing_help_tokens(row);
+    if missing.is_empty() {
+        "ok".to_string()
+    } else {
+        format!("missing: {}", missing.join(", "))
+    }
+}
+
+fn missing_help_tokens(row: CoverageRow) -> Vec<String> {
+    let fro_tokens = parse_help_flag_tokens(&fro_help_text(row.name));
+    let system_tokens = parse_help_flag_tokens(&system_help_text(row.name));
+    let tracked = tracked_help_tokens(row);
+    system_tokens
+        .intersection(&tracked)
+        .filter(|token| !fro_tokens.contains(*token))
+        .cloned()
+        .collect()
+}
+
+fn fro_help_text(command: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .arg(command)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run fro {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fro {command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("fro help should be UTF-8")
+}
+
+fn system_help_text(command: &str) -> String {
+    let output = Command::new(command)
+        .env("LC_ALL", "C")
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("system help should be UTF-8")
 }
 
 fn dispatched_compat_commands() -> BTreeSet<&'static str> {
@@ -343,30 +121,30 @@ fn compat_coverage_report_matches_snapshot() {
     let expected = "# multicall compat coverage
 # tracked surface = canonical compat items from existing help/parser/tests
 # excluded custom multicalls: b3sum, decrypt, encrypt, pv
-base64     3/3  100%  remaining: none
-b2sum     11/11 100%  remaining: none
-cat       10/10 100%  remaining: none
-cksum      7/7  100%  remaining: none
-cmp        5/5  100%  remaining: none
-cp        10/10 100%  remaining: none
-dd        14/14 100%  remaining: none
-du         6/6  100%  remaining: none
-fgrep      9/9  100%  remaining: none
-find       9/9  100%  remaining: none
-head       4/4  100%  remaining: none
-md5sum    11/11 100%  remaining: none
-mv         3/3  100%  remaining: none
-rm         4/4  100%  remaining: none
-sha224sum 11/11 100%  remaining: none
-sha256sum 11/11 100%  remaining: none
-sha384sum 11/11 100%  remaining: none
-sha512sum 11/11 100%  remaining: none
-shred      6/6  100%  remaining: none
-sort       8/12  67%  remaining: -g/-h, -M, -V, -k
-tac        2/2  100%  remaining: none
-tail       4/4  100%  remaining: none
-tar        5/5  100%  remaining: none
-wc         6/6  100%  remaining: none
+base64     3/3  100%  remaining: none  help: ok
+b2sum     11/11 100%  remaining: none  help: ok
+cat       10/10 100%  remaining: none  help: ok
+cksum      7/7  100%  remaining: none  help: ok
+cmp        5/5  100%  remaining: none  help: ok
+cp        10/10 100%  remaining: none  help: ok
+dd        14/14 100%  remaining: none  help: ok
+du         6/6  100%  remaining: none  help: ok
+fgrep      9/9  100%  remaining: none  help: ok
+find       9/9  100%  remaining: none  help: ok
+head       4/4  100%  remaining: none  help: ok
+md5sum    11/11 100%  remaining: none  help: ok
+mv         3/3  100%  remaining: none  help: ok
+rm         4/4  100%  remaining: none  help: ok
+sha224sum 11/11 100%  remaining: none  help: ok
+sha256sum 11/11 100%  remaining: none  help: ok
+sha384sum 11/11 100%  remaining: none  help: ok
+sha512sum 11/11 100%  remaining: none  help: ok
+shred      6/6  100%  remaining: none  help: ok
+sort       8/12  67%  remaining: -g/-h, -M, -V, -k  help: ok
+tac        2/2  100%  remaining: none  help: ok
+tail       4/4  100%  remaining: none  help: ok
+tar        5/5  100%  remaining: none  help: ok
+wc         6/6  100%  remaining: none  help: ok
 ";
 
     assert_eq!(report, expected);
@@ -380,18 +158,70 @@ fn compat_coverage_rows_match_dispatch_minus_custom_multicalls() {
 }
 
 #[test]
-fn compat_coverage_explicit_gap_rows_match_source_help() {
-    let sort_source = include_str!("../src/coreutils/sort.rs");
-    assert!(sort_source.contains("Unsupported GNU sort features currently return an error"));
-    assert!(sort_source.contains("general keys, month/version/human modes, and locale collation."));
-
-    let tar_source = include_str!("../src/coreutils/tar.rs");
-    assert!(tar_source.contains("whole-archive extract (-x/--extract) modes"));
-    assert!(
-        tar_source.contains("tar extract mode currently supports only whole-archive extraction")
+fn compat_help_token_parser_handles_alias_lists_and_dd_operands() {
+    let parsed = parse_help_flag_tokens(
+        "  -q, --quiet, --silent\n  --output=FILE\n  --check=diagnose-first\n  iflag=count_bytes\n  skip_bytes\n  status=none\n  FIXME: tracked GNU/coreutils flags not yet supported in this slice: -g/-h, -M, -V, -k\n",
     );
+    let expected = BTreeSet::from([
+        "--check".to_string(),
+        "--check=diagnose-first".to_string(),
+        "--output".to_string(),
+        "--quiet".to_string(),
+        "--silent".to_string(),
+        "-M".to_string(),
+        "-V".to_string(),
+        "-g".to_string(),
+        "-h".to_string(),
+        "-k".to_string(),
+        "-q".to_string(),
+        "count_bytes".to_string(),
+        "iflag=count_bytes".to_string(),
+        "none".to_string(),
+        "skip_bytes".to_string(),
+        "status=none".to_string(),
+    ]);
+    assert_eq!(parsed, expected);
+}
+
+#[test]
+fn compat_help_superset_matches_tracked_system_flags() {
+    for row in ROWS {
+        let missing = missing_help_tokens(*row);
+        assert!(
+            missing.is_empty(),
+            "{} fro help is missing tracked system flags: {}",
+            row.name,
+            missing.join(", ")
+        );
+    }
+}
+
+#[test]
+fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
+    let cp_help = fro_help_text("cp");
+    assert!(cp_help.contains("FIXME:"));
+    assert!(cp_help.contains("ownership is not preserved"));
+
+    let sort_help = fro_help_text("sort");
+    assert!(sort_help.contains("FIXME:"));
+    assert!(sort_help.contains("-g/-h, -M, -V, -k"));
+
+    let tar_help = fro_help_text("tar");
+    assert!(tar_help.contains("FIXME:"));
+    assert!(tar_help.contains("whole-archive"));
+}
+
+#[test]
+fn compat_coverage_explicit_gap_rows_match_source_help() {
+    let help_source = include_str!("../src/main_app/help.rs");
+    assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
+    assert!(help_source.contains("month/version/human modes"));
+    assert!(help_source
+        .contains("FIXME: Extract currently targets uncompressed regular-file archives"));
+    assert!(help_source.contains("FIXME: When invoked via the cp multicall alias"));
 
     let find_source = include_str!("../src/coreutils/find.rs");
-    assert!(find_source
-        .contains("-print             print each matching path followed by a newline (default)"));
+    assert!(
+        find_source.contains("-print             print each matching path followed by a newline (default)")
+    );
 }

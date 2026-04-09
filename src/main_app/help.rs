@@ -1,6 +1,7 @@
 mod hash;
 
 use super::*;
+use crate::help_compat::help_section_lines;
 #[derive(Clone, Copy)]
 pub(super) struct CommandHelp {
     name: &'static str,
@@ -299,7 +300,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "-c/--check validates one input stream and exits 1 on the first disorder; with -u it requires strict key ordering.",
                 "-n/--numeric-sort compares the leading numeric prefix of each line (optional blanks, optional '-', digits, optional fractional part) and otherwise falls back to bytewise line order unless -u suppresses the last-resort tie break.",
                 "Bytewise in-memory sorting uses a StringZilla argsort fast path; oversized inputs spill sorted runs and merge them back out-of-core.",
-                "Unsupported GNU sort features currently return an error, including general keys, month/version/human modes, and locale collation.",
+                "FIXME: Unsupported GNU sort features currently return an error, including general keys, month/version/human modes, and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],
             examples: &[
@@ -370,8 +371,8 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             notes: &[
                 "Supported compatibility slice: create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) with -f/--file.",
                 "-v/--verbose keeps create-side progress reporting, enables GNU-style verbose output for listing, and prints extracted member names during extract.",
-                "Extract currently targets uncompressed regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
-                "Compression, stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
+                "FIXME: Extract currently targets uncompressed regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
+                "FIXME: Compression, stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
             ],
             examples: &[
                 ("Archive one directory", "tar -cf tree.tar mytree"),
@@ -433,7 +434,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
-                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and preserve compatibility flags: -p/--preserve plus timestamp-bearing --preserve=... attr lists such as --preserve=timestamps or --preserve=mode,timestamps (ownership is not preserved).",
+                "FIXME: When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and preserve compatibility flags: -p/--preserve plus timestamp-bearing --preserve=... attr lists such as --preserve=timestamps or --preserve=mode,timestamps, but ownership is not preserved.",
             ],
             examples: &[
                 (
@@ -810,6 +811,13 @@ pub(super) fn print_command_help(program: &str, help: CommandHelp) {
         println!("NOTES:");
         for note in help.notes {
             println!("  - {}", note);
+        }
+    }
+    if let Some(lines) = help_section_lines(help.name) {
+        println!();
+        println!("COMPAT:");
+        for line in lines {
+            println!("  - {}", line);
         }
     }
     if !help.examples.is_empty() {
