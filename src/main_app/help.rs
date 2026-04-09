@@ -288,18 +288,18 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "sort" => Some(CommandHelp {
             name: "sort",
-            usage: "sort [-c|--check] [-m|--merge] [-n|--numeric-sort] [-r|--reverse] [-u|--unique] [-o FILE|--output=FILE] [-T DIR|--temporary-directory=DIR] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
-            summary: "Sort newline-delimited records in locale-independent ascending byte or numeric order.",
+            usage: "sort [-c|--check] [-m|--merge] [-n|--numeric-sort] [-r|--reverse] [-u|--unique] [-z|--zero-terminated] [-o FILE|--output=FILE] [-T DIR|--temporary-directory=DIR] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
+            summary: "Sort locale-independent records in ascending byte or numeric order, using newlines by default and NULs with -z.",
             notes: &[
-                "This bounded slice implements the default bytewise newline-delimited case plus merge/check, C-locale-style numeric prefix ordering, reverse/unique output, -o output-file writes, and -T spill-directory selection.",
+                "This bounded slice implements the default bytewise newline-delimited case plus -z NUL-terminated records, merge/check, C-locale-style numeric prefix ordering, reverse/unique output, -o output-file writes, and -T spill-directory selection.",
                 "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
-                "-o writes after all input has been read, so in-place rewrites like `sort -o file file` stay on the same newline-delimited backend.",
+                "-o writes after all input has been read, so in-place rewrites like `sort -o file file` stay on the same backend.",
                 "-T/--temporary-directory only matters when the out-of-core spill/merge backend actually creates temp files.",
                 "-m/--merge reuses the out-of-core merge backend for inputs that are already sorted in the requested mode.",
                 "-c/--check validates one input stream and exits 1 on the first disorder; with -u it requires strict key ordering.",
                 "-n/--numeric-sort compares the leading numeric prefix of each line (optional blanks, optional '-', digits, optional fractional part) and otherwise falls back to bytewise line order unless -u suppresses the last-resort tie break.",
                 "Bytewise in-memory sorting uses a StringZilla argsort fast path; oversized inputs spill sorted runs and merge them back out-of-core.",
-                "Unsupported GNU sort features currently return an error, including general keys, month/version/human modes, zero-terminated records, and locale collation.",
+                "Unsupported GNU sort features currently return an error, including general keys, month/version/human modes, and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],
             examples: &[

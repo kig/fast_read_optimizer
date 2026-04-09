@@ -83,11 +83,13 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("--merge"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
+    assert!(stdout.contains("--zero-terminated"));
     assert!(stdout.contains("--numeric-sort"));
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("--temporary-directory"));
     assert!(stdout.contains("Unsupported GNU sort features"));
     assert!(stdout.contains("month/version/human"));
+    assert!(!stdout.contains("zero-terminated records and locale collation"));
     assert!(!stdout.contains("temp-file controls"));
     assert!(!stdout.contains("merge/check modes"));
 }
@@ -239,6 +241,109 @@ fn sort_numeric_output_file_matches_system_and_suppresses_stdout() {
     assert_eq!(
         fs::read(&fro_output).unwrap(),
         fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
+fn sort_zero_terminated_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-zero");
+    let a = tmp.join("a.bin");
+    let b = tmp.join("b.bin");
+    fs::write(&a, b"beta\0alpha\0\0zeta\0").unwrap();
+    fs::write(&b, b"alpha\0gamma").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-z"],
+            vec!["-zr"],
+            vec!["-zu"],
+            vec!["--zero-terminated", "--reverse", "--unique"],
+            vec!["-zn"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = sort_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(&sys_args),
+                    &format!("sort zero {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [vec!["-z"], vec!["-zr"], vec!["-zu"], vec!["-zn"]] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            let mut sys_stdin_args = sort_flags.clone();
+            sys_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("sort", &fro_stdin_args, b"bbb\0a\0ab\0\0a\0bbb"),
+                run_system_sort_with_stdin(&sys_stdin_args, b"bbb\0a\0ab\0\0a\0bbb"),
+                &format!("sort zero stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_zero_terminated_output_merge_and_check_match_system() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-zero-io");
+    let left = tmp.join("left.bin");
+    let right = tmp.join("right.bin");
+    let input = tmp.join("input.bin");
+    let unsorted = tmp.join("unsorted.bin");
+    fs::write(&left, b"alpha\0charlie\0").unwrap();
+    fs::write(&right, b"beta\0delta").unwrap();
+    fs::write(&input, b"beta\0alpha\0beta").unwrap();
+    fs::write(&unsorted, b"beta\0alpha").unwrap();
+
+    let fro_output = tmp.join("fro-output.bin");
+    let sys_output = tmp.join("sys-output.bin");
+    let fro = run_fro(
+        "sort",
+        &[
+            "-z",
+            "-u",
+            "-o",
+            fro_output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+    );
+    let system = run_system_sort(&[
+        "-z",
+        "-u",
+        "-o",
+        sys_output.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
+
+    assert_same_result(
+        run_fro(
+            "sort",
+            &["-z", "-m", left.to_str().unwrap(), right.to_str().unwrap()],
+        ),
+        run_system_sort(&["-z", "-m", left.to_str().unwrap(), right.to_str().unwrap()]),
+        "sort zero merge",
+    );
+
+    assert_same_result(
+        run_fro("sort", &["-z", "-c", unsorted.to_str().unwrap()]),
+        run_system_sort(&["-z", "-c", unsorted.to_str().unwrap()]),
+        "sort zero check",
     );
 }
 

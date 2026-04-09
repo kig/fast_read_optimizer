@@ -27,13 +27,22 @@ pub(super) fn sort_inputs(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     output_path: Option<&str>,
     temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
     let memory_budget = sort_memory_budget_bytes()?;
     if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
         if total_bytes <= memory_budget {
-            return sort_inputs_in_memory(inputs, io_mode, mode, unique, reverse, output_path);
+            return sort_inputs_in_memory(
+                inputs,
+                io_mode,
+                mode,
+                unique,
+                reverse,
+                terminator,
+                output_path,
+            );
         }
     }
     sort_inputs_streamed(
@@ -42,6 +51,7 @@ pub(super) fn sort_inputs(
         mode,
         unique,
         reverse,
+        terminator,
         output_path,
         memory_budget,
         temporary_directory,
@@ -54,6 +64,7 @@ fn sort_inputs_in_memory(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     output_path: Option<&str>,
 ) -> io::Result<u64> {
     let mut total_bytes = 0u64;
@@ -70,11 +81,17 @@ fn sort_inputs_in_memory(
         total_bytes = total_bytes
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| io::Error::other("sort input byte count overflow"))?;
-        append_input_lines(&mut storage, &mut lines, &bytes, &mut next_sequence)?;
+        append_input_lines(
+            &mut storage,
+            &mut lines,
+            &bytes,
+            &mut next_sequence,
+            terminator,
+        )?;
     }
     finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse)?;
     with_output_writer(output_path, io_mode, |out| {
-        write_sorted_lines(out, &lines, &storage)
+        write_sorted_lines(out, &lines, &storage, terminator)
     })?;
     Ok(total_bytes)
 }
@@ -85,12 +102,20 @@ fn sort_inputs_streamed(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     output_path: Option<&str>,
     memory_budget: u64,
     temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
     let chunk_target = spill_chunk_target_bytes(memory_budget);
-    let mut spill = SpillSorter::new(mode, unique, reverse, chunk_target, temporary_directory);
+    let mut spill = SpillSorter::new(
+        mode,
+        unique,
+        reverse,
+        terminator,
+        chunk_target,
+        temporary_directory,
+    );
     let mut total_bytes = 0u64;
     for input in inputs {
         let bytes = visit_ordered_input_counted(input, io_mode, |block| spill.push_block(block))
@@ -114,6 +139,7 @@ pub(super) fn merge_presorted_inputs(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     output_path: Option<&str>,
     temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
@@ -124,20 +150,19 @@ pub(super) fn merge_presorted_inputs(
         let path = temp_files.next_chunk_path();
         total_bytes = total_bytes
             .checked_add(
-                write_presorted_input_chunk(&path, input, io_mode, &mut next_sequence).map_err(
-                    |err| {
+                write_presorted_input_chunk(&path, input, io_mode, &mut next_sequence, terminator)
+                    .map_err(|err| {
                         io::Error::new(
                             err.kind(),
                             format!("cannot read '{}': {err}", sort_input_label(input)),
                         )
-                    },
-                )?,
+                    })?,
             )
             .ok_or_else(|| io::Error::other("sort merge input byte count overflow"))?;
         temp_files.paths.push(path);
     }
     with_output_writer(output_path, io_mode, |out| {
-        merge_sorted_chunks(out, &temp_files.paths, mode, unique, reverse)
+        merge_sorted_chunks(out, &temp_files.paths, mode, unique, reverse, terminator)
     })?;
     Ok(total_bytes)
 }
@@ -148,34 +173,37 @@ pub(super) fn check_input_sorted(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
 ) -> io::Result<SortCheckResult> {
-    let mut checker = SortCheckState::new(mode, unique, reverse);
-    match visit_ordered_input_counted(input, io_mode, |block| checker.push_block(block)) {
-        Ok(total_bytes) => {
-            checker.finish()?;
+    let mut checker = SortCheckState::new(mode, unique, reverse, terminator);
+    let disorder_result = |total_bytes, err: io::Error| {
+        if let Some(disorder) = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SortCheckDisorder>())
+        {
             Ok(SortCheckResult {
                 total_bytes,
-                disorder: None,
+                disorder: Some(SortCheckFailure {
+                    line_number: disorder.line_number,
+                    line: disorder.line.clone(),
+                }),
             })
-        }
-        Err(err) => {
-            if let Some(disorder) = err
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<SortCheckDisorder>())
-            {
-                return Ok(SortCheckResult {
-                    total_bytes: 0,
-                    disorder: Some(SortCheckFailure {
-                        line_number: disorder.line_number,
-                        line: disorder.line.clone(),
-                    }),
-                });
-            }
+        } else {
             Err(io::Error::new(
                 err.kind(),
                 format!("cannot read '{}': {err}", sort_input_label(input)),
             ))
         }
+    };
+    match visit_ordered_input_counted(input, io_mode, |block| checker.push_block(block)) {
+        Ok(total_bytes) => match checker.finish() {
+            Ok(()) => Ok(SortCheckResult {
+                total_bytes,
+                disorder: None,
+            }),
+            Err(err) => disorder_result(total_bytes, err),
+        },
+        Err(err) => disorder_result(0, err),
     }
 }
 
@@ -216,17 +244,19 @@ struct SortCheckState {
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     previous: Option<Vec<u8>>,
     carry: Vec<u8>,
     line_number: u64,
 }
 
 impl SortCheckState {
-    fn new(mode: SortMode, unique: bool, reverse: bool) -> Self {
+    fn new(mode: SortMode, unique: bool, reverse: bool, terminator: RecordTerminator) -> Self {
         Self {
             mode,
             unique,
             reverse,
+            terminator,
             previous: None,
             carry: Vec::new(),
             line_number: 0,
@@ -235,10 +265,10 @@ impl SortCheckState {
 
     fn push_block(&mut self, block: &[u8]) -> io::Result<()> {
         let mut consumed = 0usize;
-        for newline in memchr_iter(b'\n', block) {
-            self.carry.extend_from_slice(&block[consumed..newline]);
+        for separator in memchr_iter(self.terminator.byte(), block) {
+            self.carry.extend_from_slice(&block[consumed..separator]);
             self.finish_line()?;
-            consumed = newline + 1;
+            consumed = separator + 1;
         }
         self.carry.extend_from_slice(&block[consumed..]);
         Ok(())
@@ -324,6 +354,7 @@ struct SpillSorter {
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
     chunk_target: usize,
     storage: Vec<u8>,
     lines: Vec<SortLineRef>,
@@ -338,6 +369,7 @@ impl SpillSorter {
         mode: SortMode,
         unique: bool,
         reverse: bool,
+        terminator: RecordTerminator,
         chunk_target: usize,
         temporary_directory: Option<&Path>,
     ) -> Self {
@@ -345,6 +377,7 @@ impl SpillSorter {
             mode,
             unique,
             reverse,
+            terminator,
             chunk_target,
             storage: Vec::new(),
             lines: Vec::new(),
@@ -357,10 +390,10 @@ impl SpillSorter {
 
     fn push_block(&mut self, block: &[u8]) -> io::Result<()> {
         let mut consumed = 0usize;
-        for newline in memchr_iter(b'\n', block) {
-            self.carry.extend_from_slice(&block[consumed..newline]);
+        for separator in memchr_iter(self.terminator.byte(), block) {
+            self.carry.extend_from_slice(&block[consumed..separator]);
             self.push_complete_line()?;
-            consumed = newline + 1;
+            consumed = separator + 1;
         }
         self.carry.extend_from_slice(&block[consumed..]);
         Ok(())
@@ -424,7 +457,7 @@ impl SpillSorter {
                 self.reverse,
             )?;
             return with_output_writer(output_path, io_mode, |out| {
-                write_sorted_lines(out, &self.lines, &self.storage)
+                write_sorted_lines(out, &self.lines, &self.storage, self.terminator)
             });
         }
         self.flush_chunk()?;
@@ -433,7 +466,14 @@ impl SpillSorter {
             .take()
             .ok_or_else(|| io::Error::other("missing sort spill temp files"))?;
         with_output_writer(output_path, io_mode, |out| {
-            merge_sorted_chunks(out, &temp_files.paths, self.mode, self.unique, self.reverse)
+            merge_sorted_chunks(
+                out,
+                &temp_files.paths,
+                self.mode,
+                self.unique,
+                self.reverse,
+                self.terminator,
+            )
         })
     }
 }
@@ -519,20 +559,21 @@ fn write_presorted_input_chunk(
     input: &StreamInput,
     io_mode: IOMode,
     next_sequence: &mut u64,
+    terminator: RecordTerminator,
 ) -> io::Result<u64> {
     let file = File::create(path)?;
     let mut writer = StdBufWriter::new(file);
     let mut carry = Vec::new();
     let total_bytes = visit_ordered_input_counted(input, io_mode, |block| {
         let mut consumed = 0usize;
-        for newline in memchr_iter(b'\n', block) {
-            carry.extend_from_slice(&block[consumed..newline]);
+        for separator in memchr_iter(terminator.byte(), block) {
+            carry.extend_from_slice(&block[consumed..separator]);
             write_chunk_record(&mut writer, *next_sequence, &carry)?;
             *next_sequence = next_sequence
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
             carry.clear();
-            consumed = newline + 1;
+            consumed = separator + 1;
         }
         carry.extend_from_slice(&block[consumed..]);
         Ok(())
@@ -635,6 +676,7 @@ fn merge_sorted_chunks(
     mode: SortMode,
     unique: bool,
     reverse: bool,
+    terminator: RecordTerminator,
 ) -> io::Result<()> {
     let mut readers = paths
         .iter()
@@ -661,7 +703,7 @@ fn merge_sorted_chunks(
             _ => true,
         };
         if should_write {
-            buffered_write_sort_line(out, &mut output_buffer, &item.record.line)?;
+            buffered_write_sort_line(out, &mut output_buffer, &item.record.line, terminator)?;
             if unique {
                 last_written = Some(item.record.line.clone());
             }
