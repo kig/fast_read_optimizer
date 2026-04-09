@@ -17,7 +17,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 
 ### P0: high-use utility families where I/O + parallelism can move the needle
 
-- [ ] `cat` / `read` / `head` / `tail`: keep the plain byte-copy and range fast paths hot, and close the remaining gap on the small-cutoff pipe case for `head -n`.
+- [ ] `cat` / `read` / `head` / `tail`: keep the plain byte-copy and range fast paths hot; for the small-cutoff streamed-stdin `head -n` case, the remaining gap is currently diagnosed as process-startup/runtime-init dominated rather than a `head` helper issue, so avoid speculative path rewrites unless a shared startup reduction lands.
 - [ ] `rm` / recursive delete: make large-tree deletion a first-class perf target alongside correctness/parity coverage, since it is heavily used and shares traversal/scheduling machinery with other tree tools.
 - [ ] `find` / `du`: keep pushing the directory-walk scheduler and metadata batching, because traversal wins compound into multiple multicall tools.
   - [ ] Fast traversal of every byte in a directory tree.
