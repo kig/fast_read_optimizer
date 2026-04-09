@@ -684,7 +684,6 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                         resolved_copy.copy_strategy,
                                     )?
                                 };
-                                sync_path(&copied_target_path_string)?;
                                 guard.ensure_source_unchanged()?;
                                 let diff_page_cache = config.get_params_for_path(
                                     "diff",

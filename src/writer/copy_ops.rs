@@ -647,7 +647,7 @@ pub fn copy_file_range_threaded(
         qd_d,
         io_mode_read,
         io_mode_write,
-        true,
+        false,
         progress_count,
     )
 }

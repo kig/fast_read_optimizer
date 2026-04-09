@@ -7,7 +7,7 @@ use crate::block_hash::{
 use crate::common::{AlignedBuffer, CopyAutoMode, CopyStrategy, ReadAutoStrategy, ReadPathKind};
 use crate::differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use crate::io_util::{
-    direct_writer_supported, open_reader_files, sync_path, validate_read_result, CopyOperationGuard,
+    direct_writer_supported, open_reader_files, validate_read_result, CopyOperationGuard,
 };
 use crate::mincore::is_first_page_resident;
 use crate::optimizer::run_optimizer;
