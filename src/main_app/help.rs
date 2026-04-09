@@ -164,10 +164,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "gzip" => Some(CommandHelp {
             name: "gzip",
             usage: "gzip [-d] [-c] [-k] [-f] [-1..-9] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file]",
-            summary: "Experimental gzip-compatible compressor/decompressor using mgzip output and an mgzip-aware fast decode path.",
+            summary: "Experimental gzip-compatible compressor/decompressor using mgzip output plus an optional rapidgzip generic decode path.",
             notes: &[
                 "This bounded slice focuses on one input at a time, fast file decompression, and basic gzip/gunzip/zcat flows instead of full GNU gzip parity.",
-                "Compression writes mgzip-compatible gzip members via gzp; decompression uses gzp's parallel mgzip reader for mgzip streams and falls back to the standard multi-member gzip reader for generic gzip inputs.",
+                "Compression writes mgzip-compatible gzip members via gzp; mgzip decompression uses gzp's parallel mgzip reader.",
+                "When built with the optional rapidgzip-backend feature, regular generic .gz file decompression uses rapidgzip; otherwise, and for stdin-backed generic gzip input, fro falls back to the standard multi-member gzip reader.",
                 "Regular-file compression inputs use fro's ordered block visitor; regular-file decompression outputs use fro's buffered file writer.",
                 "--auto/--no-direct/--direct currently affect the compression-side fro input path only; decompression does not yet route compressed-input reads through fro's direct/page-cache selectors.",
                 "Without -c/--stdout or -o/--output, gzip writes FILE.gz, gunzip writes FILE with a .gz suffix stripped, and default in-place conversions remove the source unless -k is used.",
@@ -183,10 +184,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "gunzip" => Some(CommandHelp {
             name: "gunzip",
             usage: "gunzip [-c] [-k] [-f] [--threads N] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
-            summary: "Experimental gzip-compatible decompressor alias with an mgzip-aware fast path.",
+            summary: "Experimental gzip-compatible decompressor alias with mgzip fast-path support and optional rapidgzip generic file decode.",
             notes: &[
                 "gunzip is the same bounded experimental implementation as gzip -d.",
-                "Regular-file outputs use fro's buffered writer; mgzip streams use gzp's parallel mgzip decompressor, while generic gzip streams fall back to the standard reader.",
+                "Regular-file outputs use fro's buffered writer; mgzip streams use gzp's parallel mgzip decompressor.",
+                "Generic file-backed gzip inputs use rapidgzip only when fro is built with the optional rapidgzip-backend feature; other generic gzip inputs fall back to the standard reader.",
                 "--auto/--no-direct/--direct are currently compression-side flags and do not retune decompression input reads.",
             ],
             examples: &[
@@ -197,9 +199,10 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         "zcat" => Some(CommandHelp {
             name: "zcat",
             usage: "zcat [--threads N] [--auto|--no-direct|--direct] [--report-gbps] [file.gz]",
-            summary: "Experimental gzip-compatible stdout decompressor alias with an mgzip-aware fast path.",
+            summary: "Experimental gzip-compatible stdout decompressor alias with mgzip fast-path support and optional rapidgzip generic file decode.",
             notes: &[
                 "zcat is equivalent to the bounded experimental gzip -dc path.",
+                "Generic file-backed gzip inputs use rapidgzip only when fro is built with the optional rapidgzip-backend feature.",
                 "It keeps the input file and always writes decompressed bytes to stdout.",
             ],
             examples: &[("Print one archive", "zcat payload.bin.gz")],
@@ -427,7 +430,8 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             summary: "Create, list, or extract ustar archives; .tar.gz/.tgz is experimental.",
             notes: &[
                 "Supported compatibility slice: create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) with -f/--file.",
-                "Experimental gzip support accepts -z/--gzip/--gunzip/--ungzip or auto-detects .tar.gz/.tgz archives; decompression uses rapidgzip and create uses mgzip-compatible output via gzp.",
+                "Experimental gzip support accepts -z/--gzip/--gunzip/--ungzip or auto-detects .tar.gz/.tgz archives; create uses mgzip-compatible output via gzp.",
+                "When built with the optional rapidgzip-backend feature, .tar.gz/.tgz list and extract use rapidgzip for decompression; otherwise they fall back to the standard multi-member gzip reader.",
                 "-v/--verbose keeps create-side progress reporting, enables GNU-style verbose output for listing, and prints extracted member names during extract.",
                 "FIXME: Extract currently targets regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
                 "FIXME: Compression is currently limited to gzip, uses a sequential tar writer on create, and does not yet preserve the uncompressed fast-path copy engine through compressed extraction.",
@@ -956,7 +960,7 @@ pub(super) fn print_general_help(program: &str) {
         ("base64", "encode or decode base64 data"),
         (
             "gzip",
-            "experimental mgzip/rapidgzip gzip compatibility slice",
+            "experimental mgzip plus optional rapidgzip gzip slice",
         ),
         (
             "encrypt",

@@ -9,6 +9,14 @@ use std::time::Instant;
 
 const GZIP_COPY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GzipDecodeBackend {
+    Mgzip,
+    Standard,
+    #[cfg(feature = "rapidgzip-backend")]
+    Rapidgzip,
+}
+
 #[derive(Clone)]
 struct GzipOptions {
     decompress: bool,
@@ -331,12 +339,7 @@ fn run_compress(options: &GzipOptions, output_path: Option<&Path>) -> io::Result
 }
 
 fn run_decompress(options: &GzipOptions, output_path: Option<&Path>) -> io::Result<u64> {
-    let mut reader = match &options.input {
-        StreamInput::File(path) => {
-            open_gzip_reader_from_stream(File::open(path)?, options.threads)?
-        }
-        StreamInput::Stdin { .. } => open_gzip_reader_from_stream(stdin_file()?, options.threads)?,
-    };
+    let mut reader = open_gzip_reader(&options.input, options.threads)?;
 
     let mut sink = open_decompress_sink(output_path, options.force)?;
     let mut total = 0_u64;
@@ -407,21 +410,55 @@ fn gzp_error(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("mgzip error: {err}"))
 }
 
+#[cfg(feature = "rapidgzip-backend")]
+fn rapidgzip_error(err: rapidgzip::Error) -> io::Error {
+    io::Error::other(format!("rapidgzip error: {err}"))
+}
+
+fn open_gzip_reader(input: &StreamInput, threads: Option<usize>) -> io::Result<Box<dyn Read>> {
+    match input {
+        StreamInput::File(path) => open_gzip_reader_from_path(Path::new(path), threads),
+        StreamInput::Stdin { .. } => open_gzip_reader_from_stream(stdin_file()?, threads),
+    }
+}
+
+fn choose_gzip_decode_backend(prefix: &[u8], _path_backed: bool) -> GzipDecodeBackend {
+    if is_mgzip_prefix(prefix) {
+        GzipDecodeBackend::Mgzip
+    } else {
+        #[cfg(feature = "rapidgzip-backend")]
+        if _path_backed {
+            return GzipDecodeBackend::Rapidgzip;
+        }
+        GzipDecodeBackend::Standard
+    }
+}
+
+fn open_gzip_reader_from_path(path: &Path, threads: Option<usize>) -> io::Result<Box<dyn Read>> {
+    let (prefix, reader) = probe_gzip_prefix(File::open(path)?)?;
+    match choose_gzip_decode_backend(&prefix, true) {
+        GzipDecodeBackend::Mgzip => open_mgzip_reader(prefix, reader, threads),
+        GzipDecodeBackend::Standard => {
+            let replay = std::io::Cursor::new(prefix).chain(reader);
+            Ok(Box::new(MultiGzDecoder::new(replay)))
+        }
+        #[cfg(feature = "rapidgzip-backend")]
+        GzipDecodeBackend::Rapidgzip => open_rapidgzip_reader(path, threads),
+    }
+}
+
 fn open_gzip_reader_from_stream(reader: File, threads: Option<usize>) -> io::Result<Box<dyn Read>> {
     let (prefix, reader) = probe_gzip_prefix(reader)?;
-    let is_mgzip = is_mgzip_prefix(&prefix);
-    let replay = std::io::Cursor::new(prefix).chain(reader);
-    if is_mgzip {
-        let reader = match threads {
-            Some(threads) => ParDecompressBuilder::<Mgzip>::new()
-                .num_threads(threads)
-                .map_err(gzp_error)?
-                .from_reader(replay),
-            None => ParDecompressBuilder::<Mgzip>::new().from_reader(replay),
-        };
-        Ok(Box::new(reader))
-    } else {
-        Ok(Box::new(MultiGzDecoder::new(replay)))
+    match choose_gzip_decode_backend(&prefix, false) {
+        GzipDecodeBackend::Mgzip => open_mgzip_reader(prefix, reader, threads),
+        GzipDecodeBackend::Standard => {
+            let replay = std::io::Cursor::new(prefix).chain(reader);
+            Ok(Box::new(MultiGzDecoder::new(replay)))
+        }
+        #[cfg(feature = "rapidgzip-backend")]
+        GzipDecodeBackend::Rapidgzip => {
+            unreachable!("rapidgzip is only used for path-backed gzip inputs")
+        }
     }
 }
 
@@ -442,9 +479,44 @@ fn is_mgzip_prefix(prefix: &[u8]) -> bool {
         && prefix[13] == b'G'
 }
 
+fn open_mgzip_reader(
+    prefix: Vec<u8>,
+    reader: File,
+    threads: Option<usize>,
+) -> io::Result<Box<dyn Read>> {
+    let replay = std::io::Cursor::new(prefix).chain(reader);
+    let reader = match threads {
+        Some(threads) => ParDecompressBuilder::<Mgzip>::new()
+            .num_threads(threads)
+            .map_err(gzp_error)?
+            .from_reader(replay),
+        None => ParDecompressBuilder::<Mgzip>::new().from_reader(replay),
+    };
+    Ok(Box::new(reader))
+}
+
+#[cfg(feature = "rapidgzip-backend")]
+fn open_rapidgzip_reader(path: &Path, threads: Option<usize>) -> io::Result<Box<dyn Read>> {
+    let mut builder = rapidgzip::ReaderBuilder::new();
+    if let Some(threads) = threads {
+        let threads = u32::try_from(threads).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("gzip: thread count {threads} exceeds rapidgzip limit"),
+            )
+        })?;
+        builder = builder.parallelism(threads);
+    }
+    builder
+        .open(path)
+        .map(|reader| Box::new(reader) as Box<dyn Read>)
+        .map_err(rapidgzip_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{write::GzEncoder, Compression as FlateCompression};
 
     fn gzip_test_temp_file(name: &str) -> PathBuf {
         let base = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -507,6 +579,54 @@ mod tests {
         ];
         assert_eq!(run_gzip("gunzip", &decompress_args).unwrap(), 0);
         assert_eq!(fs::read(&restored).unwrap(), bytes);
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(compressed);
+        let _ = fs::remove_file(restored);
+    }
+
+    #[test]
+    fn generic_gzip_roundtrip_restores_original_bytes() {
+        let input = gzip_test_temp_file("fro-gzip-generic-input");
+        let compressed = gzip_test_temp_file("fro-gzip-generic-output.gz");
+        let restored = gzip_test_temp_file("fro-gzip-generic-restored");
+        let bytes = (0..(384 * 1024 + 91))
+            .map(|i| ((i * 13 + 5) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&input, &bytes).unwrap();
+
+        let mut encoder = GzEncoder::new(Vec::new(), FlateCompression::default());
+        encoder.write_all(&bytes).unwrap();
+        let compressed_bytes = encoder.finish().unwrap();
+        fs::write(&compressed, compressed_bytes).unwrap();
+
+        let decompress_args = vec![
+            "gunzip".to_string(),
+            "-k".to_string(),
+            "-o".to_string(),
+            restored.display().to_string(),
+            compressed.display().to_string(),
+        ];
+        assert_eq!(run_gzip("gunzip", &decompress_args).unwrap(), 0);
+        assert_eq!(fs::read(&restored).unwrap(), bytes);
+
+        let prefix = fs::read(&compressed).unwrap();
+        let expected = if cfg!(feature = "rapidgzip-backend") {
+            #[cfg(feature = "rapidgzip-backend")]
+            {
+                GzipDecodeBackend::Rapidgzip
+            }
+            #[cfg(not(feature = "rapidgzip-backend"))]
+            {
+                GzipDecodeBackend::Standard
+            }
+        } else {
+            GzipDecodeBackend::Standard
+        };
+        assert_eq!(
+            choose_gzip_decode_backend(&prefix[..prefix.len().min(20)], true),
+            expected
+        );
 
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(compressed);

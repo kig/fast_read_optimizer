@@ -4,12 +4,14 @@ use crate::config::{self, IOParams};
 use crate::io_util::{sync_parent_directory, sync_path};
 use crate::main_app::TarCompression;
 use crate::writer::{copy_file_range_threaded, OffsetWriter};
-use flate2::read::MultiGzDecoder;
 use gzp::{deflate::Mgzip, ZBuilder};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
+
+#[cfg(not(feature = "rapidgzip-backend"))]
+use flate2::read::MultiGzDecoder;
 
 const TAR_BLOCK_SIZE: u64 = 512;
 const TAR_EOF_BLOCKS: u64 = TAR_BLOCK_SIZE * 2;
@@ -261,8 +263,15 @@ fn gzp_error(err: impl std::fmt::Display) -> io::Error {
 }
 
 #[cfg(feature = "rapidgzip-backend")]
+fn rapidgzip_error(err: rapidgzip::Error) -> io::Error {
+    io::Error::other(format!("rapidgzip error: {err}"))
+}
+
+#[cfg(feature = "rapidgzip-backend")]
 fn open_gzip_archive(path: &Path) -> io::Result<Box<dyn Read>> {
-    Ok(Box::new(rapidgzip::Reader::open(path)?))
+    rapidgzip::Reader::open(path)
+        .map(|reader| Box::new(reader) as Box<dyn Read>)
+        .map_err(rapidgzip_error)
 }
 
 #[cfg(not(feature = "rapidgzip-backend"))]
