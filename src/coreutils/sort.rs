@@ -1,25 +1,20 @@
 use super::*;
+use stringzilla::stringzilla as sz;
 
-const RADIX_SORT_MAX_LINE_LEN: usize = 256;
-const RADIX_SORT_MAX_WORK: usize = 128 * 1024 * 1024;
+mod external;
+
+const SORT_WRITE_BUFFER_SIZE: usize = 2 << 20;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SortLineRef {
     start: usize,
     len: usize,
+    sequence: u64,
 }
 
 impl SortLineRef {
     fn bytes<'a>(self, storage: &'a [u8]) -> &'a [u8] {
         &storage[self.start..self.start + self.len]
-    }
-
-    fn radix_key_at(self, storage: &[u8], depth: usize) -> usize {
-        if depth < self.len {
-            usize::from(storage[self.start + depth]) + 1
-        } else {
-            0
-        }
     }
 }
 
@@ -144,6 +139,73 @@ fn compare_numeric_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
     compare_numeric_prefixes(parse_numeric_prefix(left), parse_numeric_prefix(right))
 }
 
+fn compare_line_refs(
+    left: SortLineRef,
+    right: SortLineRef,
+    storage: &[u8],
+    mode: SortMode,
+    unique: bool,
+) -> std::cmp::Ordering {
+    match mode {
+        SortMode::Bytewise => left
+            .bytes(storage)
+            .cmp(right.bytes(storage))
+            .then_with(|| left.sequence.cmp(&right.sequence)),
+        SortMode::Numeric => {
+            let numeric = compare_numeric_lines(left.bytes(storage), right.bytes(storage));
+            if numeric != std::cmp::Ordering::Equal {
+                return numeric;
+            }
+            if unique {
+                left.sequence.cmp(&right.sequence)
+            } else {
+                left.bytes(storage)
+                    .cmp(right.bytes(storage))
+                    .then_with(|| left.sequence.cmp(&right.sequence))
+            }
+        }
+    }
+}
+
+fn compare_output_lines(
+    left: &[u8],
+    left_sequence: u64,
+    right: &[u8],
+    right_sequence: u64,
+    mode: SortMode,
+    unique: bool,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let asc = match mode {
+        SortMode::Bytewise => left
+            .cmp(right)
+            .then_with(|| left_sequence.cmp(&right_sequence)),
+        SortMode::Numeric => {
+            let numeric = compare_numeric_lines(left, right);
+            if numeric != std::cmp::Ordering::Equal {
+                numeric
+            } else if unique {
+                left_sequence.cmp(&right_sequence)
+            } else {
+                left.cmp(right)
+                    .then_with(|| left_sequence.cmp(&right_sequence))
+            }
+        }
+    };
+    if reverse {
+        asc.reverse()
+    } else {
+        asc
+    }
+}
+
+fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
+    match mode {
+        SortMode::Bytewise => left == right,
+        SortMode::Numeric => compare_numeric_lines(left, right) == std::cmp::Ordering::Equal,
+    }
+}
+
 fn print_sort_help(program: &str) {
     println!("sort - Sort newline-delimited records");
     println!();
@@ -169,6 +231,8 @@ fn print_sort_help(program: &str) {
     println!("Notes:");
     println!("  - Use '-' once to read stdin.");
     println!("  - Use '--' before file names that start with '-'.");
+    println!("  - Bytewise in-memory sorting uses a StringZilla argsort fast path.");
+    println!("  - Inputs larger than available memory spill sorted runs and merge them.");
     println!("  - Unsupported GNU sort features currently return an error:");
     println!("    general keys, month/version/human modes, merge/check modes,");
     println!("    zero-terminated records, temp-file controls, and locale collation.");
@@ -185,6 +249,7 @@ fn append_input_lines(
     storage: &mut Vec<u8>,
     lines: &mut Vec<SortLineRef>,
     input: &[u8],
+    next_sequence: &mut u64,
 ) -> io::Result<()> {
     let base = storage.len();
     storage.extend_from_slice(input);
@@ -195,7 +260,11 @@ fn append_input_lines(
             lines.push(SortLineRef {
                 start: base + line_start,
                 len: idx - line_start,
+                sequence: *next_sequence,
             });
+            *next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
             line_start = idx + 1;
         }
     }
@@ -203,61 +272,43 @@ fn append_input_lines(
         lines.push(SortLineRef {
             start: base + line_start,
             len: input.len() - line_start,
+            sequence: *next_sequence,
         });
+        *next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
     }
 
     Ok(())
 }
 
-fn sort_line_refs(lines: &mut [SortLineRef], storage: &[u8], mode: SortMode, unique: bool) {
-    if mode == SortMode::Numeric {
-        if unique {
-            lines.sort_by(|left, right| {
-                compare_numeric_lines(left.bytes(storage), right.bytes(storage))
-            });
-        } else {
-            lines.sort_unstable_by(|left, right| {
-                compare_numeric_lines(left.bytes(storage), right.bytes(storage))
-                    .then_with(|| left.bytes(storage).cmp(right.bytes(storage)))
-            });
-        }
-        return;
-    }
-
+fn sort_line_refs(
+    lines: &mut [SortLineRef],
+    storage: &[u8],
+    mode: SortMode,
+    unique: bool,
+) -> io::Result<()> {
     if lines.len() < 2 {
-        return;
+        return Ok(());
     }
-
-    let max_len = lines.iter().map(|line| line.len).max().unwrap_or(0);
-    let work = max_len.saturating_mul(lines.len());
-    if max_len == 0 || max_len > RADIX_SORT_MAX_LINE_LEN || work > RADIX_SORT_MAX_WORK {
-        lines.sort_unstable_by(|left, right| left.bytes(storage).cmp(right.bytes(storage)));
-        return;
+    match mode {
+        SortMode::Bytewise => {
+            let snapshot = lines.to_vec();
+            let mut order = vec![0 as sz::SortedIdx; snapshot.len()];
+            sz::argsort_permutation_by(|idx| snapshot[idx].bytes(storage), &mut order).map_err(
+                |status| io::Error::other(format!("StringZilla sort failed: {status:?}")),
+            )?;
+            for (dst, sorted_idx) in lines.iter_mut().zip(order.into_iter()) {
+                *dst = snapshot[sorted_idx];
+            }
+        }
+        SortMode::Numeric => {
+            lines.sort_unstable_by(|left, right| {
+                compare_line_refs(*left, *right, storage, mode, unique)
+            });
+        }
     }
-
-    let mut from = lines.to_vec();
-    let mut to = vec![SortLineRef::default(); lines.len()];
-    for depth in (0..max_len).rev() {
-        let mut counts = [0usize; 257];
-        for line in &from {
-            counts[line.radix_key_at(storage, depth)] += 1;
-        }
-
-        let mut offsets = [0usize; 257];
-        let mut total = 0usize;
-        for (idx, count) in counts.into_iter().enumerate() {
-            offsets[idx] = total;
-            total += count;
-        }
-
-        for line in &from {
-            let key = line.radix_key_at(storage, depth);
-            to[offsets[key]] = *line;
-            offsets[key] += 1;
-        }
-        std::mem::swap(&mut from, &mut to);
-    }
-    lines.copy_from_slice(&from);
+    Ok(())
 }
 
 fn finalize_sorted_lines(
@@ -266,22 +317,16 @@ fn finalize_sorted_lines(
     mode: SortMode,
     unique: bool,
     reverse: bool,
-) {
-    sort_line_refs(lines, storage, mode, unique);
+) -> io::Result<()> {
+    sort_line_refs(lines, storage, mode, unique)?;
     if unique {
-        match mode {
-            SortMode::Bytewise => {
-                lines.dedup_by(|left, right| left.bytes(storage) == right.bytes(storage))
-            }
-            SortMode::Numeric => lines.dedup_by(|left, right| {
-                compare_numeric_lines(left.bytes(storage), right.bytes(storage))
-                    == std::cmp::Ordering::Equal
-            }),
-        }
+        lines
+            .dedup_by(|left, right| same_sort_key(left.bytes(storage), right.bytes(storage), mode));
     }
     if reverse {
         lines.reverse();
     }
+    Ok(())
 }
 
 fn apply_short_sort_flags(
@@ -309,11 +354,41 @@ fn write_sorted_lines<W: Write>(
     lines: &[SortLineRef],
     storage: &[u8],
 ) -> io::Result<()> {
+    let mut buffer = Vec::with_capacity(SORT_WRITE_BUFFER_SIZE);
     for line in lines {
-        out.write_all(line.bytes(storage))?;
-        out.write_all(b"\n")?;
+        buffered_write_sort_line(&mut out, &mut buffer, line.bytes(storage))?;
     }
+    flush_sort_output_buffer(&mut out, &mut buffer)?;
     out.flush()
+}
+
+fn buffered_write_sort_line<W: Write + ?Sized>(
+    out: &mut W,
+    buffer: &mut Vec<u8>,
+    line: &[u8],
+) -> io::Result<()> {
+    if buffer.len() + line.len() + 1 > SORT_WRITE_BUFFER_SIZE && !buffer.is_empty() {
+        flush_sort_output_buffer(out, buffer)?;
+    }
+    if line.len() + 1 >= SORT_WRITE_BUFFER_SIZE {
+        out.write_all(line)?;
+        out.write_all(b"\n")?;
+        return Ok(());
+    }
+    buffer.extend_from_slice(line);
+    buffer.push(b'\n');
+    Ok(())
+}
+
+fn flush_sort_output_buffer<W: Write + ?Sized>(
+    out: &mut W,
+    buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    if !buffer.is_empty() {
+        out.write_all(buffer)?;
+        buffer.clear();
+    }
+    Ok(())
 }
 
 pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
@@ -429,40 +504,28 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     }
 
     let started_at = std::time::Instant::now();
-    let mut total_bytes = 0u64;
-    let mut storage = Vec::new();
-    let mut lines = Vec::new();
-    for input in &inputs {
-        let bytes = match loaded_or_stream_bytes(input, io_mode) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                eprintln!("sort: cannot read '{}': {err}", sort_input_label(input));
-                return Ok(2);
+    let total_bytes = match external::sort_inputs(
+        &inputs,
+        io_mode,
+        mode,
+        unique,
+        reverse,
+        output_path.as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            if let Some(path) = output_path.as_deref() {
+                if err.kind() == io::ErrorKind::PermissionDenied {
+                    eprintln!("sort: cannot write '{path}': {err}");
+                } else {
+                    eprintln!("sort: {err}");
+                }
+            } else {
+                eprintln!("sort: {err}");
             }
-        };
-        total_bytes = total_bytes
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("sort input byte count overflow"))?;
-        append_input_lines(&mut storage, &mut lines, &bytes)?;
-    }
-
-    finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse);
-
-    let write_result = if let Some(path) = output_path.as_deref() {
-        let mut out = fro::create_with_mode(path, io_mode)?;
-        write_sorted_lines(&mut out, &lines, &storage)
-    } else {
-        let out = stdout_buf_writer()?;
-        write_sorted_lines(out, &lines, &storage)
-    };
-    if let Err(err) = write_result {
-        if let Some(path) = output_path.as_deref() {
-            eprintln!("sort: cannot write '{path}': {err}");
-        } else {
-            eprintln!("sort: write failed: {err}");
+            return Ok(2);
         }
-        return Ok(2);
-    }
+    };
 
     if report_throughput {
         report_gbps("sort", total_bytes, started_at);
@@ -477,12 +540,13 @@ mod tests {
     fn refs_for_lines(lines: &[&[u8]]) -> (Vec<u8>, Vec<SortLineRef>) {
         let mut storage = Vec::new();
         let mut refs = Vec::new();
-        for line in lines {
+        for (sequence, line) in lines.iter().enumerate() {
             let start = storage.len();
             storage.extend_from_slice(line);
             refs.push(SortLineRef {
                 start,
                 len: line.len(),
+                sequence: sequence as u64,
             });
         }
         (storage, refs)
@@ -499,7 +563,7 @@ mod tests {
             b"z".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        sort_line_refs(&mut refs, &storage, SortMode::Bytewise, false);
+        sort_line_refs(&mut refs, &storage, SortMode::Bytewise, false).unwrap();
         let sorted = refs
             .iter()
             .map(|line| line.bytes(&storage).to_vec())
@@ -521,7 +585,8 @@ mod tests {
     fn append_input_lines_keeps_missing_final_newline_as_a_record() {
         let mut storage = Vec::new();
         let mut refs = Vec::new();
-        append_input_lines(&mut storage, &mut refs, b"beta\nalpha").unwrap();
+        let mut next_sequence = 0;
+        append_input_lines(&mut storage, &mut refs, b"beta\nalpha", &mut next_sequence).unwrap();
         let lines = refs
             .iter()
             .map(|line| line.bytes(&storage).to_vec())
@@ -541,7 +606,7 @@ mod tests {
         let (storage, refs) = refs_for_lines(&input);
 
         let mut sorted = refs.clone();
-        finalize_sorted_lines(&mut sorted, &storage, SortMode::Bytewise, false, false);
+        finalize_sorted_lines(&mut sorted, &storage, SortMode::Bytewise, false, false).unwrap();
         assert_eq!(
             sorted
                 .iter()
@@ -557,7 +622,7 @@ mod tests {
         );
 
         let mut unique_only = refs.clone();
-        finalize_sorted_lines(&mut unique_only, &storage, SortMode::Bytewise, true, false);
+        finalize_sorted_lines(&mut unique_only, &storage, SortMode::Bytewise, true, false).unwrap();
         assert_eq!(
             unique_only
                 .iter()
@@ -573,7 +638,8 @@ mod tests {
             SortMode::Bytewise,
             true,
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(
             unique_reverse
                 .iter()
@@ -597,7 +663,7 @@ mod tests {
             b"  10".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&lines);
-        sort_line_refs(&mut refs, &storage, SortMode::Numeric, false);
+        sort_line_refs(&mut refs, &storage, SortMode::Numeric, false).unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -625,7 +691,7 @@ mod tests {
             b"2".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        finalize_sorted_lines(&mut refs, &storage, SortMode::Numeric, true, false);
+        finalize_sorted_lines(&mut refs, &storage, SortMode::Numeric, true, false).unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())

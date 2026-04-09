@@ -291,6 +291,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
                 "-o writes after all input has been read, so in-place rewrites like `sort -o file file` stay on the same newline-delimited backend.",
                 "-n/--numeric-sort compares the leading numeric prefix of each line (optional blanks, optional '-', digits, optional fractional part) and otherwise falls back to bytewise line order unless -u suppresses the last-resort tie break.",
+                "Bytewise in-memory sorting uses a StringZilla argsort fast path; oversized inputs spill sorted runs and merge them back out-of-core.",
                 "Unsupported GNU sort features currently return an error, including general keys, month/version/human modes, merge/check modes, zero-terminated records, temp-file controls, and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],

@@ -2,6 +2,7 @@
 
 ## 2026-04-09
 
+- `sort` now uses a StringZilla-backed bytewise argsort fast path for in-memory ordering, and large or streamed inputs spill sorted runs plus perform an n-way merge so newline-delimited sorting can complete out-of-core instead of assuming every input fits in RAM.
 - `tar` now supports a bounded GNU-style extract slice for uncompressed whole-archive extraction: `tar -xf` / `tar --extract --file` can unpack regular files, directories, and symlinks into the current directory or `-C` destination, reuse the existing archive reader plus threaded copy helper for file payloads, and reject unsafe or unsupported member paths/types explicitly.
 - `sort` gained a bounded numeric-ordering slice on top of the same newline-delimited backend: `-n` / `--numeric-sort` now compare leading C-locale-style numeric prefixes, compose with `-r`, `-u`, and `-o`, and keep GNU-like `-n -u` first-line retention for numerically equal records instead of broadening into general-key or locale work.
 - `cksum` gained a bounded fro-style `--check` slice without bloating `src/coreutils/hash.rs`: shared checksum-check policy/reporting now lives in `src/coreutils/hash/check.rs`, `cksum`-specific parsing/execution lives in `src/coreutils/hash/cksum.rs`, and the verifier reuses the regular-file CRC/hash fast path while supporting `--quiet`, `--status`, `--warn`, `--strict`, and `--ignore-missing`.

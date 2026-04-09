@@ -8,6 +8,49 @@ fn run_system_sort(args: &[&str]) -> Output {
         .expect("failed to run system sort")
 }
 
+fn run_fro_env(command: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fro"));
+    cmd.arg(command).args(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("failed to run fro coreutils command")
+}
+
+fn run_fro_with_stdin_env(
+    command: &str,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fro"));
+    cmd.arg(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn fro coreutils command");
+    let mut stdin = child.stdin.take().expect("missing child stdin");
+    let input = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&input).or_else(|err| match err.kind() {
+            std::io::ErrorKind::BrokenPipe => Ok(()),
+            _ => Err(err),
+        })
+    });
+    let output = child
+        .wait_with_output()
+        .expect("failed to read child output");
+    writer
+        .join()
+        .expect("stdin writer thread panicked")
+        .expect("failed to write child stdin");
+    output
+}
+
 fn run_system_sort_with_stdin(args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new("sort")
         .env("LC_ALL", "C")
@@ -317,4 +360,68 @@ fn sort_output_file_supports_in_place_rewrite_and_stdin() {
     assert!(fro.stdout.is_empty());
     assert_eq!(fro.stderr, system.stderr);
     assert_eq!(fs::read(&fro_stdin).unwrap(), fs::read(&sys_stdin).unwrap());
+}
+
+#[test]
+fn sort_spills_regular_files_when_memory_budget_is_low() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-spill-file");
+    let input = tmp.join("input.txt");
+    let mut bytes = Vec::new();
+    for idx in 0..120000 {
+        bytes.extend_from_slice(format!("line-{idx:05}\n").as_bytes());
+    }
+    fs::write(&input, &bytes).unwrap();
+
+    let fro_output = tmp.join("fro-spill.txt");
+    let sys_output = tmp.join("sys-spill.txt");
+    let fro = run_fro_env(
+        "sort",
+        &[
+            "--no-direct",
+            "-r",
+            "-o",
+            fro_output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+        &[("FRO_SORT_MAX_IN_MEMORY_BYTES", "65536")],
+    );
+    let system = run_system_sort(&[
+        "-r",
+        "-o",
+        sys_output.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
+fn sort_spills_stream_input_when_memory_budget_is_low() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-spill-stdin");
+    let fro_output = tmp.join("fro-spill-stdin.txt");
+    let sys_output = tmp.join("sys-spill-stdin.txt");
+    let mut input = Vec::new();
+    for idx in 0..220000 {
+        input.extend_from_slice(format!("{:06}\n", 220000 - idx).as_bytes());
+    }
+
+    let fro = run_fro_with_stdin_env(
+        "sort",
+        &["-o", fro_output.to_str().unwrap(), "-"],
+        &input,
+        &[("FRO_SORT_MAX_IN_MEMORY_BYTES", "32768")],
+    );
+    let system = run_system_sort_with_stdin(&["-o", sys_output.to_str().unwrap(), "-"], &input);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
 }
