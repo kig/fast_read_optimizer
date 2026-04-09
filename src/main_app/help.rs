@@ -276,11 +276,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "head" => Some(CommandHelp {
             name: "head",
-            usage: "head [-n lines|-c bytes] [--lines=lines|--bytes=bytes] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
+            usage: "head [-n lines|-c bytes] [--lines=lines|--bytes=bytes] [-z|--zero-terminated] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Print the first lines or bytes of each input.",
             notes: &[
-                "Supports classic head counts including obsolete -NUM and -NUM[bkm][cqv] forms, plus -NUM \"all but last\" forms for -n/-c.",
+                "Supports classic head counts including obsolete -NUM and -NUM[bkm][cqvz] forms, plus -NUM \"all but last\" forms for -n/-c.",
                 "GNU-style --lines/--bytes long forms are accepted, including =VALUE syntax and negative counts.",
+                "-z/--zero-terminated switches line counting from newline-delimited lines to NUL-delimited records while leaving byte modes unchanged.",
                 "Use -q/--quiet/--silent to suppress headers and -v/--verbose to always print them; the last one wins.",
                 "--report-gbps writes effective emitted-byte throughput to stderr after payload output completes.",
             ],
@@ -329,10 +330,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tail" => Some(CommandHelp {
             name: "tail",
-            usage: "tail [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
+            usage: "tail [-n lines|-c bytes] [-z|--zero-terminated] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Print the last lines or bytes of each input.",
             notes: &[
                 "Supports classic tail counts including +N start offsets for -n/-c.",
+                "-z/--zero-terminated switches line counting from newline-delimited lines to NUL-delimited records while leaving byte modes unchanged.",
                 "Use -q to suppress headers and -v to always print them; the last one wins.",
                 "Byte-mode on non-seekable inputs keeps only a bounded trailing window before final output.",
                 "--report-gbps writes effective emitted-byte throughput to stderr after payload output completes.",

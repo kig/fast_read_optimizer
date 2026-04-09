@@ -1,13 +1,13 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
-use std::process::Command;
 
 #[path = "../src/help_compat.rs"]
 mod help_compat;
 
 use help_compat::{
-    parse_help_flag_tokens, tracked_help_tokens, CoverageRow, EXCLUDED_CUSTOM_MULTICALLS, ROWS,
+    fro_help_text, help_token_coverage, parse_help_flag_tokens, system_help_text,
+    tracked_help_tokens, CoverageRow, EXCLUDED_CUSTOM_MULTICALLS, ROWS,
 };
 
 fn render_report() -> String {
@@ -28,6 +28,24 @@ fn render_report() -> String {
     out
 }
 
+fn render_actual_help_coverage_report() -> String {
+    let mut out = String::from(
+        "# actual tokenized help coverage\n# rows are tracked multicall commands; coverage = tokenized fro <cmd> --help vs system <cmd> --help on this host\n",
+    );
+    for row in ROWS {
+        let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), row.name);
+        out.push_str(&format!(
+            "{:<9} {:>3}/{:<3} {:>3}%  remaining: {}\n",
+            row.name,
+            coverage.covered_count(),
+            coverage.total_count(),
+            coverage.percent(),
+            coverage.remaining_text(),
+        ));
+    }
+    out
+}
+
 fn help_superset_status(row: CoverageRow) -> String {
     let missing = missing_help_tokens(row);
     if missing.is_empty() {
@@ -38,7 +56,7 @@ fn help_superset_status(row: CoverageRow) -> String {
 }
 
 fn missing_help_tokens(row: CoverageRow) -> Vec<String> {
-    let fro_tokens = parse_help_flag_tokens(&fro_help_text(row.name));
+    let fro_tokens = parse_help_flag_tokens(&fro_help_text(env!("CARGO_BIN_EXE_fro"), row.name));
     let system_tokens = parse_help_flag_tokens(&system_help_text(row.name));
     let tracked = tracked_help_tokens(row);
     system_tokens
@@ -46,38 +64,6 @@ fn missing_help_tokens(row: CoverageRow) -> Vec<String> {
         .filter(|token| !fro_tokens.contains(*token))
         .cloned()
         .collect()
-}
-
-fn fro_help_text(command: &str) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_fro"))
-        .arg(command)
-        .arg("--help")
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run fro {command} --help: {err}"));
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "fro {command} --help failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).expect("fro help should be UTF-8")
-}
-
-fn system_help_text(command: &str) -> String {
-    let output = Command::new(command)
-        .env("LC_ALL", "C")
-        .arg("--help")
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run {command} --help: {err}"));
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{command} --help failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).expect("system help should be UTF-8")
 }
 
 fn dispatched_compat_commands() -> BTreeSet<&'static str> {
@@ -133,7 +119,7 @@ fgrep      9/9  100%  remaining: none  help: ok
 find       9/9  100%  remaining: none  help: ok
 head       5/5  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
-mv         3/3  100%  remaining: none  help: ok
+mv         5/5  100%  remaining: none  help: ok
 rm         7/7  100%  remaining: none  help: ok
 sha224sum 11/11 100%  remaining: none  help: ok
 sha256sum 11/11 100%  remaining: none  help: ok
@@ -145,6 +131,42 @@ tac        2/2  100%  remaining: none  help: ok
 tail       5/5  100%  remaining: none  help: ok
 tar        5/5  100%  remaining: none  help: ok
 wc         6/6  100%  remaining: none  help: ok
+";
+
+    assert_eq!(report, expected);
+}
+
+#[test]
+fn actual_help_coverage_report_matches_snapshot() {
+    let report = render_actual_help_coverage_report();
+    println!("{report}");
+
+    let expected = "# actual tokenized help coverage
+# rows are tracked multicall commands; coverage = tokenized fro <cmd> --help vs system <cmd> --help on this host
+base64      6/8    75%  remaining: --help, --version
+b2sum      15/19   79%  remaining: --help, --length, --version, -l
+cat        17/19   89%  remaining: --help, --version
+cksum       0/2     0%  remaining: --help, --version
+cmp        11/14   79%  remaining: --help, --version, -v
+cp         22/57   39%  remaining: --attributes-only, --backup, --context, --copy-contents, --dereference, --force, --help, --interactive, --link, --no-preserve, --one-file-system, --parents, --preserve=all, --preserve=links, --reflink=auto, --reflink=never, --remove-destination, --sparse, --sparse=always, --sparse=auto, --sparse=never, --strip-trailing-slashes, --suffix, --symbolic-link, --version, -H, -L, -S, -Z, -b, -d, -f, -i, -l, -x
+dd          0/2     0%  remaining: --help, --version
+du         12/44   27%  remaining: --apparent-size, --block-size, --bytes, --count-links, --dereference, --dereference-args, --exclude, --exclude-from, --files0-from, --help, --inodes, --no-dereference, --null, --one-file-system, --si, --threshold, --time, --time-style, --version, -0, -B, -D, -H, -L, -P, -X, -b, -k, -l, -m, -t, -x
+fgrep      17/87   20%  remaining: --after-context, --basic-regexp, --before-context, --binary, --binary-files, --binary-files=text, --binary-files=without-match, --byte-offset, --color, --colour, --context, --dereference-recursive, --devices, --directories, --directories=recurse, --exclude, --exclude-dir, --exclude-from, --extended-regexp, --files-with-matches, --files-without-match, --group-separator, --help, --include, --initial-tab, --label, --line-buffered, --max-count, --no-filename, --no-group-separator, --no-messages, --null, --null-data, --only-matching, --perl-regexp, --quiet, --recursive, --silent, --text, --version, --with-filename, --word-regexp, -A, -B, -C, -D, -E, -G, -H, -I, -L, -N, -P, -R, -T, -U, -V, -Z, -a, -b, -d, -h, -l, -m, -o, -q, -r, -s, -w, -z
+find        7/78    9%  remaining: --help, --version, -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype
+head       11/15   73%  remaining: --bytes=, --help, --lines=, --version
+md5sum     15/17   88%  remaining: --help, --version
+mv         11/23   48%  remaining: --backup, --context, --force, --help, --interactive, --strip-trailing-slashes, --suffix, --version, -S, -Z, -b, -i
+rm         12/18   67%  remaining: --help, --no-preserve-root, --one-file-system, --preserve-root, --version, -foo
+sha224sum  15/17   88%  remaining: --help, --version
+sha256sum  15/17   88%  remaining: --help, --version
+sha384sum  15/17   88%  remaining: --help, --version
+sha512sum  15/17   88%  remaining: --help, --version
+shred       9/17   53%  remaining: --exact, --help, --iterations, --random-source, --remove, --version, --zero, -x
+sort       23/55   42%  remaining: --batch-size, --buffer-size, --check=diagnose-first, --check=quiet, --check=silent, --compress-program, --debug, --dictionary-order, --field-separator, --files0-from, --help, --ignore-case, --ignore-leading-blanks, --ignore-nonprinting, --key, --month-sort, --parallel, --random-sort, --random-source, --sort, --stable, --version, --version-sort, -C, -R, -S, -b, -d, -f, -i, -s, -t
+tac         0/8     0%  remaining: --before, --help, --regex, --separator, --version, -b, -r, -s
+tail        6/24   25%  remaining: --bytes, --bytes=, --follow, --follow=name, --help, --lines, --lines=, --max-unchanged-stats, --pid, --quiet, --retry, --silent, --sleep-interval, --verbose, --version, -F, -f, -s
+tar        15/230   7%  remaining: --absolute-names, --acls, --add-file, --after-date, --after-date=DATE-OR-FILE, --anchored, --append, --atime-preserve, --auto-compress, --backup, --block-number, --blocking-factor, --bzip2, --catenate, --check-device, --check-links, --checkpoint, --checkpoint-action, --clamp-mtime, --compare, --compress, --concatenate, --confirmation, --delay-directory-restore, --delete, --dereference, --diff, --exclude, --exclude-backups, --exclude-caches, --exclude-caches-all, --exclude-caches-under, --exclude-from, --exclude-ignore, --exclude-ignore-recursive, --exclude-tag, --exclude-tag-all, --exclude-tag-under, --exclude-vcs, --exclude-vcs-ignores, --files-from, --force-local, --format, --format=gnu, --format=posix, --format=v7, --full-time, --get, --group, --group-map, --gunzip, --gzip, --hard-dereference, --help, --hole-detection, --ignore-case, --ignore-command-error, --ignore-failed-read, --ignore-zeros, --incremental, --index-file, --info-script, --interactive, --keep-directory-symlink, --keep-newer-files, --keep-old-files, --label, --level, --listed-incremental, --lzip, --lzma, --lzop, --mode, --mtime, --mtime=DATE-OR-FILE, --multi-volume, --new-volume-script, --newer, --newer-mtime, --newer=DATE-OR-FILE, --no-acls, --no-anchored, --no-auto-compress, --no-check-device, --no-delay-directory-restore, --no-ignore-case, --no-ignore-command-error, --no-null, --no-overwrite-dir, --no-quote-chars, --no-recursion, --no-same-owner, --no-same-permissions, --no-seek, --no-selinux, --no-unquote, --no-verbatim-files-from, --no-wildcards, --no-wildcards-match-slash, --no-xattrs, --null, --numeric-owner, --occurrence, --old-archive, --one-file-system, --one-top-level, --overwrite, --overwrite-dir, --owner, --owner-map, --pax-option, --pax-option=keyword, --portability, --posix, --preserve-order, --preserve-permissions, --quote-chars, --quoting-style, --quoting-style=escape, --read-full-records, --record-size, --recursion, --recursive-unlink, --remove-files, --restrict, --rmt-command, --rmt-command=, --rsh-command, --rsh-command=, --same-order, --same-owner, --same-permissions, --seek, --selinux, --show-defaults, --show-omitted-dirs, --show-snapshot-field-ranges, --show-stored-names, --show-transformed-names, --skip-old-files, --sort, --sparse, --sparse-version, --starting-file, --starting-file=MEMBER-NAME, --strip-components, --suffix, --tape-length, --test-label, --to-command, --to-stdout, --totals, --touch, --transform, --uncompress, --ungzip, --unlink-first, --unquote, --update, --usage, --use-compress-program, --utc, --verbatim-files-from, --verify, --version, --volno-file, --warning, --wildcards, --wildcards-match-slash, --xattrs, --xattrs-exclude, --xattrs-include, --xform, --xz, --zstd, -A, -B, -F, -G, -H, -I, -J, -K, -L, -M, -N, -O, -P, -R, -S, -T, -U, -V, -W, -X, -Z, -a, -b, -d, -f-, -g, -h, -i, -j, -k, -l, -m, -n, -o, -p, -r, -s, -u, -w, -z
+wc         11/13   85%  remaining: --help, --version
 ";
 
     assert_eq!(report, expected);
@@ -196,15 +218,15 @@ fn compat_help_superset_matches_tracked_system_flags() {
 
 #[test]
 fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
-    let cp_help = fro_help_text("cp");
+    let cp_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "cp");
     assert!(cp_help.contains("FIXME:"));
     assert!(cp_help.contains("ownership is not preserved"));
 
-    let sort_help = fro_help_text("sort");
+    let sort_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "sort");
     assert!(sort_help.contains("FIXME:"));
     assert!(sort_help.contains("-M, -V, -k"));
 
-    let tar_help = fro_help_text("tar");
+    let tar_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "tar");
     assert!(tar_help.contains("FIXME:"));
     assert!(tar_help.contains("whole-archive"));
 }

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoverageRow {
@@ -194,6 +196,8 @@ pub const ROWS: &[CoverageRow] = &[
     CoverageRow {
         name: "mv",
         covered: &[
+            "-n/--no-clobber",
+            "-u/--update",
             "-v/--verbose",
             "-t/--target-directory",
             "-T/--no-target-directory",
@@ -244,14 +248,16 @@ pub const ROWS: &[CoverageRow] = &[
             "(default bytewise ascending)",
             "-m/-c",
             "-g/-h",
+            "-M/--month-sort",
             "-n/--numeric-sort",
             "-r/--reverse",
             "-u/--unique",
+            "-V/--version-sort",
             "-z/--zero-terminated",
             "-o/--output",
             "-T/--temporary-directory",
         ],
-        remaining: &["-M", "-V", "-k"],
+        remaining: &["-k"],
     },
     CoverageRow {
         name: "tac",
@@ -318,6 +324,94 @@ pub fn tracked_help_tokens(row: CoverageRow) -> BTreeSet<String> {
         .iter()
         .chain(row.remaining.iter())
         .flat_map(|entry| parse_help_flag_tokens(entry))
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpTokenCoverage {
+    pub fro_tokens: BTreeSet<String>,
+    pub system_tokens: BTreeSet<String>,
+}
+
+impl HelpTokenCoverage {
+    pub fn covered_count(&self) -> usize {
+        self.system_tokens.intersection(&self.fro_tokens).count()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.system_tokens.len()
+    }
+
+    pub fn percent(&self) -> usize {
+        let total = self.total_count();
+        if total == 0 {
+            100
+        } else {
+            (self.covered_count() * 100 + total / 2) / total
+        }
+    }
+
+    pub fn missing_tokens(&self) -> Vec<String> {
+        self.system_tokens
+            .difference(&self.fro_tokens)
+            .cloned()
+            .collect()
+    }
+
+    pub fn remaining_text(&self) -> String {
+        let missing = self.missing_tokens();
+        if missing.is_empty() {
+            "none".to_string()
+        } else {
+            missing.join(", ")
+        }
+    }
+}
+
+pub fn help_token_coverage(fro_exe: impl AsRef<OsStr>, command: &str) -> HelpTokenCoverage {
+    HelpTokenCoverage {
+        fro_tokens: parse_help_flag_surface_tokens(&fro_help_text(fro_exe, command)),
+        system_tokens: parse_help_flag_surface_tokens(&system_help_text(command)),
+    }
+}
+
+pub fn fro_help_text(fro_exe: impl AsRef<OsStr>, command: &str) -> String {
+    let output = Command::new(fro_exe)
+        .arg(command)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run fro {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fro {command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("fro help should be UTF-8")
+}
+
+pub fn system_help_text(command: &str) -> String {
+    let output = Command::new(command)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("system help should be UTF-8")
+}
+
+pub fn parse_help_flag_surface_tokens(text: &str) -> BTreeSet<String> {
+    parse_help_flag_tokens(text)
+        .into_iter()
+        .filter(|token| token.starts_with('-'))
         .collect()
 }
 
