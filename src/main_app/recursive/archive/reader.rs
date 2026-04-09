@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -309,12 +310,6 @@ fn copy_reader_member_to_file<R: Read + ?Sized>(
     destination_path: &Path,
     size: u64,
 ) -> io::Result<()> {
-    if let Some(parent) = destination_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
     let mut destination = fs::File::create(destination_path)?;
     let mut remaining = size;
     let mut buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
@@ -444,6 +439,15 @@ fn apply_directory_metadata(path: &Path, mode: u32, mtime: u64) -> io::Result<()
     set_extracted_mtime(path, mtime, false)
 }
 
+fn ensure_cached_parent_dir(path: &Path, created_dirs: &mut HashSet<PathBuf>) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && created_dirs.insert(parent.to_path_buf()) {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_archive_member_to_file(
     archive_path: &Path,
     destination_path: &Path,
@@ -514,6 +518,7 @@ pub(super) fn extract_tar_archive(
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let mut directory_entries = Vec::new();
+    let mut created_dirs = HashSet::new();
     let config = config::load_config(None);
 
     loop {
@@ -546,12 +551,14 @@ pub(super) fn extract_tar_archive(
                         "tar regular-file entry resolved to an empty extraction path",
                     ));
                 }
+                ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
                 copy_archive_member_to_file(archive_path, &target_path, &entry, &config)?;
                 apply_regular_file_metadata(&target_path, &entry)?;
             }
             b'5' => {
                 if !relative_path.as_os_str().is_empty() {
                     fs::create_dir_all(&target_path)?;
+                    created_dirs.insert(target_path.clone());
                     directory_entries.push((target_path.clone(), entry.mode, entry.mtime));
                 }
             }
@@ -562,11 +569,7 @@ pub(super) fn extract_tar_archive(
                         "tar symlink entry resolved to an empty extraction path",
                     ));
                 }
-                if let Some(parent) = target_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
                 let link_target = std::ffi::OsString::from_vec(entry.link_target.clone());
                 if fs::symlink_metadata(&target_path).is_ok() {
                     fs::remove_file(&target_path)?;
@@ -635,6 +638,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let mut directory_entries = Vec::new();
+    let mut created_dirs = HashSet::new();
     visit_tar_archive(reader, archive_path, |entry, reader| {
         let relative_path = sanitized_tar_path(&entry.path)?;
         let target_path = destination_root.join(&relative_path);
@@ -646,6 +650,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
                         "tar regular-file entry resolved to an empty extraction path",
                     ));
                 }
+                ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
                 copy_reader_member_to_file(reader, &target_path, entry.size)?;
                 apply_regular_file_metadata(&target_path, entry)?;
                 entry.size
@@ -653,6 +658,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
             b'5' => {
                 if !relative_path.as_os_str().is_empty() {
                     fs::create_dir_all(&target_path)?;
+                    created_dirs.insert(target_path.clone());
                     directory_entries.push((target_path.clone(), entry.mode, entry.mtime));
                 }
                 0
@@ -664,11 +670,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
                         "tar symlink entry resolved to an empty extraction path",
                     ));
                 }
-                if let Some(parent) = target_path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
+                ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
                 let link_target = std::ffi::OsString::from_vec(entry.link_target.clone());
                 if fs::symlink_metadata(&target_path).is_ok() {
                     fs::remove_file(&target_path)?;
