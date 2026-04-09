@@ -2,6 +2,7 @@ mod hash;
 
 use super::*;
 use crate::help_compat::help_section_lines;
+use std::borrow::Cow;
 #[derive(Clone, Copy)]
 pub(super) struct CommandHelp {
     name: &'static str,
@@ -828,6 +829,56 @@ pub(super) fn print_command_help(program: &str, help: CommandHelp) {
             println!("    {} {}", program, command);
         }
     }
+}
+
+fn rewrite_help_command<'a>(text: &'a str, from: &str, to: &str) -> Cow<'a, str> {
+    if text == from {
+        return Cow::Owned(to.to_string());
+    }
+    if let Some(rest) = text.strip_prefix(from).filter(|rest| rest.starts_with(' ')) {
+        return Cow::Owned(format!("{to}{rest}"));
+    }
+    Cow::Borrowed(text)
+}
+
+pub(crate) fn print_direct_command_help(command_name: &str, help_name: &str) -> bool {
+    let Some(help) = command_help(help_name) else {
+        return false;
+    };
+    let display_name = rewrite_help_command(help.name, help.name, command_name);
+    println!("{display_name} - {}", help.summary);
+    println!();
+    println!("USAGE:");
+    println!(
+        "  {}",
+        rewrite_help_command(help.usage, help.name, command_name)
+    );
+    if !help.notes.is_empty() {
+        println!();
+        println!("NOTES:");
+        for note in help.notes {
+            println!("  - {}", note);
+        }
+    }
+    if let Some(lines) = help_section_lines(help_name) {
+        println!();
+        println!("COMPAT:");
+        for line in lines {
+            println!("  - {}", line);
+        }
+    }
+    if !help.examples.is_empty() {
+        println!();
+        println!("EXAMPLES:");
+        for (description, command) in help.examples {
+            println!("  {}", description);
+            println!(
+                "    {}",
+                rewrite_help_command(command, help.name, command_name)
+            );
+        }
+    }
+    true
 }
 
 pub(super) fn print_general_help(program: &str) {

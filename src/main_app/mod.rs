@@ -49,6 +49,7 @@ mod util;
 
 use self::copy_plan::{CopyRewriteMode, ResolvedCopyExecution};
 use self::file_list::*;
+pub(crate) use self::help::print_direct_command_help;
 use self::help::*;
 use self::read_sweep::*;
 use self::tuning::*;

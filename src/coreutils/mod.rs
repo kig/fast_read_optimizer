@@ -119,6 +119,22 @@ pub fn rewrite_subcommand_alias(args: Vec<String>) -> Vec<String> {
     args
 }
 
+fn multicall_help_command(name: &str) -> Option<&str> {
+    match name {
+        "cp" => Some("copy"),
+        other if is_coreutils_command(other) => Some(other),
+        _ => None,
+    }
+}
+
+fn is_multicall_help_flag(arg: Option<&String>) -> bool {
+    matches!(arg.map(String::as_str), Some("-h" | "--help"))
+}
+
+fn is_multicall_version_flag(arg: Option<&String>) -> bool {
+    matches!(arg.map(String::as_str), Some("--version"))
+}
+
 fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
     let mut rewritten = Vec::with_capacity(command_args.len());
     let mut end_flags = false;
@@ -236,6 +252,16 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
     let Some(invoked) = invoked_name(args.first().map(String::as_str).unwrap_or_default()) else {
         return Ok(None);
     };
+    if let Some(help_name) = multicall_help_command(&invoked) {
+        if is_multicall_help_flag(args.get(1)) {
+            crate::main_app::print_direct_command_help(&invoked, help_name);
+            return Ok(Some(0));
+        }
+        if is_multicall_version_flag(args.get(1)) {
+            print_coreutils_version(&invoked);
+            return Ok(Some(0));
+        }
+    }
     run_named_command(&invoked, args)
 }
 
@@ -325,7 +351,11 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
     if !is_coreutils_command(invoked) {
         return Ok(None);
     }
-    if args.get(1).map(String::as_str) == Some("--version") {
+    if is_multicall_help_flag(args.get(1)) {
+        crate::main_app::print_direct_command_help(invoked, invoked);
+        return Ok(Some(0));
+    }
+    if is_multicall_version_flag(args.get(1)) {
         print_coreutils_version(invoked);
         return Ok(Some(0));
     }
