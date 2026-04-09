@@ -28,6 +28,7 @@ pub(super) fn sort_inputs(
     unique: bool,
     reverse: bool,
     output_path: Option<&str>,
+    temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
     let memory_budget = sort_memory_budget_bytes()?;
     if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
@@ -43,6 +44,7 @@ pub(super) fn sort_inputs(
         reverse,
         output_path,
         memory_budget,
+        temporary_directory,
     )
 }
 
@@ -85,9 +87,10 @@ fn sort_inputs_streamed(
     reverse: bool,
     output_path: Option<&str>,
     memory_budget: u64,
+    temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
     let chunk_target = spill_chunk_target_bytes(memory_budget);
-    let mut spill = SpillSorter::new(mode, unique, reverse, chunk_target);
+    let mut spill = SpillSorter::new(mode, unique, reverse, chunk_target, temporary_directory);
     let mut total_bytes = 0u64;
     for input in inputs {
         let bytes = visit_ordered_input_counted(input, io_mode, |block| spill.push_block(block))
@@ -112,8 +115,9 @@ pub(super) fn merge_presorted_inputs(
     unique: bool,
     reverse: bool,
     output_path: Option<&str>,
+    temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
-    let mut temp_files = SpillTempFiles::new();
+    let mut temp_files = SpillTempFiles::new(temporary_directory)?;
     let mut next_sequence = 0u64;
     let mut total_bytes = 0u64;
     for input in inputs {
@@ -325,11 +329,18 @@ struct SpillSorter {
     lines: Vec<SortLineRef>,
     carry: Vec<u8>,
     next_sequence: u64,
+    temporary_directory: Option<PathBuf>,
     temp_files: Option<SpillTempFiles>,
 }
 
 impl SpillSorter {
-    fn new(mode: SortMode, unique: bool, reverse: bool, chunk_target: usize) -> Self {
+    fn new(
+        mode: SortMode,
+        unique: bool,
+        reverse: bool,
+        chunk_target: usize,
+        temporary_directory: Option<&Path>,
+    ) -> Self {
         Self {
             mode,
             unique,
@@ -339,6 +350,7 @@ impl SpillSorter {
             lines: Vec::new(),
             carry: Vec::new(),
             next_sequence: 0,
+            temporary_directory: temporary_directory.map(Path::to_path_buf),
             temp_files: None,
         }
     }
@@ -384,7 +396,13 @@ impl SpillSorter {
             self.unique,
             self.reverse,
         )?;
-        let temp_files = self.temp_files.get_or_insert_with(SpillTempFiles::new);
+        if self.temp_files.is_none() {
+            self.temp_files = Some(SpillTempFiles::new(self.temporary_directory.as_deref())?);
+        }
+        let temp_files = self
+            .temp_files
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing sort spill temp files"))?;
         let path = temp_files.next_chunk_path();
         write_chunk_file(&path, &self.lines, &self.storage)?;
         temp_files.paths.push(path);
@@ -427,19 +445,51 @@ struct SpillTempFiles {
 }
 
 impl SpillTempFiles {
-    fn new() -> Self {
-        let mut dir = std::env::temp_dir();
+    fn new(temporary_directory: Option<&Path>) -> io::Result<Self> {
+        let base_dir = if let Some(path) = temporary_directory {
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "cannot create temporary file in '{}': Not a directory",
+                        path.display()
+                    )))
+                }
+                Err(err) => {
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot create temporary file in '{}': {err}",
+                            path.display()
+                        ),
+                    ))
+                }
+            }
+        } else {
+            std::env::temp_dir()
+        };
+        let mut dir = base_dir;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         dir.push(format!("fro-sort-{}-{timestamp}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        Self {
+        fs::create_dir(&dir).map_err(|err| {
+            let parent =
+                temporary_directory.unwrap_or_else(|| dir.parent().unwrap_or(Path::new(".")));
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "cannot create temporary file in '{}': {err}",
+                    parent.display()
+                ),
+            )
+        })?;
+        Ok(Self {
             dir,
             paths: Vec::new(),
             next_index: 0,
-        }
+        })
     }
 
     fn next_chunk_path(&mut self) -> PathBuf {

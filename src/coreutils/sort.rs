@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use stringzilla::stringzilla as sz;
 
 mod external;
@@ -236,6 +237,9 @@ fn print_sort_help(program: &str) {
     println!("  -u, --unique         output only the first of an equal run");
     println!("  -o FILE              write result to FILE after reading all input");
     println!("      --output=FILE    same as -o FILE");
+    println!("  -T DIR               write spill files under DIR when out-of-core merge is needed");
+    println!("      --temporary-directory=DIR");
+    println!("                       same as -T DIR");
     println!("      --auto           choose direct IO automatically for regular files");
     println!("      --direct         force direct IO for regular files when possible");
     println!("      --no-direct      force page-cache IO for regular files");
@@ -247,11 +251,12 @@ fn print_sort_help(program: &str) {
     println!("  - Use '--' before file names that start with '-'.");
     println!("  - Bytewise in-memory sorting uses a StringZilla argsort fast path.");
     println!("  - Inputs larger than available memory spill sorted runs and merge them.");
+    println!("  - -T only matters when spill temp files are actually created.");
     println!("  - -m reuses the spill/merge backend on already sorted inputs.");
     println!("  - -c validates one input stream and exits 1 on the first disorder.");
     println!("  - Unsupported GNU sort features currently return an error:");
     println!("    general keys, month/version/human modes,");
-    println!("    zero-terminated records, temp-file controls, and locale collation.");
+    println!("    zero-terminated records and locale collation.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -420,6 +425,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut reverse = false;
     let mut unique = false;
     let mut output_path = None;
+    let mut temporary_directory = None;
     let mut files = Vec::new();
     let mut end_flags = false;
     let mut idx = 1usize;
@@ -446,12 +452,24 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 output_path = Some(path.clone());
                 idx += 1;
             }
+            "-T" | "--temporary-directory" if !end_flags => {
+                let Some(path) = args.get(idx + 1) else {
+                    eprintln!("sort: option requires an argument -- 'T'");
+                    eprintln!("Try 'sort --help' for more information.");
+                    return Ok(2);
+                };
+                temporary_directory = Some(path.clone());
+                idx += 1;
+            }
             "--auto" if !end_flags => io_mode = IOMode::Auto,
             "--direct" if !end_flags => io_mode = IOMode::Direct,
             "--no-direct" if !end_flags => io_mode = IOMode::PageCache,
             "--report-gbps" if !end_flags => report_throughput = true,
             other if !end_flags && other.starts_with("--output=") => {
                 output_path = Some(other["--output=".len()..].to_string());
+            }
+            other if !end_flags && other.starts_with("--temporary-directory=") => {
+                temporary_directory = Some(other["--temporary-directory=".len()..].to_string());
             }
             other
                 if !end_flags
@@ -493,6 +511,21 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                             }
                             break;
                         }
+                        'T' => {
+                            let value_start = 2 + pos;
+                            if value_start < other.len() {
+                                temporary_directory = Some(other[value_start..].to_string());
+                            } else {
+                                let Some(path) = args.get(idx + 1) else {
+                                    eprintln!("sort: option requires an argument -- 'T'");
+                                    eprintln!("Try 'sort --help' for more information.");
+                                    return Ok(2);
+                                };
+                                temporary_directory = Some(path.clone());
+                                consumed_next = true;
+                            }
+                            break;
+                        }
                         _ => {
                             handled = false;
                             break;
@@ -502,7 +535,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 if !handled {
                     eprintln!("sort: unsupported option '{other}'");
                     eprintln!(
-                        "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o."
+                        "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o/-T."
                     );
                     eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
@@ -514,7 +547,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o."
+                    "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o/-T."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
@@ -574,6 +607,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 unique,
                 reverse,
                 output_path.as_deref(),
+                temporary_directory.as_deref().map(Path::new),
             )
         } else {
             external::sort_inputs(
@@ -583,6 +617,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 unique,
                 reverse,
                 output_path.as_deref(),
+                temporary_directory.as_deref().map(Path::new),
             )
         } {
             Ok(bytes) => bytes,
