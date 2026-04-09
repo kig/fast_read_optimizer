@@ -275,17 +275,19 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "sort" => Some(CommandHelp {
             name: "sort",
-            usage: "sort [-r|--reverse] [-u|--unique] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
+            usage: "sort [-r|--reverse] [-u|--unique] [-o FILE|--output=FILE] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
             summary: "Sort newline-delimited records in locale-independent ascending byte order.",
             notes: &[
-                "This bounded slice implements the default bytewise newline-delimited case plus reverse/unique output.",
+                "This bounded slice implements the default bytewise newline-delimited case plus reverse/unique output and -o output-file writes.",
                 "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
-                "Unsupported GNU sort features currently return an error, including numeric/month/version modes, keys, merge/check modes, zero-terminated records, output/temp-file controls, and locale collation.",
+                "-o writes after all input has been read, so in-place rewrites like `sort -o file file` stay on the same bytewise backend.",
+                "Unsupported GNU sort features currently return an error, including numeric/month/version modes, keys, merge/check modes, zero-terminated records, temp-file controls, and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],
             examples: &[
                 ("Sort one file to stdout", "sort names.txt"),
                 ("Sort unique records in reverse byte order", "sort -ru names.txt"),
+                ("Rewrite one file in place", "sort -o names.txt names.txt"),
                 ("Sort one file with page-cache reads forced", "sort --no-direct names.txt"),
             ],
         }),

@@ -31,11 +31,13 @@ fn print_sort_help(program: &str) {
     println!(
         "This bounded slice sorts newline-delimited records in locale-independent byte order."
     );
-    println!("It currently supports the default case plus reverse/unique output.");
+    println!("It currently supports the default case plus reverse/unique and -o output.");
     println!();
     println!("Supported options:");
     println!("  -r, --reverse        reverse the result of comparisons");
     println!("  -u, --unique         output only the first of an equal run");
+    println!("  -o FILE              write result to FILE after reading all input");
+    println!("      --output=FILE    same as -o FILE");
     println!("      --auto           choose direct IO automatically for regular files");
     println!("      --direct         force direct IO for regular files when possible");
     println!("      --no-direct      force page-cache IO for regular files");
@@ -47,7 +49,7 @@ fn print_sort_help(program: &str) {
     println!("  - Use '--' before file names that start with '-'.");
     println!("  - Unsupported GNU sort features currently return an error:");
     println!("    numeric/month/version modes, keys, merge/check modes,");
-    println!("    zero-terminated records, output/temp-file controls, and locale collation.");
+    println!("    zero-terminated records, temp-file controls, and locale collation.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -151,15 +153,30 @@ fn apply_short_sort_flags(arg: &str, reverse: &mut bool, unique: &mut bool) -> b
     true
 }
 
+fn write_sorted_lines<W: Write>(
+    mut out: W,
+    lines: &[SortLineRef],
+    storage: &[u8],
+) -> io::Result<()> {
+    for line in lines {
+        out.write_all(line.bytes(storage))?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()
+}
+
 pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut report_throughput = false;
     let mut reverse = false;
     let mut unique = false;
+    let mut output_path = None;
     let mut files = Vec::new();
     let mut end_flags = false;
+    let mut idx = 1usize;
 
-    for arg in &args[1..] {
+    while idx < args.len() {
+        let arg = &args[idx];
         match arg.as_str() {
             "--" if !end_flags => end_flags = true,
             "-h" | "--help" if !end_flags => {
@@ -168,21 +185,79 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             }
             "-r" | "--reverse" if !end_flags => reverse = true,
             "-u" | "--unique" if !end_flags => unique = true,
+            "-o" | "--output" if !end_flags => {
+                let Some(path) = args.get(idx + 1) else {
+                    eprintln!("sort: option requires an argument -- 'o'");
+                    eprintln!("Try 'sort --help' for more information.");
+                    return Ok(2);
+                };
+                output_path = Some(path.clone());
+                idx += 1;
+            }
             "--auto" if !end_flags => io_mode = IOMode::Auto,
             "--direct" if !end_flags => io_mode = IOMode::Direct,
             "--no-direct" if !end_flags => io_mode = IOMode::PageCache,
             "--report-gbps" if !end_flags => report_throughput = true,
+            other if !end_flags && other.starts_with("--output=") => {
+                output_path = Some(other["--output=".len()..].to_string());
+            }
             other if !end_flags && apply_short_sort_flags(other, &mut reverse, &mut unique) => {}
+            other
+                if !end_flags
+                    && other.starts_with('-')
+                    && !other.starts_with("--")
+                    && other != "-" =>
+            {
+                let mut handled = true;
+                let mut consumed_next = false;
+                for (pos, flag) in other[1..].char_indices() {
+                    match flag {
+                        'r' => reverse = true,
+                        'u' => unique = true,
+                        'o' => {
+                            let value_start = 2 + pos;
+                            if value_start < other.len() {
+                                output_path = Some(other[value_start..].to_string());
+                            } else {
+                                let Some(path) = args.get(idx + 1) else {
+                                    eprintln!("sort: option requires an argument -- 'o'");
+                                    eprintln!("Try 'sort --help' for more information.");
+                                    return Ok(2);
+                                };
+                                output_path = Some(path.clone());
+                                consumed_next = true;
+                            }
+                            break;
+                        }
+                        _ => {
+                            handled = false;
+                            break;
+                        }
+                    }
+                }
+                if !handled {
+                    eprintln!("sort: unsupported option '{other}'");
+                    eprintln!(
+                        "sort: fro sort currently supports only bytewise line sorting with optional reverse/unique output and -o."
+                    );
+                    eprintln!("Try 'sort --help' for more information.");
+                    return Ok(2);
+                }
+                if consumed_next {
+                    idx += 1;
+                }
+            }
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports only bytewise line sorting with optional reverse/unique output."
+                    "sort: fro sort currently supports only bytewise line sorting with optional reverse/unique output and -o."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
             }
             other => files.push(other.to_string()),
         }
+        idx += 1;
     }
 
     let inputs = parse_stream_inputs(files);
@@ -217,12 +292,21 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
 
     finalize_sorted_lines(&mut lines, &storage, unique, reverse);
 
-    let mut out = stdout_buf_writer()?;
-    for line in &lines {
-        out.write_all(line.bytes(&storage))?;
-        out.write_all(b"\n")?;
+    let write_result = if let Some(path) = output_path.as_deref() {
+        let mut out = fro::create_with_mode(path, io_mode)?;
+        write_sorted_lines(&mut out, &lines, &storage)
+    } else {
+        let out = stdout_buf_writer()?;
+        write_sorted_lines(out, &lines, &storage)
+    };
+    if let Err(err) = write_result {
+        if let Some(path) = output_path.as_deref() {
+            eprintln!("sort: cannot write '{path}': {err}");
+        } else {
+            eprintln!("sort: write failed: {err}");
+        }
+        return Ok(2);
     }
-    out.flush()?;
 
     if report_throughput {
         report_gbps("sort", total_bytes, started_at);

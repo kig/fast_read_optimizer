@@ -37,6 +37,7 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("bytewise"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
+    assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("Unsupported GNU sort features"));
     assert!(!stdout.contains("reverse, unique"));
 }
@@ -97,4 +98,119 @@ fn sort_rejects_unsupported_flags_with_help_hint() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported option '-n'"));
     assert!(stderr.contains("Try 'sort --help' for more information."));
+}
+
+#[test]
+fn sort_output_file_matches_system_and_suppresses_stdout() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-output");
+    let input = tmp.join("input.txt");
+    fs::write(&input, b"beta\nalpha\nbeta\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for form in ["split", "long", "attached"] {
+            let fro_output = tmp.join(format!("fro-output-{form}.txt"));
+            let sys_output = tmp.join(format!("sys-output-{form}.txt"));
+            let mut fro_args = io_flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            fro_args.push("-u".to_string());
+            match form {
+                "split" => {
+                    fro_args.push("-o".to_string());
+                    fro_args.push(fro_output.to_string_lossy().into_owned());
+                }
+                "long" => {
+                    fro_args.push(format!("--output={}", fro_output.display()));
+                }
+                "attached" => {
+                    fro_args.push(format!("-o{}", fro_output.display()));
+                }
+                _ => unreachable!(),
+            }
+            fro_args.push(input.to_string_lossy().into_owned());
+            let fro_args_refs = fro_args.iter().map(String::as_str).collect::<Vec<_>>();
+
+            let fro = run_fro("sort", &fro_args_refs);
+            let system = match form {
+                "split" => run_system_sort(&[
+                    "-u",
+                    "-o",
+                    sys_output.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]),
+                "long" => {
+                    let output_flag = format!("--output={}", sys_output.display());
+                    run_system_sort(&["-u", output_flag.as_str(), input.to_str().unwrap()])
+                }
+                "attached" => {
+                    let output_flag = format!("-o{}", sys_output.display());
+                    run_system_sort(&["-u", output_flag.as_str(), input.to_str().unwrap()])
+                }
+                _ => unreachable!(),
+            };
+
+            assert_eq!(fro.status.code(), system.status.code());
+            assert!(fro.stdout.is_empty(), "fro unexpectedly wrote to stdout");
+            assert!(
+                system.stdout.is_empty(),
+                "system sort unexpectedly wrote to stdout"
+            );
+            assert_eq!(fro.stderr, system.stderr);
+            assert_eq!(
+                fs::read(&fro_output).unwrap(),
+                fs::read(&sys_output).unwrap()
+            );
+            let _ = fs::remove_file(&fro_output);
+            let _ = fs::remove_file(&sys_output);
+        }
+    }
+}
+
+#[test]
+fn sort_output_file_supports_in_place_rewrite_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-output-in-place");
+
+    let fro_in_place = tmp.join("fro-in-place.txt");
+    let sys_in_place = tmp.join("sys-in-place.txt");
+    fs::write(&fro_in_place, b"bbb\na\nbbb\n").unwrap();
+    fs::write(&sys_in_place, b"bbb\na\nbbb\n").unwrap();
+    let fro = run_fro(
+        "sort",
+        &[
+            "-u",
+            "-o",
+            fro_in_place.to_str().unwrap(),
+            fro_in_place.to_str().unwrap(),
+        ],
+    );
+    let system = run_system_sort(&[
+        "-u",
+        "-o",
+        sys_in_place.to_str().unwrap(),
+        sys_in_place.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_in_place).unwrap(),
+        fs::read(&sys_in_place).unwrap()
+    );
+
+    let fro_stdin = tmp.join("fro-stdin.txt");
+    let sys_stdin = tmp.join("sys-stdin.txt");
+    let fro = run_fro_with_stdin(
+        "sort",
+        &["-r", "-o", fro_stdin.to_str().unwrap(), "-"],
+        b"bbb\na\nab\n",
+    );
+    let system = run_system_sort_with_stdin(
+        &["-r", "-o", sys_stdin.to_str().unwrap(), "-"],
+        b"bbb\na\nab\n",
+    );
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(fs::read(&fro_stdin).unwrap(), fs::read(&sys_stdin).unwrap());
 }

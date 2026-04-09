@@ -231,8 +231,9 @@ const ROWS: &[CoverageRow] = &[
             "(default bytewise ascending)",
             "-r/--reverse",
             "-u/--unique",
+            "-o/--output",
         ],
-        remaining: &["-n/-g/-h", "-M", "-V", "-k", "-m/-c", "-z", "-o/-T"],
+        remaining: &["-n/-g/-h", "-M", "-V", "-k", "-m/-c", "-z", "-T"],
     },
     CoverageRow {
         name: "tac",
@@ -342,7 +343,7 @@ sha256sum 11/11 100%  remaining: none
 sha384sum 11/11 100%  remaining: none
 sha512sum 11/11 100%  remaining: none
 shred      6/6  100%  remaining: none
-sort       3/10  30%  remaining: -n/-g/-h, -M, -V, -k, -m/-c, -z, -o/-T
+sort       4/11  36%  remaining: -n/-g/-h, -M, -V, -k, -m/-c, -z, -T
 tac        2/2  100%  remaining: none
 tail       4/4  100%  remaining: none
 tar        4/5   80%  remaining: -x/--extract
@@ -364,8 +365,7 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
     let sort_source = include_str!("../src/coreutils/sort.rs");
     assert!(sort_source.contains("Unsupported GNU sort features currently return an error"));
     assert!(sort_source.contains("numeric/month/version modes, keys, merge/check modes,"));
-    assert!(sort_source
-        .contains("zero-terminated records, output/temp-file controls, and locale collation."));
+    assert!(sort_source.contains("zero-terminated records, temp-file controls, and locale collation."));
 
     let tar_source = include_str!("../src/coreutils/tar.rs");
     assert!(tar_source.contains("whole-archive list (-t/--list) modes"));
