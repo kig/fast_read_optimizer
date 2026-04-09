@@ -169,6 +169,9 @@ fn build_tests_includes_coreutils_big_file_cases() {
     let names = tests.iter().map(|test| test.name).collect::<Vec<_>>();
     for expected in [
         "coreutils cat (hot)",
+        "coreutils cmp (hot)",
+        "coreutils head -c full (hot)",
+        "coreutils tail -c full (hot)",
         "coreutils fgrep --count (hot)",
         "coreutils wc -l (hot)",
         "coreutils cksum (hot)",

@@ -97,10 +97,13 @@ fn parse_tail_count(value: &str, flag: &str) -> io::Result<TailCount> {
     })
 }
 
-fn parse_tail_options(args: &[String]) -> io::Result<(IOMode, TailMode, HeaderMode, Vec<String>)> {
+fn parse_tail_options(
+    args: &[String],
+) -> io::Result<(IOMode, TailMode, HeaderMode, bool, Vec<String>)> {
     let mut io_mode = IOMode::Auto;
     let mut mode = TailMode::Lines(TailCount::FromEnd(10));
     let mut header_mode = HeaderMode::Auto;
+    let mut report_gbps = false;
     let mut files = Vec::new();
     let mut i = 1usize;
     while i < args.len() {
@@ -108,6 +111,7 @@ fn parse_tail_options(args: &[String]) -> io::Result<(IOMode, TailMode, HeaderMo
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            "--report-gbps" => report_gbps = true,
             "-q" => header_mode = HeaderMode::Never,
             "-v" => header_mode = HeaderMode::Always,
             "-n" => {
@@ -148,7 +152,7 @@ fn parse_tail_options(args: &[String]) -> io::Result<(IOMode, TailMode, HeaderMo
         }
         i += 1;
     }
-    Ok((io_mode, mode, header_mode, files))
+    Ok((io_mode, mode, header_mode, report_gbps, files))
 }
 
 fn write_regular_range<W: Write>(out: &mut W, path: &str, range: ByteRange) -> io::Result<()> {
@@ -222,15 +226,16 @@ fn regular_tail_start_offset(path: &str, mode: TailMode) -> io::Result<u64> {
     }
 }
 
-fn try_write_tail_regular_path_fast(path: &str, start_offset: u64) -> io::Result<bool> {
+fn try_write_tail_regular_path_fast(path: &str, start_offset: u64) -> io::Result<Option<u64>> {
     let mut noop = |_bytes: u64| Ok(());
-    Ok(copy_path_range_to_fd_with_progress(
+    let copied = copy_path_range_to_fd_with_progress(
         path,
         libc::STDOUT_FILENO,
         ByteRange::starting_at(start_offset),
         &mut noop,
-    )?
-    .is_some())
+    )?;
+    let emitted_len = std::fs::metadata(path)?.len().saturating_sub(start_offset);
+    Ok(copied.map(|written| written.min(emitted_len)))
 }
 
 #[derive(Debug)]
@@ -663,13 +668,15 @@ fn write_tail_windowed<W: Write>(
 }
 
 pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
-    let (io_mode, mode, header_mode, files) = parse_tail_options(args)?;
+    let (io_mode, mode, header_mode, report_throughput, files) = parse_tail_options(args)?;
     let inputs = parse_stream_inputs(files);
     let show_headers = match header_mode {
         HeaderMode::Auto => inputs.len() > 1,
         HeaderMode::Always => true,
         HeaderMode::Never => false,
     };
+    let started_at = report_throughput.then(std::time::Instant::now);
+    let mut total_output_bytes = 0_u64;
     let mut out = None;
     for (index, input) in inputs.iter().enumerate() {
         if show_headers {
@@ -683,15 +690,19 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
             };
             writeln!(out, "==> {label} <==")?;
         }
-        match input {
+        let emitted_bytes = match input {
             StreamInput::File(path) if is_regular_input_path(path)? => {
                 let start_offset = regular_tail_start_offset(path, mode)?;
                 if let Some(out) = out.as_mut() {
                     out.flush()?;
                 }
-                if !try_write_tail_regular_path_fast(path, start_offset)? {
+                if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
+                    written
+                } else {
                     let out = out.get_or_insert(stdout_buf_writer()?);
-                    write_regular_range(out, path, ByteRange::starting_at(start_offset))?;
+                    let mut counted = CountingWrite::new(out);
+                    write_regular_range(&mut counted, path, ByteRange::starting_at(start_offset))?;
+                    counted.bytes_written()
                 }
             }
             StreamInput::Stdin { .. } => {
@@ -700,30 +711,48 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                     if let Some(out) = out.as_mut() {
                         out.flush()?;
                     }
-                    if !try_write_tail_regular_path_fast(path, start_offset)? {
+                    if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
+                        written
+                    } else {
                         let out = out.get_or_insert(stdout_buf_writer()?);
-                        write_regular_range(out, path, ByteRange::starting_at(start_offset))?;
+                        let mut counted = CountingWrite::new(out);
+                        write_regular_range(
+                            &mut counted,
+                            path,
+                            ByteRange::starting_at(start_offset),
+                        )?;
+                        counted.bytes_written()
                     }
                 } else if let TailMode::Bytes(TailCount::FromEnd(count)) = mode {
-                    if let Some(out) = out.as_mut() {
-                        out.flush()?;
+                    if !report_throughput {
+                        if let Some(out) = out.as_mut() {
+                            out.flush()?;
+                        }
                     }
-                    if !try_write_tail_pipe_bytes_fast(input, count)? {
+                    if !report_throughput && try_write_tail_pipe_bytes_fast(input, count)? {
+                        count
+                    } else {
                         let out = out.get_or_insert(stdout_buf_writer()?);
-                        write_tail_windowed(out, input, io_mode, mode)?;
+                        let mut counted = CountingWrite::new(out);
+                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        counted.bytes_written()
                     }
                 } else if matches!(mode, TailMode::Lines(TailCount::FromEnd(_))) {
                     let out = out.get_or_insert(stdout_buf_writer()?);
-                    write_tail_windowed(out, input, io_mode, mode)?;
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                    counted.bytes_written()
                 } else {
                     let out = out.get_or_insert(stdout_buf_writer()?);
-                    write_tail_from_start(out, input, io_mode, mode)?;
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                    counted.bytes_written()
                 }
             }
             StreamInput::File(path) => {
                 if let TailMode::Bytes(TailCount::FromEnd(count)) = mode {
                     let file_type = std::fs::metadata(path)?.file_type();
-                    if file_type.is_fifo() {
+                    if file_type.is_fifo() && !report_throughput {
                         if let Some(out) = out.as_mut() {
                             out.flush()?;
                         }
@@ -731,26 +760,47 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                             let out = out.get_or_insert(stdout_buf_writer()?);
                             write_tail_windowed(out, input, io_mode, mode)?;
                         }
-                        continue;
+                        count
+                    } else if file_type.is_fifo() {
+                        let out = out.get_or_insert(stdout_buf_writer()?);
+                        let mut counted = CountingWrite::new(out);
+                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        counted.bytes_written()
+                    } else if matches!(
+                        mode,
+                        TailMode::Bytes(TailCount::FromEnd(_))
+                            | TailMode::Lines(TailCount::FromEnd(_))
+                    ) {
+                        let out = out.get_or_insert(stdout_buf_writer()?);
+                        let mut counted = CountingWrite::new(out);
+                        write_tail_windowed(&mut counted, input, io_mode, mode)?;
+                        counted.bytes_written()
+                    } else {
+                        let out = out.get_or_insert(stdout_buf_writer()?);
+                        let mut counted = CountingWrite::new(out);
+                        write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                        counted.bytes_written()
                     }
-                }
-                if matches!(
-                    mode,
-                    TailMode::Bytes(TailCount::FromEnd(_)) | TailMode::Lines(TailCount::FromEnd(_))
-                ) {
-                    let out = out.get_or_insert(stdout_buf_writer()?);
-                    write_tail_windowed(out, input, io_mode, mode)?;
                 } else {
                     let out = out.get_or_insert(stdout_buf_writer()?);
-                    write_tail_from_start(out, input, io_mode, mode)?;
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_from_start(&mut counted, input, io_mode, mode)?;
+                    counted.bytes_written()
                 }
             }
-        }
+        };
+        total_output_bytes = total_output_bytes
+            .checked_add(emitted_bytes)
+            .ok_or_else(|| io::Error::other("tail output byte count overflow"))?;
     }
     match out {
         Some(out) => out.into_inner(),
         None => Ok(()),
+    }?;
+    if let Some(started_at) = started_at {
+        report_gbps("tail", total_output_bytes, started_at);
     }
+    Ok(())
 }
 
 #[cfg(test)]

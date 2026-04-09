@@ -164,10 +164,13 @@ fn parse_obsolete_head_arg(arg: &str) -> io::Result<Option<(HeadMode, Option<Hea
     Ok(Some((mode, header_mode)))
 }
 
-fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMode, Vec<String>)> {
+fn parse_head_options(
+    args: &[String],
+) -> io::Result<(IOMode, HeadMode, HeaderMode, bool, Vec<String>)> {
     let mut io_mode = IOMode::Auto;
     let mut mode = HeadMode::Lines(HeadCount::FromStart(10));
     let mut header_mode = HeaderMode::Auto;
+    let mut report_gbps = false;
     let mut files = Vec::new();
     let mut i = 1usize;
     while i < args.len() {
@@ -175,6 +178,7 @@ fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMo
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            "--report-gbps" => report_gbps = true,
             "--quiet" | "--silent" => header_mode = HeaderMode::Never,
             "--verbose" => header_mode = HeaderMode::Always,
             "--lines" => {
@@ -246,7 +250,7 @@ fn parse_head_options(args: &[String]) -> io::Result<(IOMode, HeadMode, HeaderMo
         }
         i += 1;
     }
-    Ok((io_mode, mode, header_mode, files))
+    Ok((io_mode, mode, header_mode, report_gbps, files))
 }
 
 fn write_head_bytes_from_start<W: Write>(
@@ -269,23 +273,24 @@ fn write_head_bytes_from_start<W: Write>(
     })
 }
 
-fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
+fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<Option<u64>> {
     if cfg!(test) {
-        return Ok(false);
+        return Ok(None);
     }
     if bytes == 0 {
-        return Ok(true);
+        return Ok(Some(0));
     }
     let mut noop = |_bytes: u64| Ok(());
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
-            Ok(copy_path_range_to_fd_with_progress(
+            let copied = copy_path_range_to_fd_with_progress(
                 path,
                 libc::STDOUT_FILENO,
                 ByteRange::up_to(bytes),
                 &mut noop,
-            )?
-            .is_some())
+            )?;
+            let file_len = std::fs::metadata(path)?.len();
+            Ok(copied.map(|written| written.min(file_len)))
         }
         StreamInput::Stdin { .. } => {
             if let Some(copied) = copy_fd_range_to_fd_with_progress(
@@ -294,7 +299,7 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
                 ByteRange::up_to(bytes),
                 &mut noop,
             )? {
-                return Ok(copied == bytes);
+                return Ok(Some(copied));
             }
             Ok(copy_fd_to_fd_splice_limited_counted(
                 libc::STDIN_FILENO,
@@ -302,7 +307,7 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
                 bytes,
                 &mut noop,
             )?
-            .is_some())
+            .map(|written| written.min(bytes)))
         }
         StreamInput::File(path) => {
             let file_type = fs::metadata(path)?.file_type();
@@ -314,9 +319,9 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<bool> {
                     bytes,
                     &mut noop,
                 )?
-                .is_some());
+                .map(|written| written.min(bytes)));
             }
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -568,14 +573,15 @@ fn should_use_small_stream_stdout_fast_path(
 }
 
 pub(super) fn run_head(args: &[String]) -> io::Result<()> {
-    let (io_mode, mode, header_mode, files) = parse_head_options(args)?;
+    let (io_mode, mode, header_mode, report_throughput, files) = parse_head_options(args)?;
     let inputs = parse_stream_inputs(files);
     let show_headers = match header_mode {
         HeaderMode::Auto => inputs.len() > 1,
         HeaderMode::Always => true,
         HeaderMode::Never => false,
     };
-    if should_use_small_stream_stdout_fast_path(&inputs, mode, show_headers)? {
+    if !report_throughput && should_use_small_stream_stdout_fast_path(&inputs, mode, show_headers)?
+    {
         let [StreamInput::Stdin { .. }] = inputs.as_slice() else {
             unreachable!("small stream fast path requires a single stdin input");
         };
@@ -584,6 +590,8 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
         };
         return write_head_lines_small_stdin_fast(lines);
     }
+    let started_at = report_throughput.then(std::time::Instant::now);
+    let mut total_output_bytes = 0_u64;
     let mut out = stdout_buf_writer()?;
     for (index, input) in inputs.iter().enumerate() {
         if show_headers {
@@ -596,40 +604,61 @@ pub(super) fn run_head(args: &[String]) -> io::Result<()> {
             };
             writeln!(&mut out, "==> {label} <==")?;
         }
-        match mode {
+        let emitted_bytes = match mode {
             HeadMode::Lines(count) => match count {
-                HeadCount::FromStart(lines) => {
-                    match input {
-                        StreamInput::File(path) if is_regular_input_path(path)? => {
-                            write_head_lines_regular_input(&mut out, path, lines)?;
-                            continue;
-                        }
-                        StreamInput::Stdin { .. } => {
-                            if let Some(path) = regular_stdin_path()? {
-                                write_head_lines_regular_input(&mut out, path, lines)?;
-                                continue;
-                            }
-                        }
-                        _ => {}
+                HeadCount::FromStart(lines) => match input {
+                    StreamInput::File(path) if is_regular_input_path(path)? => {
+                        let mut counted = CountingWrite::new(&mut out);
+                        write_head_lines_regular_input(&mut counted, path, lines)?;
+                        counted.bytes_written()
                     }
-                    write_head_lines_from_start(&mut out, input, lines)?
-                }
+                    StreamInput::Stdin { .. } => {
+                        if let Some(path) = regular_stdin_path()? {
+                            let mut counted = CountingWrite::new(&mut out);
+                            write_head_lines_regular_input(&mut counted, path, lines)?;
+                            counted.bytes_written()
+                        } else {
+                            let mut counted = CountingWrite::new(&mut out);
+                            write_head_lines_from_start(&mut counted, input, lines)?;
+                            counted.bytes_written()
+                        }
+                    }
+                    _ => {
+                        let mut counted = CountingWrite::new(&mut out);
+                        write_head_lines_from_start(&mut counted, input, lines)?;
+                        counted.bytes_written()
+                    }
+                },
                 HeadCount::AllButLast(lines) => {
-                    write_head_lines_all_but_last(&mut out, input, io_mode, lines)?
+                    let mut counted = CountingWrite::new(&mut out);
+                    write_head_lines_all_but_last(&mut counted, input, io_mode, lines)?;
+                    counted.bytes_written()
                 }
             },
             HeadMode::Bytes(count) => match count {
                 HeadCount::FromStart(bytes) => {
-                    if write_head_bytes_fast(input, bytes)? {
-                        continue;
+                    if let Some(written) = write_head_bytes_fast(input, bytes)? {
+                        written
+                    } else {
+                        let mut counted = CountingWrite::new(&mut out);
+                        write_head_bytes_from_start(&mut counted, input, io_mode, bytes)?;
+                        counted.bytes_written()
                     }
-                    write_head_bytes_from_start(&mut out, input, io_mode, bytes)?
                 }
                 HeadCount::AllButLast(bytes) => {
-                    write_head_bytes_all_but_last(&mut out, input, io_mode, bytes)?
+                    let mut counted = CountingWrite::new(&mut out);
+                    write_head_bytes_all_but_last(&mut counted, input, io_mode, bytes)?;
+                    counted.bytes_written()
                 }
             },
-        }
+        };
+        total_output_bytes = total_output_bytes
+            .checked_add(emitted_bytes)
+            .ok_or_else(|| io::Error::other("head output byte count overflow"))?;
     }
-    out.into_inner()
+    out.into_inner()?;
+    if let Some(started_at) = started_at {
+        report_gbps("head", total_output_bytes, started_at);
+    }
+    Ok(())
 }

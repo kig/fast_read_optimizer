@@ -177,6 +177,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let mut quiet = false;
     let mut verbose = false;
     let mut print_bytes = false;
+    let mut report_throughput = false;
     let mut limit = None::<u64>;
     let mut first_skip = 0u64;
     let mut second_skip = 0u64;
@@ -197,6 +198,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             "-s" | "--quiet" | "--silent" => quiet = true,
             "-l" | "--verbose" => verbose = true,
             "-b" | "--print-bytes" => print_bytes = true,
+            "--report-gbps" => report_throughput = true,
             "-n" | "--bytes" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -256,8 +258,12 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let shared_remaining = first_remaining.min(second_remaining);
     let compare_len =
         cmp_effective_compare_len_with_skips(first_len, second_len, first_skip, second_skip, limit);
+    let started_at = report_throughput.then(std::time::Instant::now);
     if compare_len == 0 {
         if limit == Some(0) || first_remaining == second_remaining {
+            if let Some(started_at) = started_at {
+                report_gbps("cmp", 0, started_at);
+            }
             return Ok(0);
         }
         if !quiet {
@@ -325,6 +331,9 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             };
             eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
             return Ok(1);
+        }
+        if let Some(started_at) = started_at {
+            report_gbps("cmp", compare_len, started_at);
         }
         return Ok(if had_mismatch { 1 } else { 0 });
     }
@@ -422,6 +431,9 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         return Ok(1);
     }
 
+    if let Some(started_at) = started_at {
+        report_gbps("cmp", compare_len, started_at);
+    }
     Ok(0)
 }
 

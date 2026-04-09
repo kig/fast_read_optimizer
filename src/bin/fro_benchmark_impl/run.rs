@@ -37,6 +37,7 @@ pub(super) fn main_impl() {
               - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)\n\
               - --iters 5               (override internal -n for fro invocations; useful for quick runs/tests)\n\
               - --repeat 3              (run each benchmark multiple times; report min/max and judge by best steady-state run)\n\
+              - metric column           (GB/s for throughput rows; files/s for tree-walk comparisons)\n\
               - -c, --config cfg.json   (pass the same config to every fro subprocess in the benchmark run)\n\
               - --skip-build            (do not run `cargo build --release`; assume binaries already built)\n\
               - --no-fail               (do not exit nonzero on regressions; still prints PASS/REGRESSION)"
@@ -263,11 +264,12 @@ pub(super) fn main_impl() {
             need_recursive_tree = true;
         }
 
-        if (op == "diff" || op == "dual-read-bench") && t.args.iter().any(|s| s == &target_file_dir)
+        if (op == "diff" || op == "dual-read-bench" || op == "cmp")
+            && t.args.iter().any(|s| s == &target_file_dir)
         {
             need_target_dir_matching = true;
         }
-        if (op == "diff" || op == "dual-read-bench")
+        if (op == "diff" || op == "dual-read-bench" || op == "cmp")
             && t.args.iter().any(|s| s == &target_file_cache)
         {
             need_target_cache_matching = true;

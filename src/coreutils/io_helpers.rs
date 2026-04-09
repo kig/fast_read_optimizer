@@ -46,6 +46,48 @@ pub(crate) fn report_gbps(command: &str, bytes: u64, started_at: std::time::Inst
     );
 }
 
+pub(crate) struct CountingWrite<'a, W> {
+    inner: &'a mut W,
+    bytes_written: u64,
+}
+
+impl<'a, W> CountingWrite<'a, W> {
+    pub(crate) fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    pub(crate) fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWrite<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("counted write byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| io::Error::other("counted write byte count overflow"))?;
+        Ok(())
+    }
+}
+
 pub(crate) fn ensure_files(
     program: &str,
     files: Vec<String>,

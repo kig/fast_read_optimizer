@@ -200,9 +200,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "cmp" => Some(CommandHelp {
             name: "cmp",
-            usage: "cmp [--auto|--no-direct|--direct] [--] <file1> <file2>",
+            usage: "cmp [--auto|--no-direct|--direct] [--report-gbps] [--] <file1> <file2>",
             summary: "Compare two files using fro's diff engine and GNU cmp-style reporting.",
-            notes: &["Exits nonzero on mismatch or size difference."],
+            notes: &[
+                "Exits nonzero on mismatch or size difference.",
+                "--report-gbps writes effective compared-input throughput to stderr after successful full comparisons.",
+            ],
             examples: &[("Compare two files", "cmp a.bin b.bin")],
         }),
         "fgrep" => Some(CommandHelp {
@@ -270,12 +273,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "head" => Some(CommandHelp {
             name: "head",
-            usage: "head [-n lines|-c bytes] [--lines=lines|--bytes=bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "head [-n lines|-c bytes] [--lines=lines|--bytes=bytes] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Print the first lines or bytes of each input.",
             notes: &[
                 "Supports classic head counts including obsolete -NUM and -NUM[bkm][cqv] forms, plus -NUM \"all but last\" forms for -n/-c.",
                 "GNU-style --lines/--bytes long forms are accepted, including =VALUE syntax and negative counts.",
                 "Use -q/--quiet/--silent to suppress headers and -v/--verbose to always print them; the last one wins.",
+                "--report-gbps writes effective emitted-byte throughput to stderr after payload output completes.",
             ],
             examples: &[
                 ("Print the first ten lines", "head notes.txt"),
@@ -312,12 +316,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tail" => Some(CommandHelp {
             name: "tail",
-            usage: "tail [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] <file> [file ...]",
+            usage: "tail [-n lines|-c bytes] [-q|-v] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
             summary: "Print the last lines or bytes of each input.",
             notes: &[
                 "Supports classic tail counts including +N start offsets for -n/-c.",
                 "Use -q to suppress headers and -v to always print them; the last one wins.",
                 "Byte-mode on non-seekable inputs keeps only a bounded trailing window before final output.",
+                "--report-gbps writes effective emitted-byte throughput to stderr after payload output completes.",
             ],
             examples: &[
                 ("Print the last ten lines", "tail notes.txt"),

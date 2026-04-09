@@ -127,3 +127,58 @@ fn base64_report_gbps_keeps_stdout_and_writes_stderr() {
     assert_eq!(reported.stdout, plain.stdout);
     assert_gbps_report(&reported.stderr, "base64");
 }
+
+#[test]
+fn cmp_report_gbps_keeps_success_output_and_writes_stderr() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-report-gbps");
+    let left = tmp.join("left.bin");
+    let right = tmp.join("right.bin");
+    let bytes = (0..8192)
+        .map(|i| ((i * 23 + 11) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&left, &bytes).unwrap();
+    fs::write(&right, &bytes).unwrap();
+
+    let plain = run_fro("cmp", &[left.to_str().unwrap(), right.to_str().unwrap()]);
+    let reported = run_fro(
+        "cmp",
+        &[
+            "--report-gbps",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+    );
+
+    assert!(plain.status.success());
+    assert!(reported.status.success());
+    assert_eq!(reported.stdout, plain.stdout);
+    assert_gbps_report(&reported.stderr, "cmp");
+}
+
+#[test]
+fn head_and_tail_report_gbps_keep_stdout_and_write_stderr() {
+    let tmp = unique_temp_dir("fro-coreutils-head-tail-report-gbps");
+    let path = tmp.join("input.bin");
+    fs::write(
+        &path,
+        (0..16384)
+            .map(|i| ((i * 29 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for (command, args) in [
+        ("head", vec!["-c", "1MiB", path.to_str().unwrap()]),
+        ("tail", vec!["-c", "1MiB", path.to_str().unwrap()]),
+    ] {
+        let plain = run_fro(command, &args);
+        let mut reported_args = vec!["--report-gbps"];
+        reported_args.extend(args.iter().copied());
+        let reported = run_fro(command, &reported_args);
+
+        assert!(plain.status.success(), "{command} plain failed");
+        assert!(reported.status.success(), "{command} reported failed");
+        assert_eq!(reported.stdout, plain.stdout, "{command} stdout changed");
+        assert_gbps_report(&reported.stderr, command);
+    }
+}

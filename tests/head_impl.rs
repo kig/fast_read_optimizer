@@ -39,6 +39,11 @@ struct CaptureWriter {
     bytes: Vec<u8>,
 }
 
+struct CountingWrite<'a, W> {
+    inner: &'a mut W,
+    bytes_written: u64,
+}
+
 impl Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.bytes.extend_from_slice(buf);
@@ -55,6 +60,37 @@ impl CaptureWriter {
         CAPTURED_STDOUT.with(|captured| {
             *captured.borrow_mut() = self.bytes;
         });
+        Ok(())
+    }
+}
+
+impl<'a, W> CountingWrite<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWrite<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.bytes_written += buf.len() as u64;
         Ok(())
     }
 }
@@ -114,6 +150,8 @@ fn write_raw_fd_all(fd: libc::c_int, buf: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
+
+fn report_gbps(_command: &str, _bytes: u64, _started_at: std::time::Instant) {}
 
 #[path = "../src/coreutils/head.rs"]
 mod head;
