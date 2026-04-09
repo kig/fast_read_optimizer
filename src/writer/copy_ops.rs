@@ -136,6 +136,30 @@ pub fn copy_file_range_syscall(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
 ) -> io::Result<u64> {
+    copy_file_range_syscall_with_progress(
+        source,
+        filename,
+        source_offset,
+        dest_offset,
+        copy_size,
+        truncate_target,
+        io_mode_read,
+        io_mode_write,
+        None,
+    )
+}
+
+fn copy_file_range_syscall_with_progress(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    progress_count: Option<Arc<AtomicU64>>,
+) -> io::Result<u64> {
     if io_mode_read == IOMode::Direct || io_mode_write == IOMode::Direct {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -213,11 +237,15 @@ pub fn copy_file_range_syscall(
             ));
         }
         copied_total = copied_total.saturating_add(copied as u64);
+        if let Some(progress_count) = progress_count.as_ref() {
+            progress_count.fetch_add(copied as u64, Ordering::SeqCst);
+        }
     }
 
     Ok(copied_total)
 }
 
+#[allow(dead_code)]
 pub fn copy_file_range_chunked(
     source: &str,
     filename: &str,
@@ -230,6 +258,36 @@ pub fn copy_file_range_chunked(
     copy_range_qd: usize,
     io_mode_read: IOMode,
     io_mode_write: IOMode,
+) -> io::Result<u64> {
+    copy_file_range_chunked_with_progress(
+        source,
+        filename,
+        source_offset,
+        dest_offset,
+        copy_size,
+        truncate_target,
+        copy_range_threads,
+        copy_range_block_size,
+        copy_range_qd,
+        io_mode_read,
+        io_mode_write,
+        None,
+    )
+}
+
+fn copy_file_range_chunked_with_progress(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    copy_range_threads: u64,
+    copy_range_block_size: u64,
+    copy_range_qd: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    progress_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<u64> {
     if io_mode_read == IOMode::Direct || io_mode_write == IOMode::Direct {
         return Err(io::Error::new(
@@ -296,6 +354,7 @@ pub fn copy_file_range_chunked(
 
     for _ in 0..copy_range_threads {
         let next_offset = next_offset.clone();
+        let progress_count = progress_count.clone();
         let source = source.to_string();
         let filename = filename.to_string();
         threads.push(std::thread::spawn(move || -> io::Result<u64> {
@@ -370,6 +429,9 @@ pub fn copy_file_range_chunked(
                         ));
                     }
                     copied_extent += copied as u64;
+                    if let Some(progress_count) = progress_count.as_ref() {
+                        progress_count.fetch_add(copied as u64, Ordering::SeqCst);
+                    }
                 }
                 copied_local += copied_extent;
             }
@@ -479,6 +541,7 @@ fn copy_file_range_threaded_impl(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
     sync_after_write: bool,
+    progress_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<u64> {
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
@@ -505,6 +568,7 @@ fn copy_file_range_threaded_impl(
 
     for thread_id in 0..num_threads {
         let write_count = write_count.clone();
+        let progress_count = progress_count.clone();
         let filename = filename.to_string();
         let source = source.to_string();
         threads.push(std::thread::spawn(move || -> io::Result<()> {
@@ -525,6 +589,7 @@ fn copy_file_range_threaded_impl(
                 qd,
                 &mut io_uring,
                 write_count,
+                progress_count,
                 None,
                 copy_size,
                 direct_read,
@@ -565,6 +630,7 @@ pub fn copy_file_range_threaded(
     qd_d: usize,
     io_mode_read: IOMode,
     io_mode_write: IOMode,
+    progress_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<u64> {
     copy_file_range_threaded_impl(
         source,
@@ -582,6 +648,7 @@ pub fn copy_file_range_threaded(
         io_mode_read,
         io_mode_write,
         true,
+        progress_count,
     )
 }
 
@@ -885,6 +952,50 @@ pub fn copy_file_range_with_strategy(
     io_mode_write: IOMode,
     copy_strategy: CopyStrategy,
 ) -> io::Result<u64> {
+    copy_file_range_with_strategy_and_progress(
+        source,
+        filename,
+        source_offset,
+        dest_offset,
+        copy_size,
+        truncate_target,
+        num_threads_p,
+        block_size_p,
+        qd_p,
+        num_threads_d,
+        block_size_d,
+        qd_d,
+        copy_range_threads,
+        copy_range_block_size,
+        copy_range_qd,
+        io_mode_read,
+        io_mode_write,
+        copy_strategy,
+        None,
+    )
+}
+
+pub fn copy_file_range_with_strategy_and_progress(
+    source: &str,
+    filename: &str,
+    source_offset: u64,
+    dest_offset: u64,
+    copy_size: u64,
+    truncate_target: bool,
+    num_threads_p: u64,
+    block_size_p: u64,
+    qd_p: usize,
+    num_threads_d: u64,
+    block_size_d: u64,
+    qd_d: usize,
+    copy_range_threads: u64,
+    copy_range_block_size: u64,
+    copy_range_qd: usize,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    copy_strategy: CopyStrategy,
+    progress_count: Option<Arc<AtomicU64>>,
+) -> io::Result<u64> {
     match copy_strategy {
         CopyStrategy::Auto | CopyStrategy::Threaded => {
             #[cfg(test)]
@@ -904,12 +1015,13 @@ pub fn copy_file_range_with_strategy(
                 qd_d,
                 io_mode_read,
                 io_mode_write,
+                progress_count,
             )
         }
         CopyStrategy::CopyFileRange => {
             #[cfg(test)]
             record_copy_backend(source, filename, RecordedCopyBackend::CopyFileRange);
-            copy_file_range_chunked(
+            copy_file_range_chunked_with_progress(
                 source,
                 filename,
                 source_offset,
@@ -921,12 +1033,13 @@ pub fn copy_file_range_with_strategy(
                 copy_range_qd,
                 io_mode_read,
                 io_mode_write,
+                progress_count,
             )
         }
         CopyStrategy::CopyFileRangeSingle => {
             #[cfg(test)]
             record_copy_backend(source, filename, RecordedCopyBackend::CopyFileRangeSingle);
-            copy_file_range_syscall(
+            copy_file_range_syscall_with_progress(
                 source,
                 filename,
                 source_offset,
@@ -935,6 +1048,7 @@ pub fn copy_file_range_with_strategy(
                 truncate_target,
                 io_mode_read,
                 io_mode_write,
+                progress_count,
             )
         }
         CopyStrategy::Reflink => {

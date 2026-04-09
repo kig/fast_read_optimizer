@@ -330,7 +330,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "dd" => Some(CommandHelp {
             name: "dd",
-            usage: "dd if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct] [oflag=direct] [conv=notrunc,fsync] [status=none|progress]",
+            usage: "dd if=<input> of=<output> [bs=<size>] [count=<blocks>] [skip=<blocks>] [seek=<blocks>] [iflag=direct] [oflag=direct] [conv=notrunc,fsync] [status=none|noxfer|progress]",
             summary: "Copy byte ranges with dd-style operands on top of fro I/O primitives.",
             notes: &[
                 "Whole-file copies without offset/count flags use the tuned copy path directly.",
@@ -399,16 +399,14 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tar" => Some(CommandHelp {
             name: "tar",
-            usage: "tar (-cf <archive.tar> [-v] <source> | -tf <archive.tar>)",
+            usage: "tar (-cf <archive.tar> [-v] <source> | -tf[v] <archive.tar>)",
             summary: "Create or list an uncompressed ustar archive.",
             notes: &[
                 "Supported compatibility slice: create (-c/--create) and whole-archive list (-t/--list) with -f/--file.",
-                "Verbose listing, extraction, compression, stdin archives, and member filters remain unsupported.",
+                "-v/--verbose keeps create-side progress reporting and enables GNU-style verbose output for listing.",
+                "Extraction, compression, stdin archives, and member filters remain unsupported.",
             ],
-            examples: &[
-                ("Archive one directory", "tar -cf tree.tar mytree"),
-                ("List one archive", "tar -tf tree.tar"),
-            ],
+            examples: &[("Archive one directory", "tar -cf tree.tar mytree"), ("List one archive verbosely", "tar -tvf tree.tar")],
         }),
         "shred" => Some(CommandHelp {
             name: "shred",

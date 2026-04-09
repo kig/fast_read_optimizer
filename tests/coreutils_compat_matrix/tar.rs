@@ -152,11 +152,27 @@ fn cartesian_tar_list_matches_system_tar() {
             run_system("tar", &["-tf", archive_str]),
             archive_str,
         );
+        assert_same_result(
+            run_fro("tar", &["-tvf", archive_str]),
+            run_system("tar", &["-tvf", archive_str]),
+            &format!("verbose {archive_str}"),
+        );
     }
 
     assert_same_result(
         run_fro("tar", &["--list", "--file", sys_tar.to_str().unwrap()]),
         run_system("tar", &["--list", "--file", sys_tar.to_str().unwrap()]),
         "long flags",
+    );
+    assert_same_result(
+        run_fro(
+            "tar",
+            &["--list", "--verbose", "--file", sys_tar.to_str().unwrap()],
+        ),
+        run_system(
+            "tar",
+            &["--list", "--verbose", "--file", sys_tar.to_str().unwrap()],
+        ),
+        "long verbose flags",
     );
 }

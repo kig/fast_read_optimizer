@@ -111,7 +111,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
     let archive = archive.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Usage: {program} (-cf <archive.tar> <source> | -tf <archive.tar>)"),
+            format!("Usage: {program} (-cf <archive.tar> <source> | -tf[v] <archive.tar>)"),
         )
     })?;
 
@@ -130,19 +130,13 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             )?;
         }
         Some(TarMode::List) => {
-            if verbose {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tar verbose listing (-tv/-vt) is not yet implemented",
-                ));
-            }
             if !paths.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "tar list mode currently supports only whole-archive listing",
                 ));
             }
-            crate::main_app::list_tar_archive(Path::new(&archive))?;
+            crate::main_app::list_tar_archive(Path::new(&archive), verbose)?;
         }
         None => {
             return Err(io::Error::new(

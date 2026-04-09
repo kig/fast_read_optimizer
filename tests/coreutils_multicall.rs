@@ -337,6 +337,31 @@ fn multicall_dd_status_noxfer_prints_records_only() {
 }
 
 #[test]
+fn multicall_dd_status_progress_reports_progress_and_summary() {
+    let tmp = unique_temp_dir("fro-coreutils-dd-progress");
+    let input = tmp.join("input.bin");
+    let output = tmp.join("output.bin");
+    let bytes = (0..97).map(|i| ((i * 13) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, &bytes).unwrap();
+
+    let out = assert_success(run_fro(
+        "dd",
+        &[
+            &format!("if={}", input.display()),
+            &format!("of={}", output.display()),
+            "bs=10",
+            "status=progress",
+        ],
+    ));
+    assert_eq!(fs::read(&output).unwrap(), bytes);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("bytes copied,"), "stderr:\n{stderr}");
+    assert!(stderr.contains("9+1 records in"), "stderr:\n{stderr}");
+    assert!(stderr.contains("9+1 records out"), "stderr:\n{stderr}");
+    assert!(stderr.contains("97 bytes copied in"), "stderr:\n{stderr}");
+}
+
+#[test]
 fn multicall_cat_and_wc_accept_stdin_and_dash() {
     let bytes = b"one two\nthree\n";
 

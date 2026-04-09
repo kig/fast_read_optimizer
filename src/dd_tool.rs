@@ -4,6 +4,7 @@ use crate::{CopyStrategy, IOMode};
 use std::fs::OpenOptions;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ enum StatusMode {
 const DEFAULT_DD_BLOCK_SIZE: u64 = 512;
 const DD_COPY_FILE_RANGE_SINGLE_MAX: u64 = 1 << 20;
 const DD_COPY_FILE_RANGE_CHUNKED_MAX: u64 = 16 << 20;
+const DD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 struct Options {
     input: String,
@@ -227,6 +229,45 @@ fn print_records_only(bytes: u64, block_size: u64) {
     eprintln!("{}+{} records out", full_records, partial_records);
 }
 
+fn print_progress(bytes: u64, elapsed: Duration) {
+    let secs = elapsed.as_secs_f64();
+    eprintln!(
+        "{} bytes copied, {:.3} s, {:.1} GB/s",
+        bytes,
+        secs,
+        if secs == 0.0 {
+            f64::INFINITY
+        } else {
+            bytes as f64 / secs / 1e9
+        }
+    );
+}
+
+fn spawn_progress_thread(
+    start: Instant,
+    copied: Arc<AtomicU64>,
+    stop_rx: mpsc::Receiver<()>,
+    reported_progress: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let mut last_reported = 0;
+        loop {
+            match stop_rx.recv_timeout(DD_PROGRESS_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let bytes = copied.load(Ordering::Relaxed);
+                    if bytes > last_reported {
+                        print_progress(bytes, start.elapsed());
+                        last_reported = bytes;
+                        reported_progress.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 fn dd_small_medium_copy_strategy(
     copy_len: u64,
     input_mode: IOMode,
@@ -268,13 +309,14 @@ fn copy_file_range_with_dd_strategy(
     io_mode_read: IOMode,
     io_mode_write: IOMode,
     copy_strategy: CopyStrategy,
+    progress_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<u64> {
     let config = load_config(None);
     let guard = CopyOperationGuard::new(source, target, true)?;
     let page_cache = config.get_params_for_path("copy", false, target);
     let direct = config.get_params_for_path("copy", true, target);
     let copy_range = config.get_copy_range_params_for_path(target);
-    let copied = crate::writer::copy_file_range_with_strategy(
+    let copied = crate::writer::copy_file_range_with_strategy_and_progress(
         source,
         target,
         source_offset,
@@ -293,6 +335,7 @@ fn copy_file_range_with_dd_strategy(
         io_mode_read,
         io_mode_write,
         copy_strategy,
+        progress_count,
     )?;
     guard.ensure_source_unchanged()?;
     Ok(copied)
@@ -343,6 +386,22 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
         && !opts.notrunc
     {
         let record_block_size = DEFAULT_DD_BLOCK_SIZE;
+        let copied = Arc::new(AtomicU64::new(0));
+        let reported_progress = Arc::new(AtomicBool::new(false));
+        let progress_counter = if opts.status == StatusMode::Progress {
+            Some(copied.clone())
+        } else {
+            None
+        };
+        let progress_control = if opts.status == StatusMode::Progress {
+            let (stop_tx, stop_rx) = mpsc::channel();
+            Some((
+                stop_tx,
+                spawn_progress_thread(start, copied.clone(), stop_rx, reported_progress.clone()),
+            ))
+        } else {
+            None
+        };
         let bytes = if dd_copy_file_range_eligible(&opts.input, &opts.output)? {
             match dd_small_medium_copy_strategy(
                 std::fs::metadata(&opts.input)?.len(),
@@ -359,22 +418,47 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
                     opts.input_mode,
                     opts.output_mode,
                     copy_strategy,
+                    progress_counter.clone(),
                 )?,
-                None => crate::copy_file_with_modes(
+                None => copy_file_range_with_dd_strategy(
                     &opts.input,
                     &opts.output,
+                    0,
+                    0,
+                    u64::MAX,
+                    true,
                     opts.input_mode,
                     opts.output_mode,
+                    CopyStrategy::Threaded,
+                    progress_counter.clone(),
                 )?,
             }
         } else {
-            crate::copy_file_with_modes(
+            copy_file_range_with_dd_strategy(
                 &opts.input,
                 &opts.output,
+                0,
+                0,
+                u64::MAX,
+                true,
                 opts.input_mode,
                 opts.output_mode,
+                CopyStrategy::Threaded,
+                progress_counter.clone(),
             )?
         };
+        if let Some((stop_tx, progress_thread)) = progress_control {
+            let _ = stop_tx.send(());
+            progress_thread
+                .join()
+                .map_err(|_| io::Error::other("progress thread panicked"))??;
+        }
+        if opts.status == StatusMode::Progress
+            && bytes > 0
+            && !reported_progress.load(Ordering::Relaxed)
+        {
+            print_progress(bytes, start.elapsed());
+        }
         if opts.fsync {
             OpenOptions::new()
                 .read(true)
@@ -422,18 +506,20 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
         copy_len.div_ceil(block_size) as usize
     };
     let copied = Arc::new(AtomicU64::new(0));
-    let copied_progress = copied.clone();
-    let done = Arc::new(AtomicBool::new(false));
-    let done_progress = done.clone();
+    let reported_progress = Arc::new(AtomicBool::new(false));
+    let progress_counter = if opts.status == StatusMode::Progress {
+        Some(copied.clone())
+    } else {
+        None
+    };
     let start_block = opts.skip;
     let end_block = start_block + job_count as u64;
-    let progress_thread = if opts.status == StatusMode::Progress {
-        Some(thread::spawn(move || {
-            while !done_progress.load(Ordering::Relaxed) {
-                eprintln!("{} bytes copied", copied_progress.load(Ordering::Relaxed));
-                thread::sleep(Duration::from_millis(250));
-            }
-        }))
+    let progress_control = if opts.status == StatusMode::Progress {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        Some((
+            stop_tx,
+            spawn_progress_thread(start, copied.clone(), stop_rx, reported_progress.clone()),
+        ))
     } else {
         None
     };
@@ -444,13 +530,16 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
     } else {
         None
     };
+    let dev_null_progress = progress_counter.clone();
     let copy_result = if is_dev_null {
         input.foreach_block_parallel(block_size, move |block_index, data| {
             let block_index = block_index as u64;
             if block_index < start_block || block_index >= end_block {
                 return Ok(());
             }
-            copied.fetch_add(data.len() as u64, Ordering::Relaxed);
+            if let Some(progress_counter) = dev_null_progress.as_ref() {
+                progress_counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
             Ok(())
         })?;
         Ok(copy_len)
@@ -465,9 +554,10 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
             opts.input_mode,
             opts.output_mode,
             copy_strategy,
+            progress_counter.clone(),
         )
     } else {
-        crate::copy_file_range_with_modes(
+        copy_file_range_with_dd_strategy(
             &opts.input,
             &opts.output,
             input_offset,
@@ -476,15 +566,23 @@ pub fn run_dd(args: &[String]) -> io::Result<()> {
             !opts.notrunc,
             opts.input_mode,
             opts.output_mode,
+            CopyStrategy::Threaded,
+            progress_counter.clone(),
         )
     };
-    done.store(true, Ordering::Relaxed);
-    if let Some(progress_thread) = progress_thread {
+    if let Some((stop_tx, progress_thread)) = progress_control {
+        let _ = stop_tx.send(());
         progress_thread
             .join()
-            .map_err(|_| io::Error::other("progress thread panicked"))?;
+            .map_err(|_| io::Error::other("progress thread panicked"))??;
     }
     let bytes_copied = copy_result?;
+    if opts.status == StatusMode::Progress
+        && bytes_copied > 0
+        && !reported_progress.load(Ordering::Relaxed)
+    {
+        print_progress(bytes_copied, start.elapsed());
+    }
 
     if opts.fsync {
         OpenOptions::new()
@@ -590,6 +688,20 @@ mod tests {
         .expect("parse dd args");
 
         assert!(matches!(opts.status, StatusMode::NoXfer));
+    }
+
+    #[test]
+    fn dd_progress_thread_stays_quiet_without_completed_bytes() {
+        let copied = Arc::new(AtomicU64::new(0));
+        let reported_progress = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = spawn_progress_thread(Instant::now(), copied, stop_rx, reported_progress);
+        thread::sleep(DD_PROGRESS_INTERVAL.saturating_mul(2));
+        let _ = stop_tx.send(());
+        handle
+            .join()
+            .expect("progress thread join")
+            .expect("progress thread result");
     }
 
     #[test]

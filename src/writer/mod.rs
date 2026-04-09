@@ -607,6 +607,7 @@ fn thread_writer(
     qd: usize,
     io_uring: &mut IoUring,
     write_count: Arc<AtomicU64>,
+    progress_count: Option<Arc<AtomicU64>>,
     random_block: Option<&[u8]>,
     total_size: u64,
     use_direct_read: bool,
@@ -725,6 +726,9 @@ fn thread_writer(
         } else {
             // Write finished
             write_count.fetch_add(result as u64, Ordering::SeqCst);
+            if let Some(progress_count) = progress_count.as_ref() {
+                progress_count.fetch_add(result as u64, Ordering::SeqCst);
+            }
             inflight -= 1;
             if next_offset < total_size {
                 buffer_offsets[idx] = next_offset;

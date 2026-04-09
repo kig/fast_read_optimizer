@@ -2,6 +2,8 @@
 
 ## 2026-04-09
 
+- `tar -tvf` now prints GNU-style verbose whole-archive listings for uncompressed archives on top of the same reader used by plain `tar -tf`, raising the tracked tar compatibility slice to create/list/verbose-list while still leaving extraction unsupported.
+- `dd status=progress` now reports periodic line-based byte-progress snapshots without replacing the tuned copy engines: the progress path threads an optional completed-bytes counter through the existing copy strategies and still prints the normal final summary.
 - `tar` gained a bounded compatibility slice for whole-archive listing: `tar -tf` / `tar --list --file` now streams member names from uncompressed archives while create mode stays on the existing archive writer path, with focused parity coverage against GNU tar on both fro-generated and system-generated archives.
 - `sort` gained a bounded common-flags slice on top of the existing bytewise newline-delimited path: `-r` / `--reverse`, `-u` / `--unique`, and clustered `-ru` / `-ur` now compose with the same ordering backend instead of erroring, with focused parity coverage against system `sort`.
 - Added a bounded `read` fast-path verification slice to complement the existing `cat` backend checks: plain small regular-file `read --no-direct` / `read --direct` cases now prove they stay on the simple single-thread path, while large reads still prove they pick up tuned threaded params once they cross the strategy cutoff.

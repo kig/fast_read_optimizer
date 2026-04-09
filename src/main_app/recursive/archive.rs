@@ -247,6 +247,6 @@ pub(crate) fn create_uncompressed_tar(
     Ok(total_size)
 }
 
-pub(crate) fn list_uncompressed_tar(path: &Path) -> io::Result<()> {
-    reader::list_tar_archive(path)
+pub(crate) fn list_uncompressed_tar(path: &Path, verbose: bool) -> io::Result<()> {
+    reader::list_tar_archive(path, verbose)
 }

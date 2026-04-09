@@ -120,8 +120,9 @@ const ROWS: &[CoverageRow] = &[
             "oflag=direct",
             "status=none",
             "status=noxfer",
+            "status=progress",
         ],
-        remaining: &["status=progress"],
+        remaining: &[],
     },
     CoverageRow {
         name: "du",
@@ -245,8 +246,8 @@ const ROWS: &[CoverageRow] = &[
     },
     CoverageRow {
         name: "tar",
-        covered: &["-c/--create", "-f/--file", "-t/--list"],
-        remaining: &["-v/--verbose", "-x/--extract"],
+        covered: &["-c/--create", "-f/--file", "-t/--list", "-v/--verbose"],
+        remaining: &["-x/--extract"],
     },
     CoverageRow {
         name: "wc",
@@ -328,7 +329,7 @@ cat       10/10 100%  remaining: none
 cksum      1/1  100%  remaining: none
 cmp        5/5  100%  remaining: none
 cp         9/9  100%  remaining: none
-dd        13/14  93%  remaining: status=progress
+dd        14/14 100%  remaining: none
 du         6/6  100%  remaining: none
 fgrep      9/9  100%  remaining: none
 find       9/9  100%  remaining: none
@@ -344,7 +345,7 @@ shred      6/6  100%  remaining: none
 sort       3/10  30%  remaining: -n/-g/-h, -M, -V, -k, -m/-c, -z, -o/-T
 tac        2/2  100%  remaining: none
 tail       4/4  100%  remaining: none
-tar        3/5   60%  remaining: -v/--verbose, -x/--extract
+tar        4/5   80%  remaining: -x/--extract
 wc         6/6  100%  remaining: none
 ";
 
@@ -367,8 +368,8 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
         .contains("zero-terminated records, output/temp-file controls, and locale collation."));
 
     let tar_source = include_str!("../src/coreutils/tar.rs");
-    assert!(tar_source
-        .contains("supports only create (-c/--create) and whole-archive list (-t/--list) modes"));
+    assert!(tar_source.contains("whole-archive list (-t/--list) modes"));
+    assert!(tar_source.contains("extract mode (-x/--extract) is not yet implemented"));
 
     let find_source = include_str!("../src/coreutils/find.rs");
     assert!(find_source

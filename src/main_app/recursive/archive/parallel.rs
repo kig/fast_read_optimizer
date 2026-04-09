@@ -297,6 +297,7 @@ pub(super) fn write_tar_large_entry(
             direct_params.qd,
             IOMode::Auto,
             IOMode::Direct,
+            None,
         )?;
         Ok(tar_entry_total_len(entry))
     } else {
