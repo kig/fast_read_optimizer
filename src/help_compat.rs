@@ -204,6 +204,9 @@ pub const ROWS: &[CoverageRow] = &[
         covered: &[
             "-d/--dir",
             "-f/--force",
+            "-i",
+            "-I",
+            "--interactive[=WHEN]",
             "-r/-R/--recursive",
             "-v/--verbose",
         ],
@@ -418,7 +421,9 @@ fn normalize_bare_assignment(token: &str) -> Option<Vec<String>> {
 
 fn looks_like_metavar(rhs: &str) -> bool {
     !rhs.is_empty()
-        && rhs
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || matches!(ch, '_' | '[' | ']' | '<' | '>'))
+        && rhs.chars().all(|ch| {
+            ch.is_ascii_uppercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '_' | '[' | ']' | '<' | '>')
+        })
 }

@@ -199,9 +199,12 @@ fn multicall_rm_help_and_force_zero_operands_work() {
     let help_stdout = String::from_utf8_lossy(&help.stdout);
     assert_eq!(help.status.code(), Some(0));
     assert!(help_stdout.contains("rm - Remove files or directory trees"));
-    assert!(help_stdout.contains("[-f] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"));
+    assert!(help_stdout.contains(
+        "[-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
+    ));
     assert!(help_stdout.contains("ignores missing operands and missing files"));
     assert!(help_stdout.contains("-d/--dir removes empty directories"));
+    assert!(help_stdout.contains("last conflicting prompt flag wins"));
     assert!(help.stderr.is_empty());
 
     assert_success(run_fro("rm", &["-f"]));

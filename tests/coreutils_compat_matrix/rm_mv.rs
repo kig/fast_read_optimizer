@@ -118,6 +118,108 @@ fn rm_dir_matches_system_for_empty_and_non_empty_directories() {
 }
 
 #[test]
+fn rm_interactive_prompt_modes_match_system_for_representative_cases() {
+    let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-interactive");
+
+    let fro_root = tmp.join("always-fro");
+    let sys_root = tmp.join("always-sys");
+    fs::create_dir_all(&fro_root).unwrap();
+    fs::create_dir_all(&sys_root).unwrap();
+    fs::write(fro_root.join("file.txt"), b"alpha\n").unwrap();
+    fs::write(sys_root.join("file.txt"), b"alpha\n").unwrap();
+    let fro_always = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["rm", "--interactive", "file.txt"],
+        &fro_root,
+        Some(b"n\n"),
+    );
+    let sys_always = run_command_in_dir(
+        "rm",
+        &["--interactive", "file.txt"],
+        &sys_root,
+        Some(b"n\n"),
+    );
+    assert_same_result(fro_always, sys_always, "rm --interactive file decline");
+    assert_eq!(
+        fro_root.join("file.txt").exists(),
+        sys_root.join("file.txt").exists()
+    );
+
+    let fro_once = tmp.join("once-fro");
+    let sys_once = tmp.join("once-sys");
+    for root in [&fro_once, &sys_once] {
+        fs::create_dir_all(root.join("dir/sub")).unwrap();
+        fs::write(root.join("dir/sub/file.txt"), b"beta\n").unwrap();
+    }
+    let fro_once_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["rm", "--interactive=once", "-r", "dir"],
+        &fro_once,
+        Some(b"y\n"),
+    );
+    let sys_once_out = run_command_in_dir(
+        "rm",
+        &["--interactive=once", "-r", "dir"],
+        &sys_once,
+        Some(b"y\n"),
+    );
+    assert_same_result(
+        fro_once_out,
+        sys_once_out,
+        "rm --interactive=once -r accepted",
+    );
+    assert_eq!(fro_once.join("dir").exists(), sys_once.join("dir").exists());
+
+    for (flags, label, expect_exists, prompt_stdin) in [
+        (
+            vec!["-if", "file.txt"],
+            "rm -if last flag wins",
+            false,
+            None,
+        ),
+        (
+            vec!["-fi", "file.txt"],
+            "rm -fi last flag wins",
+            true,
+            Some(b"n\n".as_slice()),
+        ),
+        (
+            vec!["-i", "--interactive=never", "file.txt"],
+            "rm --interactive=never last flag wins",
+            false,
+            None,
+        ),
+    ] {
+        let fro_case = tmp.join(format!("conflict-fro-{}", label.replace(' ', "-")));
+        let sys_case = tmp.join(format!("conflict-sys-{}", label.replace(' ', "-")));
+        fs::create_dir_all(&fro_case).unwrap();
+        fs::create_dir_all(&sys_case).unwrap();
+        fs::write(fro_case.join("file.txt"), b"gamma\n").unwrap();
+        fs::write(sys_case.join("file.txt"), b"gamma\n").unwrap();
+        let mut fro_args = vec!["rm"];
+        fro_args.extend(flags.iter().copied());
+        let fro_out = run_command_in_dir(
+            env!("CARGO_BIN_EXE_fro"),
+            &fro_args,
+            &fro_case,
+            prompt_stdin,
+        );
+        let sys_out = run_command_in_dir("rm", &flags, &sys_case, prompt_stdin);
+        assert_same_result(fro_out, sys_out, label);
+        assert_eq!(
+            fro_case.join("file.txt").exists(),
+            sys_case.join("file.txt").exists(),
+            "{label}: side effects mismatch"
+        );
+        assert_eq!(
+            fro_case.join("file.txt").exists(),
+            expect_exists,
+            "{label}: expected file state"
+        );
+    }
+}
+
+#[test]
 fn cartesian_mv_file_and_recursive_directory_match_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-rm-mv-mv-matrix");
 

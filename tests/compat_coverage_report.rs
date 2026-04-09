@@ -134,7 +134,7 @@ find       9/9  100%  remaining: none  help: ok
 head       4/4  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
 mv         3/3  100%  remaining: none  help: ok
-rm         4/4  100%  remaining: none  help: ok
+rm         7/7  100%  remaining: none  help: ok
 sha224sum 11/11 100%  remaining: none  help: ok
 sha256sum 11/11 100%  remaining: none  help: ok
 sha384sum 11/11 100%  remaining: none  help: ok
@@ -216,12 +216,12 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
     let help_source = include_str!("../src/main_app/help.rs");
     assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
     assert!(help_source.contains("month/version/human modes"));
-    assert!(help_source
-        .contains("FIXME: Extract currently targets uncompressed regular-file archives"));
+    assert!(
+        help_source.contains("FIXME: Extract currently targets uncompressed regular-file archives")
+    );
     assert!(help_source.contains("FIXME: When invoked via the cp multicall alias"));
 
     let find_source = include_str!("../src/coreutils/find.rs");
-    assert!(
-        find_source.contains("-print             print each matching path followed by a newline (default)")
-    );
+    assert!(find_source
+        .contains("-print             print each matching path followed by a newline (default)"));
 }

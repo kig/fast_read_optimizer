@@ -116,11 +116,12 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "rm" => Some(CommandHelp {
             name: "rm",
-            usage: "rm [-f] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
+            usage: "rm [-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
             summary: "Remove files or directory trees, with recursive delete using fro's tree-walk plumbing.",
             notes: &[
                 "-d/--dir removes empty directories without switching to the recursive tree-walk path.",
                 "-f/--force ignores missing operands and missing files, matching the common cleanup flow.",
+                "-i, -I, and --interactive[=WHEN] add bounded GNU-like prompting; the last conflicting prompt flag wins.",
                 "Recursive removal uses the existing tree-delete helper; plain file removal stays on the simple unlink path.",
             ],
             examples: &[

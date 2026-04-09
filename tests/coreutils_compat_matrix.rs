@@ -69,6 +69,37 @@ fn run_system_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> Ou
         .unwrap_or_else(|err| panic!("failed to collect {program} output: {err}"))
 }
 
+fn run_command_in_dir(
+    program: &str,
+    args: &[&str],
+    current_dir: &Path,
+    stdin_bytes: Option<&[u8]>,
+) -> Output {
+    let mut command = Command::new(program);
+    command.current_dir(current_dir).args(args);
+    if let Some(stdin_bytes) = stdin_bytes {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to spawn {program}: {err}"));
+        child
+            .stdin
+            .take()
+            .expect("missing child stdin")
+            .write_all(stdin_bytes)
+            .expect("failed to write child stdin");
+        child
+            .wait_with_output()
+            .unwrap_or_else(|err| panic!("failed to collect {program} output: {err}"))
+    } else {
+        command
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+    }
+}
+
 fn make_fifo(path: &Path) {
     let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
