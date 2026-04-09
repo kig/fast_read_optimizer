@@ -72,7 +72,9 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         print_general_help(args[0].as_str());
         return Ok(ParseOutcome::Early(0));
     }
-    if args.len() >= 3 && is_help_flag(args[2].as_str()) {
+    let subcommand_short_help_is_real_flag = args.get(1).is_some_and(|command| command == "sort")
+        && args.get(2).is_some_and(|arg| arg == "-h");
+    if args.len() >= 3 && is_help_flag(args[2].as_str()) && !subcommand_short_help_is_real_flag {
         if let Some(help) = command_help(args[1].as_str()) {
             print_command_help(args[0].as_str(), help);
         } else {

@@ -242,6 +242,7 @@ pub const ROWS: &[CoverageRow] = &[
         covered: &[
             "(default bytewise ascending)",
             "-m/-c",
+            "-g/-h",
             "-n/--numeric-sort",
             "-r/--reverse",
             "-u/--unique",
@@ -249,7 +250,7 @@ pub const ROWS: &[CoverageRow] = &[
             "-o/--output",
             "-T/--temporary-directory",
         ],
-        remaining: &["-g/-h", "-M", "-V", "-k"],
+        remaining: &["-M", "-V", "-k"],
     },
     CoverageRow {
         name: "tac",

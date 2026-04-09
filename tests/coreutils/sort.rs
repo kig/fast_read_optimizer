@@ -78,8 +78,12 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("newline-delimited"));
     assert!(stdout.contains("byte"));
+    assert!(stdout.contains("general-numeric"));
+    assert!(stdout.contains("human-numeric"));
     assert!(stdout.contains("numeric"));
     assert!(stdout.contains("--check"));
+    assert!(stdout.contains("--general-numeric-sort"));
+    assert!(stdout.contains("--human-numeric-sort"));
     assert!(stdout.contains("--merge"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
@@ -88,7 +92,8 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("--temporary-directory"));
     assert!(stdout.contains("Unsupported GNU sort features"));
-    assert!(stdout.contains("month/version/human"));
+    assert!(stdout.contains("month/version"));
+    assert!(stdout.contains("key selection"));
     assert!(!stdout.contains("zero-terminated records and locale collation"));
     assert!(!stdout.contains("temp-file controls"));
     assert!(!stdout.contains("merge/check modes"));
@@ -204,6 +209,140 @@ fn sort_numeric_matches_system_for_files_and_stdin() {
                     b"1.0\n1\n1.00\n10\n2\n-3\n.5\n+2\nx\n",
                 ),
                 &format!("sort numeric stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_general_numeric_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-general");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"x\nNaN\n-inf\n-3\n.5\n02\n0x10\n1e2\ninf\n").unwrap();
+    fs::write(&b, b"1E+02\n+inf\n-nan\n0\n-0\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-g"],
+            vec!["--general-numeric-sort"],
+            vec!["-gr"],
+            vec!["-gu"],
+            vec!["--general-numeric-sort", "--reverse", "--unique"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort general numeric {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [
+            vec!["-g"],
+            vec!["-gr"],
+            vec!["-gu"],
+            vec!["--general-numeric-sort", "--reverse", "--unique"],
+        ] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin(
+                    "sort",
+                    &fro_stdin_args,
+                    b"x\nNaN\n-inf\n-3\n.5\n02\n0x10\n1e2\n1E+02\n+inf\ninf\n",
+                ),
+                run_system_sort_with_stdin(
+                    sort_flags
+                        .iter()
+                        .copied()
+                        .chain(["-"])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    b"x\nNaN\n-inf\n-3\n.5\n02\n0x10\n1e2\n1E+02\n+inf\ninf\n",
+                ),
+                &format!("sort general numeric stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_human_numeric_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-human");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"2K\n1G\n512M\n100\n1.5K\n-2K\n1KiB\n0\nfoo\n").unwrap();
+    fs::write(&b, b"1000\n1024\n1K\n1.0K\n1024K\n1M\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-h"],
+            vec!["--human-numeric-sort"],
+            vec!["-hr"],
+            vec!["-hu"],
+            vec!["--human-numeric-sort", "--reverse", "--unique"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort human numeric {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [
+            vec!["-h"],
+            vec!["-hr"],
+            vec!["-hu"],
+            vec!["--human-numeric-sort", "--reverse", "--unique"],
+        ] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin(
+                    "sort",
+                    &fro_stdin_args,
+                    b"2K\n1G\n512M\n100\n1.5K\n-2K\n1KiB\n1000\n1024\n1K\n1.0K\n1024K\n1M\nfoo\n",
+                ),
+                run_system_sort_with_stdin(
+                    sort_flags
+                        .iter()
+                        .copied()
+                        .chain(["-"])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    b"2K\n1G\n512M\n100\n1.5K\n-2K\n1KiB\n1000\n1024\n1K\n1.0K\n1024K\n1M\nfoo\n",
+                ),
+                &format!("sort human numeric stdin {:?}", fro_stdin_args),
             );
         }
     }
@@ -467,6 +606,101 @@ fn sort_check_matches_system_status_and_diagnostics() {
         run_fro_with_stdin("sort", &["-c", "-"], b"beta\nalpha\n"),
         run_system_sort_with_stdin(&["-c", "-"], b"beta\nalpha\n"),
         "sort check stdin",
+    );
+}
+
+#[test]
+fn sort_general_and_human_merge_check_and_spill_match_system() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-general-human-backends");
+    let general_left = tmp.join("general-left.txt");
+    let general_right = tmp.join("general-right.txt");
+    let general_unsorted = tmp.join("general-unsorted.txt");
+    let human_left = tmp.join("human-left.txt");
+    let human_right = tmp.join("human-right.txt");
+    let human_unsorted = tmp.join("human-unsorted.txt");
+    let spill_input = tmp.join("spill-input.txt");
+    let fro_output = tmp.join("fro-spill.txt");
+    let sys_output = tmp.join("sys-spill.txt");
+
+    fs::write(&general_left, b"NaN\n-inf\n-3\n").unwrap();
+    fs::write(&general_right, b".5\n10\ninf\n").unwrap();
+    fs::write(&general_unsorted, b"10\n-inf\n").unwrap();
+    fs::write(&human_left, b"-2K\n1000\n1K\n").unwrap();
+    fs::write(&human_right, b"1024K\n1M\n1G\n").unwrap();
+    fs::write(&human_unsorted, b"1K\n1000\n").unwrap();
+
+    let mut spill_bytes = Vec::new();
+    for idx in 0..120000 {
+        spill_bytes.extend_from_slice(format!("{}e1\n", 120000 - idx).as_bytes());
+    }
+    fs::write(&spill_input, &spill_bytes).unwrap();
+
+    assert_same_result(
+        run_fro(
+            "sort",
+            &[
+                "-mg",
+                general_left.to_str().unwrap(),
+                general_right.to_str().unwrap(),
+            ],
+        ),
+        run_system_sort(&[
+            "-mg",
+            general_left.to_str().unwrap(),
+            general_right.to_str().unwrap(),
+        ]),
+        "sort merge general numeric",
+    );
+    assert_same_result(
+        run_fro("sort", &["-cg", general_unsorted.to_str().unwrap()]),
+        run_system_sort(&["-cg", general_unsorted.to_str().unwrap()]),
+        "sort check general numeric",
+    );
+    assert_same_result(
+        run_fro(
+            "sort",
+            &[
+                "-mh",
+                human_left.to_str().unwrap(),
+                human_right.to_str().unwrap(),
+            ],
+        ),
+        run_system_sort(&[
+            "-mh",
+            human_left.to_str().unwrap(),
+            human_right.to_str().unwrap(),
+        ]),
+        "sort merge human numeric",
+    );
+    assert_same_result(
+        run_fro("sort", &["-ch", human_unsorted.to_str().unwrap()]),
+        run_system_sort(&["-ch", human_unsorted.to_str().unwrap()]),
+        "sort check human numeric",
+    );
+
+    let fro = run_fro_env(
+        "sort",
+        &[
+            "-g",
+            "--no-direct",
+            "-o",
+            fro_output.to_str().unwrap(),
+            spill_input.to_str().unwrap(),
+        ],
+        &[("FRO_SORT_MAX_IN_MEMORY_BYTES", "65536")],
+    );
+    let system = run_system_sort(&[
+        "-g",
+        "-o",
+        sys_output.to_str().unwrap(),
+        spill_input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
     );
 }
 

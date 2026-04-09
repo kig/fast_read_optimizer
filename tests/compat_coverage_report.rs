@@ -140,7 +140,7 @@ sha256sum 11/11 100%  remaining: none  help: ok
 sha384sum 11/11 100%  remaining: none  help: ok
 sha512sum 11/11 100%  remaining: none  help: ok
 shred      6/6  100%  remaining: none  help: ok
-sort       8/12  67%  remaining: -g/-h, -M, -V, -k  help: ok
+sort       9/12  75%  remaining: -M, -V, -k  help: ok
 tac        2/2  100%  remaining: none  help: ok
 tail       4/4  100%  remaining: none  help: ok
 tar        5/5  100%  remaining: none  help: ok
@@ -160,7 +160,7 @@ fn compat_coverage_rows_match_dispatch_minus_custom_multicalls() {
 #[test]
 fn compat_help_token_parser_handles_alias_lists_and_dd_operands() {
     let parsed = parse_help_flag_tokens(
-        "  -q, --quiet, --silent\n  --output=FILE\n  --check=diagnose-first\n  iflag=count_bytes\n  skip_bytes\n  status=none\n  FIXME: tracked GNU/coreutils flags not yet supported in this slice: -g/-h, -M, -V, -k\n",
+        "  -q, --quiet, --silent\n  --output=FILE\n  --check=diagnose-first\n  iflag=count_bytes\n  skip_bytes\n  status=none\n  FIXME: tracked GNU/coreutils flags not yet supported in this slice: -M, -V, -k\n",
     );
     let expected = BTreeSet::from([
         "--check".to_string(),
@@ -170,8 +170,6 @@ fn compat_help_token_parser_handles_alias_lists_and_dd_operands() {
         "--silent".to_string(),
         "-M".to_string(),
         "-V".to_string(),
-        "-g".to_string(),
-        "-h".to_string(),
         "-k".to_string(),
         "-q".to_string(),
         "count_bytes".to_string(),
@@ -204,7 +202,7 @@ fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
 
     let sort_help = fro_help_text("sort");
     assert!(sort_help.contains("FIXME:"));
-    assert!(sort_help.contains("-g/-h, -M, -V, -k"));
+    assert!(sort_help.contains("-M, -V, -k"));
 
     let tar_help = fro_help_text("tar");
     assert!(tar_help.contains("FIXME:"));
@@ -215,7 +213,7 @@ fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
 fn compat_coverage_explicit_gap_rows_match_source_help() {
     let help_source = include_str!("../src/main_app/help.rs");
     assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
-    assert!(help_source.contains("month/version/human modes"));
+    assert!(help_source.contains("key selection (-k), month/version modes (-M/-V)"));
     assert!(
         help_source.contains("FIXME: Extract currently targets uncompressed regular-file archives")
     );

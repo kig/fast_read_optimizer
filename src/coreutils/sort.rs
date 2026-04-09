@@ -24,6 +24,8 @@ impl SortLineRef {
 enum SortMode {
     Bytewise,
     Numeric,
+    GeneralNumeric,
+    HumanNumeric,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,6 +57,30 @@ impl<'a> NumericPrefix<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GeneralNaNSign {
+    ExplicitPlus,
+    None,
+    Negative,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GeneralNumericPrefix<'a> {
+    Invalid,
+    NaN {
+        sign: GeneralNaNSign,
+        token: &'a [u8],
+    },
+    Number(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HumanNumericPrefix<'a> {
+    negative: bool,
+    suffix_rank: u8,
+    number: NumericPrefix<'a>,
+}
+
 fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
     let first_non_zero = bytes
         .iter()
@@ -72,11 +98,17 @@ fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
     &bytes[..last_non_zero]
 }
 
+fn trim_leading_blanks(bytes: &[u8]) -> &[u8] {
+    let first_non_blank = bytes
+        .iter()
+        .position(|&byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &bytes[first_non_blank..]
+}
+
 fn parse_numeric_prefix(line: &[u8]) -> NumericPrefix<'_> {
+    let line = trim_leading_blanks(line);
     let mut idx = 0usize;
-    while idx < line.len() && matches!(line[idx], b' ' | b'\t') {
-        idx += 1;
-    }
 
     let negative = idx < line.len() && line[idx] == b'-';
     if negative {
@@ -157,6 +189,211 @@ fn compare_numeric_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
     compare_numeric_prefixes(parse_numeric_prefix(left), parse_numeric_prefix(right))
 }
 
+fn parse_general_numeric_prefix(line: &[u8]) -> GeneralNumericPrefix<'_> {
+    let trimmed = trim_leading_blanks(line);
+    if trimmed.is_empty() {
+        return GeneralNumericPrefix::Invalid;
+    }
+
+    let nul_cutoff = trimmed
+        .iter()
+        .position(|&byte| byte == b'\0')
+        .unwrap_or(trimmed.len());
+    let mut buffer = Vec::with_capacity(nul_cutoff + 1);
+    buffer.extend_from_slice(&trimmed[..nul_cutoff]);
+    buffer.push(0);
+
+    let start = buffer.as_ptr() as *const libc::c_char;
+    let mut end = std::ptr::null_mut();
+    let value = unsafe { libc::strtod(start, &mut end) };
+    if std::ptr::eq(end as *const libc::c_char, start) {
+        return GeneralNumericPrefix::Invalid;
+    }
+    let consumed = unsafe { end.offset_from(start) as usize }.min(nul_cutoff);
+    if value.is_nan() {
+        let sign = match trimmed.first().copied() {
+            Some(b'+') => GeneralNaNSign::ExplicitPlus,
+            Some(b'-') => GeneralNaNSign::Negative,
+            _ => GeneralNaNSign::None,
+        };
+        return GeneralNumericPrefix::NaN {
+            sign,
+            token: &trimmed[..consumed],
+        };
+    }
+    GeneralNumericPrefix::Number(value)
+}
+
+fn human_suffix_rank(byte: u8) -> Option<u8> {
+    Some(match byte {
+        b'k' | b'K' => 1,
+        b'm' | b'M' => 2,
+        b'g' | b'G' => 3,
+        b't' | b'T' => 4,
+        b'p' | b'P' => 5,
+        b'e' | b'E' => 6,
+        b'z' | b'Z' => 7,
+        b'y' | b'Y' => 8,
+        _ => return None,
+    })
+}
+
+fn parse_human_numeric_prefix(line: &[u8]) -> Option<HumanNumericPrefix<'_>> {
+    let line = trim_leading_blanks(line);
+    let mut idx = 0usize;
+    if matches!(line.first(), Some(b'+')) {
+        return None;
+    }
+
+    let negative = idx < line.len() && line[idx] == b'-';
+    if negative {
+        idx += 1;
+    }
+
+    let int_start = idx;
+    while idx < line.len() && line[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    let int_digits = &line[int_start..idx];
+
+    let frac_digits = if idx < line.len() && line[idx] == b'.' {
+        idx += 1;
+        let frac_start = idx;
+        while idx < line.len() && line[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        &line[frac_start..idx]
+    } else {
+        &[]
+    };
+
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+
+    let suffix_rank = line
+        .get(idx)
+        .copied()
+        .and_then(human_suffix_rank)
+        .unwrap_or(0);
+
+    Some(HumanNumericPrefix {
+        negative,
+        suffix_rank,
+        number: NumericPrefix {
+            negative,
+            int_digits: trim_leading_zeros(int_digits),
+            frac_digits: trim_trailing_zeros(frac_digits),
+        },
+    })
+}
+
+fn compare_lowercase_preferring_lower(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let max_len = left.len().max(right.len());
+    for idx in 0..max_len {
+        let Some(&left_byte) = left.get(idx) else {
+            return std::cmp::Ordering::Less;
+        };
+        let Some(&right_byte) = right.get(idx) else {
+            return std::cmp::Ordering::Greater;
+        };
+        let left_fold = left_byte.to_ascii_lowercase();
+        let right_fold = right_byte.to_ascii_lowercase();
+        match left_fold.cmp(&right_fold) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+        match (
+            left_byte.is_ascii_lowercase(),
+            right_byte.is_ascii_lowercase(),
+        ) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        match left_byte.cmp(&right_byte) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn compare_general_numeric_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    match (
+        parse_general_numeric_prefix(left),
+        parse_general_numeric_prefix(right),
+    ) {
+        (GeneralNumericPrefix::Invalid, GeneralNumericPrefix::Invalid) => std::cmp::Ordering::Equal,
+        (GeneralNumericPrefix::Invalid, _) => std::cmp::Ordering::Less,
+        (_, GeneralNumericPrefix::Invalid) => std::cmp::Ordering::Greater,
+        (
+            GeneralNumericPrefix::NaN {
+                sign: left_sign,
+                token: left_token,
+            },
+            GeneralNumericPrefix::NaN {
+                sign: right_sign,
+                token: right_token,
+            },
+        ) => left_sign
+            .cmp(&right_sign)
+            .then_with(|| compare_lowercase_preferring_lower(left_token, right_token)),
+        (GeneralNumericPrefix::NaN { .. }, GeneralNumericPrefix::Number(_)) => {
+            std::cmp::Ordering::Less
+        }
+        (GeneralNumericPrefix::Number(_), GeneralNumericPrefix::NaN { .. }) => {
+            std::cmp::Ordering::Greater
+        }
+        (GeneralNumericPrefix::Number(left_value), GeneralNumericPrefix::Number(right_value)) => {
+            left_value
+                .partial_cmp(&right_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+}
+
+fn compare_human_numeric_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let invalid_vs_valid = |valid: HumanNumericPrefix<'_>| {
+        if valid.number.is_zero() {
+            std::cmp::Ordering::Equal
+        } else if valid.negative {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        }
+    };
+    match (
+        parse_human_numeric_prefix(left),
+        parse_human_numeric_prefix(right),
+    ) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(valid)) => invalid_vs_valid(valid),
+        (Some(valid), None) => invalid_vs_valid(valid).reverse(),
+        (Some(left_key), Some(right_key)) => match (left_key.negative, right_key.negative) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => left_key
+                .suffix_rank
+                .cmp(&right_key.suffix_rank)
+                .then_with(|| compare_numeric_prefixes(left_key.number, right_key.number)),
+            (true, true) => right_key
+                .suffix_rank
+                .cmp(&left_key.suffix_rank)
+                .then_with(|| compare_numeric_prefixes(left_key.number, right_key.number)),
+        },
+    }
+}
+
+fn compare_sort_keys(left: &[u8], right: &[u8], mode: SortMode) -> std::cmp::Ordering {
+    match mode {
+        SortMode::Bytewise => left.cmp(right),
+        SortMode::Numeric => compare_numeric_lines(left, right),
+        SortMode::GeneralNumeric => compare_general_numeric_lines(left, right),
+        SortMode::HumanNumeric => compare_human_numeric_lines(left, right),
+    }
+}
+
 fn compare_line_refs(
     left: SortLineRef,
     right: SortLineRef,
@@ -169,10 +406,10 @@ fn compare_line_refs(
             .bytes(storage)
             .cmp(right.bytes(storage))
             .then_with(|| left.sequence.cmp(&right.sequence)),
-        SortMode::Numeric => {
-            let numeric = compare_numeric_lines(left.bytes(storage), right.bytes(storage));
-            if numeric != std::cmp::Ordering::Equal {
-                return numeric;
+        SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric => {
+            let key_order = compare_sort_keys(left.bytes(storage), right.bytes(storage), mode);
+            if key_order != std::cmp::Ordering::Equal {
+                return key_order;
             }
             if unique {
                 left.sequence.cmp(&right.sequence)
@@ -209,16 +446,9 @@ fn compare_line_bytes(
     mode: SortMode,
     reverse: bool,
 ) -> std::cmp::Ordering {
-    let asc = match mode {
-        SortMode::Bytewise => left.cmp(right),
-        SortMode::Numeric => {
-            let numeric = compare_numeric_lines(left, right);
-            if numeric != std::cmp::Ordering::Equal {
-                numeric
-            } else {
-                left.cmp(right)
-            }
-        }
+    let asc = match compare_sort_keys(left, right, mode) {
+        std::cmp::Ordering::Equal if mode != SortMode::Bytewise => left.cmp(right),
+        other => other,
     };
     if reverse {
         asc.reverse()
@@ -231,6 +461,34 @@ fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
     match mode {
         SortMode::Bytewise => left == right,
         SortMode::Numeric => compare_numeric_lines(left, right) == std::cmp::Ordering::Equal,
+        SortMode::GeneralNumeric => match (
+            parse_general_numeric_prefix(left),
+            parse_general_numeric_prefix(right),
+        ) {
+            (GeneralNumericPrefix::Invalid, GeneralNumericPrefix::Invalid) => left == right,
+            (
+                GeneralNumericPrefix::Number(left_value),
+                GeneralNumericPrefix::Number(right_value),
+            ) => left_value == right_value,
+            _ => false,
+        },
+        SortMode::HumanNumeric => match (
+            parse_human_numeric_prefix(left),
+            parse_human_numeric_prefix(right),
+        ) {
+            (None, None) => true,
+            (None, Some(right_key)) | (Some(right_key), None) => right_key.number.is_zero(),
+            (Some(left_key), Some(right_key)) => {
+                if left_key.number.is_zero() && right_key.number.is_zero() {
+                    true
+                } else {
+                    left_key.negative == right_key.negative
+                        && left_key.suffix_rank == right_key.suffix_rank
+                        && compare_numeric_prefixes(left_key.number, right_key.number)
+                            == std::cmp::Ordering::Equal
+                }
+            }
+        },
     }
 }
 
@@ -240,14 +498,18 @@ fn print_sort_help(program: &str) {
     println!("Usage: {program} [OPTION]... [FILE]...");
     println!();
     println!(
-        "This bounded slice sorts locale-independent byte or numeric records, using newlines by default and NULs with -z."
+        "This bounded slice sorts locale-independent byte, numeric, general-numeric, or human-numeric records, using newlines by default and NULs with -z."
     );
     println!(
-        "It currently supports the default case plus -z, numeric/reverse/unique, merge/check, and -o output."
+        "It currently supports the default case plus -g/-h/-n, -z, reverse/unique, merge/check, and -o output."
     );
     println!();
     println!("Supported options:");
     println!("  -c, --check          check whether one input is already sorted");
+    println!("  -g, --general-numeric-sort");
+    println!("                       compare leading C-locale floating-point prefixes");
+    println!("  -h, --human-numeric-sort");
+    println!("                       compare leading numbers grouped by human suffix family");
     println!("  -m, --merge          merge already sorted inputs without resorting");
     println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
     println!("  -r, --reverse        reverse the result of comparisons");
@@ -262,7 +524,7 @@ fn print_sort_help(program: &str) {
     println!("      --direct         force direct IO for regular files when possible");
     println!("      --no-direct      force page-cache IO for regular files");
     println!("      --report-gbps    print aggregate input throughput to stderr");
-    println!("  -h, --help           display this help and exit");
+    println!("      --help           display this help and exit");
     println!();
     println!("Notes:");
     println!("  - Use '-' once to read stdin.");
@@ -272,8 +534,10 @@ fn print_sort_help(program: &str) {
     println!("  - -T only matters when spill temp files are actually created.");
     println!("  - -m reuses the spill/merge backend on already sorted inputs.");
     println!("  - -c validates one input stream and exits 1 on the first disorder.");
+    println!("  - -g uses C-locale strtod-style prefixes; NaNs sort after non-numbers and before infinities.");
+    println!("  - -h compares the leading numeric prefix plus an optional K/M/G/T/P/E/Z/Y suffix family.");
     println!("  - Unsupported GNU sort features currently return an error:");
-    println!("    general keys, month/version/human modes, and locale collation.");
+    println!("    key selection (-k), month/version modes (-M/-V), and locale collation.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -342,7 +606,7 @@ fn sort_line_refs(
                 *dst = snapshot[sorted_idx];
             }
         }
-        SortMode::Numeric => {
+        SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric => {
             lines.sort_unstable_by(|left, right| {
                 compare_line_refs(*left, *right, storage, mode, unique)
             });
@@ -384,6 +648,8 @@ fn apply_short_sort_flags(
     for flag in arg[1..].bytes() {
         match flag {
             b'c' => *check = true,
+            b'g' => *mode = SortMode::GeneralNumeric,
+            b'h' => *mode = SortMode::HumanNumeric,
             b'm' => *merge = true,
             b'n' => *mode = SortMode::Numeric,
             b'r' => *reverse = true,
@@ -474,11 +740,13 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
         let arg = &args[idx];
         match arg.as_str() {
             "--" if !end_flags => end_flags = true,
-            "-h" | "--help" if !end_flags => {
+            "--help" if !end_flags => {
                 print_sort_help(args[0].as_str());
                 return Ok(0);
             }
             "-c" | "--check" if !end_flags => check = true,
+            "-g" | "--general-numeric-sort" if !end_flags => mode = SortMode::GeneralNumeric,
+            "-h" | "--human-numeric-sort" if !end_flags => mode = SortMode::HumanNumeric,
             "-m" | "--merge" if !end_flags => merge = true,
             "-n" | "--numeric-sort" if !end_flags => mode = SortMode::Numeric,
             "-r" | "--reverse" if !end_flags => reverse = true,
@@ -534,6 +802,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 for (pos, flag) in other[1..].char_indices() {
                     match flag {
                         'c' => check = true,
+                        'g' => mode = SortMode::GeneralNumeric,
+                        'h' => mode = SortMode::HumanNumeric,
                         'm' => merge = true,
                         'n' => mode = SortMode::Numeric,
                         'r' => reverse = true,
@@ -578,7 +848,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 if !handled {
                     eprintln!("sort: unsupported option '{other}'");
                     eprintln!(
-                        "sort: fro sort currently supports bytewise or numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
+                        "sort: fro sort currently supports bytewise, numeric, general-numeric, or human-numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
                     );
                     eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
@@ -590,7 +860,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports bytewise or numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
+                    "sort: fro sort currently supports bytewise, numeric, general-numeric, or human-numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
@@ -877,9 +1147,74 @@ mod tests {
     }
 
     #[test]
+    fn general_numeric_compare_orders_invalid_nan_and_numbers() {
+        let lines = [
+            b"x".as_slice(),
+            b"NaN".as_slice(),
+            b"-inf".as_slice(),
+            b"-3".as_slice(),
+            b".5".as_slice(),
+            b"0x10".as_slice(),
+            b"1e2".as_slice(),
+            b"+inf".as_slice(),
+        ];
+        let (storage, mut refs) = refs_for_lines(&lines);
+        sort_line_refs(&mut refs, &storage, SortMode::GeneralNumeric, false).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"x".to_vec(),
+                b"NaN".to_vec(),
+                b"-inf".to_vec(),
+                b"-3".to_vec(),
+                b".5".to_vec(),
+                b"0x10".to_vec(),
+                b"1e2".to_vec(),
+                b"+inf".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn human_numeric_unique_compares_suffix_families() {
+        let input = [
+            b"1KiB".as_slice(),
+            b"1K".as_slice(),
+            b"1024".as_slice(),
+            b"1000".as_slice(),
+            b"1024K".as_slice(),
+            b"1M".as_slice(),
+        ];
+        let (storage, mut refs) = refs_for_lines(&input);
+        finalize_sorted_lines(&mut refs, &storage, SortMode::HumanNumeric, true, false).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"1000".to_vec(),
+                b"1024".to_vec(),
+                b"1KiB".to_vec(),
+                b"1024K".to_vec(),
+                b"1M".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
     fn compare_line_bytes_matches_numeric_last_resort_ordering() {
         assert_eq!(
             compare_line_bytes(b"1", b"1.0", SortMode::Numeric, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_line_bytes(b"x", b"NaN", SortMode::GeneralNumeric, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_line_bytes(b"1KiB", b"1024K", SortMode::HumanNumeric, false),
             std::cmp::Ordering::Less
         );
         assert_eq!(

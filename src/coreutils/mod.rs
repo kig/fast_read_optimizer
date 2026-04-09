@@ -135,6 +135,10 @@ fn is_multicall_version_flag(arg: Option<&String>) -> bool {
     matches!(arg.map(String::as_str), Some("--version"))
 }
 
+fn multicall_short_help_is_real_flag(invoked: &str, arg: Option<&String>) -> bool {
+    invoked == "sort" && matches!(arg.map(String::as_str), Some("-h"))
+}
+
 fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
     let mut rewritten = Vec::with_capacity(command_args.len());
     let mut end_flags = false;
@@ -351,7 +355,7 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
     if !is_coreutils_command(invoked) {
         return Ok(None);
     }
-    if is_multicall_help_flag(args.get(1)) {
+    if is_multicall_help_flag(args.get(1)) && !multicall_short_help_is_real_flag(invoked, args.get(1)) {
         crate::main_app::print_direct_command_help(invoked, invoked);
         return Ok(Some(0));
     }
