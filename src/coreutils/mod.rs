@@ -286,10 +286,7 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
             0
         }
         "wc" => wc::run_wc(args)?,
-        "cksum" => {
-            hash::run_cksum(args)?;
-            0
-        }
+        "cksum" => hash::cksum::run_cksum(args)?,
         "b3sum" => hash::run_hash_sum(args, HashAlgorithm::Blake3)?,
         "b2sum" => hash::run_hash_sum(args, HashAlgorithm::Blake2b512)?,
         "md5sum" => hash::run_hash_sum(args, HashAlgorithm::Md5)?,

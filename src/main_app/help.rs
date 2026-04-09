@@ -1,3 +1,5 @@
+mod hash;
+
 use super::*;
 #[derive(Clone, Copy)]
 pub(super) struct CommandHelp {
@@ -17,6 +19,9 @@ pub(super) fn print_version(program: &str) {
     println!("{program} {FRO_VERSION}");
 }
 pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
+    if let Some(help) = hash::command_help(name) {
+        return Some(help);
+    }
     match name {
         "read" => Some(CommandHelp {
             name: "read",
@@ -221,14 +226,16 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "find" => Some(CommandHelp {
             name: "find",
-            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN] [-path PATTERN] [-print|-print0]",
+            usage: "find [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]",
             summary: "Walk one or more directory trees and print matching paths.",
             notes: &[
                 "This correctness slice does not guarantee output ordering.",
                 "-maxdepth limits descent below each starting path while still printing matching roots.",
                 "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s.",
                 "-name matches only the final path component using shell glob syntax.",
+                "-iname matches basenames case-insensitively using shell glob syntax.",
                 "-path matches the whole emitted path using shell glob syntax.",
+                "-ipath matches whole emitted paths case-insensitively using shell glob syntax.",
                 "-print is the default action; -print0 emits NUL-delimited paths for xargs -0 style pipelines.",
             ],
             examples: &[
@@ -237,7 +244,9 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Walk two roots", "find src tests"),
                 ("List only regular files", "find . -type f"),
                 ("Match Rust sources by basename", "find src -name '*.rs'"),
+                ("Match Rust sources case-insensitively", "find src -iname '*.RS'"),
                 ("Match a subtree by emitted path", "find . -path '*/target/*'"),
+                ("Match a subtree case-insensitively", "find . -ipath '*/TARGET/*'"),
                 ("Emit NUL-delimited directory paths", "find src -type d -print0"),
             ],
         }),
@@ -340,65 +349,6 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             ],
             examples: &[("Copy five 4 KiB blocks with no summary", "dd if=src.bin of=dst.bin bs=4K count=5 status=none")],
         }),
-        "cksum" => Some(CommandHelp {
-            name: "cksum",
-            usage: "cksum [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
-            summary: "POSIX cksum compatibility wrapper on top of fro file reads.",
-            notes: &[
-                "Uses a table-driven POSIX CRC32 path while reusing the existing ordered input reader.",
-                "--report-gbps writes effective hashed-input throughput to stderr.",
-            ],
-            examples: &[("Print POSIX CRC32 and size", "cksum archive.tar")],
-        }),
-        "b3sum" => Some(CommandHelp {
-            name: "b3sum",
-            usage: "b3sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print BLAKE3 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
-        }),
-        "b2sum" => Some(CommandHelp {
-            name: "b2sum",
-            usage: "b2sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print BLAKE2b-512 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with BLAKE2b-512", "b2sum bigfile.dat")],
-        }),
-        "md5sum" => Some(CommandHelp {
-            name: "md5sum",
-            usage: "md5sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print MD5 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with MD5", "md5sum bigfile.dat")],
-        }),
-        "sha224sum" => Some(CommandHelp {
-            name: "sha224sum",
-            usage: "sha224sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print SHA-224 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with SHA-224", "sha224sum bigfile.dat")],
-        }),
-        "sha256sum" => Some(CommandHelp {
-            name: "sha256sum",
-            usage: "sha256sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print SHA-256 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with SHA-256", "sha256sum bigfile.dat")],
-        }),
-        "sha384sum" => Some(CommandHelp {
-            name: "sha384sum",
-            usage: "sha384sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print SHA-384 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with SHA-384", "sha384sum bigfile.dat")],
-        }),
-        "sha512sum" => Some(CommandHelp {
-            name: "sha512sum",
-            usage: "sha512sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            summary: "Print SHA-512 digests for one or more files.",
-            notes: &["--report-gbps writes effective hashed-input throughput to stderr."],
-            examples: &[("Hash one file with SHA-512", "sha512sum bigfile.dat")],
-        }),
         "tar" => Some(CommandHelp {
             name: "tar",
             usage: "tar (-cf <archive.tar> [-v] <source> | -tf[v] <archive.tar>)",
@@ -408,7 +358,10 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "-v/--verbose keeps create-side progress reporting and enables GNU-style verbose output for listing.",
                 "Extraction, compression, stdin archives, and member filters remain unsupported.",
             ],
-            examples: &[("Archive one directory", "tar -cf tree.tar mytree"), ("List one archive verbosely", "tar -tvf tree.tar")],
+            examples: &[
+                ("Archive one directory", "tar -cf tree.tar mytree"),
+                ("List one archive verbosely", "tar -tvf tree.tar"),
+            ],
         }),
         "shred" => Some(CommandHelp {
             name: "shred",

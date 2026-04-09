@@ -208,6 +208,98 @@ fn multicall_rm_help_and_force_zero_operands_work() {
 }
 
 #[test]
+fn multicall_cksum_help_and_check_flags_work() {
+    let help = run_fro("cksum", &["--help"]);
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help_stdout.contains("cksum"));
+    assert!(help_stdout.contains("--check"));
+    assert!(help_stdout.contains("--ignore-missing"));
+    assert!(help_stdout.contains("<crc> <bytes> <path>"));
+    assert!(help.stderr.is_empty());
+
+    let tmp = unique_temp_dir("fro-coreutils-cksum-check");
+    let ok_path = tmp.join("ok.bin");
+    let bad_path = tmp.join("bad.bin");
+    fs::write(&ok_path, b"cksum-ok-data").unwrap();
+    fs::write(&bad_path, b"cksum-bad-data").unwrap();
+
+    let ok_line =
+        String::from_utf8(assert_success(run_fro("cksum", &[ok_path.to_str().unwrap()])).stdout)
+            .unwrap();
+    let bad_line = ok_line.replace(ok_path.to_str().unwrap(), bad_path.to_str().unwrap());
+    let manifest = tmp.join("manifest.cksum");
+    fs::write(&manifest, format!("{ok_line}{bad_line}")).unwrap();
+
+    let output = run_fro("cksum", &["--check", manifest.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains(&format!("{}: OK", ok_path.to_str().unwrap())));
+    assert!(stdout.contains(&format!("{}: FAILED", bad_path.to_str().unwrap())));
+    assert!(stderr.contains("computed checksum did NOT match"));
+
+    let quiet = run_fro("cksum", &["--quiet", "--check", manifest.to_str().unwrap()]);
+    assert_eq!(quiet.status.code(), Some(1));
+    let quiet_stdout = String::from_utf8_lossy(&quiet.stdout);
+    assert!(!quiet_stdout.contains(": OK"));
+    assert!(quiet_stdout.contains(": FAILED"));
+
+    let status = run_fro(
+        "cksum",
+        &["--status", "--check", manifest.to_str().unwrap()],
+    );
+    assert_eq!(status.status.code(), Some(1));
+    assert!(status.stdout.is_empty());
+    assert!(status.stderr.is_empty());
+}
+
+#[test]
+fn multicall_cksum_check_warn_strict_and_ignore_missing_work() {
+    let tmp = unique_temp_dir("fro-coreutils-cksum-check-flags");
+    let ok_path = tmp.join("ok.bin");
+    let missing_path = tmp.join("missing.bin");
+    fs::write(&ok_path, b"cksum-flag-data").unwrap();
+
+    let ok_line =
+        String::from_utf8(assert_success(run_fro("cksum", &[ok_path.to_str().unwrap()])).stdout)
+            .unwrap();
+    let malformed_manifest = tmp.join("malformed.cksum");
+    fs::write(&malformed_manifest, format!("bogus-line\n{ok_line}")).unwrap();
+
+    let warn = assert_success(run_fro(
+        "cksum",
+        &["--warn", "--check", malformed_manifest.to_str().unwrap()],
+    ));
+    assert!(
+        String::from_utf8_lossy(&warn.stderr).contains("improperly formatted cksum checksum line")
+    );
+
+    let strict = run_fro(
+        "cksum",
+        &["--strict", "--check", malformed_manifest.to_str().unwrap()],
+    );
+    assert_eq!(strict.status.code(), Some(1));
+
+    let missing_manifest = tmp.join("missing.cksum");
+    let missing_line = ok_line.replace(ok_path.to_str().unwrap(), missing_path.to_str().unwrap());
+    fs::write(&missing_manifest, missing_line).unwrap();
+
+    let ignored = run_fro(
+        "cksum",
+        &[
+            "--ignore-missing",
+            "--status",
+            "--check",
+            missing_manifest.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(ignored.status.code(), Some(1));
+    assert!(ignored.stdout.is_empty());
+    assert!(ignored.stderr.is_empty());
+}
+
+#[test]
 fn multicall_cat_tac_and_wc_match_expected_text_behavior() {
     let tmp = unique_temp_dir("fro-coreutils-text");
     let path = tmp.join("text.txt");

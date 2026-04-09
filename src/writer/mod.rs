@@ -836,6 +836,7 @@ fn fill_write_buffer(
 
 mod api;
 mod copy_ops;
+mod copy_strategy;
 #[cfg(kani)]
 mod kani_proofs;
 #[cfg(test)]
@@ -843,3 +844,4 @@ mod tests;
 
 pub use api::*;
 pub use copy_ops::*;
+pub use copy_strategy::*;

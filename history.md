@@ -2,6 +2,7 @@
 
 ## 2026-04-09
 
+- `cksum` gained a bounded fro-style `--check` slice without bloating `src/coreutils/hash.rs`: shared checksum-check policy/reporting now lives in `src/coreutils/hash/check.rs`, `cksum`-specific parsing/execution lives in `src/coreutils/hash/cksum.rs`, and the verifier reuses the regular-file CRC/hash fast path while supporting `--quiet`, `--status`, `--warn`, `--strict`, and `--ignore-missing`.
 - `sort` gained a bounded output-file slice: `-o FILE`, `--output=FILE`, and attached `-oFILE` now write the sorted result to a file after all input has been read, so stdout is suppressed and in-place rewrites reuse the same bytewise ordering backend instead of requiring temp-file machinery.
 - `tar -tvf` now prints GNU-style verbose whole-archive listings for uncompressed archives on top of the same reader used by plain `tar -tf`, raising the tracked tar compatibility slice to create/list/verbose-list while still leaving extraction unsupported.
 - `dd status=progress` now reports periodic line-based byte-progress snapshots without replacing the tuned copy engines: the progress path threads an optional completed-bytes counter through the existing copy strategies and still prints the normal final summary.

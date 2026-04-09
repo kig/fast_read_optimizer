@@ -3,6 +3,11 @@ use crc_fast::{CrcAlgorithm as FastCrcAlgorithm, Digest as CrcDigest};
 use fro::finalize_cksum_crc;
 use openssl::hash::Hasher;
 
+mod check;
+pub(crate) mod cksum;
+
+use self::check::{is_check_behavior_flag, parse_check_options, CheckOptions, ManifestEntry};
+
 fn hash_sum_needs_escape(label: &str) -> bool {
     label.bytes().any(|byte| matches!(byte, b'\\' | b'\n'))
 }
@@ -41,14 +46,6 @@ fn escaped_hash_sum_display(label: &str, zero_terminated: bool) -> (bool, String
         (false, label.to_string())
     } else {
         (true, escape_hash_sum_label(label))
-    }
-}
-
-fn escaped_hash_check_display(label: &str) -> String {
-    if label.contains('\n') {
-        format!("\\{}", escape_hash_sum_label(label))
-    } else {
-        label.to_string()
     }
 }
 
@@ -130,11 +127,7 @@ struct HashSumOptions {
     zero_terminated: bool,
     check: bool,
     tag_with_check: bool,
-    quiet: bool,
-    status_only: bool,
-    warn: bool,
-    strict: bool,
-    ignore_missing: bool,
+    check_options: CheckOptions,
     inputs: Vec<StreamInput>,
 }
 
@@ -188,7 +181,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
                     format = HashSumFormat::Default;
                     continue;
                 }
-                "--quiet" | "--status" | "-w" | "--warn" | "--strict" | "--ignore-missing" => {
+                other if is_check_behavior_flag(other) => {
                     continue;
                 }
                 "--" => {
@@ -214,13 +207,7 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
         zero_terminated,
         check,
         tag_with_check: check && saw_tag,
-        quiet: args[1..].iter().any(|arg| arg == "--quiet"),
-        status_only: args[1..].iter().any(|arg| arg == "--status"),
-        warn: args[1..]
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "-w" | "--warn")),
-        strict: args[1..].iter().any(|arg| arg == "--strict"),
-        ignore_missing: args[1..].iter().any(|arg| arg == "--ignore-missing"),
+        check_options: parse_check_options(&args[1..]),
         inputs: parse_stream_inputs(files),
     })
 }
@@ -270,35 +257,6 @@ pub(super) fn hash_check_untagged_kind(separator: u8, has_filename: bool) -> Has
         b'*' => HashCheckLineKind::UntaggedBinary,
         _ => HashCheckLineKind::Invalid,
     }
-}
-
-pub(super) fn hash_check_should_print_result(
-    success: bool,
-    quiet: bool,
-    status_only: bool,
-) -> bool {
-    !status_only && (!success || !quiet)
-}
-
-pub(super) fn hash_check_should_report_malformed_line(warn: bool, status_only: bool) -> bool {
-    warn && !status_only
-}
-
-pub(super) fn hash_check_exit_code(
-    had_failure: bool,
-    malformed_lines: usize,
-    strict: bool,
-    no_verified_files: bool,
-) -> i32 {
-    if had_failure || (strict && malformed_lines != 0) || no_verified_files {
-        1
-    } else {
-        0
-    }
-}
-
-fn is_not_found_error(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT)
 }
 
 fn hash_check_line_kind(line: &str) -> HashCheckLineKind {
@@ -403,156 +361,17 @@ fn parse_hash_check_line(line: &str, algorithm: HashAlgorithm) -> Option<(String
 }
 
 fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io::Result<i32> {
-    if options.inputs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing checksum file operand",
-        ));
-    }
-    let out = stdout_buf_writer()?;
-    let mut had_failure = false;
-    let mut had_checksum_failure = false;
-    let mut had_valid_line = false;
-    let mut verified_files = 0usize;
-    let mut unread_files = 0usize;
-    let mut malformed_lines = 0usize;
-    let mut no_valid_input = None::<String>;
-    let algorithm_name = hash_check_algorithm_name(algorithm);
-    for input in &options.inputs {
-        let input_label = match input {
-            StreamInput::File(file) => file.as_str(),
-            StreamInput::Stdin { label } => label.as_deref().unwrap_or("-"),
-        };
-        let mut input_had_valid_line = false;
-        let data = match input {
-            StreamInput::File(ref file) => fs::read_to_string(file)?,
-            StreamInput::Stdin { .. } => {
-                let mut reader = stdin_buf_reader()?;
-                let mut text = String::new();
-                reader.read_to_string(&mut text)?;
-                text
-            }
-        };
-        for (line_no, line) in data.lines().enumerate() {
-            let Some((expected_hex, path)) = parse_hash_check_line(line, algorithm) else {
-                malformed_lines += 1;
-                if hash_check_should_report_malformed_line(options.warn, options.status_only) {
-                    eprintln!(
-                        "{}: {}: {}: improperly formatted {} checksum line",
-                        hash_sum_program_name(algorithm),
-                        input_label,
-                        line_no + 1,
-                        algorithm_name
-                    );
-                }
-                continue;
-            };
-            had_valid_line = true;
-            input_had_valid_line = true;
-            let actual = match hash_file(&path, algorithm, options.io_mode) {
-                Ok(actual) => actual,
-                Err(err) if options.ignore_missing && is_not_found_error(&err) => continue,
-                Err(err) if is_not_found_error(&err) => {
-                    unread_files += 1;
-                    had_failure = true;
-                    let display_path = escaped_hash_check_display(&path);
-                    if hash_check_should_print_result(false, options.quiet, options.status_only) {
-                        out.write_all(format!("{display_path}: FAILED open or read\n").as_bytes())?;
-                    }
-                    let message = if is_not_found_error(&err) {
-                        "No such file or directory".to_string()
-                    } else {
-                        err.to_string()
-                    };
-                    eprintln!(
-                        "{}: {}: {}",
-                        hash_sum_program_name(algorithm),
-                        display_path,
-                        message
-                    );
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let success = hex_digest(&actual) == expected_hex;
-            if !success {
-                had_failure = true;
-                had_checksum_failure = true;
-            } else {
-                verified_files += 1;
-            }
-            if hash_check_should_print_result(success, options.quiet, options.status_only) {
-                let status = if success { "OK" } else { "FAILED" };
-                let display_path = escaped_hash_check_display(&path);
-                out.write_all(format!("{display_path}: {status}\n").as_bytes())?;
-            }
-        }
-        if !input_had_valid_line {
-            no_valid_input = Some(input_label.to_string());
-            break;
-        }
-    }
-    out.into_inner()?;
-    if let Some(input_label) = no_valid_input {
-        eprintln!(
-            "{}: {}: no properly formatted {} checksum lines found",
-            hash_sum_program_name(algorithm),
-            input_label,
-            algorithm_name
-        );
-        return Ok(1);
-    }
-    let no_verified_files = options.ignore_missing && had_valid_line && verified_files == 0;
-    if malformed_lines != 0 && had_valid_line && !options.status_only {
-        let phrase = if malformed_lines == 1 {
-            "line is"
-        } else {
-            "lines are"
-        };
-        eprintln!(
-            "{}: WARNING: {} {} improperly formatted",
-            hash_sum_program_name(algorithm),
-            malformed_lines,
-            phrase
-        );
-    }
-    if unread_files != 0 && !options.status_only {
-        let phrase = if unread_files == 1 {
-            "listed file could not be read"
-        } else {
-            "listed files could not be read"
-        };
-        eprintln!(
-            "{}: WARNING: {} {}",
-            hash_sum_program_name(algorithm),
-            unread_files,
-            phrase
-        );
-    }
-    if had_checksum_failure && !options.status_only {
-        eprintln!(
-            "{}: WARNING: 1 computed checksum did NOT match",
-            hash_sum_program_name(algorithm)
-        );
-    }
-    if no_verified_files && !options.status_only {
-        let input_label = match options.inputs.first() {
-            Some(StreamInput::File(file)) => file.as_str(),
-            Some(StreamInput::Stdin { label }) => label.as_deref().unwrap_or("-"),
-            None => "-",
-        };
-        eprintln!(
-            "{}: {}: no file was verified",
-            hash_sum_program_name(algorithm),
-            input_label
-        );
-    }
-    Ok(hash_check_exit_code(
-        had_failure,
-        malformed_lines,
-        options.strict,
-        no_verified_files,
-    ))
+    check::run_manifest_check(
+        hash_sum_program_name(algorithm),
+        hash_check_algorithm_name(algorithm),
+        &options.inputs,
+        options.check_options,
+        |line| {
+            parse_hash_check_line(line, algorithm)
+                .map(|(expected, path)| ManifestEntry { expected, path })
+        },
+        |path| hash_file(path, algorithm, options.io_mode).map(|digest| hex_digest(&digest)),
+    )
 }
 
 pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<i32> {
@@ -627,62 +446,6 @@ fn cksum_stream_input(input: &StreamInput, io_mode: IOMode) -> io::Result<(u32, 
     Ok((crc, bytes))
 }
 
-pub(super) fn run_cksum(args: &[String]) -> io::Result<()> {
-    let mut io_mode = IOMode::Auto;
-    let mut report_throughput = false;
-    let mut files = Vec::new();
-    for arg in &args[1..] {
-        match arg.as_str() {
-            "--auto" => io_mode = IOMode::Auto,
-            "--direct" => io_mode = IOMode::Direct,
-            "--no-direct" => io_mode = IOMode::PageCache,
-            "--report-gbps" => report_throughput = true,
-            other => files.push(other.to_string()),
-        }
-    }
-    let inputs = parse_stream_inputs(files);
-    let started_at = std::time::Instant::now();
-    let mut total_bytes = 0_u64;
-    for input in inputs {
-        let (crc, bytes) = match &input {
-            StreamInput::File(file) if is_regular_input_path(file)? => (
-                u32::from_be_bytes(
-                    hash_file(file, HashAlgorithm::CRC32, io_mode)?
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| io::Error::other("unexpected CRC32 digest length"))?,
-                ),
-                fs::metadata(file)?.len(),
-            ),
-            StreamInput::Stdin { .. } => match regular_stdin_path()? {
-                Some(path) => (
-                    u32::from_be_bytes(
-                        hash_file(&path, HashAlgorithm::CRC32, io_mode)?
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| io::Error::other("unexpected CRC32 digest length"))?,
-                    ),
-                    fs::metadata(path)?.len(),
-                ),
-                None => cksum_stream_input(&input, io_mode)?,
-            },
-            _ => cksum_stream_input(&input, io_mode)?,
-        };
-        total_bytes = total_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| io::Error::other("cksum byte count overflow"))?;
-        match input {
-            StreamInput::File(file) => println!("{} {} {}", crc, bytes, file),
-            StreamInput::Stdin { label: Some(label) } => println!("{} {} {}", crc, bytes, label),
-            StreamInput::Stdin { label: None } => println!("{} {}", crc, bytes),
-        }
-    }
-    if report_throughput {
-        report_gbps("cksum", total_bytes, started_at);
-    }
-    Ok(())
-}
-
 fn ordered_digest(algorithm: HashAlgorithm) -> Option<openssl::hash::MessageDigest> {
     match algorithm {
         HashAlgorithm::Md5 => Some(openssl::hash::MessageDigest::md5()),
@@ -708,7 +471,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::{hash_check_exit_code, hash_check_should_report_malformed_line};
+    use super::check::{hash_check_exit_code, hash_check_should_report_malformed_line};
 
     #[kani::proof]
     fn hash_check_malformed_line_policy_matches_flag_formula() {
@@ -845,36 +608,13 @@ mod tests {
     #[test]
     fn hash_check_display_only_reescapes_newlines() {
         assert_eq!(
-            escaped_hash_check_display("dir\\line\nfile.txt"),
+            check::escaped_hash_check_display("dir\\line\nfile.txt"),
             "\\dir\\\\line\\nfile.txt"
         );
-        assert_eq!(escaped_hash_check_display("dir\\line.txt"), "dir\\line.txt");
-    }
-
-    #[test]
-    fn hash_check_print_policy_matches_gnu_quiet_and_status_rules() {
-        assert!(hash_check_should_print_result(true, false, false));
-        assert!(!hash_check_should_print_result(true, true, false));
-        assert!(hash_check_should_print_result(false, true, false));
-        assert!(!hash_check_should_print_result(true, false, true));
-        assert!(!hash_check_should_print_result(false, false, true));
-    }
-
-    #[test]
-    fn hash_check_malformed_line_policy_matches_warn_and_status_rules() {
-        assert!(hash_check_should_report_malformed_line(true, false));
-        assert!(!hash_check_should_report_malformed_line(false, false));
-        assert!(!hash_check_should_report_malformed_line(true, true));
-    }
-
-    #[test]
-    fn hash_check_exit_code_matches_failure_and_strict_rules() {
-        assert_eq!(hash_check_exit_code(false, 0, false, false), 0);
-        assert_eq!(hash_check_exit_code(false, 1, false, false), 0);
-        assert_eq!(hash_check_exit_code(false, 1, true, false), 1);
-        assert_eq!(hash_check_exit_code(true, 0, false, false), 1);
-        assert_eq!(hash_check_exit_code(true, 1, true, false), 1);
-        assert_eq!(hash_check_exit_code(false, 0, false, true), 1);
+        assert_eq!(
+            check::escaped_hash_check_display("dir\\line.txt"),
+            "dir\\line.txt"
+        );
     }
 
     #[test]

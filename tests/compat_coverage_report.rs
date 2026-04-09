@@ -75,7 +75,15 @@ const ROWS: &[CoverageRow] = &[
     },
     CoverageRow {
         name: "cksum",
-        covered: &["(default)"],
+        covered: &[
+            "(default)",
+            "-c/--check",
+            "--quiet",
+            "--status",
+            "-w/--warn",
+            "--strict",
+            "--ignore-missing",
+        ],
         remaining: &[],
     },
     CoverageRow {
@@ -327,7 +335,7 @@ fn compat_coverage_report_matches_snapshot() {
 base64     3/3  100%  remaining: none
 b2sum     11/11 100%  remaining: none
 cat       10/10 100%  remaining: none
-cksum      1/1  100%  remaining: none
+cksum      7/7  100%  remaining: none
 cmp        5/5  100%  remaining: none
 cp         9/9  100%  remaining: none
 dd        14/14 100%  remaining: none
@@ -365,7 +373,9 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
     let sort_source = include_str!("../src/coreutils/sort.rs");
     assert!(sort_source.contains("Unsupported GNU sort features currently return an error"));
     assert!(sort_source.contains("numeric/month/version modes, keys, merge/check modes,"));
-    assert!(sort_source.contains("zero-terminated records, temp-file controls, and locale collation."));
+    assert!(
+        sort_source.contains("zero-terminated records, temp-file controls, and locale collation.")
+    );
 
     let tar_source = include_str!("../src/coreutils/tar.rs");
     assert!(tar_source.contains("whole-archive list (-t/--list) modes"));
