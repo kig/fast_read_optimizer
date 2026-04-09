@@ -85,15 +85,17 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("--general-numeric-sort"));
     assert!(stdout.contains("--human-numeric-sort"));
     assert!(stdout.contains("--merge"));
+    assert!(stdout.contains("--month-sort"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
+    assert!(stdout.contains("--version-sort"));
     assert!(stdout.contains("--zero-terminated"));
     assert!(stdout.contains("--numeric-sort"));
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("--temporary-directory"));
     assert!(stdout.contains("Unsupported GNU sort features"));
-    assert!(stdout.contains("month/version"));
     assert!(stdout.contains("key selection"));
+    assert!(stdout.contains("locale collation"));
     assert!(!stdout.contains("zero-terminated records and locale collation"));
     assert!(!stdout.contains("temp-file controls"));
     assert!(!stdout.contains("merge/check modes"));
@@ -349,6 +351,144 @@ fn sort_human_numeric_matches_system_for_files_and_stdin() {
 }
 
 #[test]
+fn sort_month_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-month");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"jan\nFeb\nmar\nfoo\nDec\nAug 1\nsept\nSep\n").unwrap();
+    fs::write(&b, b"JAN\njan\nJaN\n  feb\nMarx\nMarch\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-M"],
+            vec!["--month-sort"],
+            vec!["-Mr"],
+            vec!["-Mu"],
+            vec!["--month-sort", "--reverse", "--unique"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort month {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [
+            vec!["-M"],
+            vec!["-Mr"],
+            vec!["-Mu"],
+            vec!["--month-sort", "--reverse", "--unique"],
+        ] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin(
+                    "sort",
+                    &fro_stdin_args,
+                    b"jan\nFeb\nmar\nfoo\nDec\nAug 1\nsept\nSep\nJAN\njan\nJaN\n  feb\n",
+                ),
+                run_system_sort_with_stdin(
+                    sort_flags
+                        .iter()
+                        .copied()
+                        .chain(["-"])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    b"jan\nFeb\nmar\nfoo\nDec\nAug 1\nsept\nSep\nJAN\njan\nJaN\n  feb\n",
+                ),
+                &format!("sort month stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_version_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-version");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(
+        &a,
+        b"v1\nv01\nv1.0\nv1.0.2\nv1.0.10\nv1.0.02\nv1a\nv1~\nv1-1\n",
+    )
+    .unwrap();
+    fs::write(&b, b"Foo\nbar\nbar002\nbar02\nbar2\nbar2a\nbar10\nfoo\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-V"],
+            vec!["--version-sort"],
+            vec!["-Vr"],
+            vec!["-Vu"],
+            vec!["--version-sort", "--reverse", "--unique"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort version {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [
+            vec!["-V"],
+            vec!["-Vr"],
+            vec!["-Vu"],
+            vec!["--version-sort", "--reverse", "--unique"],
+        ] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin(
+                    "sort",
+                    &fro_stdin_args,
+                    b"v1\nv01\nv1.0\nv1.0.2\nv1.0.10\nv1.0.02\nv1a\nv1~\nv1-1\nbar\nbar002\nbar02\nbar2\nbar2a\nbar10\n",
+                ),
+                run_system_sort_with_stdin(
+                    sort_flags
+                        .iter()
+                        .copied()
+                        .chain(["-"])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    b"v1\nv01\nv1.0\nv1.0.2\nv1.0.10\nv1.0.02\nv1a\nv1~\nv1-1\nbar\nbar002\nbar02\nbar2\nbar2a\nbar10\n",
+                ),
+                &format!("sort version stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
 fn sort_numeric_output_file_matches_system_and_suppresses_stdout() {
     let tmp = unique_temp_dir("fro-coreutils-sort-numeric-output");
     let input = tmp.join("input.txt");
@@ -487,12 +627,12 @@ fn sort_zero_terminated_output_merge_and_check_match_system() {
 }
 
 #[test]
-fn sort_rejects_unsupported_flags_with_help_hint() {
-    let output = run_fro("sort", &["-M"]);
+fn sort_rejects_still_unsupported_key_flag_with_help_hint() {
+    let output = run_fro("sort", &["-k", "1,1"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported option '-M'"));
+    assert!(stderr.contains("unsupported option '-k'"));
     assert!(stderr.contains("Try 'sort --help' for more information."));
 }
 
@@ -691,6 +831,101 @@ fn sort_general_and_human_merge_check_and_spill_match_system() {
     );
     let system = run_system_sort(&[
         "-g",
+        "-o",
+        sys_output.to_str().unwrap(),
+        spill_input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
+fn sort_month_and_version_merge_check_and_spill_match_system() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-month-version-backends");
+    let month_left = tmp.join("month-left.txt");
+    let month_right = tmp.join("month-right.txt");
+    let month_unsorted = tmp.join("month-unsorted.txt");
+    let version_left = tmp.join("version-left.txt");
+    let version_right = tmp.join("version-right.txt");
+    let version_unsorted = tmp.join("version-unsorted.txt");
+    let spill_input = tmp.join("spill-input.txt");
+    let fro_output = tmp.join("fro-spill.txt");
+    let sys_output = tmp.join("sys-spill.txt");
+
+    fs::write(&month_left, b"Jan\nMarx\n").unwrap();
+    fs::write(&month_right, b"Apr\nDec\n").unwrap();
+    fs::write(&month_unsorted, b"Feb\nJan\n").unwrap();
+    fs::write(&version_left, b"v01\nv1\nv1.0\n").unwrap();
+    fs::write(&version_right, b"v1.0.2\nv1.0.10\n").unwrap();
+    fs::write(&version_unsorted, b"v1.0.10\nv1.0.2\n").unwrap();
+
+    let mut spill_bytes = Vec::new();
+    for idx in 0..120000 {
+        spill_bytes.extend_from_slice(format!("pkg-{}.tar\n", 120000 - idx).as_bytes());
+    }
+    fs::write(&spill_input, &spill_bytes).unwrap();
+
+    assert_same_result(
+        run_fro(
+            "sort",
+            &[
+                "-mM",
+                month_left.to_str().unwrap(),
+                month_right.to_str().unwrap(),
+            ],
+        ),
+        run_system_sort(&[
+            "-mM",
+            month_left.to_str().unwrap(),
+            month_right.to_str().unwrap(),
+        ]),
+        "sort merge month",
+    );
+    assert_same_result(
+        run_fro("sort", &["-cM", month_unsorted.to_str().unwrap()]),
+        run_system_sort(&["-cM", month_unsorted.to_str().unwrap()]),
+        "sort check month",
+    );
+    assert_same_result(
+        run_fro(
+            "sort",
+            &[
+                "-mV",
+                version_left.to_str().unwrap(),
+                version_right.to_str().unwrap(),
+            ],
+        ),
+        run_system_sort(&[
+            "-mV",
+            version_left.to_str().unwrap(),
+            version_right.to_str().unwrap(),
+        ]),
+        "sort merge version",
+    );
+    assert_same_result(
+        run_fro("sort", &["-cV", version_unsorted.to_str().unwrap()]),
+        run_system_sort(&["-cV", version_unsorted.to_str().unwrap()]),
+        "sort check version",
+    );
+
+    let fro = run_fro_env(
+        "sort",
+        &[
+            "-V",
+            "--no-direct",
+            "-o",
+            fro_output.to_str().unwrap(),
+            spill_input.to_str().unwrap(),
+        ],
+        &[("FRO_SORT_MAX_IN_MEMORY_BYTES", "65536")],
+    );
+    let system = run_system_sort(&[
+        "-V",
         "-o",
         sys_output.to_str().unwrap(),
         spill_input.to_str().unwrap(),

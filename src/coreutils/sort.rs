@@ -26,6 +26,8 @@ enum SortMode {
     Numeric,
     GeneralNumeric,
     HumanNumeric,
+    Month,
+    Version,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,6 +81,12 @@ struct HumanNumericPrefix<'a> {
     negative: bool,
     suffix_rank: u8,
     number: NumericPrefix<'a>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonthPrefix {
+    Invalid,
+    Month(u8),
 }
 
 fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
@@ -385,12 +393,209 @@ fn compare_human_numeric_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering 
     }
 }
 
+fn parse_month_prefix(line: &[u8]) -> MonthPrefix {
+    let trimmed = trim_leading_blanks(line);
+    let Some(prefix) = trimmed.get(..3) else {
+        return MonthPrefix::Invalid;
+    };
+    let month = if prefix.eq_ignore_ascii_case(b"jan") {
+        0
+    } else if prefix.eq_ignore_ascii_case(b"feb") {
+        1
+    } else if prefix.eq_ignore_ascii_case(b"mar") {
+        2
+    } else if prefix.eq_ignore_ascii_case(b"apr") {
+        3
+    } else if prefix.eq_ignore_ascii_case(b"may") {
+        4
+    } else if prefix.eq_ignore_ascii_case(b"jun") {
+        5
+    } else if prefix.eq_ignore_ascii_case(b"jul") {
+        6
+    } else if prefix.eq_ignore_ascii_case(b"aug") {
+        7
+    } else if prefix.eq_ignore_ascii_case(b"sep") {
+        8
+    } else if prefix.eq_ignore_ascii_case(b"oct") {
+        9
+    } else if prefix.eq_ignore_ascii_case(b"nov") {
+        10
+    } else if prefix.eq_ignore_ascii_case(b"dec") {
+        11
+    } else {
+        return MonthPrefix::Invalid;
+    };
+    MonthPrefix::Month(month)
+}
+
+fn compare_month_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    match (parse_month_prefix(left), parse_month_prefix(right)) {
+        (MonthPrefix::Invalid, MonthPrefix::Invalid) => std::cmp::Ordering::Equal,
+        (MonthPrefix::Invalid, MonthPrefix::Month(_)) => std::cmp::Ordering::Less,
+        (MonthPrefix::Month(_), MonthPrefix::Invalid) => std::cmp::Ordering::Greater,
+        (MonthPrefix::Month(left_month), MonthPrefix::Month(right_month)) => {
+            left_month.cmp(&right_month)
+        }
+    }
+}
+
+fn version_order(byte: u8) -> i32 {
+    if byte.is_ascii_digit() {
+        0
+    } else if byte.is_ascii_alphabetic() {
+        i32::from(byte)
+    } else if byte == b'~' {
+        -1
+    } else {
+        i32::from(byte) + i32::from(u8::MAX) + 1
+    }
+}
+
+fn version_digit(bytes: &[u8], idx: usize) -> bool {
+    bytes
+        .get(idx)
+        .copied()
+        .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+fn compare_version_core(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let mut left_pos = 0usize;
+    let mut right_pos = 0usize;
+
+    while left_pos < left.len() || right_pos < right.len() {
+        let mut first_digit_diff = 0i32;
+
+        while (left_pos < left.len() && !version_digit(left, left_pos))
+            || (right_pos < right.len() && !version_digit(right, right_pos))
+        {
+            let left_order = if left_pos < left.len() {
+                version_order(left[left_pos])
+            } else {
+                0
+            };
+            let right_order = if right_pos < right.len() {
+                version_order(right[right_pos])
+            } else {
+                0
+            };
+            match left_order.cmp(&right_order) {
+                std::cmp::Ordering::Equal => {
+                    left_pos += 1;
+                    right_pos += 1;
+                }
+                other => return other,
+            }
+        }
+
+        while left_pos < left.len() && left[left_pos] == b'0' {
+            left_pos += 1;
+        }
+        while right_pos < right.len() && right[right_pos] == b'0' {
+            right_pos += 1;
+        }
+
+        while version_digit(left, left_pos) && version_digit(right, right_pos) {
+            if first_digit_diff == 0 {
+                first_digit_diff = i32::from(left[left_pos]) - i32::from(right[right_pos]);
+            }
+            left_pos += 1;
+            right_pos += 1;
+        }
+
+        if version_digit(left, left_pos) {
+            return std::cmp::Ordering::Greater;
+        }
+        if version_digit(right, right_pos) {
+            return std::cmp::Ordering::Less;
+        }
+        if first_digit_diff != 0 {
+            return first_digit_diff.cmp(&0);
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn version_suffix_start(bytes: &[u8]) -> Option<usize> {
+    let mut suffix_start = None;
+    let mut expecting_alpha = false;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if expecting_alpha {
+            expecting_alpha = false;
+            if !(byte.is_ascii_alphabetic() || byte == b'~') {
+                suffix_start = None;
+            }
+        } else if byte == b'.' {
+            expecting_alpha = true;
+            suffix_start.get_or_insert(idx);
+        } else if !(byte.is_ascii_alphanumeric() || byte == b'~') {
+            suffix_start = None;
+        }
+    }
+    suffix_start
+}
+
+fn compare_version_lines(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    if left == right {
+        return std::cmp::Ordering::Equal;
+    }
+    if left.is_empty() {
+        return std::cmp::Ordering::Less;
+    }
+    if right.is_empty() {
+        return std::cmp::Ordering::Greater;
+    }
+    if left == b"." {
+        return std::cmp::Ordering::Less;
+    }
+    if right == b"." {
+        return std::cmp::Ordering::Greater;
+    }
+    if left == b".." {
+        return std::cmp::Ordering::Less;
+    }
+    if right == b".." {
+        return std::cmp::Ordering::Greater;
+    }
+    if left[0] == b'.' && right[0] != b'.' {
+        return std::cmp::Ordering::Less;
+    }
+    if left[0] != b'.' && right[0] == b'.' {
+        return std::cmp::Ordering::Greater;
+    }
+
+    let (left_body, right_body) = if left[0] == b'.' && right[0] == b'.' {
+        (&left[1..], &right[1..])
+    } else {
+        (left, right)
+    };
+
+    let mut left_len = version_suffix_start(left_body).unwrap_or(left_body.len());
+    let mut right_len = version_suffix_start(right_body).unwrap_or(right_body.len());
+    if (left_len != left_body.len() || right_len != right_body.len())
+        && left_len == right_len
+        && left_body[..left_len] == right_body[..right_len]
+    {
+        left_len = left_body.len();
+        right_len = right_body.len();
+    }
+
+    let primary = compare_version_core(&left_body[..left_len], &right_body[..right_len]);
+    if primary == std::cmp::Ordering::Equal {
+        left.cmp(right)
+    } else {
+        primary
+    }
+}
+
 fn compare_sort_keys(left: &[u8], right: &[u8], mode: SortMode) -> std::cmp::Ordering {
     match mode {
         SortMode::Bytewise => left.cmp(right),
         SortMode::Numeric => compare_numeric_lines(left, right),
         SortMode::GeneralNumeric => compare_general_numeric_lines(left, right),
         SortMode::HumanNumeric => compare_human_numeric_lines(left, right),
+        SortMode::Month => compare_month_lines(left, right),
+        SortMode::Version => compare_version_lines(left, right),
     }
 }
 
@@ -406,7 +611,11 @@ fn compare_line_refs(
             .bytes(storage)
             .cmp(right.bytes(storage))
             .then_with(|| left.sequence.cmp(&right.sequence)),
-        SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric => {
+        SortMode::Numeric
+        | SortMode::GeneralNumeric
+        | SortMode::HumanNumeric
+        | SortMode::Month
+        | SortMode::Version => {
             let key_order = compare_sort_keys(left.bytes(storage), right.bytes(storage), mode);
             if key_order != std::cmp::Ordering::Equal {
                 return key_order;
@@ -489,6 +698,14 @@ fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
                 }
             }
         },
+        SortMode::Month => match (parse_month_prefix(left), parse_month_prefix(right)) {
+            (MonthPrefix::Invalid, MonthPrefix::Invalid) => true,
+            (MonthPrefix::Month(left_month), MonthPrefix::Month(right_month)) => {
+                left_month == right_month
+            }
+            _ => false,
+        },
+        SortMode::Version => compare_version_lines(left, right) == std::cmp::Ordering::Equal,
     }
 }
 
@@ -498,10 +715,10 @@ fn print_sort_help(program: &str) {
     println!("Usage: {program} [OPTION]... [FILE]...");
     println!();
     println!(
-        "This bounded slice sorts locale-independent byte, numeric, general-numeric, or human-numeric records, using newlines by default and NULs with -z."
+        "This bounded slice sorts locale-independent byte, numeric, general-numeric, human-numeric, month, or version records, using newlines by default and NULs with -z."
     );
     println!(
-        "It currently supports the default case plus -g/-h/-n, -z, reverse/unique, merge/check, and -o output."
+        "It currently supports the default case plus -g/-h/-M/-n/-V, -z, reverse/unique, merge/check, and -o output."
     );
     println!();
     println!("Supported options:");
@@ -511,9 +728,11 @@ fn print_sort_help(program: &str) {
     println!("  -h, --human-numeric-sort");
     println!("                       compare leading numbers grouped by human suffix family");
     println!("  -m, --merge          merge already sorted inputs without resorting");
+    println!("  -M, --month-sort     compare leading month abbreviations like GNU sort -M");
     println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
     println!("  -r, --reverse        reverse the result of comparisons");
     println!("  -u, --unique         output only the first of an equal run");
+    println!("  -V, --version-sort   compare digit runs with GNU version-order semantics");
     println!("  -z, --zero-terminated  use NUL as the input and output record terminator");
     println!("  -o FILE              write result to FILE after reading all input");
     println!("      --output=FILE    same as -o FILE");
@@ -536,8 +755,10 @@ fn print_sort_help(program: &str) {
     println!("  - -c validates one input stream and exits 1 on the first disorder.");
     println!("  - -g uses C-locale strtod-style prefixes; NaNs sort after non-numbers and before infinities.");
     println!("  - -h compares the leading numeric prefix plus an optional K/M/G/T/P/E/Z/Y suffix family.");
+    println!("  - -M looks at the first nonblank three-letter month abbreviation and treats other lines as invalid month keys.");
+    println!("  - -V uses GNU/libc version-order comparisons while preserving the existing spill, merge, and check backend.");
     println!("  - Unsupported GNU sort features currently return an error:");
-    println!("    key selection (-k), month/version modes (-M/-V), and locale collation.");
+    println!("    key selection (-k) and locale collation.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -606,7 +827,11 @@ fn sort_line_refs(
                 *dst = snapshot[sorted_idx];
             }
         }
-        SortMode::Numeric | SortMode::GeneralNumeric | SortMode::HumanNumeric => {
+        SortMode::Numeric
+        | SortMode::GeneralNumeric
+        | SortMode::HumanNumeric
+        | SortMode::Month
+        | SortMode::Version => {
             lines.sort_unstable_by(|left, right| {
                 compare_line_refs(*left, *right, storage, mode, unique)
             });
@@ -650,10 +875,12 @@ fn apply_short_sort_flags(
             b'c' => *check = true,
             b'g' => *mode = SortMode::GeneralNumeric,
             b'h' => *mode = SortMode::HumanNumeric,
+            b'M' => *mode = SortMode::Month,
             b'm' => *merge = true,
             b'n' => *mode = SortMode::Numeric,
             b'r' => *reverse = true,
             b'u' => *unique = true,
+            b'V' => *mode = SortMode::Version,
             b'z' => *terminator = RecordTerminator::Nul,
             _ => return false,
         }
@@ -747,10 +974,12 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             "-c" | "--check" if !end_flags => check = true,
             "-g" | "--general-numeric-sort" if !end_flags => mode = SortMode::GeneralNumeric,
             "-h" | "--human-numeric-sort" if !end_flags => mode = SortMode::HumanNumeric,
+            "-M" | "--month-sort" if !end_flags => mode = SortMode::Month,
             "-m" | "--merge" if !end_flags => merge = true,
             "-n" | "--numeric-sort" if !end_flags => mode = SortMode::Numeric,
             "-r" | "--reverse" if !end_flags => reverse = true,
             "-u" | "--unique" if !end_flags => unique = true,
+            "-V" | "--version-sort" if !end_flags => mode = SortMode::Version,
             "-z" | "--zero-terminated" if !end_flags => terminator = RecordTerminator::Nul,
             "-o" | "--output" if !end_flags => {
                 let Some(path) = args.get(idx + 1) else {
@@ -804,10 +1033,12 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                         'c' => check = true,
                         'g' => mode = SortMode::GeneralNumeric,
                         'h' => mode = SortMode::HumanNumeric,
+                        'M' => mode = SortMode::Month,
                         'm' => merge = true,
                         'n' => mode = SortMode::Numeric,
                         'r' => reverse = true,
                         'u' => unique = true,
+                        'V' => mode = SortMode::Version,
                         'z' => terminator = RecordTerminator::Nul,
                         'o' => {
                             let value_start = 2 + pos;
@@ -848,7 +1079,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 if !handled {
                     eprintln!("sort: unsupported option '{other}'");
                     eprintln!(
-                        "sort: fro sort currently supports bytewise, numeric, general-numeric, or human-numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
+                        "sort: fro sort currently supports bytewise, numeric, general-numeric, human-numeric, month, or version record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
                     );
                     eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
@@ -860,7 +1091,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports bytewise, numeric, general-numeric, or human-numeric record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
+                    "sort: fro sort currently supports bytewise, numeric, general-numeric, human-numeric, month, or version record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
@@ -1204,6 +1435,60 @@ mod tests {
     }
 
     #[test]
+    fn month_sort_groups_by_month_prefix_and_treats_invalid_as_equal_keys() {
+        let input = [
+            b"foo".as_slice(),
+            b"Jan".as_slice(),
+            b"January".as_slice(),
+            b"  feb".as_slice(),
+            b"Feb".as_slice(),
+            b"Dec".as_slice(),
+        ];
+        let (storage, mut refs) = refs_for_lines(&input);
+        finalize_sorted_lines(&mut refs, &storage, SortMode::Month, true, false).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"foo".to_vec(),
+                b"Jan".to_vec(),
+                b"  feb".to_vec(),
+                b"Dec".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn version_sort_matches_strverscmp_style_digit_ordering() {
+        let input = [
+            b"v1".as_slice(),
+            b"v01".as_slice(),
+            b"v1.0".as_slice(),
+            b"v1.0.02".as_slice(),
+            b"v1.0.2".as_slice(),
+            b"v1.0.10".as_slice(),
+            b"v1~".as_slice(),
+        ];
+        let (storage, mut refs) = refs_for_lines(&input);
+        sort_line_refs(&mut refs, &storage, SortMode::Version, false).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"v1~".to_vec(),
+                b"v01".to_vec(),
+                b"v1".to_vec(),
+                b"v1.0".to_vec(),
+                b"v1.0.02".to_vec(),
+                b"v1.0.2".to_vec(),
+                b"v1.0.10".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
     fn compare_line_bytes_matches_numeric_last_resort_ordering() {
         assert_eq!(
             compare_line_bytes(b"1", b"1.0", SortMode::Numeric, false),
@@ -1215,6 +1500,14 @@ mod tests {
         );
         assert_eq!(
             compare_line_bytes(b"1KiB", b"1024K", SortMode::HumanNumeric, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_line_bytes(b"JAN", b"Jan", SortMode::Month, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_line_bytes(b"v01", b"v1", SortMode::Version, false),
             std::cmp::Ordering::Less
         );
         assert_eq!(

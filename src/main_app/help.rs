@@ -131,11 +131,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "mv" => Some(CommandHelp {
             name: "mv",
-            usage: "mv [-f] [-v] [-T] [-t DIRECTORY] <source>... <target>",
+            usage: "mv [-f] [-n] [-u] [-v] [-T] [-t DIRECTORY] <source>... <target>",
             summary: "Rename files or move them into a directory, with cross-filesystem fallback via fro copy helpers.",
             notes: &[
                 "Same-filesystem moves use rename(2) when possible.",
                 "Cross-filesystem file and directory moves fall back to the fro copy/remove path.",
+                "-n/--no-clobber skips an existing destination without touching the fast rename or copy/remove backends.",
+                "-u/--update only replaces a destination when the source entry is newer than the existing target.",
                 "-T/--no-target-directory treats the destination as a path, matching GNU mv.",
             ],
             examples: &[
@@ -292,10 +294,10 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "sort" => Some(CommandHelp {
             name: "sort",
-            usage: "sort [-c|--check] [-g|--general-numeric-sort] [-h|--human-numeric-sort] [-m|--merge] [-n|--numeric-sort] [-r|--reverse] [-u|--unique] [-z|--zero-terminated] [-o FILE|--output=FILE] [-T DIR|--temporary-directory=DIR] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
-            summary: "Sort locale-independent records in ascending byte, numeric, general-numeric, or human-numeric order, using newlines by default and NULs with -z.",
+            usage: "sort [-c|--check] [-g|--general-numeric-sort] [-h|--human-numeric-sort] [-m|--merge] [-M|--month-sort] [-n|--numeric-sort] [-r|--reverse] [-u|--unique] [-V|--version-sort] [-z|--zero-terminated] [-o FILE|--output=FILE] [-T DIR|--temporary-directory=DIR] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
+            summary: "Sort locale-independent records in ascending byte, numeric, general-numeric, human-numeric, month, or version order, using newlines by default and NULs with -z.",
             notes: &[
-                "This bounded slice implements the default bytewise newline-delimited case plus -g/-h/-n prefix-based numeric modes, -z NUL-terminated records, merge/check, reverse/unique output, -o output-file writes, and -T spill-directory selection.",
+                "This bounded slice implements the default bytewise newline-delimited case plus -g/-h/-M/-n/-V compatibility modes, -z NUL-terminated records, merge/check, reverse/unique output, -o output-file writes, and -T spill-directory selection.",
                 "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
                 "-o writes after all input has been read, so in-place rewrites like `sort -o file file` stay on the same backend.",
                 "-T/--temporary-directory only matters when the out-of-core spill/merge backend actually creates temp files.",
@@ -303,9 +305,11 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "-c/--check validates one input stream and exits 1 on the first disorder; with -u it requires strict key ordering.",
                 "-g/--general-numeric-sort compares leading C-locale strtod-style floating-point prefixes, keeping GNU-style nonnumeric/NaN/infinity ordering and the existing sort/spill/check backend.",
                 "-h/--human-numeric-sort compares leading decimal prefixes plus an optional K/M/G/T/P/E/Z/Y suffix family, matching GNU sort's suffix-group ordering instead of normalizing across suffixes.",
+                "-M/--month-sort compares the first nonblank three-letter month abbreviation in each line, matching GNU sort's invalid-key and tie-break behavior while keeping the existing sort/spill/check backend.",
                 "-n/--numeric-sort compares the leading numeric prefix of each line (optional blanks, optional '-', digits, optional fractional part) and otherwise falls back to bytewise line order unless -u suppresses the last-resort tie break.",
+                "-V/--version-sort uses GNU/coreutils-style version ordering for mixed text-and-digit records while preserving the same spill, merge, and check backend.",
                 "Bytewise in-memory sorting uses a StringZilla argsort fast path; oversized inputs spill sorted runs and merge them back out-of-core.",
-                "FIXME: Unsupported GNU sort features currently return an error, including key selection (-k), month/version modes (-M/-V), and locale collation.",
+                "FIXME: Unsupported GNU sort features currently return an error, including key selection (-k) and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],
             examples: &[
@@ -314,7 +318,9 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 ("Merge two already sorted files", "sort -m a.txt b.txt"),
                 ("Sort one file by general numeric prefixes", "sort -g floats.txt"),
                 ("Sort one file by human-readable size prefixes", "sort -h sizes.txt"),
+                ("Sort one file by leading month names", "sort -M months.txt"),
                 ("Sort one file by numeric prefixes", "sort -n scores.txt"),
+                ("Sort one file with version ordering", "sort -V release-tags.txt"),
                 ("Sort unique records in reverse byte order", "sort -ru names.txt"),
                 ("Rewrite one file in place", "sort -o names.txt names.txt"),
                 ("Spill large temporary runs under one directory", "sort -T scratch big.txt"),
