@@ -441,6 +441,14 @@ pub(crate) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
     recursive::archive::list_uncompressed_tar(path, verbose)
 }
 
+pub(crate) fn extract_tar_archive(
+    path: &Path,
+    destination: Option<&Path>,
+    verbose: bool,
+) -> io::Result<()> {
+    recursive::archive::extract_uncompressed_tar(path, destination, verbose)
+}
+
 pub(crate) fn bench_tar_archive(
     variant: &str,
     source: &Path,

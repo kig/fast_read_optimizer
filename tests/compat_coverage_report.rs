@@ -256,8 +256,14 @@ const ROWS: &[CoverageRow] = &[
     },
     CoverageRow {
         name: "tar",
-        covered: &["-c/--create", "-f/--file", "-t/--list", "-v/--verbose"],
-        remaining: &["-x/--extract"],
+        covered: &[
+            "-c/--create",
+            "-f/--file",
+            "-t/--list",
+            "-v/--verbose",
+            "-x/--extract",
+        ],
+        remaining: &[],
     },
     CoverageRow {
         name: "wc",
@@ -355,7 +361,7 @@ shred      6/6  100%  remaining: none
 sort       5/12  42%  remaining: -g/-h, -M, -V, -k, -m/-c, -z, -T
 tac        2/2  100%  remaining: none
 tail       4/4  100%  remaining: none
-tar        4/5   80%  remaining: -x/--extract
+tar        5/5  100%  remaining: none
 wc         6/6  100%  remaining: none
 ";
 
@@ -379,8 +385,10 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
     );
 
     let tar_source = include_str!("../src/coreutils/tar.rs");
-    assert!(tar_source.contains("whole-archive list (-t/--list) modes"));
-    assert!(tar_source.contains("extract mode (-x/--extract) is not yet implemented"));
+    assert!(tar_source.contains("whole-archive extract (-x/--extract) modes"));
+    assert!(
+        tar_source.contains("tar extract mode currently supports only whole-archive extraction")
+    );
 
     let find_source = include_str!("../src/coreutils/find.rs");
     assert!(find_source

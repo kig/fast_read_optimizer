@@ -4,6 +4,7 @@ use super::*;
 enum TarMode {
     Create,
     List,
+    Extract,
 }
 
 fn set_tar_mode(mode: &mut Option<TarMode>, next: TarMode) -> io::Result<()> {
@@ -26,6 +27,7 @@ fn parse_short_tar_flags(
     mode: &mut Option<TarMode>,
     verbose: &mut bool,
     archive: &mut Option<String>,
+    extract_dir: &mut Option<String>,
 ) -> io::Result<()> {
     let chars = arg[1..].chars().collect::<Vec<_>>();
     let mut pos = 0usize;
@@ -33,12 +35,7 @@ fn parse_short_tar_flags(
         match chars[pos] {
             'c' => set_tar_mode(mode, TarMode::Create)?,
             't' => set_tar_mode(mode, TarMode::List)?,
-            'x' => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tar extract mode (-x/--extract) is not yet implemented",
-                ))
-            }
+            'x' => set_tar_mode(mode, TarMode::Extract)?,
             'v' => *verbose = true,
             'f' => {
                 if pos + 1 < chars.len() {
@@ -50,6 +47,21 @@ fn parse_short_tar_flags(
                     args.get(*index)
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidInput, "missing value for -f")
+                        })?
+                        .clone(),
+                );
+                return Ok(());
+            }
+            'C' => {
+                if pos + 1 < chars.len() {
+                    *extract_dir = Some(chars[pos + 1..].iter().collect());
+                    return Ok(());
+                }
+                *index += 1;
+                *extract_dir = Some(
+                    args.get(*index)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "missing value for -C")
                         })?
                         .clone(),
                 );
@@ -72,6 +84,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
     let mut mode = None;
     let mut verbose = false;
     let mut archive: Option<String> = None;
+    let mut extract_dir: Option<String> = None;
     let mut paths = Vec::new();
     let mut end_flags = false;
 
@@ -85,10 +98,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
         } else if !end_flags && arg == "--list" {
             set_tar_mode(&mut mode, TarMode::List)?;
         } else if !end_flags && arg == "--extract" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "tar extract mode (-x/--extract) is not yet implemented",
-            ));
+            set_tar_mode(&mut mode, TarMode::Extract)?;
         } else if !end_flags && arg == "--verbose" {
             verbose = true;
         } else if !end_flags && arg == "--file" {
@@ -100,8 +110,27 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
                     })?
                     .clone(),
             );
+        } else if !end_flags && arg == "--directory" {
+            i += 1;
+            extract_dir = Some(
+                args.get(i)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "missing value for --directory")
+                    })?
+                    .clone(),
+            );
+        } else if !end_flags && arg.starts_with("--directory=") {
+            extract_dir = Some(arg["--directory=".len()..].to_string());
         } else if !end_flags && arg.starts_with('-') && arg.len() > 1 {
-            parse_short_tar_flags(arg, args, &mut i, &mut mode, &mut verbose, &mut archive)?;
+            parse_short_tar_flags(
+                arg,
+                args,
+                &mut i,
+                &mut mode,
+                &mut verbose,
+                &mut archive,
+                &mut extract_dir,
+            )?;
         } else {
             paths.push(arg.clone());
         }
@@ -111,9 +140,18 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
     let archive = archive.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Usage: {program} (-cf <archive.tar> <source> | -tf[v] <archive.tar>)"),
+            format!(
+                "Usage: {program} (-cf <archive.tar> <source> | -tf[v] <archive.tar> | -xf[v] <archive.tar> [-C <dir>])"
+            ),
         )
     })?;
+
+    if extract_dir.is_some() && !matches!(mode, Some(TarMode::Extract)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tar -C/--directory is currently supported only with extract mode",
+        ));
+    }
 
     match mode {
         Some(TarMode::Create) => {
@@ -138,10 +176,23 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             }
             crate::main_app::list_tar_archive(Path::new(&archive), verbose)?;
         }
+        Some(TarMode::Extract) => {
+            if !paths.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tar extract mode currently supports only whole-archive extraction",
+                ));
+            }
+            crate::main_app::extract_tar_archive(
+                Path::new(&archive),
+                extract_dir.as_deref().map(Path::new),
+                verbose,
+            )?;
+        }
         None => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "tar currently supports only create (-c/--create) and whole-archive list (-t/--list) modes",
+                "tar currently supports create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) modes",
             ));
         }
     }

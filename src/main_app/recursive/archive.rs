@@ -250,3 +250,11 @@ pub(crate) fn create_uncompressed_tar(
 pub(crate) fn list_uncompressed_tar(path: &Path, verbose: bool) -> io::Result<()> {
     reader::list_tar_archive(path, verbose)
 }
+
+pub(crate) fn extract_uncompressed_tar(
+    path: &Path,
+    destination: Option<&Path>,
+    verbose: bool,
+) -> io::Result<()> {
+    reader::extract_tar_archive(path, destination, verbose)
+}

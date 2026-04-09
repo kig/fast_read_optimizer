@@ -353,16 +353,18 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tar" => Some(CommandHelp {
             name: "tar",
-            usage: "tar (-cf <archive.tar> [-v] <source> | -tf[v] <archive.tar>)",
-            summary: "Create or list an uncompressed ustar archive.",
+            usage: "tar (-cf <archive.tar> [-v] <source> | -tf[v] <archive.tar> | -xf[v] <archive.tar> [-C dir])",
+            summary: "Create, list, or extract an uncompressed ustar archive.",
             notes: &[
-                "Supported compatibility slice: create (-c/--create) and whole-archive list (-t/--list) with -f/--file.",
-                "-v/--verbose keeps create-side progress reporting and enables GNU-style verbose output for listing.",
-                "Extraction, compression, stdin archives, and member filters remain unsupported.",
+                "Supported compatibility slice: create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) with -f/--file.",
+                "-v/--verbose keeps create-side progress reporting, enables GNU-style verbose output for listing, and prints extracted member names during extract.",
+                "Extract currently targets uncompressed regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
+                "Compression, stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
             ],
             examples: &[
                 ("Archive one directory", "tar -cf tree.tar mytree"),
                 ("List one archive verbosely", "tar -tvf tree.tar"),
+                ("Extract one archive into a directory", "tar -xf tree.tar -C out"),
             ],
         }),
         "shred" => Some(CommandHelp {

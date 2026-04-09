@@ -33,6 +33,41 @@ fn tar_fixture(prefix: &str) -> (PathBuf, PathBuf, String) {
     (tmp, source_root, source_name)
 }
 
+fn encode_tar_octal(value: u64, field_len: usize) -> Vec<u8> {
+    let digits = format!("{value:o}");
+    let mut field = vec![b'0'; field_len];
+    let start = field_len - digits.len() - 1;
+    field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    field[field_len - 1] = 0;
+    field
+}
+
+fn manual_tar_header(path: &str, size: u64, typeflag: u8) -> [u8; 512] {
+    let path_bytes = path.as_bytes();
+    assert!(path_bytes.len() <= 100);
+    let mut header = [0u8; 512];
+    header[..path_bytes.len()].copy_from_slice(path_bytes);
+    header[100..108].copy_from_slice(&encode_tar_octal(0o644, 8));
+    header[108..116].copy_from_slice(&encode_tar_octal(0, 8));
+    header[116..124].copy_from_slice(&encode_tar_octal(0, 8));
+    header[124..136].copy_from_slice(&encode_tar_octal(size, 12));
+    header[136..148].copy_from_slice(&encode_tar_octal(1_700_000_000, 12));
+    header[148..156].fill(b' ');
+    header[156] = typeflag;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum = header.iter().map(|byte| u32::from(*byte)).sum::<u32>() as u64;
+    let checksum_digits = format!("{checksum:o}");
+    let mut checksum_field = [b'0'; 8];
+    let start = 6 - checksum_digits.len();
+    checksum_field[start..start + checksum_digits.len()]
+        .copy_from_slice(checksum_digits.as_bytes());
+    checksum_field[6] = 0;
+    checksum_field[7] = b' ';
+    header[148..156].copy_from_slice(&checksum_field);
+    header
+}
+
 #[test]
 fn cartesian_tar_create_matches_system_extraction() {
     let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-matrix");
@@ -110,6 +145,156 @@ fn cartesian_tar_create_matches_system_extraction() {
     let fro_tree = snapshot_tree(&fro_extract.join(root_name));
     let sys_tree = snapshot_tree(&sys_extract.join(root_name));
     assert_eq!(fro_tree, sys_tree);
+}
+
+#[test]
+fn cartesian_tar_extract_matches_system_tar() {
+    let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-extract");
+    let fro_tar = tmp.join("fro.tar");
+    let sys_tar = tmp.join("sys.tar");
+
+    assert_success(run_fro(
+        "tar",
+        &[
+            "-cf",
+            fro_tar.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ],
+    ));
+    let sys_out = run_system(
+        "bash",
+        &[
+            "-lc",
+            &format!(
+                "cd {} && tar -cf {} {}",
+                tmp.display(),
+                sys_tar.display(),
+                source_name
+            ),
+        ],
+    );
+    assert!(
+        sys_out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sys_out.stdout),
+        String::from_utf8_lossy(&sys_out.stderr)
+    );
+
+    for archive in [&fro_tar, &sys_tar] {
+        let fro_extract = tmp.join(format!(
+            "fro-extract-{}",
+            archive.file_stem().unwrap().to_string_lossy()
+        ));
+        let sys_extract = tmp.join(format!(
+            "sys-extract-{}",
+            archive.file_stem().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&fro_extract).unwrap();
+        fs::create_dir_all(&sys_extract).unwrap();
+
+        let archive_str = archive.to_str().unwrap();
+        assert_same_result(
+            run_fro(
+                "tar",
+                &["-xf", archive_str, "-C", fro_extract.to_str().unwrap()],
+            ),
+            run_system(
+                "tar",
+                &["-xf", archive_str, "-C", sys_extract.to_str().unwrap()],
+            ),
+            &format!("extract {archive_str}"),
+        );
+
+        let fro_tree = snapshot_tree(&fro_extract.join(&source_name));
+        let sys_tree = snapshot_tree(&sys_extract.join(&source_name));
+        assert_eq!(fro_tree, sys_tree, "tree mismatch for {archive_str}");
+    }
+}
+
+#[test]
+fn cartesian_tar_extract_verbose_matches_system_tar() {
+    let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-extract-verbose");
+    let archive = tmp.join("archive.tar");
+
+    assert_success(run_fro(
+        "tar",
+        &[
+            "-cf",
+            archive.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ],
+    ));
+
+    let fro_extract = tmp.join("fro-extract");
+    let sys_extract = tmp.join("sys-extract");
+    fs::create_dir_all(&fro_extract).unwrap();
+    fs::create_dir_all(&sys_extract).unwrap();
+
+    assert_same_result(
+        run_fro(
+            "tar",
+            &[
+                "--extract",
+                "--verbose",
+                "--file",
+                archive.to_str().unwrap(),
+                "--directory",
+                fro_extract.to_str().unwrap(),
+            ],
+        ),
+        run_system(
+            "tar",
+            &[
+                "--extract",
+                "--verbose",
+                "--file",
+                archive.to_str().unwrap(),
+                "--directory",
+                sys_extract.to_str().unwrap(),
+            ],
+        ),
+        "long extract verbose flags",
+    );
+
+    let fro_tree = snapshot_tree(&fro_extract.join(&source_name));
+    let sys_tree = snapshot_tree(&sys_extract.join(&source_name));
+    assert_eq!(fro_tree, sys_tree);
+}
+
+#[test]
+fn tar_extract_rejects_absolute_member_paths() {
+    let tmp = unique_temp_dir("fro-coreutils-tar-extract-absolute");
+    let archive = tmp.join("absolute.tar");
+    let extract_dir = tmp.join("extract");
+    fs::create_dir_all(&extract_dir).unwrap();
+    let payload = b"unsafe\n";
+    let mut archive_bytes = Vec::new();
+    archive_bytes.extend_from_slice(&manual_tar_header("/abs.txt", payload.len() as u64, b'0'));
+    archive_bytes.extend_from_slice(payload);
+    archive_bytes.resize(1024, 0);
+    archive_bytes.extend_from_slice(&[0u8; 1024]);
+    fs::write(&archive, archive_bytes).unwrap();
+
+    let fro_out = run_fro(
+        "tar",
+        &[
+            "-xf",
+            archive.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !fro_out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fro_out.stdout),
+        String::from_utf8_lossy(&fro_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fro_out.stderr).contains("rejects absolute member paths"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&fro_out.stderr)
+    );
 }
 
 #[test]
