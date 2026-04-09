@@ -454,12 +454,6 @@ fn copy_archive_member_to_file(
     entry: &TarArchiveEntry,
     config: &config::LoadedConfig,
 ) -> io::Result<()> {
-    if let Some(parent) = destination_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
     if entry.size == 0 {
         let _ = fs::File::create(destination_path)?;
         return Ok(());

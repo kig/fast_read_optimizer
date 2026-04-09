@@ -1,5 +1,7 @@
 use super::*;
 
+const SMALL_ZFS_STORAGE_PROBE_LIMIT: u64 = 1 << 20;
+
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedCopyExecution {
     pub(super) copy_strategy: CopyStrategy,
@@ -132,7 +134,8 @@ pub(super) fn resolve_copy_execution(
         CopyAutoMode::Heuristic => {
             let (source_cached, target_cached, source_len, target_len) =
                 inspect_copy_auto_state(source_path, path);
-            let (redundancy, reflink_possible) = detect_copy_storage_policy(source_path, path);
+            let (redundancy, reflink_possible) =
+                detect_copy_storage_policy(source_path, path, source_len);
             if rewrite_mode == CopyRewriteMode::Auto
                 && redundancy == StorageRedundancy::Redundant
                 && reflink_possible
@@ -501,6 +504,10 @@ pub(super) fn zfs_storage_redundancy_from_status(out: &str) -> StorageRedundancy
     StorageRedundancy::NonRedundant
 }
 
+pub(super) fn should_skip_small_zfs_storage_probe(source_len: Option<u64>) -> bool {
+    source_len.is_some_and(|len| len <= SMALL_ZFS_STORAGE_PROBE_LIMIT)
+}
+
 pub(super) fn zfs_storage_redundancy(dataset: &str) -> StorageRedundancy {
     let pool = dataset.split('/').next().unwrap_or(dataset);
     let output = Command::new("zpool")
@@ -533,13 +540,17 @@ pub(super) fn mount_storage_redundancy(info: &MountInfoBrief) -> StorageRedundan
 pub(super) fn detect_copy_storage_policy(
     source_path: &str,
     target_path: &str,
+    source_len: Option<u64>,
 ) -> (StorageRedundancy, bool) {
     let source_mount = mount_info_for_path(Path::new(source_path));
     let target_mount = mount_info_for_path(Path::new(target_path));
-    let redundancy = target_mount
-        .as_ref()
-        .map(mount_storage_redundancy)
-        .unwrap_or(StorageRedundancy::Unknown);
+    let redundancy = target_mount.as_ref().map_or(StorageRedundancy::Unknown, |info| {
+        if info.fstype == "zfs" && should_skip_small_zfs_storage_probe(source_len) {
+            StorageRedundancy::Unknown
+        } else {
+            mount_storage_redundancy(info)
+        }
+    });
     let reflink_possible = match (source_mount.as_ref(), target_mount.as_ref()) {
         (Some(source), Some(target))
             if source.mount_point == target.mount_point

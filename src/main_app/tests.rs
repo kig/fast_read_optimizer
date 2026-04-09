@@ -5,8 +5,9 @@ use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
     choose_nonredundant_full_copy_plan, describe_copy_path, parse_zpool_status_leaves,
     should_prefer_cached_diff_overwrite, should_prefer_cached_read_direct_write,
-    target_is_similar_size, zfs_storage_redundancy_from_status, HeuristicCopyPlan,
-    ResolvedCopyExecution, StorageRedundancy,
+    should_skip_small_zfs_storage_probe, target_is_similar_size,
+    zfs_storage_redundancy_from_status, HeuristicCopyPlan, ResolvedCopyExecution,
+    StorageRedundancy,
 };
 use crate::main_app::recursive::move_dir;
 use crate::main_app::tuning::{
@@ -94,6 +95,14 @@ fn zfs_redundancy_marks_stripe_nonredundant() {
         zfs_storage_redundancy_from_status(status),
         StorageRedundancy::NonRedundant
     );
+}
+
+#[test]
+fn tiny_files_skip_expensive_zfs_storage_probe() {
+    assert!(should_skip_small_zfs_storage_probe(Some(4096)));
+    assert!(should_skip_small_zfs_storage_probe(Some(1 << 20)));
+    assert!(!should_skip_small_zfs_storage_probe(Some((1 << 20) + 1)));
+    assert!(!should_skip_small_zfs_storage_probe(None));
 }
 
 #[test]

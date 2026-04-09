@@ -1,5 +1,6 @@
 use crate::{open_with_mode, IOMode};
 use crc_fast::{checksum as crc_fast_checksum, CrcAlgorithm as FastCrcAlgorithm};
+use std::fs;
 use std::io;
 use std::mem::size_of;
 use std::sync::OnceLock;
@@ -7,6 +8,7 @@ use std::sync::OnceLock;
 const CKSUM_WIDTH: usize = 32;
 const CKSUM_POLY: u32 = 0x04c11db7;
 const CKSUM_COMBINE_INPUT_XOR: u32 = 0xffff_ffff;
+const SMALL_FILE_CKSUM_LIMIT: u64 = 64 * 1024;
 
 type CksumOperatorMatrix = [u32; CKSUM_WIDTH];
 
@@ -121,7 +123,25 @@ fn reduce_cksum_chunks(chunks: Vec<CksumChunk>) -> u32 {
     }
 }
 
+fn try_hash_small_file_crc32(path: &str, io_mode: IOMode) -> io::Result<Option<u32>> {
+    if io_mode == IOMode::Direct {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > SMALL_FILE_CKSUM_LIMIT {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    Ok(Some(finalize_cksum_crc(
+        cksum_crc_block(&bytes),
+        bytes.len() as u64,
+    )))
+}
+
 pub fn hash_file_crc32(path: &str, io_mode: IOMode) -> io::Result<u32> {
+    if let Some(crc) = try_hash_small_file_crc32(path, io_mode)? {
+        return Ok(crc);
+    }
     let file = open_with_mode(path, io_mode)?;
     let block_size = file.block_size()?;
     file.map_reduce_blocks(
@@ -145,6 +165,7 @@ pub fn hash_file_crc32(path: &str, io_mode: IOMode) -> io::Result<u32> {
 mod tests {
     use super::*;
     use crc_fast::checksum_combine as crc_fast_checksum_combine;
+    use std::fs;
 
     #[test]
     fn crc32_cksum_update_matches_posix_cksum_examples() {
@@ -204,7 +225,7 @@ mod tests {
             .unwrap()
             .join("target")
             .join("test-tmp");
-        std::fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&base).unwrap();
         let path = base.join(format!(
             "fro-cksum-regular-{}-{}.bin",
             std::process::id(),
@@ -216,13 +237,41 @@ mod tests {
         let bytes = (0..(3 * 1024 * 1024 + 517))
             .map(|i| ((i * 37 + 11) % 251) as u8)
             .collect::<Vec<_>>();
-        std::fs::write(&path, &bytes).unwrap();
+        fs::write(&path, &bytes).unwrap();
 
         let regular = hash_file_crc32(path.to_str().unwrap(), IOMode::PageCache).unwrap();
         assert_eq!(
             regular,
             finalize_cksum_crc(cksum_crc_block(&bytes), bytes.len() as u64)
         );
-        let _ = std::fs::remove_file(path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn small_file_crc32_fast_path_matches_finalize() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(format!(
+            "fro-cksum-small-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = (0..8192)
+            .map(|i| ((i * 19 + 7) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+
+        let crc = hash_file_crc32(path.to_str().unwrap(), IOMode::Auto).unwrap();
+        assert_eq!(
+            crc,
+            finalize_cksum_crc(cksum_crc_block(&bytes), bytes.len() as u64)
+        );
+        let _ = fs::remove_file(path);
     }
 }

@@ -29,6 +29,8 @@ enum FgrepRegularFilePath {
     LineFilterMultiPattern,
 }
 
+const FGREP_SMALL_FILE_PROBE_LIMIT: u64 = 64 * 1024;
+
 struct ParsedFgrepArgs {
     io_mode: IOMode,
     options: FgrepOptions,
@@ -184,6 +186,16 @@ fn fgrep_regular_file_path(options: FgrepOptions, pattern_count: usize) -> Fgrep
     } else {
         FgrepRegularFilePath::LineFilterMultiPattern
     }
+}
+
+fn try_load_small_regular_file_bytes(path: &str, io_mode: IOMode) -> io::Result<Option<Vec<u8>>> {
+    if matches!(io_mode, IOMode::Direct) {
+        return Ok(None);
+    }
+    if fs::metadata(path)?.len() > FGREP_SMALL_FILE_PROBE_LIMIT {
+        return Ok(None);
+    }
+    fs::read(path).map(Some)
 }
 
 fn write_matching_line<W: Write>(
@@ -765,14 +777,28 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let started_at = std::time::Instant::now();
     let mut total_bytes = 0_u64;
     let multi_file = inputs.len() > 1;
-    let config = load_config(None);
+    let mut config = None;
     for input in inputs {
         match &input {
             StreamInput::File(file) if is_regular_input_path(file)? => match regular_file_path {
                 FgrepRegularFilePath::LiteralSearchOffsets => {
+                    if let Some(data) = try_load_small_regular_file_bytes(file, io_mode)? {
+                        total_bytes += data.len() as u64;
+                        matched_any |= write_filtered_lines(
+                            &mut out,
+                            file,
+                            data.as_slice(),
+                            pattern.raw.as_slice(),
+                            pattern.normalized.as_slice(),
+                            multi_file,
+                            options,
+                        )?;
+                        continue;
+                    }
+                    let config = config.get_or_insert_with(|| load_config(None));
                     total_bytes += fs::metadata(file)?.len();
                     let (matches, _) = grep_match_offsets_for_mode(
-                        &config,
+                        config,
                         "grep",
                         file,
                         internal_io_mode(io_mode),
@@ -786,7 +812,12 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                             continue;
                         }
                     }
-                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
+                    let data = load_file_to_memory_for_mode(
+                        config,
+                        "read_to_memory",
+                        file,
+                        internal_io_mode(io_mode),
+                    )?;
                     matched_any |= write_matching_lines(
                         &mut out,
                         file,
