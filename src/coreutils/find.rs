@@ -119,7 +119,7 @@ struct FindPlan {
 }
 
 impl FindPlan {
-    fn matches(&self, path: &Path, file_type: fs::FileType, depth: usize) -> bool {
+    fn matches_root(&self, path: &Path, file_type: fs::FileType, depth: usize) -> bool {
         self.max_depth.is_none_or(|max_depth| depth <= max_depth)
             && self
                 .type_filter
@@ -132,6 +132,29 @@ impl FindPlan {
                 .path_pattern
                 .as_ref()
                 .is_none_or(|pattern| find_path_matches(pattern, path))
+    }
+
+    fn matches_child(
+        &self,
+        dir: &Path,
+        file_name: &std::ffi::OsStr,
+        file_type: fs::FileType,
+        depth: usize,
+        path_bytes: &mut Vec<u8>,
+    ) -> bool {
+        self.max_depth.is_none_or(|max_depth| depth <= max_depth)
+            && self
+                .type_filter
+                .is_none_or(|expected| expected.matches(file_type))
+            && self
+                .name_pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches(file_name.as_bytes()))
+            && self.path_pattern.as_ref().is_none_or(|pattern| {
+                path_bytes.clear();
+                append_find_child_path_bytes(path_bytes, dir, file_name);
+                pattern.matches(path_bytes)
+            })
     }
 
     fn should_descend(&self, depth: usize) -> bool {
@@ -171,7 +194,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
             }
             Err(err) => return Err(err),
         };
-        if plan.matches(&path, metadata.file_type(), 0) {
+        if plan.matches_root(&path, metadata.file_type(), 0) {
             write_find_path(&output, &path, plan.output_delimiter)?;
         }
         if metadata.file_type().is_dir() && plan.should_descend(0) {
@@ -209,6 +232,7 @@ fn walk_find_subtree(
 ) -> io::Result<()> {
     let mut stack = vec![start_dir];
     let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
+    let mut path_bytes = Vec::new();
     while let Some(task) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -235,25 +259,27 @@ fn walk_find_subtree(
                 }
                 Err(err) => return Err(err),
             };
-            let path = entry.path();
+            let file_name = entry.file_name();
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) if is_permission_denied(&err) => {
+                    let path = child_find_path(&dir, &file_name);
                     write_warning_line("find", &path, &err, "cannot access");
                     had_warnings.store(true, Ordering::SeqCst);
                     continue;
                 }
                 Err(err) => return Err(err),
             };
-            if plan.matches(&path, file_type, child_depth) {
-                append_find_path(&mut chunk, &path, plan.output_delimiter);
+            if plan.matches_child(&dir, &file_name, file_type, child_depth, &mut path_bytes) {
+                append_find_child_path(&mut chunk, &dir, &file_name, plan.output_delimiter);
                 if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
-                    output.write_all(&std::mem::take(&mut chunk))?;
+                    output.write_all(&chunk)?;
+                    chunk.clear();
                 }
             }
             if file_type.is_dir() && plan.should_descend(child_depth) {
                 child_dirs.push(FindTask {
-                    dir: path,
+                    dir: child_find_path(&dir, &file_name),
                     depth: child_depth,
                 });
             }
@@ -428,6 +454,30 @@ fn write_find_path(output: &FindOutput, path: &Path, output_delimiter: u8) -> io
 fn append_find_path(chunk: &mut Vec<u8>, path: &Path, output_delimiter: u8) {
     chunk.extend_from_slice(path.as_os_str().as_bytes());
     chunk.push(output_delimiter);
+}
+
+fn append_find_child_path(
+    chunk: &mut Vec<u8>,
+    dir: &Path,
+    file_name: &std::ffi::OsStr,
+    output_delimiter: u8,
+) {
+    append_find_child_path_bytes(chunk, dir, file_name);
+    chunk.push(output_delimiter);
+}
+
+fn append_find_child_path_bytes(chunk: &mut Vec<u8>, dir: &Path, file_name: &std::ffi::OsStr) {
+    chunk.extend_from_slice(dir.as_os_str().as_bytes());
+    if !dir.as_os_str().as_bytes().ends_with(b"/") {
+        chunk.push(b'/');
+    }
+    chunk.extend_from_slice(file_name.as_bytes());
+}
+
+fn child_find_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    let mut path = dir.to_path_buf();
+    path.push(file_name);
+    path
 }
 
 fn find_name_matches(pattern: &FindGlobPattern, path: &Path) -> bool {
