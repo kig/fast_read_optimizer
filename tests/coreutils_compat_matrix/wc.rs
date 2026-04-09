@@ -316,6 +316,46 @@ fn wc_long_bytes_flag_matches_system_on_sparse_regular_file() {
 }
 
 #[test]
+fn wc_double_dash_stops_option_parsing_like_system() {
+    let tmp = unique_temp_dir("fro-coreutils-wc-double-dash");
+    let dashed = tmp.join("-l");
+    let long_dashed = tmp.join("--bytes");
+    fs::write(&dashed, b"alpha beta\n").unwrap();
+    fs::write(&long_dashed, b"line one\nline two\n").unwrap();
+
+    for flags in io_flag_sets() {
+        let mut args = flags.clone();
+        args.push("--");
+        args.push(dashed.to_str().unwrap());
+        args.push(long_dashed.to_str().unwrap());
+        assert_same_wc_exact(
+            run_fro("wc", &args),
+            run_system(
+                "wc",
+                &[
+                    "--",
+                    dashed.to_str().unwrap(),
+                    long_dashed.to_str().unwrap(),
+                ],
+            ),
+            &format!("wc double dash {:?}", args),
+        );
+    }
+
+    for flags in io_flag_sets() {
+        let mut args = flags.clone();
+        args.push("-c");
+        args.push("--");
+        args.push(long_dashed.to_str().unwrap());
+        assert_same_wc_exact(
+            run_fro("wc", &args),
+            run_system("wc", &["-c", "--", long_dashed.to_str().unwrap()]),
+            &format!("wc -c double dash {:?}", args),
+        );
+    }
+}
+
+#[test]
 fn wc_character_count_matches_system_on_utf8_and_invalid_bytes() {
     let tmp = unique_temp_dir("fro-coreutils-wc-chars");
     let utf8 = tmp.join("utf8.txt");

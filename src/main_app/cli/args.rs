@@ -374,6 +374,10 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 cp_preserve = true;
             } else if args[i] == "--cp-no-dereference" {
                 cp_no_dereference = true;
+            } else if mode == "copy" && (args[i] == "-a" || args[i] == "--archive") {
+                recursive_copy = true;
+                cp_preserve = true;
+                cp_no_dereference = true;
             } else if args[i] == "-q" || args[i] == "--quiet" {
                 quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {

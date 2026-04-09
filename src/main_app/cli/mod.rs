@@ -20,6 +20,7 @@ pub(super) struct TestCopyRunOptions {
     pub(super) cp_no_target_directory: bool,
     pub(super) cp_update: bool,
     pub(super) cp_preserve: bool,
+    pub(super) cp_no_dereference: bool,
 }
 
 #[cfg(test)]
@@ -55,7 +56,7 @@ pub(super) fn run_test_copy(options: TestCopyRunOptions) -> io::Result<i32> {
         cp_no_target_directory: options.cp_no_target_directory,
         cp_update: options.cp_update,
         cp_preserve: options.cp_preserve,
-        cp_no_dereference: false,
+        cp_no_dereference: options.cp_no_dereference,
         verbose: options.verbose,
         source: Some(options.source),
         pattern: String::new(),

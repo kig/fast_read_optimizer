@@ -393,13 +393,10 @@ fn write_head_lines_reader<W: Write, R: Read>(
             return Ok(());
         }
         let block = &buffer[..read];
-        for newline_offset in memchr_iter(b'\n', block) {
-            remaining_lines -= 1;
-            if remaining_lines == 0 {
-                out.write_all(&block[..=newline_offset])?;
-                out.flush()?;
-                return Ok(());
-            }
+        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines) {
+            out.write_all(&block[..prefix_len])?;
+            out.flush()?;
+            return Ok(());
         }
         out.write_all(block)?;
     }
@@ -423,24 +420,35 @@ fn write_head_lines_small_stdin_fast(remaining_lines: u64) -> io::Result<()> {
     if remaining_lines == 0 {
         return Ok(());
     }
-    grow_pipe_best_effort(libc::STDIN_FILENO)?;
-    grow_pipe_best_effort(libc::STDOUT_FILENO)?;
     let mut buffer = [0_u8; HEAD_SMALL_STREAM_RAW_READ_BLOCK_SIZE];
     let mut remaining_lines = remaining_lines;
+    let mut grew_pipes = false;
     loop {
         let read = read_raw_fd(libc::STDIN_FILENO, &mut buffer)?;
         if read == 0 {
             return Ok(());
         }
         let block = &buffer[..read];
-        for newline_offset in memchr_iter(b'\n', block) {
-            remaining_lines -= 1;
-            if remaining_lines == 0 {
-                return write_raw_fd_all(libc::STDOUT_FILENO, &block[..=newline_offset]);
-            }
+        if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines) {
+            return write_raw_fd_all(libc::STDOUT_FILENO, &block[..prefix_len]);
         }
         write_raw_fd_all(libc::STDOUT_FILENO, block)?;
+        if !grew_pipes {
+            grow_pipe_best_effort(libc::STDIN_FILENO)?;
+            grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+            grew_pipes = true;
+        }
     }
+}
+
+fn head_line_prefix_len(block: &[u8], remaining_lines: &mut u64) -> Option<usize> {
+    for newline_offset in memchr_iter(b'\n', block) {
+        *remaining_lines -= 1;
+        if *remaining_lines == 0 {
+            return Some(newline_offset + 1);
+        }
+    }
+    None
 }
 
 fn tail_line_start_offset(

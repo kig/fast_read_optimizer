@@ -20,7 +20,6 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] `cat` / `read` / `head` / `tail`: keep the plain byte-copy and range fast paths hot, and close the remaining gap on the small-cutoff pipe case for `head -n`.
 - [ ] `rm` / recursive delete: make large-tree deletion a first-class perf target alongside correctness/parity coverage, since it is heavily used and shares traversal/scheduling machinery with other tree tools.
 - [ ] `find` / `du`: keep pushing the directory-walk scheduler and metadata batching, because traversal wins compound into multiple multicall tools.
-  - [x] `du`: `-S` / `--separate-dirs` now lands as a common path-preserving slice on top of the existing parallel dirwalk.
   - [ ] Fast traversal of every byte in a directory tree.
   - [ ] Revisit `io_uring` dirwalk once the environment exposes `IORING_OP_GETDENTS` / usable Rust bindings.
     - Current blocker: this host's `/usr/include/linux/io_uring.h` and the pinned `io-uring` / `iou` crate surfaces do not expose the opcode yet.
@@ -70,7 +69,6 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] `base64`: treat as strategically relevant because it exercises reusable transform-style machinery, but keep it behind the higher-use command families until the shared helper work needs it.
 - [ ] file encryption
   - [ ] fast file encryption/decryption with the optimized IO paths, producing OpenSSL-compatible aes-256-ctr output via the OpenSSL library, 512 KiB blocks, `ParallelStream` mappers, and `num_cpus` worker parallelism
-  - [x] add the right automatic input/output pairing helper for this mapper-style workload (regular-file ↔ regular-file, stream ↔ stream, mixed cases) and document that future transform-style tools should reuse it instead of open-coding path selection
   - [ ] add an authenticated integrity/MAC story around the current unauthenticated AES-256-CTR-compatible format without breaking the OpenSSL-compatible path
 
 ### Parked / explicitly lower-priority for now

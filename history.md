@@ -1,7 +1,18 @@
 # History
 
+## 2026-04-09
+
+- `sort` gained a bounded common-flags slice on top of the existing bytewise newline-delimited path: `-r` / `--reverse`, `-u` / `--unique`, and clustered `-ru` / `-ur` now compose with the same ordering backend instead of erroring, with focused parity coverage against system `sort`.
+- Added a bounded `read` fast-path verification slice to complement the existing `cat` backend checks: plain small regular-file `read --no-direct` / `read --direct` cases now prove they stay on the simple single-thread path, while large reads still prove they pick up tuned threaded params once they cross the strategy cutoff.
+
 ## 2026-04-08
 
+- Recursive dir-queue wakeups now track sleeping workers and wake only the number needed for newly queued sibling subtrees, while still broadcasting when the last active worker drains; focused queue tests cover both fanout wakeup and clean shutdown.
+- Added a test-backed multicall/coreutils compatibility coverage report that prints, for each implemented GNU-targeting command, the percentage of compatibly implemented flag surface plus a compact one-line list of remaining gaps, so planning can target the biggest real compatibility holes without re-deriving the matrix by hand.
+- `wc` now honors `--` to stop option parsing, so dashed filenames reuse the same optimized metadata, mapped-block, and fd-parallel counting backends instead of being rejected as flags, with focused helper-selection and compatibility coverage.
+- `cp` now supports GNU-style `-a` / `--archive` as a bounded recursive-copy compatibility slice, mapping it onto the existing preserve + no-dereference behavior while keeping the threaded recursive-copy backend on real-copy executions and adding focused parity coverage for recursive timestamps and symlink metadata.
+- The shared `find`/`du` work queue now tracks actual waiters so batched subtree enqueue only wakes the number of sleeping workers that can claim new tasks, and worker completion only broadcasts when the last active worker drains the queue; focused queue tests plus a synthetic ignored perf surface make the dirwalk scheduler's wakeup behavior easier to validate.
+- `head -n` small streamed-stdin fast paths now defer stdin/stdout pipe growth until after the first full block if the newline cutoff was not already satisfied, removing `F_SETPIPE_SZ` setup work from one-read completions while reusing a shared newline-prefix helper across the raw and buffered line writers.
 - `cksum` now uses a fixed-function cached `CRC-32/CKSUM` combine operator instead of calling the generic `crc-fast` matrix-building combine path for every mapped block merge, keeping the file-side CRC math aligned with the same polynomial while removing repeated GF(2) setup work.
 - `base64` decode reorg now caches its chosen decode kernel per stream and keeps the AVX2 sanitize/compact path active for `--ignore-garbage` inputs until padding, with focused coverage for both large dirty-input success and valid-bytes-after-padding rejection.
 - `split-manifest-recursive-copy-bench` now reports manifest-build vs copy-phase timing plus dir/symlink/small/large task counts, and focused regression coverage pins both the benchmark registration and the helper's reported phase/task counters.

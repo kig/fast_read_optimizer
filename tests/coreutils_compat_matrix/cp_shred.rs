@@ -1,9 +1,7 @@
 use super::*;
-
 #[test]
 fn cartesian_cp_and_shred_match_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-copy-shred-matrix");
-
     for flags in io_flag_sets() {
         let source = tmp.join(format!("cp-src-{}.bin", flags.join("_")));
         let fro_target = tmp.join(format!("cp-fro-{}.bin", flags.join("_")));
@@ -15,7 +13,6 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-
         let mut fro_args = flags.clone();
         fro_args.push(source.to_str().unwrap());
         fro_args.push(fro_target.to_str().unwrap());
@@ -29,7 +26,6 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
             fs::read(&fro_target).unwrap(),
             fs::read(&sys_target).unwrap()
         );
-
         let fro_zero = tmp.join(format!("shred-fro-zero-{}.bin", flags.join("_")));
         let sys_zero = tmp.join(format!("shred-sys-zero-{}.bin", flags.join("_")));
         fs::write(&fro_zero, vec![0x55; 32768]).unwrap();
@@ -43,7 +39,6 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
             &format!("shred zero {:?}", fro_zero_args),
         );
         assert_eq!(fs::read(&fro_zero).unwrap(), fs::read(&sys_zero).unwrap());
-
         let fro_remove = tmp.join(format!("shred-fro-remove-{}.bin", flags.join("_")));
         let sys_remove = tmp.join(format!("shred-sys-remove-{}.bin", flags.join("_")));
         fs::write(&fro_remove, vec![0x99; 32768]).unwrap();
@@ -59,21 +54,17 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
         assert_eq!(fro_remove.exists(), sys_remove.exists());
     }
 }
-
 #[test]
 fn shred_size_verbose_and_force_match_system_side_effects() {
     let tmp = unique_temp_dir("fro-coreutils-shred-flags");
-
     for flags in io_flag_sets() {
         let suffix = if flags.is_empty() {
             "auto".to_string()
         } else {
             flags.join("_").replace("--", "")
         };
-
         let size_file = tmp.join(format!("shred-size-{suffix}.bin"));
         fs::write(&size_file, b"0123456789").unwrap();
-
         let mut fro_size_args = flags.clone();
         fro_size_args.extend(["-n", "0", "-z", "-s", "4", size_file.to_str().unwrap()]);
         let sys_size_args = ["-n", "0", "-z", "-s", "4", size_file.to_str().unwrap()];
@@ -86,7 +77,6 @@ fn shred_size_verbose_and_force_match_system_side_effects() {
             fs::read(&size_file).unwrap(),
             vec![0, 0, 0, 0, b'4', b'5', b'6', b'7', b'8', b'9']
         );
-
         let verbose_file = tmp.join(format!("shred-verbose-{suffix}.bin"));
         fs::write(&verbose_file, b"abcdef").unwrap();
 
@@ -496,6 +486,93 @@ fn cp_preserve_matches_system_for_recursive_timestamps() {
                 "mtime_nsec mismatch for {:?}",
                 rel
             );
+        }
+    }
+}
+
+#[test]
+fn cp_archive_matches_system_for_recursive_timestamps() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = unique_temp_dir("fro-coreutils-cp-archive");
+
+    for archive_flag in ["-a", "--archive"] {
+        for flags in io_flag_sets() {
+            let suffix = if flags.is_empty() {
+                "auto".to_string()
+            } else {
+                flags.join("_").replace("--", "")
+            };
+            let archive_name = archive_flag.trim_start_matches('-').replace('-', "_");
+
+            let source_root = tmp.join(format!("archive-src-{archive_name}-{suffix}"));
+            let fro_dest_parent = tmp.join(format!("archive-fro-{archive_name}-{suffix}"));
+            let sys_dest_parent = tmp.join(format!("archive-sys-{archive_name}-{suffix}"));
+            let nested = source_root.join("nested/deeper");
+            fs::create_dir_all(&nested).unwrap();
+            fs::create_dir_all(&fro_dest_parent).unwrap();
+            fs::create_dir_all(&sys_dest_parent).unwrap();
+
+            let file = source_root.join("small.txt");
+            let nested_dir = source_root.join("nested");
+            let link = nested_dir.join("link-small");
+            fs::write(&file, b"alpha\nbeta\n").unwrap();
+            fs::write(nested.join("large.bin"), b"payload").unwrap();
+            symlink("../small.txt", &link).unwrap();
+
+            set_file_mtime(&file, 1_700_220_000);
+            set_file_mtime(&nested.join("large.bin"), 1_700_220_010);
+            set_file_mtime(&nested_dir, 1_700_220_020);
+            set_file_mtime(&source_root, 1_700_220_030);
+            set_symlink_mtime(&link, 1_700_220_040);
+
+            let mut fro_args = flags.clone();
+            fro_args.extend([
+                archive_flag,
+                source_root.to_str().unwrap(),
+                fro_dest_parent.to_str().unwrap(),
+            ]);
+            let sys_args = [
+                archive_flag,
+                source_root.to_str().unwrap(),
+                sys_dest_parent.to_str().unwrap(),
+            ];
+            assert_same_result(
+                run_fro("cp", &fro_args),
+                run_system("cp", &sys_args),
+                &format!("cp archive recursive {:?}", fro_args),
+            );
+
+            let copied_name = source_root.file_name().unwrap();
+            let fro_root = fro_dest_parent.join(copied_name);
+            let sys_root = sys_dest_parent.join(copied_name);
+            assert_eq!(snapshot_tree(&fro_root), snapshot_tree(&sys_root));
+
+            for rel in [
+                std::path::Path::new("small.txt"),
+                std::path::Path::new("nested"),
+                std::path::Path::new("nested/deeper/large.bin"),
+            ] {
+                let fro_meta = fs::metadata(fro_root.join(rel)).unwrap();
+                let sys_meta = fs::metadata(sys_root.join(rel)).unwrap();
+                assert_eq!(
+                    fro_meta.mtime(),
+                    sys_meta.mtime(),
+                    "mtime mismatch for {:?}",
+                    rel
+                );
+                assert_eq!(
+                    fro_meta.mtime_nsec(),
+                    sys_meta.mtime_nsec(),
+                    "mtime_nsec mismatch for {:?}",
+                    rel
+                );
+            }
+
+            let fro_link_meta = fs::symlink_metadata(fro_root.join("nested/link-small")).unwrap();
+            let sys_link_meta = fs::symlink_metadata(sys_root.join("nested/link-small")).unwrap();
+            assert_eq!(fro_link_meta.mtime(), sys_link_meta.mtime());
+            assert_eq!(fro_link_meta.mtime_nsec(), sys_link_meta.mtime_nsec());
         }
     }
 }

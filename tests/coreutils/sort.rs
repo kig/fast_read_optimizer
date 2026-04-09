@@ -35,7 +35,10 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("newline-delimited"));
     assert!(stdout.contains("bytewise"));
+    assert!(stdout.contains("--reverse"));
+    assert!(stdout.contains("--unique"));
     assert!(stdout.contains("Unsupported GNU sort features"));
+    assert!(!stdout.contains("reverse, unique"));
 }
 
 #[test]
@@ -47,35 +50,51 @@ fn sort_matches_system_for_files_and_stdin() {
     fs::write(&b, b"alpha\ngamma").unwrap();
 
     for io_flags in io_flag_sets() {
-        for files in [
-            vec![a.to_str().unwrap()],
-            vec![a.to_str().unwrap(), b.to_str().unwrap()],
+        for sort_flags in [
+            vec![],
+            vec!["-r"],
+            vec!["-u"],
+            vec!["-ru"],
+            vec!["--reverse", "--unique"],
         ] {
-            let mut fro_args = io_flags.clone();
-            fro_args.extend(files.iter().copied());
-            assert_same_result(
-                run_fro("sort", &fro_args),
-                run_system_sort(&files),
-                &format!("sort {:?}", fro_args),
-            );
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                let mut sys_args = sort_flags.clone();
+                sys_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(&sys_args),
+                    &format!("sort {:?}", fro_args),
+                );
+            }
         }
 
-        let mut fro_stdin_args = io_flags.clone();
-        fro_stdin_args.push("-");
-        assert_same_result(
-            run_fro_with_stdin("sort", &fro_stdin_args, b"bbb\na\nab\n\na"),
-            run_system_sort_with_stdin(&["-"], b"bbb\na\nab\n\na"),
-            &format!("sort stdin {:?}", io_flags),
-        );
+        for sort_flags in [vec![], vec!["-r"], vec!["-u"], vec!["-ru"]] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            let mut sys_stdin_args = sort_flags.clone();
+            sys_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin("sort", &fro_stdin_args, b"bbb\na\nab\n\na\nbbb"),
+                run_system_sort_with_stdin(&sys_stdin_args, b"bbb\na\nab\n\na\nbbb"),
+                &format!("sort stdin {:?}", fro_stdin_args),
+            );
+        }
     }
 }
 
 #[test]
 fn sort_rejects_unsupported_flags_with_help_hint() {
-    let output = run_fro("sort", &["-r"]);
+    let output = run_fro("sort", &["-n"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported option '-r'"));
+    assert!(stderr.contains("unsupported option '-n'"));
     assert!(stderr.contains("Try 'sort --help' for more information."));
 }

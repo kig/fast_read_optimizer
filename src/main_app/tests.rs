@@ -433,6 +433,7 @@ fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
             cp_no_target_directory: false,
             cp_update: false,
             cp_preserve: false,
+            cp_no_dereference: false,
         };
         (case.configure)(&mut args, &source, &target);
 
@@ -481,6 +482,7 @@ fn cp_recursive_preserve_and_verbose_keep_threaded_copy_backend() {
         cp_no_target_directory: false,
         cp_update: false,
         cp_preserve: true,
+        cp_no_dereference: false,
     };
 
     writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
@@ -492,6 +494,55 @@ fn cp_recursive_preserve_and_verbose_keep_threaded_copy_backend() {
     assert_eq!(exit_code, 0);
     assert_eq!(fs::read(&copied).unwrap(), fs::read(&source_file).unwrap());
     assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+
+    let source_mtime = fs::metadata(&source_file).unwrap().mtime();
+    let copied_mtime = fs::metadata(&copied).unwrap().mtime();
+    assert_eq!(copied_mtime, source_mtime);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_archive_recursive_keeps_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive-archive");
+    let source_root = root.join("source");
+    let source_dir = source_root.join("dir");
+    let target_root = root.join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("payload.bin");
+    fs::write(&source_file, b"recursive-archive-payload").unwrap();
+    set_path_mtime(&source_file, 1_234_567_890);
+    std::os::unix::fs::symlink("../dir/payload.bin", source_root.join("payload-link")).unwrap();
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: true,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve: true,
+        cp_no_dereference: true,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    let copied = target_root.join("dir/payload.bin");
+    let copied_link = target_root.join("payload-link");
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source_file).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+    assert_eq!(
+        fs::read_link(&copied_link).unwrap(),
+        PathBuf::from("../dir/payload.bin")
+    );
 
     let source_mtime = fs::metadata(&source_file).unwrap().mtime();
     let copied_mtime = fs::metadata(&copied).unwrap().mtime();

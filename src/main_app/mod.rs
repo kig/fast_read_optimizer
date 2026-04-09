@@ -132,6 +132,7 @@ struct RecursiveDirectoryQueue<T> {
 struct RecursiveDirectoryQueueState<T> {
     queue: VecDeque<T>,
     active_workers: usize,
+    waiting_workers: usize,
 }
 
 struct RecursiveTaskQueue<T> {

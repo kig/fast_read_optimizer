@@ -28,10 +28,14 @@ fn print_sort_help(program: &str) {
     println!();
     println!("Usage: {program} [OPTION]... [FILE]...");
     println!();
-    println!("This bounded first slice sorts newline-delimited records in ascending byte order.");
-    println!("It is locale-independent and currently implements only the default bytewise case.");
+    println!(
+        "This bounded slice sorts newline-delimited records in locale-independent byte order."
+    );
+    println!("It currently supports the default case plus reverse/unique output.");
     println!();
     println!("Supported options:");
+    println!("  -r, --reverse        reverse the result of comparisons");
+    println!("  -u, --unique         output only the first of an equal run");
     println!("      --auto           choose direct IO automatically for regular files");
     println!("      --direct         force direct IO for regular files when possible");
     println!("      --no-direct      force page-cache IO for regular files");
@@ -42,7 +46,7 @@ fn print_sort_help(program: &str) {
     println!("  - Use '-' once to read stdin.");
     println!("  - Use '--' before file names that start with '-'.");
     println!("  - Unsupported GNU sort features currently return an error:");
-    println!("    reverse, unique, numeric/month/version modes, keys, merge/check modes,");
+    println!("    numeric/month/version modes, keys, merge/check modes,");
     println!("    zero-terminated records, output/temp-file controls, and locale collation.");
 }
 
@@ -118,9 +122,40 @@ fn sort_line_refs(lines: &mut [SortLineRef], storage: &[u8]) {
     lines.copy_from_slice(&from);
 }
 
+fn finalize_sorted_lines(
+    lines: &mut Vec<SortLineRef>,
+    storage: &[u8],
+    unique: bool,
+    reverse: bool,
+) {
+    sort_line_refs(lines, storage);
+    if unique {
+        lines.dedup_by(|left, right| left.bytes(storage) == right.bytes(storage));
+    }
+    if reverse {
+        lines.reverse();
+    }
+}
+
+fn apply_short_sort_flags(arg: &str, reverse: &mut bool, unique: &mut bool) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg == "-" {
+        return false;
+    }
+    for flag in arg[1..].bytes() {
+        match flag {
+            b'r' => *reverse = true,
+            b'u' => *unique = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut report_throughput = false;
+    let mut reverse = false;
+    let mut unique = false;
     let mut files = Vec::new();
     let mut end_flags = false;
 
@@ -131,14 +166,17 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 print_sort_help(args[0].as_str());
                 return Ok(0);
             }
+            "-r" | "--reverse" if !end_flags => reverse = true,
+            "-u" | "--unique" if !end_flags => unique = true,
             "--auto" if !end_flags => io_mode = IOMode::Auto,
             "--direct" if !end_flags => io_mode = IOMode::Direct,
             "--no-direct" if !end_flags => io_mode = IOMode::PageCache,
             "--report-gbps" if !end_flags => report_throughput = true,
+            other if !end_flags && apply_short_sort_flags(other, &mut reverse, &mut unique) => {}
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports only bytewise ascending line sorting."
+                    "sort: fro sort currently supports only bytewise line sorting with optional reverse/unique output."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
@@ -177,7 +215,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
         append_input_lines(&mut storage, &mut lines, &bytes)?;
     }
 
-    sort_line_refs(&mut lines, &storage);
+    finalize_sorted_lines(&mut lines, &storage, unique, reverse);
 
     let mut out = stdout_buf_writer()?;
     for line in &lines {
@@ -249,5 +287,53 @@ mod tests {
             .map(|line| line.bytes(&storage).to_vec())
             .collect::<Vec<_>>();
         assert_eq!(lines, vec![b"beta".to_vec(), b"alpha".to_vec()]);
+    }
+
+    #[test]
+    fn finalize_sorted_lines_applies_unique_and_reverse_after_sorting() {
+        let input = [
+            b"beta".as_slice(),
+            b"alpha".as_slice(),
+            b"beta".as_slice(),
+            b"alpha".as_slice(),
+            b"".as_slice(),
+        ];
+        let (storage, refs) = refs_for_lines(&input);
+
+        let mut sorted = refs.clone();
+        finalize_sorted_lines(&mut sorted, &storage, false, false);
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                b"".to_vec(),
+                b"alpha".to_vec(),
+                b"alpha".to_vec(),
+                b"beta".to_vec(),
+                b"beta".to_vec(),
+            ]
+        );
+
+        let mut unique_only = refs.clone();
+        finalize_sorted_lines(&mut unique_only, &storage, true, false);
+        assert_eq!(
+            unique_only
+                .iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"".to_vec(), b"alpha".to_vec(), b"beta".to_vec()]
+        );
+
+        let mut unique_reverse = refs;
+        finalize_sorted_lines(&mut unique_reverse, &storage, true, true);
+        assert_eq!(
+            unique_reverse
+                .iter()
+                .map(|line| line.bytes(&storage).to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"beta".to_vec(), b"alpha".to_vec(), b"".to_vec()]
+        );
     }
 }

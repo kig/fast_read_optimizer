@@ -4,6 +4,13 @@ mod count;
 
 use self::count::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WcExecutionBackend {
+    MetadataFastPath,
+    MappedBlocks,
+    FdParallel,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct WcInputs {
     inputs: Vec<StreamInput>,
@@ -110,16 +117,18 @@ fn wc_totals_for_input(
     config: &crate::config::LoadedConfig,
     io_mode: IOMode,
 ) -> io::Result<WcTotals> {
-    if let Some(totals) = wc_metadata_totals(input, options)? {
-        return Ok(totals);
-    }
-
-    match input {
-        StreamInput::File(file) if options.chars || options.max_line_length => {
-            let mut reader = std::fs::File::open(file)?;
-            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+    match wc_execution_backend(input, options)? {
+        WcExecutionBackend::MetadataFastPath => {
+            return wc_metadata_totals(input, options)?.ok_or_else(|| {
+                io::Error::other("wc metadata backend selected without metadata totals")
+            });
         }
-        StreamInput::File(file) if is_regular_input_path(file)? => {
+        WcExecutionBackend::MappedBlocks => {
+            let StreamInput::File(file) = input else {
+                return Err(io::Error::other(
+                    "wc mapped-block backend selected for non-file input",
+                ));
+            };
             let count_options = WcCountOptions {
                 max_line_length: false,
                 ..options
@@ -133,13 +142,39 @@ fn wc_totals_for_input(
             )?;
             Ok(reduce_wc_counts(&blocks.blocks))
         }
-        StreamInput::File(file) => {
-            let mut reader = std::fs::File::open(file)?;
-            wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+        WcExecutionBackend::FdParallel => match input {
+            StreamInput::File(file) => {
+                let mut reader = std::fs::File::open(file)?;
+                wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
+            }
+            StreamInput::Stdin { .. } => {
+                wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
+            }
+        },
+    }
+}
+
+fn wc_execution_backend(
+    input: &StreamInput,
+    options: WcCountOptions,
+) -> io::Result<WcExecutionBackend> {
+    if options.bytes
+        && !options.lines
+        && !options.words
+        && !options.chars
+        && !options.max_line_length
+        && matches!(input, StreamInput::File(path) if is_regular_input_path(path)?)
+    {
+        return Ok(WcExecutionBackend::MetadataFastPath);
+    }
+
+    match input {
+        StreamInput::File(file)
+            if !options.chars && !options.max_line_length && is_regular_input_path(file)? =>
+        {
+            Ok(WcExecutionBackend::MappedBlocks)
         }
-        StreamInput::Stdin { .. } => {
-            wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
-        }
+        StreamInput::File(_) | StreamInput::Stdin { .. } => Ok(WcExecutionBackend::FdParallel),
     }
 }
 
@@ -193,9 +228,17 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
     let mut report_throughput = false;
     let mut files0_from = None::<String>;
     let mut files = Vec::new();
+    let mut stop_parsing_flags = false;
     let mut i = 1usize;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        if stop_parsing_flags {
+            files.push(arg.to_string());
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--" => stop_parsing_flags = true,
             "-l" | "--lines" => print_lines = true,
             "-w" | "--words" => print_words = true,
             "-m" | "--chars" => print_chars = true,

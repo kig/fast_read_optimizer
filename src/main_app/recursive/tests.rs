@@ -2,6 +2,7 @@ use super::*;
 use crate::common::{CopyStrategy, IOMode};
 use crate::config::{AppConfig, LoadedConfig};
 use crate::main_app::copy_plan::CopyRewriteMode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_recursive_test_dir(prefix: &str) -> PathBuf {
@@ -68,6 +69,62 @@ fn recursive_task_queue_enqueue_batch_preserves_fifo_order() {
     assert_eq!(queue.claim(&stop), Some(2));
     assert_eq!(queue.claim(&stop), Some(3));
     assert_eq!(queue.claim(&stop), None);
+}
+
+#[test]
+fn recursive_directory_queue_batch_enqueue_wakes_one_waiter_per_task() {
+    let queue = Arc::new(RecursiveDirectoryQueue::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    queue.enqueue_one(1_u8);
+    let claimed = queue.claim(&stop).unwrap();
+    assert_eq!(claimed, 1);
+
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let queue = queue.clone();
+        let stop = stop.clone();
+        waiters.push(std::thread::spawn(move || {
+            let task = queue.claim(&stop);
+            if task.is_some() {
+                queue.complete_claim();
+            }
+            task
+        }));
+    }
+
+    while queue.state.lock().unwrap().waiting_workers < 2 {
+        std::thread::yield_now();
+    }
+
+    queue.enqueue([2_u8, 3_u8]);
+    queue.complete_claim();
+
+    let mut claimed = waiters
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    claimed.sort();
+    assert_eq!(claimed, vec![Some(2), Some(3)]);
+}
+
+#[test]
+fn recursive_directory_queue_wakes_waiters_when_last_worker_finishes() {
+    let queue = Arc::new(RecursiveDirectoryQueue::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    queue.enqueue_one(7_u8);
+    let claimed = queue.claim(&stop).unwrap();
+    assert_eq!(claimed, 7);
+
+    let waiter_queue = queue.clone();
+    let waiter_stop = stop.clone();
+    let waiter = std::thread::spawn(move || waiter_queue.claim(&waiter_stop));
+
+    while queue.state.lock().unwrap().waiting_workers < 1 {
+        std::thread::yield_now();
+    }
+
+    queue.complete_claim();
+    assert_eq!(waiter.join().unwrap(), None);
 }
 
 #[test]

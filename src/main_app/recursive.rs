@@ -200,6 +200,7 @@ impl<T> Default for RecursiveDirectoryQueue<T> {
             state: Mutex::new(RecursiveDirectoryQueueState {
                 queue: VecDeque::new(),
                 active_workers: 0,
+                waiting_workers: 0,
             }),
             ready: Condvar::new(),
         }
@@ -209,13 +210,18 @@ impl<T> Default for RecursiveDirectoryQueue<T> {
 impl<T> RecursiveDirectoryQueue<T> {
     pub(super) fn enqueue(&self, tasks: impl IntoIterator<Item = T>) {
         let mut state = self.state.lock().unwrap();
-        let mut added = false;
+        let mut added = 0_usize;
         for task in tasks {
             state.queue.push_back(task);
-            added = true;
+            added += 1;
         }
-        if added {
-            self.ready.notify_all();
+        if added == 0 {
+            return;
+        }
+        let to_wake = added.min(state.waiting_workers);
+        drop(state);
+        for _ in 0..to_wake {
+            self.ready.notify_one();
         }
     }
 
@@ -238,14 +244,20 @@ impl<T> RecursiveDirectoryQueue<T> {
             if state.active_workers == 0 {
                 return None;
             }
+            state.waiting_workers += 1;
             state = self.ready.wait(state).unwrap();
+            state.waiting_workers = state.waiting_workers.saturating_sub(1);
         }
     }
 
     pub(super) fn complete_claim(&self) {
         let mut state = self.state.lock().unwrap();
         state.active_workers = state.active_workers.saturating_sub(1);
-        self.ready.notify_all();
+        let should_wake_all = state.active_workers == 0;
+        drop(state);
+        if should_wake_all {
+            self.ready.notify_all();
+        }
     }
 
     pub(super) fn wake_all(&self) {

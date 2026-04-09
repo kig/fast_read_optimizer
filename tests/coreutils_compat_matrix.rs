@@ -234,6 +234,34 @@ fn set_file_mtime(path: &Path, secs: i64) {
     );
 }
 
+fn set_symlink_mtime(path: &Path, secs: i64) {
+    let times = [
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+    ];
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "utimensat symlink failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 fn wc_flag_sets() -> Vec<Vec<&'static str>> {
     vec![
         vec![],

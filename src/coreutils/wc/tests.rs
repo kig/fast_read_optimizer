@@ -227,6 +227,82 @@ fn wc_metadata_totals_only_applies_to_byte_only_regular_files() {
 }
 
 #[test]
+fn wc_regular_file_count_flows_keep_expected_execution_backends() {
+    let tmp = wc_test_temp_file("fro-wc-backend");
+    std::fs::write(&tmp, b"alpha beta\n").unwrap();
+    let file = tmp.display().to_string();
+    let input = StreamInput::File(file);
+
+    assert_eq!(
+        wc_execution_backend(
+            &input,
+            WcCountOptions {
+                lines: false,
+                words: false,
+                chars: false,
+                bytes: true,
+                max_line_length: false,
+            }
+        )
+        .unwrap(),
+        WcExecutionBackend::MetadataFastPath
+    );
+    for options in [
+        WcCountOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            max_line_length: false,
+        },
+        WcCountOptions {
+            lines: false,
+            words: true,
+            chars: false,
+            bytes: false,
+            max_line_length: false,
+        },
+        WcCountOptions {
+            lines: true,
+            words: true,
+            chars: false,
+            bytes: true,
+            max_line_length: false,
+        },
+    ] {
+        assert_eq!(
+            wc_execution_backend(&input, options).unwrap(),
+            WcExecutionBackend::MappedBlocks,
+            "options {options:?} should keep the mapped-block backend"
+        );
+    }
+    for options in [
+        WcCountOptions {
+            lines: false,
+            words: false,
+            chars: true,
+            bytes: false,
+            max_line_length: false,
+        },
+        WcCountOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            max_line_length: true,
+        },
+    ] {
+        assert_eq!(
+            wc_execution_backend(&input, options).unwrap(),
+            WcExecutionBackend::FdParallel,
+            "options {options:?} should stay on the fd-parallel backend"
+        );
+    }
+
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[test]
 fn wc_character_count_matches_gnu_style_utf8_handling() {
     let options = WcCountOptions {
         lines: true,

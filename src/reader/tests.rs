@@ -18,6 +18,12 @@ fn unique_temp_file(prefix: &str) -> PathBuf {
     base.join(format!("{}-{}-{}.bin", prefix, pid, nanos))
 }
 
+fn create_sparse_temp_file(prefix: &str, len: u64) -> PathBuf {
+    let path = unique_temp_file(prefix);
+    fs::File::create(&path).unwrap().set_len(len).unwrap();
+    path
+}
+
 #[test]
 fn load_file_to_memory_round_trips_bytes() {
     let path = unique_temp_file("fro-load");
@@ -230,6 +236,134 @@ fn resolve_reader_params_for_mode_uses_config_mode() {
     assert_eq!(params.num_threads, 9);
     assert_eq!(params.block_size, 2 * 1024 * 1024);
     assert_eq!(params.qd, 3);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn plain_small_page_cache_read_keeps_simple_params() {
+    let path = create_sparse_temp_file("fro-read-small-page-cache", 128 * 1024);
+
+    let mut cfg = AppConfig::default();
+    cfg.read.page_cache = IOParams {
+        num_threads: 9,
+        block_size: 2 * 1024 * 1024,
+        qd: 7,
+    };
+
+    let loaded = LoadedConfig::Legacy {
+        path: PathBuf::from("fro.json"),
+        config: cfg,
+    };
+
+    let params =
+        resolve_reader_params_for_mode(&loaded, "read", path.to_str().unwrap(), IOMode::PageCache)
+            .unwrap();
+    assert_eq!(
+        params,
+        ResolvedReadParams {
+            use_direct: false,
+            num_threads: 1,
+            block_size: benchmark_block_size(128 * 1024) as u64,
+            qd: 1,
+        }
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn plain_large_page_cache_read_uses_threaded_config_params() {
+    let path = create_sparse_temp_file("fro-read-large-page-cache", 256 * 1024 * 1024);
+
+    let mut cfg = AppConfig::default();
+    cfg.read.page_cache = IOParams {
+        num_threads: 9,
+        block_size: 2 * 1024 * 1024,
+        qd: 7,
+    };
+
+    let loaded = LoadedConfig::Legacy {
+        path: PathBuf::from("fro.json"),
+        config: cfg,
+    };
+
+    let params =
+        resolve_reader_params_for_mode(&loaded, "read", path.to_str().unwrap(), IOMode::PageCache)
+            .unwrap();
+    assert_eq!(
+        params,
+        ResolvedReadParams {
+            use_direct: false,
+            num_threads: 9,
+            block_size: 2 * 1024 * 1024,
+            qd: 7,
+        }
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn plain_small_direct_read_keeps_simple_params() {
+    let path = create_sparse_temp_file("fro-read-small-direct", 128 * 1024);
+
+    let mut cfg = AppConfig::default();
+    cfg.read.direct = IOParams {
+        num_threads: 11,
+        block_size: 4 * 1024 * 1024,
+        qd: 5,
+    };
+
+    let loaded = LoadedConfig::Legacy {
+        path: PathBuf::from("fro.json"),
+        config: cfg,
+    };
+
+    let params =
+        resolve_reader_params_for_mode(&loaded, "read", path.to_str().unwrap(), IOMode::Direct)
+            .unwrap();
+    assert_eq!(
+        params,
+        ResolvedReadParams {
+            use_direct: true,
+            num_threads: 1,
+            block_size: benchmark_block_size(128 * 1024) as u64,
+            qd: 1,
+        }
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn plain_large_direct_read_uses_threaded_config_params() {
+    let path = create_sparse_temp_file("fro-read-large-direct", 256 * 1024 * 1024);
+
+    let mut cfg = AppConfig::default();
+    cfg.read.direct = IOParams {
+        num_threads: 11,
+        block_size: 4 * 1024 * 1024,
+        qd: 5,
+    };
+
+    let loaded = LoadedConfig::Legacy {
+        path: PathBuf::from("fro.json"),
+        config: cfg,
+    };
+
+    let params =
+        resolve_reader_params_for_mode(&loaded, "read", path.to_str().unwrap(), IOMode::Direct)
+            .unwrap();
+    assert_eq!(
+        params,
+        ResolvedReadParams {
+            use_direct: true,
+            num_threads: 11,
+            block_size: 4 * 1024 * 1024,
+            qd: 5,
+        }
+    );
 
     let _ = fs::remove_file(path);
 }

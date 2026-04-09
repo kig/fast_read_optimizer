@@ -1,5 +1,4 @@
 use super::*;
-
 #[derive(Clone, Copy)]
 pub(super) struct CommandHelp {
     name: &'static str,
@@ -8,19 +7,15 @@ pub(super) struct CommandHelp {
     notes: &'static [&'static str],
     examples: &'static [(&'static str, &'static str)],
 }
-
 pub(super) fn is_help_flag(arg: &str) -> bool {
     arg == "--help" || arg == "-h"
 }
-
 pub(super) fn is_version_flag(arg: &str) -> bool {
     arg == "--version"
 }
-
 pub(super) fn print_version(program: &str) {
     println!("{program} {FRO_VERSION}");
 }
-
 pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
     match name {
         "read" => Some(CommandHelp {
@@ -280,16 +275,17 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "sort" => Some(CommandHelp {
             name: "sort",
-            usage: "sort [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
+            usage: "sort [-r|--reverse] [-u|--unique] [--auto|--no-direct|--direct] [--report-gbps] [--] [file ...]",
             summary: "Sort newline-delimited records in locale-independent ascending byte order.",
             notes: &[
-                "This bounded first slice implements only the default bytewise newline-delimited case.",
+                "This bounded slice implements the default bytewise newline-delimited case plus reverse/unique output.",
                 "Use '-' once to read stdin; repeated '-' operands are rejected instead of pretending to reread stdin.",
-                "Unsupported GNU sort features currently return an error, including reverse/unique/numeric modes, keys, merge/check modes, zero-terminated records, output/temp-file controls, and locale collation.",
+                "Unsupported GNU sort features currently return an error, including numeric/month/version modes, keys, merge/check modes, zero-terminated records, output/temp-file controls, and locale collation.",
                 "--report-gbps writes aggregate input throughput to stderr after sorting completes.",
             ],
             examples: &[
                 ("Sort one file to stdout", "sort names.txt"),
+                ("Sort unique records in reverse byte order", "sort -ru names.txt"),
                 ("Sort one file with page-cache reads forced", "sort --no-direct names.txt"),
             ],
         }),
@@ -316,12 +312,13 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "wc" => Some(CommandHelp {
             name: "wc",
-            usage: "wc [-l] [-w] [-m] [-c] [-L] [--lines] [--words] [--chars] [--bytes] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] [--report-gbps] <file> [file ...]",
+            usage: "wc [-l] [-w] [-m] [-c] [-L] [--lines] [--words] [--chars] [--bytes] [--max-line-length] [--files0-from=F] [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
             summary: "Count lines, words, characters, bytes, and max line length using fro block visitors.",
             notes: &[
                 "Without -l/-w/-m/-c/-L, prints lines, words, and bytes.",
                 "--lines/--words/--chars/--bytes match the GNU wc long count flags.",
                 "--files0-from=F reads NUL-delimited input names from F (or stdin when F is -).",
+                "-- stops option parsing so filenames beginning with - are counted as inputs.",
                 "--report-gbps writes effective processed-input throughput to stderr.",
             ],
             examples: &[
@@ -461,7 +458,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "For non-verified copy modes, fro also checks whether the source file's size/mtime/ctime changed during the operation and fails if it did.",
                 "When using --via-memory, tune read and write separately instead of saving copy params.",
                 "Verification success is reported to stderr unless --quiet is used.",
-                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and -p/--preserve (mode+timestamps for recursive and regular copies; ownership is not preserved) compatibility flags.",
+                "When invoked via the cp multicall alias, the wrapper also understands GNU cp's -a/--archive, -n/--no-clobber, -t/--target-directory, -u/--update, -v/--verbose, -T/--no-target-directory, -P/--no-dereference, and -p/--preserve (mode+timestamps for recursive and regular copies; ownership is not preserved) compatibility flags.",
             ],
             examples: &[
                 (
