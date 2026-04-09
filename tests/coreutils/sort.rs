@@ -34,12 +34,14 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("newline-delimited"));
-    assert!(stdout.contains("bytewise"));
+    assert!(stdout.contains("byte"));
+    assert!(stdout.contains("numeric"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
+    assert!(stdout.contains("--numeric-sort"));
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("Unsupported GNU sort features"));
-    assert!(!stdout.contains("reverse, unique"));
+    assert!(stdout.contains("month/version/human"));
 }
 
 #[test]
@@ -91,12 +93,114 @@ fn sort_matches_system_for_files_and_stdin() {
 }
 
 #[test]
+fn sort_numeric_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-numeric");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"10\n2\n-3\n.5\n02\nx\n").unwrap();
+    fs::write(&b, b"1.0\n1\n1.00\n+2\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-n"],
+            vec!["--numeric-sort"],
+            vec!["-nr"],
+            vec!["-nu"],
+            vec!["--numeric-sort", "--reverse", "--unique"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort numeric {:?}", fro_args),
+                );
+            }
+        }
+
+        for sort_flags in [
+            vec!["-n"],
+            vec!["-nr"],
+            vec!["-nu"],
+            vec!["--numeric-sort", "--reverse", "--unique"],
+        ] {
+            let mut fro_stdin_args = io_flags.clone();
+            fro_stdin_args.extend(sort_flags.iter().copied());
+            fro_stdin_args.push("-");
+            assert_same_result(
+                run_fro_with_stdin(
+                    "sort",
+                    &fro_stdin_args,
+                    b"1.0\n1\n1.00\n10\n2\n-3\n.5\n+2\nx\n",
+                ),
+                run_system_sort_with_stdin(
+                    sort_flags
+                        .iter()
+                        .copied()
+                        .chain(["-"])
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    b"1.0\n1\n1.00\n10\n2\n-3\n.5\n+2\nx\n",
+                ),
+                &format!("sort numeric stdin {:?}", fro_stdin_args),
+            );
+        }
+    }
+}
+
+#[test]
+fn sort_numeric_output_file_matches_system_and_suppresses_stdout() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-numeric-output");
+    let input = tmp.join("input.txt");
+    fs::write(&input, b"1.0\n1\n1.00\n10\n2\n-3\n.5\n+2\nx\n").unwrap();
+
+    let fro_output = tmp.join("fro-output.txt");
+    let sys_output = tmp.join("sys-output.txt");
+    let fro = run_fro(
+        "sort",
+        &[
+            "--numeric-sort",
+            "--unique",
+            "-o",
+            fro_output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+    );
+    let system = run_system_sort(&[
+        "--numeric-sort",
+        "--unique",
+        "-o",
+        sys_output.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert!(system.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
 fn sort_rejects_unsupported_flags_with_help_hint() {
-    let output = run_fro("sort", &["-n"]);
+    let output = run_fro("sort", &["-M"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported option '-n'"));
+    assert!(stderr.contains("unsupported option '-M'"));
     assert!(stderr.contains("Try 'sort --help' for more information."));
 }
 
