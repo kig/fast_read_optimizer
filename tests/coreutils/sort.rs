@@ -627,13 +627,16 @@ fn sort_zero_terminated_output_merge_and_check_match_system() {
 }
 
 #[test]
-fn sort_rejects_still_unsupported_key_flag_with_help_hint() {
-    let output = run_fro("sort", &["-k", "1,1"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unsupported option '-k'"));
-    assert!(stderr.contains("Try 'sort --help' for more information."));
+fn sort_unsupported_key_flag_falls_back_to_system_sort() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-key-fallback");
+    let input = tmp.join("input.txt");
+    fs::write(&input, b"beta 2\nalpha 1\n").unwrap();
+
+    assert_same_result(
+        run_fro("sort", &["-k", "1,1", input.to_str().unwrap()]),
+        run_system_sort(&["-k", "1,1", input.to_str().unwrap()]),
+        "sort unsupported key fallback",
+    );
 }
 
 #[test]

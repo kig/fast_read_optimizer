@@ -18,6 +18,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
@@ -137,6 +138,112 @@ fn is_multicall_version_flag(arg: Option<&String>) -> bool {
 
 fn multicall_short_help_is_real_flag(invoked: &str, arg: Option<&String>) -> bool {
     invoked == "sort" && matches!(arg.map(String::as_str), Some("-h"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalFallbackCommand {
+    Ripgrep,
+    UutilsCoreutils,
+    SystemCommand,
+}
+
+impl ExternalFallbackCommand {
+    fn build(self, invoked: &str, args: &[String]) -> (String, Vec<String>) {
+        let forwarded = args.iter().skip(1).cloned().collect::<Vec<_>>();
+        match self {
+            ExternalFallbackCommand::Ripgrep => {
+                let mut command_args = vec![
+                    "--fixed-strings".to_string(),
+                    "--color".to_string(),
+                    "never".to_string(),
+                    "--no-config".to_string(),
+                ];
+                command_args.extend(forwarded);
+                ("rg".to_string(), command_args)
+            }
+            ExternalFallbackCommand::UutilsCoreutils => {
+                let mut command_args = vec![invoked.to_string()];
+                command_args.extend(forwarded);
+                ("coreutils".to_string(), command_args)
+            }
+            ExternalFallbackCommand::SystemCommand => (invoked.to_string(), forwarded),
+        }
+    }
+}
+
+fn fallback_candidates(invoked: &str) -> &'static [ExternalFallbackCommand] {
+    match invoked {
+        "fgrep" => &[
+            ExternalFallbackCommand::Ripgrep,
+            ExternalFallbackCommand::UutilsCoreutils,
+            ExternalFallbackCommand::SystemCommand,
+        ],
+        "cat" | "base64" | "cmp" | "dd" | "du" | "find" | "tac" | "wc" | "cksum" | "b2sum"
+        | "md5sum" | "sha224sum" | "sha256sum" | "sha384sum" | "sha512sum" | "head" | "tail"
+        | "rm" | "mv" | "tar" | "shred" | "sort" | "cp" => &[
+            ExternalFallbackCommand::UutilsCoreutils,
+            ExternalFallbackCommand::SystemCommand,
+        ],
+        _ => &[],
+    }
+}
+
+fn should_try_external_fallback(err: &io::Error) -> bool {
+    if err.kind() != io::ErrorKind::InvalidInput {
+        return false;
+    }
+    let lowered = err.to_string().to_ascii_lowercase();
+    lowered.contains("unsupported")
+        || lowered.contains("unknown flag")
+        || lowered.contains("unknown option")
+        || lowered.contains("invalid option")
+}
+
+fn stderr_indicates_option_parse_failure(stderr: &[u8]) -> bool {
+    let lowered = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    lowered.contains("unrecognized option")
+        || lowered.contains("unknown option")
+        || lowered.contains("unsupported option")
+        || lowered.contains("invalid option")
+        || lowered.contains("unexpected argument")
+        || lowered.contains("found argument")
+        || lowered.contains("wasn't expected")
+        || lowered.contains("unknown subcommand")
+        || lowered.contains("unrecognized subcommand")
+}
+
+fn run_external_fallback(invoked: &str, args: &[String]) -> io::Result<Option<i32>> {
+    for candidate in fallback_candidates(invoked) {
+        let (program, command_args) = candidate.build(invoked, args);
+        let child = match Command::new(program)
+            .args(&command_args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let output = child.wait_with_output()?;
+        if matches!(output.status.code(), Some(1 | 2))
+            && stderr_indicates_option_parse_failure(&output.stderr)
+        {
+            continue;
+        }
+        io::stdout().write_all(&output.stdout)?;
+        io::stderr().write_all(&output.stderr)?;
+        return Ok(Some(output.status.code().unwrap_or(1)));
+    }
+    Ok(None)
+}
+
+pub(crate) fn try_external_command_fallback(
+    invoked: &str,
+    args: &[String],
+) -> io::Result<Option<i32>> {
+    run_external_fallback(invoked, args)
 }
 
 fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
@@ -312,6 +419,30 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn unsupported_invalid_input_errors_trigger_external_fallback() {
+        let err = io::Error::new(io::ErrorKind::InvalidInput, "unsupported sort flag --debug");
+        assert!(should_try_external_fallback(&err));
+    }
+
+    #[test]
+    fn non_unsupported_invalid_input_errors_do_not_trigger_external_fallback() {
+        let err = io::Error::new(io::ErrorKind::InvalidInput, "missing argument for -n");
+        assert!(!should_try_external_fallback(&err));
+    }
+
+    #[test]
+    fn fgrep_prefers_rg_then_coreutils_then_system() {
+        assert_eq!(
+            fallback_candidates("fgrep"),
+            &[
+                ExternalFallbackCommand::Ripgrep,
+                ExternalFallbackCommand::UutilsCoreutils,
+                ExternalFallbackCommand::SystemCommand,
+            ]
+        );
+    }
 }
 
 pub fn try_run_subcommand(
@@ -355,7 +486,9 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
     if !is_coreutils_command(invoked) {
         return Ok(None);
     }
-    if is_multicall_help_flag(args.get(1)) && !multicall_short_help_is_real_flag(invoked, args.get(1)) {
+    if is_multicall_help_flag(args.get(1))
+        && !multicall_short_help_is_real_flag(invoked, args.get(1))
+    {
         crate::main_app::print_direct_command_help(invoked, invoked);
         return Ok(Some(0));
     }
@@ -363,53 +496,63 @@ fn run_named_command(invoked: &str, args: &[String]) -> io::Result<Option<i32>> 
         print_coreutils_version(invoked);
         return Ok(Some(0));
     }
-    let code = match invoked {
+    let result = match invoked {
         "cat" => {
             cat::run_cat(args)?;
-            0
+            Ok(0)
         }
-        "base64" => base64::run_base64(args)?,
-        "encrypt" => encrypt::run_encrypt(args)?,
-        "decrypt" => encrypt::run_decrypt(args)?,
-        "cmp" => cmp::run_cmp(args)?,
+        "base64" => base64::run_base64(args),
+        "encrypt" => encrypt::run_encrypt(args),
+        "decrypt" => encrypt::run_decrypt(args),
+        "cmp" => cmp::run_cmp(args),
         "dd" => {
             fro::dd_tool::run_dd(args)?;
-            0
+            Ok(0)
         }
-        "fgrep" => fgrep::run_fgrep(args)?,
-        "find" => find::run_find(args)?,
-        "du" => du::run_du(args)?,
+        "fgrep" => fgrep::run_fgrep(args),
+        "find" => find::run_find(args),
+        "du" => du::run_du(args),
         "tac" => {
             tac::run_tac(args)?;
-            0
+            Ok(0)
         }
-        "wc" => wc::run_wc(args)?,
-        "cksum" => hash::cksum::run_cksum(args)?,
-        "b3sum" => hash::run_hash_sum(args, HashAlgorithm::Blake3)?,
-        "b2sum" => hash::run_hash_sum(args, HashAlgorithm::Blake2b512)?,
-        "md5sum" => hash::run_hash_sum(args, HashAlgorithm::Md5)?,
-        "sha224sum" => hash::run_hash_sum(args, HashAlgorithm::Sha224)?,
-        "sha256sum" => hash::run_hash_sum(args, HashAlgorithm::Sha256)?,
-        "sha384sum" => hash::run_hash_sum(args, HashAlgorithm::Sha384)?,
-        "sha512sum" => hash::run_hash_sum(args, HashAlgorithm::Sha512)?,
+        "wc" => wc::run_wc(args),
+        "cksum" => hash::cksum::run_cksum(args),
+        "b3sum" => hash::run_hash_sum(args, HashAlgorithm::Blake3),
+        "b2sum" => hash::run_hash_sum(args, HashAlgorithm::Blake2b512),
+        "md5sum" => hash::run_hash_sum(args, HashAlgorithm::Md5),
+        "sha224sum" => hash::run_hash_sum(args, HashAlgorithm::Sha224),
+        "sha256sum" => hash::run_hash_sum(args, HashAlgorithm::Sha256),
+        "sha384sum" => hash::run_hash_sum(args, HashAlgorithm::Sha384),
+        "sha512sum" => hash::run_hash_sum(args, HashAlgorithm::Sha512),
         "head" => {
             head::run_head(args)?;
-            0
+            Ok(0)
         }
         "tail" => {
             tail::run_tail(args)?;
-            0
+            Ok(0)
         }
         "pv" => {
             pv::run_pv(args)?;
-            0
+            Ok(0)
         }
-        "rm" => rm::run_rm(args)?,
-        "mv" => mv::run_mv(args)?,
-        "tar" => tar::run_tar(args)?,
-        "shred" => shred::run_shred(args)?,
-        "sort" => sort::run_sort(args)?,
+        "rm" => rm::run_rm(args),
+        "mv" => mv::run_mv(args),
+        "tar" => tar::run_tar(args),
+        "shred" => shred::run_shred(args),
+        "sort" => sort::run_sort(args),
         _ => return Ok(None),
     };
-    Ok(Some(code))
+    match result {
+        Ok(code) => Ok(Some(code)),
+        Err(err) if should_try_external_fallback(&err) => {
+            if let Some(code) = run_external_fallback(invoked, args)? {
+                Ok(Some(code))
+            } else {
+                Err(err)
+            }
+        }
+        Err(err) => Err(err),
+    }
 }

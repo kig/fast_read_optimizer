@@ -30,8 +30,9 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [ ] Explore layout-aware scheduling ideas only when profiling says traversal is still media- or cache-order limited (inode ordering, locality-aware worker assignment, batching small files).
 - [ ] `cp` / `mv` / `dd`: keep investing in the shared copy/write pipeline and finish the highest-value compatibility slices that preserve the optimized backend instead of exploding the long-tail flag matrix.
   - [ ] `cp`/`fro copy`: prioritize `--archive` / preserve-metadata flows, dereference/no-dereference choices, and other path-preserving behavior that matters for real recursive copies.
+  - [x] Unsupported multicall/coreutils flags now fall back externally instead of hard-failing: `fgrep` first tries `rg --fixed-strings`, then `coreutils <cmd>`, then the system command; other bounded coreutils commands try `coreutils <cmd>` and then the system command, and `cp` unknown-flag parsing now reuses the same fallback chain from the alias parser.
   - [ ] `mv`: keep the same-fs fast path and cross-fs copy+remove path healthy; treat the observed ZFS-specific anomaly as background investigation, not active front-of-queue work.
-- [ ] `sort`: keep extending the bounded newline/NUL-delimited sort backend one compare mode at a time instead of jumping to full GNU semantics; the tracked row is now `9/12`, with `-M`, `-V`, and `-k` remaining after landing `-z` plus `-g/-h`.
+- [ ] `sort`: keep extending the bounded newline/NUL-delimited sort backend one compare mode at a time instead of jumping to full GNU semantics; the tracked row is now `11/12`, with `-k` remaining after landing `-z`, `-g/-h`, and the bounded `-M/-V` compare modes.
 - [ ] `wc` / checksum family: prioritize the common byte/line/word/count and `md5sum`-style integrity flows that directly reuse fast read/hash primitives; long-tail digest-CLI parity can wait behind those wins.
 
 ### P1: tuning, config selection, and benchmark safety
@@ -69,7 +70,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] `wc`: prioritize `--bytes`, `--lines`, and `--words` because they align with the existing fast scan path and observed usage.
 - [ ] `md5sum` / shared digest UX: keep the ordinary output/check flows polished before spending time on long-tail `b2sum` / `b3sum` flags.
 - [ ] `grep` / `fgrep`: keep moving toward a more complete high-performance literal-search tool, using `rg` libraries where practical, but do not let it crowd out the higher-use file-movement and tree-walk work above.
-- [ ] `sort`: the compare-help snapshot shows a much larger GNU long tail, but the bounded semantic next steps remain `-M`, `-V`, and `-k`; prefer compare-mode-friendly semantics before key extraction, and keep `fro sort -h` reserved for human-numeric sort while `fro sort --help` remains the explicit help path.
+- [ ] `sort`: the compare-help snapshot shows a much larger GNU long tail, but the bounded semantic next step is now `-k`; prefer compare-mode-friendly semantics before broader locale/key semantics, and keep `fro sort -h` reserved for human-numeric sort while `fro sort --help` remains the explicit help path.
 
 ### P2: transform-style helpers and lower-frequency but strategic work
 

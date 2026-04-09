@@ -55,6 +55,28 @@ pub(super) enum ParseOutcome {
     Parsed(ParsedArgs),
 }
 
+fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
+    if raw_args.get(1).is_some_and(|arg| arg == "cp") {
+        let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
+        rebuilt.push("cp".to_string());
+        rebuilt.extend(raw_args.iter().skip(2).cloned());
+        rebuilt
+    } else if raw_args.get(1).is_some_and(|arg| arg == "copy") {
+        let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
+        rebuilt.push("cp".to_string());
+        rebuilt.extend(
+            raw_args
+                .iter()
+                .skip(2)
+                .filter(|arg| arg.as_str() != "--cp-compat")
+                .cloned(),
+        );
+        rebuilt
+    } else {
+        raw_args.to_vec()
+    }
+}
+
 pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     let raw_args: Vec<String> = env::args().collect();
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
@@ -67,7 +89,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         print_version(raw_args[0].as_str());
         return Ok(ParseOutcome::Early(0));
     }
-    let args = coreutils::rewrite_subcommand_alias(coreutils::rewrite_alias_args(raw_args));
+    let args = coreutils::rewrite_subcommand_alias(coreutils::rewrite_alias_args(raw_args.clone()));
     if args.len() < 2 || is_help_flag(args[1].as_str()) {
         print_general_help(args[0].as_str());
         return Ok(ParseOutcome::Early(0));
@@ -397,6 +419,14 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                     })?;
                 }
             } else {
+                if mode == "copy" && cp_compat {
+                    let fallback_args = rebuild_cp_fallback_args(&raw_args);
+                    if let Some(code) =
+                        coreutils::try_external_command_fallback("cp", &fallback_args)?
+                    {
+                        return Ok(ParseOutcome::Early(code));
+                    }
+                }
                 eprintln!("Unknown flag for {}: {}", args[0], args[i]);
                 println!();
                 if let Some(help) = command_help(args[0].as_str()) {
@@ -892,4 +922,50 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         overlap_large_file,
         small_file_thread_cache_state,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebuild_cp_fallback_args;
+
+    #[test]
+    fn rebuild_cp_fallback_args_normalizes_fro_cp_subcommand() {
+        let raw_args = vec![
+            "fro".to_string(),
+            "cp".to_string(),
+            "--backup=numbered".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ];
+        assert_eq!(
+            rebuild_cp_fallback_args(&raw_args),
+            vec![
+                "cp".to_string(),
+                "--backup=numbered".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebuild_cp_fallback_args_strips_cp_compat_marker_for_copy_mode() {
+        let raw_args = vec![
+            "fro".to_string(),
+            "copy".to_string(),
+            "--cp-compat".to_string(),
+            "--backup=numbered".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ];
+        assert_eq!(
+            rebuild_cp_fallback_args(&raw_args),
+            vec![
+                "cp".to_string(),
+                "--backup=numbered".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
 }

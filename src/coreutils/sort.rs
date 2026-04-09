@@ -1077,24 +1077,20 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                     }
                 }
                 if !handled {
-                    eprintln!("sort: unsupported option '{other}'");
-                    eprintln!(
-                        "sort: fro sort currently supports bytewise, numeric, general-numeric, human-numeric, month, or version record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
-                    );
-                    eprintln!("Try 'sort --help' for more information.");
-                    return Ok(2);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported sort flag: {other}"),
+                    ));
                 }
                 if consumed_next {
                     idx += 1;
                 }
             }
             other if !end_flags && other.starts_with('-') && other != "-" => {
-                eprintln!("sort: unsupported option '{other}'");
-                eprintln!(
-                    "sort: fro sort currently supports bytewise, numeric, general-numeric, human-numeric, month, or version record sorting, optional -z NUL terminators, merge/check modes, optional reverse/unique output, and -o/-T."
-                );
-                eprintln!("Try 'sort --help' for more information.");
-                return Ok(2);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported sort flag: {other}"),
+                ));
             }
             other => files.push(other.to_string()),
         }
