@@ -437,6 +437,10 @@ pub(crate) fn create_tar_archive(source: &Path, output: &Path, verbose: bool) ->
     recursive::archive::create_uncompressed_tar(source, output, verbose)
 }
 
+pub(crate) fn list_tar_archive(path: &Path) -> io::Result<()> {
+    recursive::archive::list_uncompressed_tar(path)
+}
+
 pub(crate) fn bench_tar_archive(
     variant: &str,
     source: &Path,

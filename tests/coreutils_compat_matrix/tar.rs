@@ -10,9 +10,8 @@ fn assert_success(output: Output) -> Output {
     output
 }
 
-#[test]
-fn cartesian_tar_create_matches_system_extraction() {
-    let tmp = unique_temp_dir("fro-coreutils-tar-matrix");
+fn tar_fixture(prefix: &str) -> (PathBuf, PathBuf, String) {
+    let tmp = unique_temp_dir(prefix);
     let source_root = tmp.join("tar-src");
     let source_name = source_root
         .file_name()
@@ -31,7 +30,12 @@ fn cartesian_tar_create_matches_system_extraction() {
     )
     .unwrap();
     symlink("../small.txt", source_root.join("nested/link-small")).unwrap();
+    (tmp, source_root, source_name)
+}
 
+#[test]
+fn cartesian_tar_create_matches_system_extraction() {
+    let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-matrix");
     let fro_tar = tmp.join("fro.tar");
     let sys_tar = tmp.join("sys.tar");
     let fro_out = assert_success(run_fro(
@@ -106,4 +110,53 @@ fn cartesian_tar_create_matches_system_extraction() {
     let fro_tree = snapshot_tree(&fro_extract.join(root_name));
     let sys_tree = snapshot_tree(&sys_extract.join(root_name));
     assert_eq!(fro_tree, sys_tree);
+}
+
+#[test]
+fn cartesian_tar_list_matches_system_tar() {
+    let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-list");
+    let fro_tar = tmp.join("fro.tar");
+    let sys_tar = tmp.join("sys.tar");
+
+    assert_success(run_fro(
+        "tar",
+        &[
+            "-cf",
+            fro_tar.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ],
+    ));
+    let sys_out = run_system(
+        "bash",
+        &[
+            "-lc",
+            &format!(
+                "cd {} && tar -cf {} {}",
+                tmp.display(),
+                sys_tar.display(),
+                source_name
+            ),
+        ],
+    );
+    assert!(
+        sys_out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sys_out.stdout),
+        String::from_utf8_lossy(&sys_out.stderr)
+    );
+
+    for archive in [&fro_tar, &sys_tar] {
+        let archive_str = archive.to_str().unwrap();
+        assert_same_result(
+            run_fro("tar", &["-tf", archive_str]),
+            run_system("tar", &["-tf", archive_str]),
+            archive_str,
+        );
+    }
+
+    assert_same_result(
+        run_fro("tar", &["--list", "--file", sys_tar.to_str().unwrap()]),
+        run_system("tar", &["--list", "--file", sys_tar.to_str().unwrap()]),
+        "long flags",
+    );
 }

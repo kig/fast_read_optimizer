@@ -245,8 +245,8 @@ const ROWS: &[CoverageRow] = &[
     },
     CoverageRow {
         name: "tar",
-        covered: &["-c/--create", "-f/--file"],
-        remaining: &["-v/--verbose", "-t/--list", "-x/--extract"],
+        covered: &["-c/--create", "-f/--file", "-t/--list"],
+        remaining: &["-v/--verbose", "-x/--extract"],
     },
     CoverageRow {
         name: "wc",
@@ -344,7 +344,7 @@ shred      6/6  100%  remaining: none
 sort       3/10  30%  remaining: -n/-g/-h, -M, -V, -k, -m/-c, -z, -o/-T
 tac        2/2  100%  remaining: none
 tail       4/4  100%  remaining: none
-tar        2/5   40%  remaining: -v/--verbose, -t/--list, -x/--extract
+tar        3/5   60%  remaining: -v/--verbose, -x/--extract
 wc         6/6  100%  remaining: none
 ";
 
@@ -367,7 +367,8 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
         .contains("zero-terminated records, output/temp-file controls, and locale collation."));
 
     let tar_source = include_str!("../src/coreutils/tar.rs");
-    assert!(tar_source.contains("supports only create mode (-c/--create)"));
+    assert!(tar_source
+        .contains("supports only create (-c/--create) and whole-archive list (-t/--list) modes"));
 
     let find_source = include_str!("../src/coreutils/find.rs");
     assert!(find_source

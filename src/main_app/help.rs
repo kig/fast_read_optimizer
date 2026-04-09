@@ -399,10 +399,16 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tar" => Some(CommandHelp {
             name: "tar",
-            usage: "tar -cf <archive.tar> [-v] <source>",
-            summary: "Create an uncompressed ustar archive from a file or directory tree.",
-            notes: &["Only create mode is currently implemented; extraction stays delegated to system tar."],
-            examples: &[("Archive one directory", "tar -cf tree.tar mytree")],
+            usage: "tar (-cf <archive.tar> [-v] <source> | -tf <archive.tar>)",
+            summary: "Create or list an uncompressed ustar archive.",
+            notes: &[
+                "Supported compatibility slice: create (-c/--create) and whole-archive list (-t/--list) with -f/--file.",
+                "Verbose listing, extraction, compression, stdin archives, and member filters remain unsupported.",
+            ],
+            examples: &[
+                ("Archive one directory", "tar -cf tree.tar mytree"),
+                ("List one archive", "tar -tf tree.tar"),
+            ],
         }),
         "shred" => Some(CommandHelp {
             name: "shred",

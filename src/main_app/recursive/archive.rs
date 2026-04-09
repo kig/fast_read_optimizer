@@ -75,6 +75,7 @@ mod bench;
 mod format;
 mod manifest;
 mod parallel;
+mod reader;
 pub(crate) use bench::bench_tar_archive_variant;
 
 use self::format::*;
@@ -244,4 +245,8 @@ pub(crate) fn create_uncompressed_tar(
         );
     }
     Ok(total_size)
+}
+
+pub(crate) fn list_uncompressed_tar(path: &Path) -> io::Result<()> {
+    reader::list_tar_archive(path)
 }
