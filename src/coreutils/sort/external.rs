@@ -11,6 +11,16 @@ const SORT_MEM_LIMIT_ENV: &str = "FRO_SORT_MAX_IN_MEMORY_BYTES";
 const SORT_MIN_SPILL_CHUNK_BYTES: u64 = 8 << 20;
 const SORT_STREAM_BLOCK_SIZE: usize = 2 << 20;
 
+pub(super) struct SortCheckFailure {
+    pub(super) line_number: u64,
+    pub(super) line: Vec<u8>,
+}
+
+pub(super) struct SortCheckResult {
+    pub(super) total_bytes: u64,
+    pub(super) disorder: Option<SortCheckFailure>,
+}
+
 pub(super) fn sort_inputs(
     inputs: &[StreamInput],
     io_mode: IOMode,
@@ -95,6 +105,76 @@ fn sort_inputs_streamed(
     Ok(total_bytes)
 }
 
+pub(super) fn merge_presorted_inputs(
+    inputs: &[StreamInput],
+    io_mode: IOMode,
+    mode: SortMode,
+    unique: bool,
+    reverse: bool,
+    output_path: Option<&str>,
+) -> io::Result<u64> {
+    let mut temp_files = SpillTempFiles::new();
+    let mut next_sequence = 0u64;
+    let mut total_bytes = 0u64;
+    for input in inputs {
+        let path = temp_files.next_chunk_path();
+        total_bytes = total_bytes
+            .checked_add(
+                write_presorted_input_chunk(&path, input, io_mode, &mut next_sequence).map_err(
+                    |err| {
+                        io::Error::new(
+                            err.kind(),
+                            format!("cannot read '{}': {err}", sort_input_label(input)),
+                        )
+                    },
+                )?,
+            )
+            .ok_or_else(|| io::Error::other("sort merge input byte count overflow"))?;
+        temp_files.paths.push(path);
+    }
+    with_output_writer(output_path, io_mode, |out| {
+        merge_sorted_chunks(out, &temp_files.paths, mode, unique, reverse)
+    })?;
+    Ok(total_bytes)
+}
+
+pub(super) fn check_input_sorted(
+    input: &StreamInput,
+    io_mode: IOMode,
+    mode: SortMode,
+    unique: bool,
+    reverse: bool,
+) -> io::Result<SortCheckResult> {
+    let mut checker = SortCheckState::new(mode, unique, reverse);
+    match visit_ordered_input_counted(input, io_mode, |block| checker.push_block(block)) {
+        Ok(total_bytes) => {
+            checker.finish()?;
+            Ok(SortCheckResult {
+                total_bytes,
+                disorder: None,
+            })
+        }
+        Err(err) => {
+            if let Some(disorder) = err
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<SortCheckDisorder>())
+            {
+                return Ok(SortCheckResult {
+                    total_bytes: 0,
+                    disorder: Some(SortCheckFailure {
+                        line_number: disorder.line_number,
+                        line: disorder.line.clone(),
+                    }),
+                });
+            }
+            Err(io::Error::new(
+                err.kind(),
+                format!("cannot read '{}': {err}", sort_input_label(input)),
+            ))
+        }
+    }
+}
+
 fn sort_memory_budget_bytes() -> io::Result<u64> {
     if let Ok(value) = std::env::var(SORT_MEM_LIMIT_ENV) {
         return value.parse::<u64>().map_err(|err| {
@@ -127,6 +207,80 @@ fn spill_chunk_target_bytes(memory_budget: u64) -> usize {
         .max(SORT_MIN_SPILL_CHUNK_BYTES)
         .min(usize::MAX as u64) as usize
 }
+
+struct SortCheckState {
+    mode: SortMode,
+    unique: bool,
+    reverse: bool,
+    previous: Option<Vec<u8>>,
+    carry: Vec<u8>,
+    line_number: u64,
+}
+
+impl SortCheckState {
+    fn new(mode: SortMode, unique: bool, reverse: bool) -> Self {
+        Self {
+            mode,
+            unique,
+            reverse,
+            previous: None,
+            carry: Vec::new(),
+            line_number: 0,
+        }
+    }
+
+    fn push_block(&mut self, block: &[u8]) -> io::Result<()> {
+        let mut consumed = 0usize;
+        for newline in memchr_iter(b'\n', block) {
+            self.carry.extend_from_slice(&block[consumed..newline]);
+            self.finish_line()?;
+            consumed = newline + 1;
+        }
+        self.carry.extend_from_slice(&block[consumed..]);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        if !self.carry.is_empty() {
+            self.finish_line()?;
+        }
+        Ok(())
+    }
+
+    fn finish_line(&mut self) -> io::Result<()> {
+        self.line_number = self
+            .line_number
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sort check line count overflow"))?;
+        let current = std::mem::take(&mut self.carry);
+        if let Some(previous) = self.previous.as_deref() {
+            let compare = compare_line_bytes(previous, &current, self.mode, self.reverse);
+            let strict_duplicate = self.unique && same_sort_key(previous, &current, self.mode);
+            if compare == Ordering::Greater || strict_duplicate {
+                return Err(io::Error::other(SortCheckDisorder {
+                    line_number: self.line_number,
+                    line: current,
+                }));
+            }
+        }
+        self.previous = Some(current);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SortCheckDisorder {
+    line_number: u64,
+    line: Vec<u8>,
+}
+
+impl std::fmt::Display for SortCheckDisorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sort disorder at line {}", self.line_number)
+    }
+}
+
+impl std::error::Error for SortCheckDisorder {}
 
 fn total_regular_input_bytes(inputs: &[StreamInput]) -> io::Result<Option<u64>> {
     let mut total = 0u64;
@@ -304,13 +458,50 @@ impl Drop for SpillTempFiles {
     }
 }
 
+fn write_chunk_record<W: Write>(writer: &mut W, sequence: u64, line: &[u8]) -> io::Result<()> {
+    writer.write_all(&sequence.to_le_bytes())?;
+    writer.write_all(&(line.len() as u64).to_le_bytes())?;
+    writer.write_all(line)
+}
+
+fn write_presorted_input_chunk(
+    path: &Path,
+    input: &StreamInput,
+    io_mode: IOMode,
+    next_sequence: &mut u64,
+) -> io::Result<u64> {
+    let file = File::create(path)?;
+    let mut writer = StdBufWriter::new(file);
+    let mut carry = Vec::new();
+    let total_bytes = visit_ordered_input_counted(input, io_mode, |block| {
+        let mut consumed = 0usize;
+        for newline in memchr_iter(b'\n', block) {
+            carry.extend_from_slice(&block[consumed..newline]);
+            write_chunk_record(&mut writer, *next_sequence, &carry)?;
+            *next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
+            carry.clear();
+            consumed = newline + 1;
+        }
+        carry.extend_from_slice(&block[consumed..]);
+        Ok(())
+    })?;
+    if !carry.is_empty() {
+        write_chunk_record(&mut writer, *next_sequence, &carry)?;
+        *next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
+    }
+    writer.flush()?;
+    Ok(total_bytes)
+}
+
 fn write_chunk_file(path: &Path, lines: &[SortLineRef], storage: &[u8]) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = StdBufWriter::new(file);
     for line in lines {
-        writer.write_all(&line.sequence.to_le_bytes())?;
-        writer.write_all(&(line.len as u64).to_le_bytes())?;
-        writer.write_all(line.bytes(storage))?;
+        write_chunk_record(&mut writer, line.sequence, line.bytes(storage))?;
     }
     writer.flush()
 }

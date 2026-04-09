@@ -79,12 +79,15 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("newline-delimited"));
     assert!(stdout.contains("byte"));
     assert!(stdout.contains("numeric"));
+    assert!(stdout.contains("--check"));
+    assert!(stdout.contains("--merge"));
     assert!(stdout.contains("--reverse"));
     assert!(stdout.contains("--unique"));
     assert!(stdout.contains("--numeric-sort"));
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("Unsupported GNU sort features"));
     assert!(stdout.contains("month/version/human"));
+    assert!(!stdout.contains("merge/check modes"));
 }
 
 #[test]
@@ -245,6 +248,133 @@ fn sort_rejects_unsupported_flags_with_help_hint() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported option '-M'"));
     assert!(stderr.contains("Try 'sort --help' for more information."));
+}
+
+#[test]
+fn sort_merge_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-merge");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    let c = tmp.join("c.txt");
+    fs::write(&a, b"alpha\ncharlie\n").unwrap();
+    fs::write(&b, b"beta\ndelta\n").unwrap();
+    fs::write(&c, b"1\n10\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-m"],
+            vec!["--merge"],
+            vec!["-mu"],
+            vec!["-mr"],
+            vec!["-mn"],
+            vec!["-mnr"],
+        ] {
+            let files = if sort_flags.iter().any(|flag| flag.contains('n')) {
+                vec![c.to_str().unwrap(), c.to_str().unwrap()]
+            } else {
+                vec![a.to_str().unwrap(), b.to_str().unwrap()]
+            };
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(sort_flags.iter().copied());
+            fro_args.extend(files.iter().copied());
+            let mut sys_args = sort_flags.clone();
+            sys_args.extend(files.iter().copied());
+            assert_same_result(
+                run_fro("sort", &fro_args),
+                run_system_sort(&sys_args),
+                &format!("sort merge {:?}", fro_args),
+            );
+        }
+    }
+
+    assert_same_result(
+        run_fro_with_stdin("sort", &["-m", "-"], b"alpha\nbeta\n"),
+        run_system_sort_with_stdin(&["-m", "-"], b"alpha\nbeta\n"),
+        "sort merge stdin",
+    );
+}
+
+#[test]
+fn sort_merge_output_file_supports_in_place_rewrite() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-merge-output");
+    let fro_in_place = tmp.join("fro-in-place.txt");
+    let sys_in_place = tmp.join("sys-in-place.txt");
+    fs::write(&fro_in_place, b"alpha\nbeta\n").unwrap();
+    fs::write(&sys_in_place, b"alpha\nbeta\n").unwrap();
+
+    let fro = run_fro(
+        "sort",
+        &[
+            "-m",
+            "-o",
+            fro_in_place.to_str().unwrap(),
+            fro_in_place.to_str().unwrap(),
+        ],
+    );
+    let system = run_system_sort(&[
+        "-m",
+        "-o",
+        sys_in_place.to_str().unwrap(),
+        sys_in_place.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(fs::read(&fro_in_place).unwrap(), fs::read(&sys_in_place).unwrap());
+}
+
+#[test]
+fn sort_check_matches_system_status_and_diagnostics() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-check");
+    let sorted = tmp.join("sorted.txt");
+    let unsorted = tmp.join("unsorted.txt");
+    let numeric = tmp.join("numeric.txt");
+    let numeric_dup = tmp.join("numeric-dup.txt");
+    fs::write(&sorted, b"alpha\nbeta\n").unwrap();
+    fs::write(&unsorted, b"beta\nalpha\n").unwrap();
+    fs::write(&numeric, b"2\n10\n").unwrap();
+    fs::write(&numeric_dup, b"1\n1.0\n").unwrap();
+
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-c", sorted.to_str().unwrap()],
+            vec!["--check", unsorted.to_str().unwrap()],
+            vec!["-cr", unsorted.to_str().unwrap()],
+            vec!["-cn", numeric.to_str().unwrap()],
+            vec!["-cnu", numeric_dup.to_str().unwrap()],
+        ] {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(sort_flags.iter().copied());
+            assert_same_result(
+                run_fro("sort", &fro_args),
+                run_system_sort(&sort_flags),
+                &format!("sort check {:?}", fro_args),
+            );
+        }
+    }
+
+    assert_same_result(
+        run_fro_with_stdin("sort", &["-c", "-"], b"beta\nalpha\n"),
+        run_system_sort_with_stdin(&["-c", "-"], b"beta\nalpha\n"),
+        "sort check stdin",
+    );
+}
+
+#[test]
+fn sort_check_rejects_extra_operands_and_output_flag() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-check-invalid");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"alpha\n").unwrap();
+    fs::write(&b, b"beta\n").unwrap();
+
+    let fro = run_fro("sort", &["-c", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let system = run_system_sort(&["-c", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_same_result(fro, system, "sort check extra operand");
+
+    let fro = run_fro("sort", &["--check", "-o", "out.txt", a.to_str().unwrap()]);
+    let system = run_system_sort(&["--check", "-o", "out.txt", a.to_str().unwrap()]);
+    assert_same_result(fro, system, "sort check incompatible output");
 }
 
 #[test]

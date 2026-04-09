@@ -237,12 +237,13 @@ const ROWS: &[CoverageRow] = &[
         name: "sort",
         covered: &[
             "(default bytewise ascending)",
+            "-m/-c",
             "-n/--numeric-sort",
             "-r/--reverse",
             "-u/--unique",
             "-o/--output",
         ],
-        remaining: &["-g/-h", "-M", "-V", "-k", "-m/-c", "-z", "-T"],
+        remaining: &["-g/-h", "-M", "-V", "-k", "-z", "-T"],
     },
     CoverageRow {
         name: "tac",
@@ -358,7 +359,7 @@ sha256sum 11/11 100%  remaining: none
 sha384sum 11/11 100%  remaining: none
 sha512sum 11/11 100%  remaining: none
 shred      6/6  100%  remaining: none
-sort       5/12  42%  remaining: -g/-h, -M, -V, -k, -m/-c, -z, -T
+sort       6/12  50%  remaining: -g/-h, -M, -V, -k, -z, -T
 tac        2/2  100%  remaining: none
 tail       4/4  100%  remaining: none
 tar        5/5  100%  remaining: none
@@ -379,7 +380,7 @@ fn compat_coverage_rows_match_dispatch_minus_custom_multicalls() {
 fn compat_coverage_explicit_gap_rows_match_source_help() {
     let sort_source = include_str!("../src/coreutils/sort.rs");
     assert!(sort_source.contains("Unsupported GNU sort features currently return an error"));
-    assert!(sort_source.contains("general keys, month/version/human modes, merge/check modes,"));
+    assert!(sort_source.contains("general keys, month/version/human modes,"));
     assert!(
         sort_source.contains("zero-terminated records, temp-file controls, and locale collation.")
     );

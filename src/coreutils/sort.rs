@@ -173,22 +173,32 @@ fn compare_output_lines(
     right: &[u8],
     right_sequence: u64,
     mode: SortMode,
-    unique: bool,
+    _unique: bool,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let asc = compare_line_bytes(left, right, mode, false)
+        .then_with(|| left_sequence.cmp(&right_sequence));
+    if reverse {
+        asc.reverse()
+    } else {
+        asc
+    }
+}
+
+fn compare_line_bytes(
+    left: &[u8],
+    right: &[u8],
+    mode: SortMode,
     reverse: bool,
 ) -> std::cmp::Ordering {
     let asc = match mode {
-        SortMode::Bytewise => left
-            .cmp(right)
-            .then_with(|| left_sequence.cmp(&right_sequence)),
+        SortMode::Bytewise => left.cmp(right),
         SortMode::Numeric => {
             let numeric = compare_numeric_lines(left, right);
             if numeric != std::cmp::Ordering::Equal {
                 numeric
-            } else if unique {
-                left_sequence.cmp(&right_sequence)
             } else {
                 left.cmp(right)
-                    .then_with(|| left_sequence.cmp(&right_sequence))
             }
         }
     };
@@ -214,9 +224,13 @@ fn print_sort_help(program: &str) {
     println!(
         "This bounded slice sorts newline-delimited records in locale-independent byte or numeric order."
     );
-    println!("It currently supports the default case plus numeric/reverse/unique and -o output.");
+    println!(
+        "It currently supports the default case plus numeric/reverse/unique, merge/check, and -o output."
+    );
     println!();
     println!("Supported options:");
+    println!("  -c, --check          check whether one input is already sorted");
+    println!("  -m, --merge          merge already sorted inputs without resorting");
     println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
     println!("  -r, --reverse        reverse the result of comparisons");
     println!("  -u, --unique         output only the first of an equal run");
@@ -233,8 +247,10 @@ fn print_sort_help(program: &str) {
     println!("  - Use '--' before file names that start with '-'.");
     println!("  - Bytewise in-memory sorting uses a StringZilla argsort fast path.");
     println!("  - Inputs larger than available memory spill sorted runs and merge them.");
+    println!("  - -m reuses the spill/merge backend on already sorted inputs.");
+    println!("  - -c validates one input stream and exits 1 on the first disorder.");
     println!("  - Unsupported GNU sort features currently return an error:");
-    println!("    general keys, month/version/human modes, merge/check modes,");
+    println!("    general keys, month/version/human modes,");
     println!("    zero-terminated records, temp-file controls, and locale collation.");
 }
 
@@ -331,6 +347,8 @@ fn finalize_sorted_lines(
 
 fn apply_short_sort_flags(
     arg: &str,
+    check: &mut bool,
+    merge: &mut bool,
     mode: &mut SortMode,
     reverse: &mut bool,
     unique: &mut bool,
@@ -340,6 +358,8 @@ fn apply_short_sort_flags(
     }
     for flag in arg[1..].bytes() {
         match flag {
+            b'c' => *check = true,
+            b'm' => *merge = true,
             b'n' => *mode = SortMode::Numeric,
             b'r' => *reverse = true,
             b'u' => *unique = true,
@@ -394,6 +414,8 @@ fn flush_sort_output_buffer<W: Write + ?Sized>(
 pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut report_throughput = false;
+    let mut check = false;
+    let mut merge = false;
     let mut mode = SortMode::Bytewise;
     let mut reverse = false;
     let mut unique = false;
@@ -410,6 +432,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 print_sort_help(args[0].as_str());
                 return Ok(0);
             }
+            "-c" | "--check" if !end_flags => check = true,
+            "-m" | "--merge" if !end_flags => merge = true,
             "-n" | "--numeric-sort" if !end_flags => mode = SortMode::Numeric,
             "-r" | "--reverse" if !end_flags => reverse = true,
             "-u" | "--unique" if !end_flags => unique = true,
@@ -431,7 +455,14 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             }
             other
                 if !end_flags
-                    && apply_short_sort_flags(other, &mut mode, &mut reverse, &mut unique) => {}
+                    && apply_short_sort_flags(
+                        other,
+                        &mut check,
+                        &mut merge,
+                        &mut mode,
+                        &mut reverse,
+                        &mut unique,
+                    ) => {}
             other
                 if !end_flags
                     && other.starts_with('-')
@@ -442,6 +473,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 let mut consumed_next = false;
                 for (pos, flag) in other[1..].char_indices() {
                     match flag {
+                        'c' => check = true,
+                        'm' => merge = true,
                         'n' => mode = SortMode::Numeric,
                         'r' => reverse = true,
                         'u' => unique = true,
@@ -469,7 +502,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 if !handled {
                     eprintln!("sort: unsupported option '{other}'");
                     eprintln!(
-                        "sort: fro sort currently supports bytewise or numeric line sorting plus optional reverse/unique output and -o."
+                        "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o."
                     );
                     eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
@@ -481,7 +514,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other if !end_flags && other.starts_with('-') && other != "-" => {
                 eprintln!("sort: unsupported option '{other}'");
                 eprintln!(
-                    "sort: fro sort currently supports bytewise or numeric line sorting plus optional reverse/unique output and -o."
+                    "sort: fro sort currently supports bytewise or numeric line sorting, merge/check modes, optional reverse/unique output, and -o."
                 );
                 eprintln!("Try 'sort --help' for more information.");
                 return Ok(2);
@@ -489,6 +522,15 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other => files.push(other.to_string()),
         }
         idx += 1;
+    }
+
+    if check && files.len() > 1 {
+        eprintln!("sort: extra operand '{}' not allowed with -c", files[1]);
+        return Ok(2);
+    }
+    if check && output_path.is_some() {
+        eprintln!("sort: options '-co' are incompatible");
+        return Ok(2);
     }
 
     let inputs = parse_stream_inputs(files);
@@ -504,26 +546,58 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     }
 
     let started_at = std::time::Instant::now();
-    let total_bytes = match external::sort_inputs(
-        &inputs,
-        io_mode,
-        mode,
-        unique,
-        reverse,
-        output_path.as_deref(),
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            if let Some(path) = output_path.as_deref() {
-                if err.kind() == io::ErrorKind::PermissionDenied {
-                    eprintln!("sort: cannot write '{path}': {err}");
+    let total_bytes = if check {
+        match external::check_input_sorted(&inputs[0], io_mode, mode, unique, reverse) {
+            Ok(result) => {
+                if let Some(disorder) = result.disorder {
+                    eprintln!(
+                        "sort: {}:{}: disorder: {}",
+                        sort_input_label(&inputs[0]),
+                        disorder.line_number,
+                        String::from_utf8_lossy(&disorder.line)
+                    );
+                    return Ok(1);
+                }
+                result.total_bytes
+            }
+            Err(err) => {
+                eprintln!("sort: {err}");
+                return Ok(2);
+            }
+        }
+    } else {
+        match if merge {
+            external::merge_presorted_inputs(
+                &inputs,
+                io_mode,
+                mode,
+                unique,
+                reverse,
+                output_path.as_deref(),
+            )
+        } else {
+            external::sort_inputs(
+                &inputs,
+                io_mode,
+                mode,
+                unique,
+                reverse,
+                output_path.as_deref(),
+            )
+        } {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if let Some(path) = output_path.as_deref() {
+                    if err.kind() == io::ErrorKind::PermissionDenied {
+                        eprintln!("sort: cannot write '{path}': {err}");
+                    } else {
+                        eprintln!("sort: {err}");
+                    }
                 } else {
                     eprintln!("sort: {err}");
                 }
-            } else {
-                eprintln!("sort: {err}");
+                return Ok(2);
             }
-            return Ok(2);
         }
     };
 
@@ -697,6 +771,18 @@ mod tests {
                 .map(|line| line.bytes(&storage).to_vec())
                 .collect::<Vec<_>>(),
             vec![b"1.0".to_vec(), b"2".to_vec()]
+        );
+    }
+
+    #[test]
+    fn compare_line_bytes_matches_numeric_last_resort_ordering() {
+        assert_eq!(
+            compare_line_bytes(b"1", b"1.0", SortMode::Numeric, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_line_bytes(b"beta", b"alpha", SortMode::Bytewise, true),
+            std::cmp::Ordering::Less
         );
     }
 }
