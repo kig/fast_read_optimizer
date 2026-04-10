@@ -68,6 +68,7 @@ const THROUGHPUT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::fro
 pub(crate) enum TarCompression {
     None,
     Gzip,
+    Zstd,
 }
 
 #[derive(Clone)]

@@ -30,10 +30,11 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [ ] Explore layout-aware scheduling ideas only when profiling says traversal is still media- or cache-order limited (inode ordering, locality-aware worker assignment, batching small files).
 - [ ] `cp` / `mv` / `dd`: keep investing in the shared copy/write pipeline and finish the highest-value compatibility slices that preserve the optimized backend instead of exploding the long-tail flag matrix.
   - [ ] `cp`/`fro copy`: prioritize `--archive` / preserve-metadata flows, dereference/no-dereference choices, and other path-preserving behavior that matters for real recursive copies.
-  - [x] Unsupported multicall/coreutils flags now fall back externally instead of hard-failing: `fgrep` first tries `rg --fixed-strings`, then `coreutils <cmd>`, then the system command; other bounded coreutils commands try `coreutils <cmd>` and then the system command, and `cp` unknown-flag parsing now reuses the same fallback chain from the alias parser.
+  - [x] Unsupported multicall/coreutils flags now fall back externally instead of hard-failing: `fgrep` first tries `rg --fixed-strings`, then `coreutils <cmd>`, then the system command; other bounded coreutils commands try `coreutils <cmd>` and then the system command, and `cp` unknown-flag parsing now reuses the same fallback chain from the alias parser. Use `--no-fallback` to force local failure during tests, and set `FRO_LOG_FALLBACKS=1` to log each delegated path while auditing a real system workload.
   - [ ] `mv`: keep the same-fs fast path and cross-fs copy+remove path healthy; treat the observed ZFS-specific anomaly as background investigation, not active front-of-queue work.
 - [ ] `sort`: keep extending the bounded newline/NUL-delimited sort backend one compare mode at a time instead of jumping to full GNU semantics; the tracked row is now `11/12`, with `-k` remaining after landing `-z`, `-g/-h`, and the bounded `-M/-V` compare modes.
 - [ ] `wc` / checksum family: prioritize the common byte/line/word/count and `md5sum`-style integrity flows that directly reuse fast read/hash primitives; long-tail digest-CLI parity can wait behind those wins.
+  - [ ] Latest tiny-file alias sweep still shows the worst low-latency gaps in `cmp`, the digest family (`md5sum`/`sha*sum`/`b2sum`), then `du`, `tac`, and `sort`; `encrypt` / `decrypt` are now effectively at system parity on the measured small-file slice.
 
 ### P1: tuning, config selection, and benchmark safety
 
@@ -45,6 +46,13 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [ ] Store measured maximum performance per mount and use it to inform IO-path selection.
 - [ ] Application-level tuning with the optimizer for downstream consumers of the library hot paths.
 - [ ] Avoid reading the config file on every tool invocation only if benchmarking shows it matters.
+- [ ] Reduce shared multicall startup tax (config load, parser/front-end work, and other per-invocation fixed costs) where real shell timings show the cost matters.
+  - [x] Missing device-db `ENOENT` probes are now memoized per process, cutting repeated missing-db `openat` failures on sampled tiny invocations from `18` to `3`.
+  - [x] Default-path `load_config(None)` is now cached per process and refreshed on save; a focused `2000`-load benchmark dropped from `36.637 ms` uncached to `0.928 ms` cached.
+  - [x] `/proc/self/mountinfo` reads are now cached per process and the already-found mount is reused inside config explanation/effective-config lookups; sampled startup probes dropped mountinfo opens from `13` to `1` on both `fro read -n 1 README.md` and `fro --json-config README.md`.
+  - [ ] The remaining tiny-call startup gap is still dominated by shared config and path-probe work; even dedicated one-purpose hash binaries only shave about `0.2-1.1 ms` off `fro md5sum` / `fro sha256sum`, so the next likely slice is a safe reduction of remaining per-path probe work rather than more binary factoring.
+- [x] Reject thin focused wrappers that reuse multicall/shared dispatch; that approach destroys the measured size/startup win.
+- [x] A bounded dedicated-hash-binary slice landed for `md5sum` and `sha256sum` using one-purpose binaries rather than multicall wrappers. They are about `1.99 MB` each versus `9.77 MB` for `fro`, but the startup win is modest until config load is reduced further.
 
 ### P1: reusable validation and proof work
 
@@ -57,6 +65,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - [x] Keep a tracked flag/help regression in place for implemented multicall utilities. `tests/compat_coverage_report.rs` now checks the tracked compatibility snapshot, compares `fro <util> --help` against system `--help` for the tracked GNU/coreutils slice, and requires `FIXME:` notes for current incompatibilities; use `coreutils-flags.txt` dumps to prioritize the next bounded slices outside that tracked surface.
 - [x] Keep a Rust-owned actual-help coverage snapshot in `tests/compat_coverage_report.rs` so each tracked multicall utility also has a one-line list of current system-only `--help` flags on this host plus a bounded percentage score. Use that broader delta as backlog input, but keep implementation work bounded instead of treating every listed GNU flag as active scope.
 - [ ] Build a manual validation matrix for single NVMe, md RAID0, dm-crypt, tmpfs, and network filesystems.
+- [x] Replaced the low-signal Ubuntu package-install benchmark with a shell-workload container harness (`perf/ubuntu_install_container_bench.sh` plus `docker/ubuntu-install-bench/`) that seeds deterministic local project data, runs configure/build/package/verify-style shell slices, PATH-shadows fro coreutils, logs delegated fallbacks with `FRO_LOG_FALLBACKS=1`, and records baseline vs fro wall time plus per-command fro call counts. The validated unconfined-container run (`local-shell-bench-unconfined`) exercised `996` fro calls with `0` fallbacks across `36` modules / `6` tar archives and measured `4.118850s` baseline vs `19.518400s` fro host wall (`+373.88%`).
 - [ ] Extend performance-path verification beyond `wc` so `fgrep`, `cp`, and `cat` path-preserving flag slices each have at least one helper/backend-selection assertion.
 - [ ] Decide whether the public Rust API should stay explicitly UTF-8-only long-term or grow raw `Path`/`OsStr` support deeper than the current documented contract.
 
@@ -75,7 +84,9 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 ### P2: transform-style helpers and lower-frequency but strategic work
 
 - [ ] Keep `fro::auto_select_transform_io_pairing(...)` as the standard helper for transform-style tools that may see file/pipe combinations.
-- [ ] `base64`: treat as strategically relevant because it exercises reusable transform-style machinery, but keep it behind the higher-use command families until the shared helper work needs it.
+- [x] `base64` now uses a staged regular-file-to-regular-file transform path: small files (currently `<= 2 MiB`) stay on a synchronous helper while larger files still recruit the parallel file-transform path.
+- [x] `encrypt` / `decrypt` now use a staged small regular-file-to-regular-file path with a conservative `1 MiB` payload cutoff while preserving the existing parallel path for larger files and keeping partial-read CTR block indexing correct.
+- [x] Reassessed checksum-family staging separately and rejected it for now: `cksum` already has its bounded small-file path, and the remaining tiny-file checksum gap is still startup-dominated rather than a missing read-and-reduce seam.
 - [ ] file encryption
   - [ ] fast file encryption/decryption with the optimized IO paths, producing OpenSSL-compatible aes-256-ctr output via the OpenSSL library, 512 KiB blocks, `ParallelStream` mappers, and `num_cpus` worker parallelism
   - [ ] add an authenticated integrity/MAC story around the current unauthenticated AES-256-CTR-compatible format without breaking the OpenSSL-compatible path
@@ -83,7 +94,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 ### Parked / explicitly lower-priority for now
 
 - [ ] Exhaustive per-flag checklists for every already-implemented multicall utility. Keep only the next high-value slices in active planning; archive the rest in `history.md` / git history instead of letting them dominate this file.
-- [ ] `parallel zstd` and compressed `tar` follow-ons.
+- [ ] `parallel zstd` and compressed `tar` follow-ons after the shipped tar.zstd MVP (for example parallel tar build/compress, seek/index support, and extraction-path acceleration).
 - [ ] HDD-specific sequential-I/O preference and more pipe-overlap tuning, unless new profiling shows these are blocking important workloads.
 - [ ] Integration with `rdma-pipe`.
 

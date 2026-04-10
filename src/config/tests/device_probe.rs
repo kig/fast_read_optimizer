@@ -135,6 +135,41 @@ fn device_signature_extracts_leaf_device_metadata_and_by_id() {
 }
 
 #[test]
+fn device_signature_cache_reuses_mount_source_probe_within_process() {
+    let _lock = CACHE_LOCK.lock().unwrap();
+    clear_device_signature_cache_for_tests();
+
+    let tmp = unique_temp_dir("fro-device-signature-cache");
+    let dev_root = tmp.join("dev");
+    let sys_root = tmp.join("sys/class/block");
+    std::fs::create_dir_all(dev_root.join("disk/by-id")).unwrap();
+    std::fs::create_dir_all(sys_root.join("nvme0n1/device")).unwrap();
+    std::fs::create_dir_all(sys_root.join("nvme0n1/queue")).unwrap();
+    std::fs::write(dev_root.join("nvme0n1"), b"").unwrap();
+    std::os::unix::fs::symlink("../../nvme0n1", dev_root.join("disk/by-id/nvme-fastdisk")).unwrap();
+    write_trimmed_file(&sys_root.join("nvme0n1/device/model"), "Turbo");
+    write_trimmed_file(&sys_root.join("nvme0n1/queue/rotational"), "0");
+
+    let mount = MountInfo {
+        mount_point: "/mnt/data".into(),
+        fstype: "ext4".into(),
+        mount_source: "/dev/disk/by-id/nvme-fastdisk".into(),
+    };
+    let roots = DeviceProbeRoots {
+        dev_root: dev_root.clone(),
+        sys_class_block_root: sys_root.clone(),
+    };
+
+    let cold = device_signature_from_mount_info_with_roots(&mount, &roots).unwrap();
+    std::fs::remove_dir_all(sys_root.join("nvme0n1")).unwrap();
+    let warm = device_signature_from_mount_info_with_roots(&mount, &roots).unwrap();
+
+    assert_eq!(warm, cold);
+
+    clear_device_signature_cache_for_tests();
+}
+
+#[test]
 fn device_signature_extracts_composite_dm_and_md_slaves() {
     let tmp = unique_temp_dir("fro-device-signature-composite");
     let dev_root = tmp.join("dev");

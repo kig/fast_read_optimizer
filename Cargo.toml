@@ -29,7 +29,7 @@ sha2 = "0.10"
 stringzilla = "4.6.0"
 unicode-width = "0.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 proptest = "1"

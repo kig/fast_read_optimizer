@@ -14,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 const ENCRYPT_BLOCK_SIZE: usize = 512 * 1024;
+const ENCRYPT_STAGED_FILE_TO_FILE_LIMIT: u64 = 2 * ENCRYPT_BLOCK_SIZE as u64;
 const OPENSSL_MAGIC: &[u8; 8] = b"Salted__";
 const OPENSSL_SALT_LEN: usize = 8;
 const OPENSSL_HEADER_LEN: usize = OPENSSL_MAGIC.len() + OPENSSL_SALT_LEN;
@@ -330,6 +331,9 @@ fn encrypt_regular_path(
 
     match output {
         MapperTransformOutput::RegularFile(file) => {
+            if should_use_staged_encrypt_file_to_file(path)? {
+                return encrypt_small_regular_path(path, file, cipher, material.as_ref(), header);
+            }
             let writer =
                 ParallelWriter::indexed_file(&config, "write", &file, IOMode::Auto, total_blocks)?;
             writer.write_at_index(0, header.to_vec())?;
@@ -383,6 +387,75 @@ fn encrypt_regular_path(
 }
 
 fn decrypt_regular_path(
+    path: &str,
+    output: MapperTransformOutput,
+    cipher: CipherSpec,
+    passphrase: &[u8],
+) -> io::Result<()> {
+    match output {
+        MapperTransformOutput::RegularFile(file) => {
+            if should_use_staged_decrypt_file_to_file(path)? {
+                return decrypt_small_regular_path(path, file, cipher, passphrase);
+            }
+            decrypt_parallel_path(
+                path,
+                MapperTransformOutput::RegularFile(file),
+                cipher,
+                passphrase,
+            )
+        }
+        MapperTransformOutput::Stream(file) => decrypt_parallel_path(
+            path,
+            MapperTransformOutput::Stream(file),
+            cipher,
+            passphrase,
+        ),
+    }
+}
+
+fn should_use_staged_encrypt_file_to_file(path: &str) -> io::Result<bool> {
+    staged_file_to_file_len(path, ENCRYPT_STAGED_FILE_TO_FILE_LIMIT)
+}
+
+fn should_use_staged_decrypt_file_to_file(path: &str) -> io::Result<bool> {
+    staged_file_to_file_len(
+        path,
+        ENCRYPT_STAGED_FILE_TO_FILE_LIMIT + OPENSSL_HEADER_LEN as u64,
+    )
+}
+
+fn staged_file_to_file_len(path: &str, limit: u64) -> io::Result<bool> {
+    let metadata = fs::metadata(path)?;
+    Ok(metadata.is_file() && metadata.len() <= limit)
+}
+
+fn encrypt_small_regular_path(
+    path: &str,
+    mut dest: File,
+    cipher: CipherSpec,
+    material: &(Vec<u8>, Vec<u8>),
+    header: [u8; OPENSSL_HEADER_LEN],
+) -> io::Result<()> {
+    let mut reader = File::open(path)?;
+    dest.write_all(&header)?;
+    process_reader_stream(&mut reader, &mut dest, cipher, material, Mode::Encrypt, 0)?;
+    dest.flush()
+}
+
+fn decrypt_small_regular_path(
+    path: &str,
+    mut dest: File,
+    cipher: CipherSpec,
+    passphrase: &[u8],
+) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let salt = read_openssl_header(&mut file)?;
+    let material = derive_key_iv(cipher, passphrase, &salt)?;
+    process_reader_stream(&mut file, &mut dest, cipher, &material, Mode::Decrypt, 0)?;
+    dest.flush()
+}
+
+fn decrypt_parallel_path(
     path: &str,
     output: MapperTransformOutput,
     cipher: CipherSpec,
@@ -600,4 +673,66 @@ fn parallel_config_for_path(path: &str) -> crate::config::LoadedConfig {
         config.update_params_for_path("compute", direct, path, params);
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct PartialReader {
+        inner: Cursor<Vec<u8>>,
+        max_chunk: usize,
+    }
+
+    impl PartialReader {
+        fn new(bytes: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                max_chunk,
+            }
+        }
+    }
+
+    impl Read for PartialReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = buf.len().min(self.max_chunk);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    #[test]
+    fn reader_stream_handles_partial_reads_across_encrypt_blocks() {
+        let plaintext = (0..(ENCRYPT_BLOCK_SIZE + 12345))
+            .map(|i| ((i * 17 + 29) % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut encrypted = Vec::new();
+        let mut decrypted = Vec::new();
+        let salt = [7u8; OPENSSL_SALT_LEN];
+        let passphrase = b"partial-read-regression";
+        let mut encrypt_reader_src = PartialReader::new(plaintext.clone(), 4093);
+
+        encrypt_reader(
+            &mut encrypt_reader_src,
+            &mut encrypted,
+            resolve_cipher_spec(AES_256_CTR_NAME).unwrap(),
+            passphrase,
+            salt,
+            0,
+        )
+        .unwrap();
+
+        let mut decrypt_reader_src = PartialReader::new(encrypted, 3079);
+        decrypt_reader(
+            &mut decrypt_reader_src,
+            &mut decrypted,
+            resolve_cipher_spec(AES_256_CTR_NAME).unwrap(),
+            passphrase,
+            salt,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
 }

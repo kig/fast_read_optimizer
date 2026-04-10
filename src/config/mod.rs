@@ -1,11 +1,11 @@
 use crate::common::{CopyAutoMode, ReadAutoStrategy, ReadPathKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once, OnceLock};
 
 mod device;
 mod storage;
@@ -14,17 +14,38 @@ mod tests;
 
 pub use self::storage::{load_config, resolve_default_config_path};
 
-use self::device::{device_db_match, mountpoint_for_path, normalize_path};
+#[cfg(test)]
+use self::device::clear_mountinfo_cache_for_tests;
+use self::device::{
+    device_db_match, device_signature_from_mount_info, mountpoint_for_path, normalize_path,
+};
 pub use self::device::{device_signature_for_path, mount_info_for_path};
+#[cfg(test)]
+use self::storage::clear_default_config_cache_for_tests;
 use self::storage::{
     default_bundle_v1, default_compute_mode_config, default_copy_auto_mode,
     default_copy_range_params, default_hash_mode_config, default_read_auto_strategy,
     default_read_to_memory_mode_config, default_recursive_small_file_threads,
-    default_verify_mode_config,
+    default_verify_mode_config, refresh_cached_default_config,
 };
 
 static MOUNTINFO_WARNING: Once = Once::new();
+static MISSING_DEVICE_DB_PATHS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const _: fn() -> PathBuf = resolve_default_config_path;
+
+fn missing_device_db_paths() -> &'static Mutex<HashSet<String>> {
+    MISSING_DEVICE_DB_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+fn clear_missing_device_db_paths_for_tests() {
+    missing_device_db_paths().lock().unwrap().clear();
+}
+
+#[cfg(test)]
+fn missing_device_db_path_is_cached_for_tests(path: &str) -> bool {
+    missing_device_db_paths().lock().unwrap().contains(path)
+}
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct MountInfo {
@@ -247,6 +268,30 @@ impl LoadedConfig {
         bundle.mount_overrides.by_mountpoint.get(&mount.mount_point)
     }
 
+    fn mount_patch_for_path_prefix(&self, path: &str) -> Option<&AppConfigPatch> {
+        let LoadedConfig::BundleV1 { bundle, .. } = self else {
+            return None;
+        };
+        if bundle.mount_overrides.by_mountpoint.is_empty() {
+            return None;
+        }
+        let normalized_path = normalize_path(path).to_string_lossy().into_owned();
+        bundle
+            .mount_overrides
+            .by_mountpoint
+            .iter()
+            .filter_map(|(mount_point, patch)| {
+                let normalized_mount = normalize_path(mount_point).to_string_lossy().into_owned();
+                if path_matches_mount_prefix(&normalized_path, &normalized_mount) {
+                    Some((normalized_mount.len(), patch))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, patch)| patch)
+    }
+
     fn device_db_selection_for_context(
         &self,
         mount: Option<&MountInfo>,
@@ -257,9 +302,20 @@ impl LoadedConfig {
         };
         let mount = mount?;
         for db_path in &bundle.device_db.paths {
+            if missing_device_db_paths().lock().unwrap().contains(db_path) {
+                continue;
+            }
             let data = match fs::read_to_string(db_path) {
                 Ok(data) => data,
-                Err(_) => continue,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::NotFound {
+                        missing_device_db_paths()
+                            .lock()
+                            .unwrap()
+                            .insert(db_path.clone());
+                    }
+                    continue;
+                }
             };
             let db = match serde_json::from_str::<DeviceDb>(&data) {
                 Ok(db) if db.version == 1 => db,
@@ -285,6 +341,14 @@ impl LoadedConfig {
             selection.profile.params.apply_to(&mut effective);
         }
         if let Some(patch) = self.mount_patch_for_mount(mount) {
+            patch.apply_to(&mut effective);
+        }
+        effective
+    }
+
+    fn effective_config_for_config_path(&self, path: &str) -> AppConfig {
+        let mut effective = self.defaults_ref().clone();
+        if let Some(patch) = self.mount_patch_for_path_prefix(path) {
             patch.apply_to(&mut effective);
         }
         effective
@@ -332,27 +396,33 @@ impl LoadedConfig {
         self.defaults_ref().read_auto_strategy
     }
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
-        self.effective_config_for_path(path)
+        self.effective_config_for_config_path(path)
             .get_params(mode, direct)
     }
 
     pub fn get_copy_range_params_for_path(&self, path: &str) -> IOParams {
-        self.effective_config_for_path(path).copy_range
+        self.effective_config_for_config_path(path).copy_range
     }
 
+    #[allow(dead_code)]
     pub fn get_copy_auto_mode_for_path(&self, path: &str) -> CopyAutoMode {
-        self.effective_config_for_path(path).copy_auto_mode
+        self.effective_config_for_config_path(path).copy_auto_mode
+    }
+
+    pub fn get_copy_auto_mode_for_config_path(&self, path: &str) -> CopyAutoMode {
+        self.effective_config_for_config_path(path).copy_auto_mode
     }
 
     pub fn get_read_auto_strategy_for_path(&self, path: &str) -> ReadAutoStrategy {
-        self.effective_config_for_path(path).read_auto_strategy
+        self.effective_config_for_config_path(path)
+            .read_auto_strategy
     }
 
     pub fn get_recursive_small_file_threads_for_path(
         &self,
         path: &str,
     ) -> RecursiveSmallFileThreads {
-        self.effective_config_for_path(path)
+        self.effective_config_for_config_path(path)
             .recursive_small_file_threads
     }
 
@@ -360,6 +430,7 @@ impl LoadedConfig {
         mount_info_for_path(path)
     }
 
+    #[allow(dead_code)]
     pub fn device_signature_for_path(&self, path: &str) -> Option<DeviceSignature> {
         device_signature_for_path(path)
     }
@@ -379,16 +450,19 @@ impl LoadedConfig {
         }
     }
 
+    #[allow(dead_code)]
     pub fn effective_config_for_path(&self, path: &str) -> AppConfig {
         let mount = self.mount_info_for_path(path);
-        let device = self.device_signature_for_path(path);
+        let device = mount.as_ref().and_then(device_signature_from_mount_info);
         self.effective_config_for_context(mount.as_ref(), device.as_ref())
     }
 
     pub fn explain_for_path(&self, path: &str) -> Value {
         let normalized_path = normalize_path(path);
         let mount_info = self.mount_info_for_path(path);
-        let device = self.device_signature_for_path(path);
+        let device = mount_info
+            .as_ref()
+            .and_then(device_signature_from_mount_info);
         let mount_override = self.mount_patch_for_mount(mount_info.as_ref()).cloned();
         let device_db_match =
             self.device_db_selection_for_context(mount_info.as_ref(), device.as_ref());
@@ -538,15 +612,30 @@ impl LoadedConfig {
     pub fn save(&self) {
         match self {
             LoadedConfig::Legacy { path, config } => {
-                config.save(path.to_str().unwrap_or("fro.json"))
+                if config.save(path.to_str().unwrap_or("fro.json")).is_ok() {
+                    refresh_cached_default_config(self);
+                }
             }
             LoadedConfig::BundleV1 { path, bundle } => {
                 if let Ok(data) = serde_json::to_string_pretty(bundle) {
-                    let _ = fs::write(path, data);
+                    if fs::write(path, data).is_ok() {
+                        refresh_cached_default_config(self);
+                    }
                 }
             }
         }
     }
+}
+
+fn path_matches_mount_prefix(path: &str, mount_point: &str) -> bool {
+    if mount_point == "/" {
+        return path.starts_with('/');
+    }
+    if path == mount_point {
+        return true;
+    }
+    path.strip_prefix(mount_point)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl AppConfigPatch {

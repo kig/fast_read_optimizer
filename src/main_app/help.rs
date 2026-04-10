@@ -426,15 +426,15 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
         }),
         "tar" => Some(CommandHelp {
             name: "tar",
-            usage: "tar (-c[fz] <archive.tar[.gz]> [-v] <source> | -t[fvz] <archive.tar[.gz]> | -x[fvz] <archive.tar[.gz]> [-C dir])",
-            summary: "Create, list, or extract ustar archives; .tar.gz/.tgz is experimental.",
+            usage: "tar (-c[fzJ] <archive.tar[.gz|.zst]> [-v] <source> | -t[fvzJ] <archive.tar[.gz|.zst]> | -x[fvzJ] <archive.tar[.gz|.zst]> [-C dir])",
+            summary: "Create, list, or extract ustar archives; .tar.gz/.tgz and .tar.zst/.tar.zstd are supported.",
             notes: &[
                 "Supported compatibility slice: create (-c/--create), whole-archive list (-t/--list), and whole-archive extract (-x/--extract) with -f/--file.",
-                "Experimental gzip support accepts -z/--gzip/--gunzip/--ungzip or auto-detects .tar.gz/.tgz archives; create uses mgzip-compatible output via gzp.",
+                "Compressed tar supports gzip via -z/--gzip/--gunzip/--ungzip or .tar.gz/.tgz suffixes, and zstd via -J/--zstd or .tar.zst/.tar.zstd/.tzst suffixes.",
                 "When built with the optional rapidgzip-backend feature, .tar.gz/.tgz list and extract use rapidgzip for decompression; otherwise they fall back to the standard multi-member gzip reader.",
                 "-v/--verbose keeps create-side progress reporting, enables GNU-style verbose output for listing, and prints extracted member names during extract.",
                 "FIXME: Extract currently targets regular-file archives, all-member extraction, normal relative paths, and optional -C/--directory destination selection.",
-                "FIXME: Compression is currently limited to gzip, uses a sequential tar writer on create, and does not yet preserve the uncompressed fast-path copy engine through compressed extraction.",
+                "FIXME: Compressed create still uses a single tar stream and compressed extraction still does not preserve the uncompressed fast-path copy engine.",
                 "FIXME: stdin archives, member filters, ownership preservation, and tar edge cases such as pax headers remain unsupported.",
             ],
             examples: &[
@@ -488,7 +488,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "--threaded-copy forces the existing tuned striped io_uring copy path.",
                 "--reflink requests a CoW clone/reflink when the filesystem supports it; this is fast but does not promise physically independent storage blocks.",
                 "--diff forces chunked diff-and-overwrite copy when supported; --full disables diffing and always rewrites the full file.",
-                "Without either flag, plain copy uses copy auto mode: when source and target share a reflink-capable filesystem and the target storage topology is positively identified as redundant, auto prefers reflink; when the target topology is positively identified as non-redundant (for example RAID0, ZFS stripe, or a degraded mirror), auto forces a real full copy; otherwise it falls back to the existing cache-aware threaded heuristic.",
+                "Without either flag, plain copy uses the copy auto mode configured in fro.json for the target path; that config can steer copy toward page-cache, direct, copy_file_range, or the cache-aware heuristic path without runtime topology probes.",
                 "--keep-target-size preserves an already-sized destination instead of re-truncating/re-preallocating it; this is mainly useful for best-case benchmarking.",
                 "Copy takes an advisory shared lock on the source and an advisory exclusive lock on the destination by default; use --no-lock to skip that cooperative locking.",
                 "--via-memory loads the whole source file into RAM first, then writes that buffer to the destination.",

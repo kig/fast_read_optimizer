@@ -59,7 +59,13 @@ fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
     if raw_args.get(1).is_some_and(|arg| arg == "cp") {
         let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
         rebuilt.push("cp".to_string());
-        rebuilt.extend(raw_args.iter().skip(2).cloned());
+        rebuilt.extend(
+            raw_args
+                .iter()
+                .skip(2)
+                .filter(|arg| arg.as_str() != "--no-fallback")
+                .cloned(),
+        );
         rebuilt
     } else if raw_args.get(1).is_some_and(|arg| arg == "copy") {
         let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
@@ -68,7 +74,7 @@ fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
             raw_args
                 .iter()
                 .skip(2)
-                .filter(|arg| arg.as_str() != "--cp-compat")
+                .filter(|arg| arg.as_str() != "--cp-compat" && arg.as_str() != "--no-fallback")
                 .cloned(),
         );
         rebuilt
@@ -189,6 +195,9 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         if is_flag {
             if args[i] == "--" {
                 end_flags = true;
+            } else if args[i] == "--no-fallback" {
+                i += 1;
+                continue;
             } else if args[i] == "--help" {
                 if let Some(help) = command_help(args[1].as_str()) {
                     print_command_help(args[0].as_str(), help);
@@ -419,7 +428,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                     })?;
                 }
             } else {
-                if mode == "copy" && cp_compat {
+                if mode == "copy" && cp_compat && !coreutils::args_request_no_fallback(&raw_args) {
                     let fallback_args = rebuild_cp_fallback_args(&raw_args);
                     if let Some(code) =
                         coreutils::try_external_command_fallback("cp", &fallback_args)?
@@ -432,7 +441,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 if let Some(help) = command_help(args[0].as_str()) {
                     print_command_help(args[0].as_str(), help);
                 }
-                return Ok(ParseOutcome::Early(0));
+                return Ok(ParseOutcome::Early(1));
             }
         } else if mode == "config" {
             if config_subcommand.is_none() {
@@ -954,6 +963,27 @@ mod tests {
             "fro".to_string(),
             "copy".to_string(),
             "--cp-compat".to_string(),
+            "--backup=numbered".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ];
+        assert_eq!(
+            rebuild_cp_fallback_args(&raw_args),
+            vec![
+                "cp".to_string(),
+                "--backup=numbered".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebuild_cp_fallback_args_strips_no_fallback_wrapper_flag() {
+        let raw_args = vec![
+            "fro".to_string(),
+            "cp".to_string(),
+            "--no-fallback".to_string(),
             "--backup=numbered".to_string(),
             "src".to_string(),
             "dst".to_string(),

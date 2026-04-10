@@ -20,6 +20,17 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::{mpsc, Arc, Mutex};
 
+fn path_io_params(
+    config: &LoadedConfig,
+    mode: &str,
+    path: &str,
+) -> (crate::config::IOParams, crate::config::IOParams) {
+    (
+        config.get_params_for_path(mode, false, path),
+        config.get_params_for_path(mode, true, path),
+    )
+}
+
 pub fn get_file_flags(file: &std::fs::File) -> std::io::Result<i32> {
     let fd = file.as_raw_fd();
     unsafe {
@@ -43,8 +54,7 @@ pub fn set_file_flags(file: &std::fs::File, flags: i32) -> std::io::Result<i32> 
 }
 
 pub fn default_logical_block_size(config: &LoadedConfig, mode: &str, path: &str) -> u64 {
-    let page_cache = config.get_params_for_path(mode, false, path);
-    let direct = config.get_params_for_path(mode, true, path);
+    let (page_cache, direct) = path_io_params(config, mode, path);
     page_cache.block_size.max(direct.block_size)
 }
 
@@ -167,6 +177,20 @@ impl ParallelFile {
     where
         F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
     {
+        let (page_cache, direct) = path_io_params(&self.config, &self.mode, &self.path);
+        self.foreach_block_parallel_with_params(block_size, page_cache, direct, visit)
+    }
+
+    fn foreach_block_parallel_with_params<F>(
+        &self,
+        block_size: u64,
+        page_cache: crate::config::IOParams,
+        direct: crate::config::IOParams,
+        visit: F,
+    ) -> std::io::Result<ParallelReadReport>
+    where
+        F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    {
         let path = self.path.clone();
         let config = self.config.clone();
         let effective_block_size = if self.io_mode == IOMode::Direct && block_size % 4096 != 0 {
@@ -177,8 +201,6 @@ impl ParallelFile {
         let io_mode = effective_io_mode_for_block_size(self.io_mode, effective_block_size);
         let visit = Arc::new(visit);
         let mut local_config = config.clone();
-        let page_cache = config.get_params_for_path(&self.mode, false, &path);
-        let direct = config.get_params_for_path(&self.mode, true, &path);
         local_config.update_params_for_path(
             &self.mode,
             false,
@@ -236,7 +258,13 @@ impl ParallelFile {
     where
         F: Fn(usize, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
     {
-        self.foreach_block_parallel(self.block_size()?, visit)
+        let (page_cache, direct) = path_io_params(&self.config, &self.mode, &self.path);
+        self.foreach_block_parallel_with_params(
+            page_cache.block_size.max(direct.block_size),
+            page_cache,
+            direct,
+            visit,
+        )
     }
 
     pub fn map_reduce_blocks<T, M, R, U>(
@@ -258,8 +286,7 @@ impl ParallelFile {
             block_size
         };
         let io_mode = effective_io_mode_for_block_size(self.io_mode, effective_block_size);
-        let page_cache = config.get_params_for_path(&self.mode, false, &path);
-        let direct = config.get_params_for_path(&self.mode, true, &path);
+        let (page_cache, direct) = path_io_params(&config, &self.mode, &path);
         let mut local_config = config.clone();
         local_config.update_params_for_path(
             &self.mode,

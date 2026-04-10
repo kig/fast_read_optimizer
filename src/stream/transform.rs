@@ -318,12 +318,16 @@ pub fn grow_pipe_capacity_best_effort(pipe_fd: i32, new_size: usize) {
     }
 }
 
-pub fn run_reader_transform_to_file<R: Read>(
+pub fn run_reader_transform_to_file<R, F>(
     reader: &mut R,
     dest: &mut File,
     geometry: ReaderTransformGeometry,
-    processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
-) -> io::Result<()> {
+    processor: F,
+) -> io::Result<()>
+where
+    R: Read,
+    F: Fn(&[u8], &mut [u8]) -> io::Result<usize>,
+{
     let mut read_buf = vec![0u8; geometry.read_block_size as usize];
     let mut write_buf = vec![0u8; geometry.write_block_size];
     let mut carry = Vec::new();
@@ -394,6 +398,24 @@ where
         processor,
     )?;
     Ok(())
+}
+
+pub fn run_staged_file_transform_to_file<F>(
+    path: &str,
+    dest: &mut File,
+    geometry: ReaderTransformGeometry,
+    small_file_limit: u64,
+    processor: F,
+) -> io::Result<()>
+where
+    F: for<'a> Fn(&'a [u8], &mut [u8]) -> io::Result<usize> + Send + Sync + Clone + 'static,
+{
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() && metadata.len() <= small_file_limit {
+        let mut reader = File::open(path)?;
+        return run_reader_transform_to_file(&mut reader, dest, geometry, processor);
+    }
+    run_file_transform_to_file(path, dest, geometry, processor)
 }
 
 pub fn run_reader_transform_to_pipe<R: Read>(

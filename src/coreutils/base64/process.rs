@@ -7,8 +7,8 @@ use super::process_layout::{
 use super::*;
 use crate::stream::allocate_pipe_output_buffer;
 use crate::stream::transform::{
-    run_file_transform_to_file, run_file_transform_to_pipe_with_owned_output,
-    run_reader_transform_to_file, run_reader_transform_to_pipe, run_transform_with_specs,
+    run_file_transform_to_pipe_with_owned_output, run_reader_transform_to_file,
+    run_reader_transform_to_pipe, run_staged_file_transform_to_file, run_transform_with_specs,
     PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec, TransformOutputSpec,
 };
 mod decode_reorg;
@@ -205,7 +205,7 @@ fn process_file_to_file(
         let wrap_cols = options.wrap_cols;
         let (read_block_size, write_block_size) =
             wrapped_encode_block_sizes(wrap_cols, BASE64_ENCODE_FAST_READ_BLOCK_SIZE);
-        run_file_transform_to_file(
+        run_staged_file_transform_to_file(
             path,
             dest,
             ReaderTransformGeometry {
@@ -213,6 +213,7 @@ fn process_file_to_file(
                 write_block_size,
                 input_chunk_multiple: 1,
             },
+            BASE64_STAGED_FILE_TO_FILE_LIMIT,
             move |input: &[u8], out: &mut [u8]| encode_wrapped_block_into(input, wrap_cols, out),
         )?;
         return Ok(false);
@@ -220,7 +221,7 @@ fn process_file_to_file(
     if options.decode && detect_regular_decode_layout(path)? == RegularDecodeLayout::WrappedLf76 {
         let (read_block_size, write_block_size) =
             wrapped_decode_block_sizes(BASE64_DECODE_FAST_READ_BLOCK_SIZE);
-        run_file_transform_to_file(
+        run_staged_file_transform_to_file(
             path,
             dest,
             ReaderTransformGeometry {
@@ -228,11 +229,12 @@ fn process_file_to_file(
                 write_block_size,
                 input_chunk_multiple: 1,
             },
+            BASE64_STAGED_FILE_TO_FILE_LIMIT,
             move |input: &[u8], out: &mut [u8]| decode_wrapped_block_into(input, out),
         )?;
         return Ok(false);
     }
-    run_file_transform_to_file(
+    run_staged_file_transform_to_file(
         path,
         dest,
         ReaderTransformGeometry {
@@ -240,6 +242,7 @@ fn process_file_to_file(
             write_block_size: plan.write_block_size,
             input_chunk_multiple: plan.input_chunk_multiple,
         },
+        BASE64_STAGED_FILE_TO_FILE_LIMIT,
         plan.process_chunk,
     )?;
     return Ok(false);

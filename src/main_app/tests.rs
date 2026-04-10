@@ -3,11 +3,9 @@ use crate::config;
 use crate::main_app::cli;
 use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
-    choose_nonredundant_full_copy_plan, describe_copy_path, parse_zpool_status_leaves,
-    should_prefer_cached_diff_overwrite, should_prefer_cached_read_direct_write,
-    should_skip_small_zfs_storage_probe, target_is_similar_size,
-    zfs_storage_redundancy_from_status, HeuristicCopyPlan, ResolvedCopyExecution,
-    StorageRedundancy,
+    describe_copy_path, should_prefer_cached_diff_overwrite,
+    should_prefer_cached_read_direct_write, target_is_similar_size, HeuristicCopyPlan,
+    ResolvedCopyExecution,
 };
 use crate::main_app::recursive::move_dir;
 use crate::main_app::tuning::{
@@ -41,68 +39,6 @@ fn heuristic_plan(
     } else {
         HeuristicCopyPlan::DirectReadDirectWrite
     }
-}
-
-#[test]
-fn nonredundant_policy_forces_full_copy_path() {
-    let cached = choose_nonredundant_full_copy_plan(true, Some(1024), Some(1024));
-    assert!(cached.copy_strategy == CopyStrategy::Threaded);
-    assert!(cached.io_mode_read == IOMode::PageCache);
-    assert!(cached.io_mode_write == IOMode::Direct);
-    assert!(cached.full_rewrite);
-    assert!(!cached.diff_overwrite);
-
-    let cold = choose_nonredundant_full_copy_plan(false, Some(1024), Some(1024));
-    assert!(cold.copy_strategy == CopyStrategy::Threaded);
-    assert!(cold.io_mode_read == IOMode::Direct);
-    assert!(cold.io_mode_write == IOMode::Direct);
-    assert!(cold.full_rewrite);
-    assert!(!cold.diff_overwrite);
-}
-
-#[test]
-fn parse_zpool_status_tracks_vdev_paths() {
-    let leaves = parse_zpool_status_leaves(
-        "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          mirror-0                  ONLINE       0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       ONLINE       0     0     0\n\nerrors: No known data errors\n",
-    );
-    assert_eq!(leaves.len(), 2);
-    assert_eq!(leaves[0].vdev_path, vec!["mirror-0".to_string()]);
-    assert_eq!(leaves[0].state.as_deref(), Some("ONLINE"));
-}
-
-#[test]
-fn zfs_redundancy_marks_healthy_mirror_redundant() {
-    let status = "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          mirror-0                  ONLINE       0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       ONLINE       0     0     0\n\nerrors: No known data errors\n";
-    assert_eq!(
-        zfs_storage_redundancy_from_status(status),
-        StorageRedundancy::Redundant
-    );
-}
-
-#[test]
-fn zfs_redundancy_marks_degraded_mirror_nonredundant() {
-    let status = "  pool: tank\n state: DEGRADED\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        DEGRADED     0     0     0\n          mirror-0                  DEGRADED     0     0     0\n            /dev/disk/by-id/a       ONLINE       0     0     0\n            /dev/disk/by-id/b       UNAVAIL      0     0     0  was /dev/disk/by-id/b\n\nerrors: No known data errors\n";
-    assert_eq!(
-        zfs_storage_redundancy_from_status(status),
-        StorageRedundancy::NonRedundant
-    );
-}
-
-#[test]
-fn zfs_redundancy_marks_stripe_nonredundant() {
-    let status = "  pool: tank\n state: ONLINE\nconfig:\n\n        NAME                        STATE     READ WRITE CKSUM\n        tank                        ONLINE       0     0     0\n          /dev/disk/by-id/a         ONLINE       0     0     0\n          /dev/disk/by-id/b         ONLINE       0     0     0\n\nerrors: No known data errors\n";
-    assert_eq!(
-        zfs_storage_redundancy_from_status(status),
-        StorageRedundancy::NonRedundant
-    );
-}
-
-#[test]
-fn tiny_files_skip_expensive_zfs_storage_probe() {
-    assert!(should_skip_small_zfs_storage_probe(Some(4096)));
-    assert!(should_skip_small_zfs_storage_probe(Some(1 << 20)));
-    assert!(!should_skip_small_zfs_storage_probe(Some((1 << 20) + 1)));
-    assert!(!should_skip_small_zfs_storage_probe(None));
 }
 
 #[test]

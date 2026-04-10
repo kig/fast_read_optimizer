@@ -1,9 +1,13 @@
-use super::device::{device_signature_from_mount_info_with_roots, mount_info_for_path_from_data};
+use super::device::{
+    clear_device_signature_cache_for_tests, device_signature_from_mount_info_with_roots,
+    mount_info_for_path_from_data,
+};
 use super::*;
 use std::path::Path;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let pid = std::process::id();
@@ -96,6 +100,7 @@ fn resolve_default_config_path_uses_system_when_user_missing_and_system_exists()
 #[test]
 fn load_config_creates_bundle_and_roundtrips_updates() {
     let _lock = ENV_LOCK.lock().unwrap();
+    clear_default_config_cache_for_tests();
 
     let tmp = unique_temp_dir("fro-test");
     let cfg_path = tmp.join("fro.json");
@@ -146,6 +151,136 @@ fn load_config_creates_bundle_and_roundtrips_updates() {
     restore_env_var("FRO_CONFIG", old_fro);
     restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
     restore_env_var("HOME", old_home);
+    clear_default_config_cache_for_tests();
+}
+
+#[test]
+fn load_config_default_cache_tracks_resolved_path_changes() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_default_config_cache_for_tests();
+
+    let tmp = unique_temp_dir("fro-default-cache-paths");
+    let cfg_a = tmp.join("a.json");
+    let cfg_b = tmp.join("b.json");
+
+    let old_fro = set_env_var("FRO_CONFIG", Some(cfg_a.to_str().unwrap()));
+    let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
+    let old_home = set_env_var("HOME", None);
+
+    let loaded_a = load_config(None);
+    assert_eq!(loaded_a.config_path(), cfg_a.as_path());
+
+    set_env_var("FRO_CONFIG", Some(cfg_b.to_str().unwrap()));
+    let loaded_b = load_config(None);
+    assert_eq!(loaded_b.config_path(), cfg_b.as_path());
+
+    restore_env_var("FRO_CONFIG", old_fro);
+    restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
+    restore_env_var("HOME", old_home);
+    clear_default_config_cache_for_tests();
+}
+
+#[test]
+fn mountinfo_cache_preserves_mount_result_within_process() {
+    let _lock = CACHE_LOCK.lock().unwrap();
+    clear_mountinfo_cache_for_tests();
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let cold = mount_info_for_path(path.to_str().unwrap()).expect("mount info");
+    let warm = mount_info_for_path(path.to_str().unwrap()).expect("mount info");
+
+    assert_eq!(warm, cold);
+
+    clear_mountinfo_cache_for_tests();
+}
+
+#[test]
+fn device_signature_cache_preserves_signature_within_process() {
+    let _lock = CACHE_LOCK.lock().unwrap();
+    clear_device_signature_cache_for_tests();
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let cold = load_config(None).device_signature_for_path(path.to_str().unwrap());
+    let warm = load_config(None).device_signature_for_path(path.to_str().unwrap());
+
+    assert_eq!(warm, cold);
+
+    clear_device_signature_cache_for_tests();
+}
+
+#[test]
+fn explicit_config_path_bypasses_default_config_cache() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_default_config_cache_for_tests();
+
+    let tmp = unique_temp_dir("fro-default-cache-explicit");
+    let cfg_path = tmp.join("fro.json");
+
+    let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+    let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
+    let old_home = set_env_var("HOME", None);
+
+    let cached = load_config(None);
+    assert_eq!(cached.get_params("read", true).num_threads, 16);
+
+    let mut replacement = default_bundle_v1();
+    replacement.defaults.update_params(
+        "read",
+        true,
+        IOParams {
+            num_threads: 77,
+            block_size: 8 * 1024,
+            qd: 5,
+        },
+    );
+    std::fs::write(
+        &cfg_path,
+        serde_json::to_string_pretty(&replacement).unwrap(),
+    )
+    .unwrap();
+
+    let explicit = load_config(Some(cfg_path.to_str().unwrap()));
+    assert_eq!(explicit.get_params("read", true).num_threads, 77);
+    assert_eq!(load_config(None).get_params("read", true).num_threads, 16);
+
+    restore_env_var("FRO_CONFIG", old_fro);
+    restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
+    restore_env_var("HOME", old_home);
+    clear_default_config_cache_for_tests();
+}
+
+#[test]
+fn load_config_save_refreshes_default_config_cache() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    clear_default_config_cache_for_tests();
+
+    let tmp = unique_temp_dir("fro-default-cache-save");
+    let cfg_path = tmp.join("fro.json");
+
+    let old_fro = set_env_var("FRO_CONFIG", Some(cfg_path.to_str().unwrap()));
+    let old_sys = set_env_var("FRO_SYSTEM_CONFIG", None);
+    let old_home = set_env_var("HOME", None);
+
+    let mut loaded = load_config(None);
+    loaded.update_params(
+        "read",
+        true,
+        IOParams {
+            num_threads: 88,
+            block_size: 16 * 1024,
+            qd: 6,
+        },
+    );
+    loaded.save();
+
+    let reloaded = load_config(None);
+    assert_eq!(reloaded.get_params("read", true).num_threads, 88);
+    assert_eq!(reloaded.config_path(), cfg_path.as_path());
+
+    restore_env_var("FRO_CONFIG", old_fro);
+    restore_env_var("FRO_SYSTEM_CONFIG", old_sys);
+    restore_env_var("HOME", old_home);
+    clear_default_config_cache_for_tests();
 }
 
 #[test]
@@ -284,6 +419,158 @@ fn bundle_mount_overrides_roundtrip_copy_range_and_auto_mode() {
         reloaded.get_copy_auto_mode_for_path(tmp.to_str().unwrap()),
         CopyAutoMode::CopyFileRange
     );
+}
+
+#[test]
+fn copy_auto_mode_config_path_lookup_uses_longest_override_prefix() {
+    let mut defaults = AppConfig::default();
+    defaults.copy_auto_mode = CopyAutoMode::Heuristic;
+
+    let loaded = LoadedConfig::BundleV1 {
+        path: unique_temp_dir("fro-copy-auto-prefix").join("fro.json"),
+        bundle: ConfigBundleV1 {
+            version: 1,
+            defaults,
+            mount_overrides: MountOverrides {
+                by_mountpoint: std::collections::HashMap::from([
+                    (
+                        "/data".to_string(),
+                        AppConfigPatch {
+                            copy_auto_mode: Some(CopyAutoMode::Direct),
+                            ..AppConfigPatch::default()
+                        },
+                    ),
+                    (
+                        "/data/fro".to_string(),
+                        AppConfigPatch {
+                            copy_auto_mode: Some(CopyAutoMode::CopyFileRange),
+                            ..AppConfigPatch::default()
+                        },
+                    ),
+                ]),
+            },
+            device_db: DeviceDbConfig::default(),
+        },
+    };
+
+    assert_eq!(
+        loaded.get_copy_auto_mode_for_config_path("/data/fro/run/output.bin"),
+        CopyAutoMode::CopyFileRange
+    );
+    assert_eq!(
+        loaded.get_copy_auto_mode_for_config_path("/data/other/output.bin"),
+        CopyAutoMode::Direct
+    );
+    assert_eq!(
+        loaded.get_copy_auto_mode_for_config_path("/elsewhere/output.bin"),
+        CopyAutoMode::Heuristic
+    );
+    assert_eq!(
+        loaded.get_copy_auto_mode_for_path("/data/fro/run/output.bin"),
+        CopyAutoMode::CopyFileRange
+    );
+}
+
+#[test]
+fn get_params_for_path_uses_longest_config_prefix_override() {
+    let mut defaults = AppConfig::default();
+    defaults.update_params(
+        "read",
+        true,
+        IOParams {
+            num_threads: 11,
+            block_size: 128 * 1024,
+            qd: 1,
+        },
+    );
+
+    let loaded = LoadedConfig::BundleV1 {
+        path: unique_temp_dir("fro-config-prefix-params").join("fro.json"),
+        bundle: ConfigBundleV1 {
+            version: 1,
+            defaults,
+            mount_overrides: MountOverrides {
+                by_mountpoint: std::collections::HashMap::from([
+                    (
+                        "/data".to_string(),
+                        AppConfigPatch {
+                            read: Some(ModeConfigPatch {
+                                direct: Some(IOParams {
+                                    num_threads: 22,
+                                    block_size: 256 * 1024,
+                                    qd: 2,
+                                }),
+                                ..ModeConfigPatch::default()
+                            }),
+                            ..AppConfigPatch::default()
+                        },
+                    ),
+                    (
+                        "/data/fro".to_string(),
+                        AppConfigPatch {
+                            read: Some(ModeConfigPatch {
+                                direct: Some(IOParams {
+                                    num_threads: 33,
+                                    block_size: 512 * 1024,
+                                    qd: 3,
+                                }),
+                                ..ModeConfigPatch::default()
+                            }),
+                            ..AppConfigPatch::default()
+                        },
+                    ),
+                ]),
+            },
+            device_db: DeviceDbConfig::default(),
+        },
+    };
+
+    let nested = loaded.get_params_for_path("read", true, "/data/fro/run/output.bin");
+    assert_eq!(nested.num_threads, 33);
+    assert_eq!(nested.block_size, 512 * 1024);
+    assert_eq!(nested.qd, 3);
+
+    let broader = loaded.get_params_for_path("read", true, "/data/other/output.bin");
+    assert_eq!(broader.num_threads, 22);
+    assert_eq!(broader.block_size, 256 * 1024);
+    assert_eq!(broader.qd, 2);
+
+    let defaulted = loaded.get_params_for_path("read", true, "/elsewhere/output.bin");
+    assert_eq!(defaulted.num_threads, 11);
+    assert_eq!(defaulted.block_size, 128 * 1024);
+    assert_eq!(defaulted.qd, 1);
+}
+
+#[test]
+fn missing_device_db_paths_are_memoized_after_first_miss() {
+    clear_missing_device_db_paths_for_tests();
+
+    let tmp = unique_temp_dir("fro-device-db-miss-cache");
+    let target = tmp.join("nested").join("file.bin");
+    let missing_db = tmp.join("missing-device-db.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, b"x").unwrap();
+
+    let loaded = LoadedConfig::BundleV1 {
+        path: tmp.join("fro.json"),
+        bundle: ConfigBundleV1 {
+            version: 1,
+            defaults: AppConfig::default(),
+            mount_overrides: MountOverrides::default(),
+            device_db: DeviceDbConfig {
+                paths: vec![missing_db.to_string_lossy().into_owned()],
+                allow_online_update: false,
+            },
+        },
+    };
+
+    assert!(!missing_device_db_path_is_cached_for_tests(
+        missing_db.to_str().unwrap()
+    ));
+    let _ = loaded.effective_config_for_path(target.to_str().unwrap());
+    assert!(missing_device_db_path_is_cached_for_tests(
+        missing_db.to_str().unwrap()
+    ));
 }
 
 #[test]

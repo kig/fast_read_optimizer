@@ -35,9 +35,9 @@ pub use stream::transform::{
     auto_select_transform_io_pairing, grow_pipe_capacity_best_effort, run_file_transform_to_file,
     run_file_transform_to_pipe_with_owned_output, run_mapper_transform_io_pairing,
     run_mapper_transform_with_specs, run_reader_transform_to_file, run_reader_transform_to_pipe,
-    run_transform_io_pairing, run_transform_with_specs, MapperTransformOutput,
-    MapperTransformOutputKind, PipeOutputPolicy, ReaderTransformGeometry, TransformInputSpec,
-    TransformIoPairing, TransformIoPairingKind, TransformOutputSpec,
+    run_staged_file_transform_to_file, run_transform_io_pairing, run_transform_with_specs,
+    MapperTransformOutput, MapperTransformOutputKind, PipeOutputPolicy, ReaderTransformGeometry,
+    TransformInputSpec, TransformIoPairing, TransformIoPairingKind, TransformOutputSpec,
 };
 pub use stream::{
     BlockRange, ParallelFile, ParallelReadReport, ParallelWriteReport, ParallelWriter,

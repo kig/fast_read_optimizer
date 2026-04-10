@@ -1,5 +1,27 @@
 use super::*;
 
+static MOUNTINFO_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static DEVICE_SIGNATURE_CACHE: OnceLock<Mutex<HashMap<String, Option<DeviceSignature>>>> =
+    OnceLock::new();
+
+fn mountinfo_cache() -> &'static Mutex<Option<String>> {
+    MOUNTINFO_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn device_signature_cache() -> &'static Mutex<HashMap<String, Option<DeviceSignature>>> {
+    DEVICE_SIGNATURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn clear_mountinfo_cache_for_tests() {
+    *mountinfo_cache().lock().unwrap() = None;
+}
+
+#[cfg(test)]
+pub(super) fn clear_device_signature_cache_for_tests() {
+    device_signature_cache().lock().unwrap().clear();
+}
+
 pub(super) fn device_db_match<'a>(
     db: &'a DeviceDb,
     mount: &MountInfo,
@@ -108,28 +130,37 @@ pub fn mount_info_for_path(path: &str) -> Option<MountInfo> {
     let normalized = normalize_path(path);
     let path = normalized.to_string_lossy();
 
-    let data = match fs::read_to_string("/proc/self/mountinfo") {
-        Ok(data) => data,
-        Err(err) => {
-            MOUNTINFO_WARNING.call_once(|| {
-                eprintln!(
-                    "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
-                    err
-                );
-            });
-            return None;
-        }
+    let mut cache = mountinfo_cache().lock().unwrap();
+    let data = match cache.as_ref() {
+        Some(data) => data.clone(),
+        None => match fs::read_to_string("/proc/self/mountinfo") {
+            Ok(data) => {
+                *cache = Some(data.clone());
+                data
+            }
+            Err(err) => {
+                MOUNTINFO_WARNING.call_once(|| {
+                    eprintln!(
+                        "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
+                        err
+                    );
+                });
+                return None;
+            }
+        },
     };
+    drop(cache);
 
     mount_info_for_path_from_data(&path, &data)
 }
 
+#[allow(dead_code)]
 pub fn device_signature_for_path(path: &str) -> Option<DeviceSignature> {
     let mount = mount_info_for_path(path)?;
     device_signature_from_mount_info(&mount)
 }
 
-fn device_signature_from_mount_info(mount: &MountInfo) -> Option<DeviceSignature> {
+pub(super) fn device_signature_from_mount_info(mount: &MountInfo) -> Option<DeviceSignature> {
     let roots = DeviceProbeRoots::default();
     device_signature_from_mount_info_with_roots(mount, &roots)
 }
@@ -138,20 +169,45 @@ pub(super) fn device_signature_from_mount_info_with_roots(
     mount: &MountInfo,
     roots: &DeviceProbeRoots,
 ) -> Option<DeviceSignature> {
-    if mount.mount_source.is_empty() {
-        return None;
+    let cache_key = device_signature_cache_key(mount, roots);
+    if let Some(cached) = device_signature_cache()
+        .lock()
+        .unwrap()
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
     }
 
-    let canonical_source = canonical_mount_source(&mount.mount_source, roots);
-    let block = block_device_signature_for_mount_source(&canonical_source, roots);
-    let match_keys = device_match_keys(&mount.mount_source, &canonical_source, block.as_ref());
+    let signature = if mount.mount_source.is_empty() {
+        None
+    } else {
+        let canonical_source = canonical_mount_source(&mount.mount_source, roots);
+        let block = block_device_signature_for_mount_source(&canonical_source, roots);
+        let match_keys = device_match_keys(&mount.mount_source, &canonical_source, block.as_ref());
 
-    Some(DeviceSignature {
-        mount_source: mount.mount_source.clone(),
-        canonical_source,
-        match_keys,
-        block_device: block,
-    })
+        Some(DeviceSignature {
+            mount_source: mount.mount_source.clone(),
+            canonical_source,
+            match_keys,
+            block_device: block,
+        })
+    };
+
+    device_signature_cache()
+        .lock()
+        .unwrap()
+        .insert(cache_key, signature.clone());
+    signature
+}
+
+fn device_signature_cache_key(mount: &MountInfo, roots: &DeviceProbeRoots) -> String {
+    format!(
+        "{}\n{}\n{}",
+        roots.dev_root.display(),
+        roots.sys_class_block_root.display(),
+        mount.mount_source
+    )
 }
 
 fn canonical_mount_source(source: &str, roots: &DeviceProbeRoots) -> String {

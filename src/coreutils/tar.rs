@@ -7,13 +7,25 @@ enum TarMode {
     Extract,
 }
 
-fn infer_tar_compression(archive: &str, gzip_requested: bool) -> crate::main_app::TarCompression {
+fn infer_tar_compression(
+    archive: &str,
+    gzip_requested: bool,
+    zstd_requested: bool,
+) -> crate::main_app::TarCompression {
     if gzip_requested {
         return crate::main_app::TarCompression::Gzip;
+    }
+    if zstd_requested {
+        return crate::main_app::TarCompression::Zstd;
     }
     let archive = archive.to_ascii_lowercase();
     if archive.ends_with(".tar.gz") || archive.ends_with(".tgz") {
         crate::main_app::TarCompression::Gzip
+    } else if archive.ends_with(".tar.zst")
+        || archive.ends_with(".tar.zstd")
+        || archive.ends_with(".tzst")
+    {
+        crate::main_app::TarCompression::Zstd
     } else {
         crate::main_app::TarCompression::None
     }
@@ -39,6 +51,7 @@ fn parse_short_tar_flags(
     mode: &mut Option<TarMode>,
     verbose: &mut bool,
     gzip: &mut bool,
+    zstd: &mut bool,
     archive: &mut Option<String>,
     extract_dir: &mut Option<String>,
 ) -> io::Result<()> {
@@ -51,6 +64,7 @@ fn parse_short_tar_flags(
             'x' => set_tar_mode(mode, TarMode::Extract)?,
             'v' => *verbose = true,
             'z' => *gzip = true,
+            'J' => *zstd = true,
             'f' => {
                 if pos + 1 < chars.len() {
                     *archive = Some(chars[pos + 1..].iter().collect());
@@ -98,6 +112,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
     let mut mode = None;
     let mut verbose = false;
     let mut gzip = false;
+    let mut zstd = false;
     let mut archive: Option<String> = None;
     let mut extract_dir: Option<String> = None;
     let mut paths = Vec::new();
@@ -118,6 +133,8 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             verbose = true;
         } else if !end_flags && matches!(arg.as_str(), "--gzip" | "--gunzip" | "--ungzip") {
             gzip = true;
+        } else if !end_flags && arg == "--zstd" {
+            zstd = true;
         } else if !end_flags && arg == "--file" {
             i += 1;
             archive = Some(
@@ -146,6 +163,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
                 &mut mode,
                 &mut verbose,
                 &mut gzip,
+                &mut zstd,
                 &mut archive,
                 &mut extract_dir,
             )?;
@@ -159,11 +177,17 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "Usage: {program} (-c[fz] <archive.tar[.gz]> <source> | -t[fvz] <archive.tar[.gz]> | -x[fvz] <archive.tar[.gz]> [-C <dir>])"
+                "Usage: {program} (-c[fzJ] <archive.tar[.gz|.zst]> <source> | -t[fvzJ] <archive.tar[.gz|.zst]> | -x[fvzJ] <archive.tar[.gz|.zst]> [-C <dir>])"
             ),
         )
     })?;
-    let compression = infer_tar_compression(&archive, gzip);
+    if gzip && zstd {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tar accepts at most one compression flag of --gzip/-z or --zstd/-J",
+        ));
+    }
+    let compression = infer_tar_compression(&archive, gzip, zstd);
 
     if extract_dir.is_some() && !matches!(mode, Some(TarMode::Extract)) {
         return Err(io::Error::new(
@@ -177,7 +201,7 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
             if paths.len() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("Usage: {program} -c[fz] <archive.tar[.gz]> <source>"),
+                    format!("Usage: {program} -c[fzJ] <archive.tar[.gz|.zst]> <source>"),
                 ));
             }
             crate::main_app::create_tar_archive(

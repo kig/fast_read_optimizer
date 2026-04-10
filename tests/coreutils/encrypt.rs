@@ -65,6 +65,49 @@ fn encrypt_decrypt_roundtrip_matches_plaintext() {
 }
 
 #[test]
+fn encrypt_decrypt_small_regular_file_roundtrip_matches_plaintext() {
+    let tmp = unique_temp_dir("fro-coreutils-encrypt-small-roundtrip");
+    let plaintext = tmp.join("plain.bin");
+    let ciphertext = tmp.join("cipher.bin");
+    let decrypted = tmp.join("plain.out");
+    let passphrase = tmp.join("pass.txt");
+    let bytes = (0..(700 * 1024 + 19))
+        .map(|i| ((i * 47 + 5) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&plaintext, &bytes).unwrap();
+    fs::write(&passphrase, b"small-roundtrip-secret\n").unwrap();
+
+    let encrypt = run_fro(
+        "encrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            ciphertext.to_str().unwrap(),
+            plaintext.to_str().unwrap(),
+        ],
+    );
+    assert!(encrypt.status.success());
+    assert_eq!(
+        &openssl_header(&fs::read(&ciphertext).unwrap())[..8],
+        b"Salted__"
+    );
+
+    let decrypt = run_fro(
+        "decrypt",
+        &[
+            "--passphrase-file",
+            passphrase.to_str().unwrap(),
+            "-o",
+            decrypted.to_str().unwrap(),
+            ciphertext.to_str().unwrap(),
+        ],
+    );
+    assert!(decrypt.status.success());
+    assert_eq!(fs::read(&decrypted).unwrap(), bytes);
+}
+
+#[test]
 fn encrypt_and_decrypt_support_stdio() {
     let tmp = unique_temp_dir("fro-coreutils-encrypt-stdio");
     let passphrase = tmp.join("pass.txt");

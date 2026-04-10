@@ -1,5 +1,24 @@
 use super::*;
 
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone)]
+struct CachedDefaultConfig {
+    path: PathBuf,
+    loaded: LoadedConfig,
+}
+
+static DEFAULT_CONFIG_CACHE: OnceLock<Mutex<Option<CachedDefaultConfig>>> = OnceLock::new();
+
+fn default_config_cache() -> &'static Mutex<Option<CachedDefaultConfig>> {
+    DEFAULT_CONFIG_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(super) fn clear_default_config_cache_for_tests() {
+    *default_config_cache().lock().unwrap() = None;
+}
+
 pub fn default_user_config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".fro").join("fro.json"))
@@ -32,11 +51,7 @@ pub fn resolve_default_config_path() -> PathBuf {
     default_user_config_path().unwrap_or_else(|| PathBuf::from("fro.json"))
 }
 
-pub fn load_config(path: Option<&str>) -> LoadedConfig {
-    let path = path
-        .map(PathBuf::from)
-        .unwrap_or_else(resolve_default_config_path);
-
+fn load_config_from_path(path: PathBuf) -> LoadedConfig {
     if path.exists() {
         match fs::read_to_string(&path) {
             Ok(data) => {
@@ -82,6 +97,37 @@ pub fn load_config(path: Option<&str>) -> LoadedConfig {
     }
 
     LoadedConfig::BundleV1 { path, bundle }
+}
+
+pub fn load_config(path: Option<&str>) -> LoadedConfig {
+    let Some(path) = path.map(PathBuf::from) else {
+        let path = resolve_default_config_path();
+        let mut cache = default_config_cache().lock().unwrap();
+        if let Some(cached) = cache.as_ref() {
+            if cached.path == path {
+                return cached.loaded.clone();
+            }
+        }
+
+        let loaded = load_config_from_path(path.clone());
+        *cache = Some(CachedDefaultConfig {
+            path,
+            loaded: loaded.clone(),
+        });
+        return loaded;
+    };
+
+    load_config_from_path(path)
+}
+
+pub(super) fn refresh_cached_default_config(loaded: &LoadedConfig) {
+    let mut cache = default_config_cache().lock().unwrap();
+    let Some(cached) = cache.as_mut() else {
+        return;
+    };
+    if cached.path.as_path() == loaded.config_path() {
+        cached.loaded = loaded.clone();
+    }
 }
 
 pub(super) fn default_bundle_v1() -> ConfigBundleV1 {
@@ -198,10 +244,11 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn save(&self, path: &str) {
+    pub fn save(&self, path: &str) -> io::Result<()> {
         if let Ok(data) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, data);
+            fs::write(path, data)?;
         }
+        Ok(())
     }
 
     pub fn get_params(&self, mode: &str, direct: bool) -> IOParams {

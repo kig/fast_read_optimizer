@@ -33,6 +33,11 @@ fn tar_fixture(prefix: &str) -> (PathBuf, PathBuf, String) {
     (tmp, source_root, source_name)
 }
 
+fn system_tar_supports_zstd() -> bool {
+    let output = run_system("tar", &["--help"]);
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("--zstd")
+}
+
 fn encode_tar_octal(value: u64, field_len: usize) -> Vec<u8> {
     let digits = format!("{value:o}");
     let mut field = vec![b'0'; field_len];
@@ -454,6 +459,116 @@ fn cartesian_tar_gzip_extract_matches_system_tar() {
             ],
         ),
         "gzip extract",
+    );
+
+    let fro_tree = snapshot_tree(&fro_extract.join(&source_name));
+    let sys_tree = snapshot_tree(&sys_extract.join(&source_name));
+    assert_eq!(fro_tree, sys_tree);
+}
+
+#[test]
+fn cartesian_tar_zstd_create_and_list_match_system_tar() {
+    if !system_tar_supports_zstd() {
+        return;
+    }
+    let (tmp, source_root, source_name) = tar_fixture("fro-coreutils-tar-zstd-create");
+    let fro_tar = tmp.join("fro.tar.zst");
+
+    assert_success(run_fro(
+        "tar",
+        &[
+            "-cJf",
+            fro_tar.to_str().unwrap(),
+            source_root.to_str().unwrap(),
+        ],
+    ));
+
+    let fro_list = assert_success(run_fro("tar", &["-tf", fro_tar.to_str().unwrap()]));
+    let sys_list = assert_success(run_system(
+        "tar",
+        &["--zstd", "-tf", fro_tar.to_str().unwrap()],
+    ));
+    let mut fro_lines = String::from_utf8_lossy(&fro_list.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut sys_lines = String::from_utf8_lossy(&sys_list.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fro_lines.sort();
+    sys_lines.sort();
+    assert_eq!(fro_lines, sys_lines);
+
+    let extract_dir = tmp.join("fro-zstd-extract");
+    fs::create_dir_all(&extract_dir).unwrap();
+    assert_success(run_system(
+        "tar",
+        &[
+            "--zstd",
+            "-xf",
+            fro_tar.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+        ],
+    ));
+    let extracted = snapshot_tree(&extract_dir.join(&source_name));
+    let original = snapshot_tree(&source_root);
+    assert_eq!(extracted, original);
+}
+
+#[test]
+fn cartesian_tar_zstd_extract_matches_system_tar() {
+    if !system_tar_supports_zstd() {
+        return;
+    }
+    let (tmp, _source_root, source_name) = tar_fixture("fro-coreutils-tar-zstd-extract");
+    let archive = tmp.join("sys.tar.zst");
+    let sys_out = run_system(
+        "bash",
+        &[
+            "-lc",
+            &format!(
+                "cd {} && tar --zstd -cf {} {}",
+                tmp.display(),
+                archive.display(),
+                source_name
+            ),
+        ],
+    );
+    assert!(
+        sys_out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sys_out.stdout),
+        String::from_utf8_lossy(&sys_out.stderr)
+    );
+
+    let fro_extract = tmp.join("fro-zstd-extract");
+    let sys_extract = tmp.join("sys-zstd-extract");
+    fs::create_dir_all(&fro_extract).unwrap();
+    fs::create_dir_all(&sys_extract).unwrap();
+
+    assert_same_result(
+        run_fro(
+            "tar",
+            &[
+                "-xf",
+                archive.to_str().unwrap(),
+                "-C",
+                fro_extract.to_str().unwrap(),
+            ],
+        ),
+        run_system(
+            "tar",
+            &[
+                "--zstd",
+                "-xf",
+                archive.to_str().unwrap(),
+                "-C",
+                sys_extract.to_str().unwrap(),
+            ],
+        ),
+        "zstd extract",
     );
 
     let fro_tree = snapshot_tree(&fro_extract.join(&source_name));
