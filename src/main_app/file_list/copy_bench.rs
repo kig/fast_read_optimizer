@@ -86,7 +86,7 @@ pub(crate) fn bench_manifest_recursive_copy(
         overlap_large_file_bytes: overlap_bytes,
     };
 
-    println!(
+    fro::cio_println!(
         "manifest-recursive-copy {} bytes across {} files: dirs={} dir_phase={:.4}s file_phase={:.4}s total={:.4}s file_gbps={:.3}",
         result.bytes,
         result.entries,
@@ -97,7 +97,7 @@ pub(crate) fn bench_manifest_recursive_copy(
         result.bytes as f64 / result.file_phase_secs.max(1e-9) / 1e9
     );
     if let (Some(bytes), Some(secs)) = (result.overlap_large_file_bytes, result.overlap_secs) {
-        println!(
+        fro::cio_println!(
             "manifest-recursive-copy overlap-large-file {} bytes in {:.4}s {:.3} GB/s",
             bytes,
             secs,
@@ -105,7 +105,7 @@ pub(crate) fn bench_manifest_recursive_copy(
         );
     }
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "manifest-recursive-copy details: source_root={} target_root={} manifest={}",
             source_root.display(),
             target_root.display(),

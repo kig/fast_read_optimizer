@@ -112,7 +112,14 @@ pub fn note_direct_unaligned_fallback(operation: &str, offset: u64, len: usize) 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE)
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE | libc::EPERM)
+    ) || err.kind() == io::ErrorKind::InvalidInput
+}
+
+fn posix_fallocate_should_fallback(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ENOSYS | libc::EPERM)
     ) || err.kind() == io::ErrorKind::InvalidInput
 }
 
@@ -201,7 +208,11 @@ pub fn checked_posix_fallocate(
         Ok(())
     } else {
         let err = io::Error::from_raw_os_error(rc);
-        Err(io::Error::new(err.kind(), format!("{context}: {err}")))
+        if posix_fallocate_should_fallback(&err) {
+            Ok(())
+        } else {
+            Err(io::Error::new(err.kind(), format!("{context}: {err}")))
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::io_util::checked_posix_fallocate;
+use crate::uring_util::io_uring_available;
 use std::os::unix::fs::FileExt;
 
 const SINGLE_DIRECT_WRITE_LIMIT: u64 = 512 * 1024;
@@ -59,6 +60,109 @@ fn write_all_at(file: &File, offset: u64, data: &[u8]) -> io::Result<()> {
         written += count;
     }
     Ok(())
+}
+
+fn read_full_at(file: &File, offset: u64, data: &mut [u8]) -> io::Result<()> {
+    let mut read_total = 0usize;
+    while read_total < data.len() {
+        let count = file.read_at(&mut data[read_total..], offset + read_total as u64)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short blocking copy read",
+            ));
+        }
+        read_total += count;
+    }
+    Ok(())
+}
+
+fn write_buffer_range_blocking(
+    filename: &str,
+    data: &[u8],
+    block_size: u64,
+    direct_write: bool,
+) -> io::Result<u64> {
+    let total_size = data.len() as u64;
+    let chunk_size = block_size.max(4096);
+    let (page_cache_file, direct_file, _) = open_writer_files(filename, true, Some(total_size))?;
+    let mut buffer = AlignedBuffer::new(chunk_size as usize);
+    let mut written = 0u64;
+
+    while written < total_size {
+        let chunk_len = (total_size - written).min(chunk_size) as usize;
+        buffer.as_mut_slice()[..chunk_len]
+            .copy_from_slice(&data[written as usize..written as usize + chunk_len]);
+        let aligned_write = (written % 4096 == 0) && (chunk_len as u64 == chunk_size);
+        if direct_write && !aligned_write {
+            note_direct_unaligned_fallback("write", written, chunk_len);
+        }
+        let file = if direct_write && aligned_write {
+            &direct_file
+        } else {
+            &page_cache_file
+        };
+        write_all_at(file, written, &buffer.as_slice()[..chunk_len])?;
+        written += chunk_len as u64;
+    }
+
+    Ok(total_size)
+}
+
+fn write_file_blocking(
+    source: Option<&str>,
+    filename: &str,
+    total_size: u64,
+    block_size: u64,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+    generated_pattern: GeneratedWritePattern,
+) -> io::Result<u64> {
+    let chunk_size = block_size.max(4096);
+    let (dest_page_cache, dest_direct, _) = open_writer_files(filename, true, Some(total_size))?;
+    let direct_write = io_mode_write != IOMode::PageCache;
+    let direct_read = matches!(io_mode_read, IOMode::Direct | IOMode::Auto);
+    let mut buffer = AlignedBuffer::new(chunk_size as usize);
+    let source_files = source
+        .map(|path| -> io::Result<(File, File)> {
+            let page_cache = File::open(path)?;
+            let direct = open_direct_reader_or_fallback(path, &page_cache)?;
+            Ok((page_cache, direct))
+        })
+        .transpose()?;
+    let mut written = 0u64;
+
+    while written < total_size {
+        let chunk_len = (total_size - written).min(chunk_size) as usize;
+        if let Some((source_page_cache, source_direct)) = source_files.as_ref() {
+            let aligned_read = (written % 4096 == 0) && (chunk_len as u64 == chunk_size);
+            if direct_read && !aligned_read {
+                note_direct_unaligned_fallback("copy-read", written, chunk_len);
+            }
+            let source_file = if direct_read && aligned_read {
+                source_direct
+            } else {
+                source_page_cache
+            };
+            read_full_at(source_file, written, &mut buffer.as_mut_slice()[..chunk_len])?;
+        } else {
+            fill_generated_pattern(&mut buffer.as_mut_slice()[..chunk_len], generated_pattern);
+        }
+
+        let aligned_write = (written % 4096 == 0) && (chunk_len as u64 == chunk_size);
+        if direct_write && !aligned_write {
+            note_direct_unaligned_fallback("write", written, chunk_len);
+        }
+        let dest_file = if direct_write && aligned_write {
+            &dest_direct
+        } else {
+            &dest_page_cache
+        };
+        write_all_at(dest_file, written, &buffer.as_slice()[..chunk_len])?;
+        written += chunk_len as u64;
+    }
+
+    Ok(total_size)
 }
 
 fn fill_generated_pattern(buffer: &mut [u8], pattern: GeneratedWritePattern) {
@@ -476,6 +580,10 @@ pub fn write_buffer_range(
         };
     }
 
+    if !io_uring_available(1024)? {
+        return write_buffer_range_blocking(filename, slice, block_size, direct_write);
+    }
+
     {
         let f = OpenOptions::new().write(true).create(true).open(filename)?;
         if f.metadata()?.file_type().is_file() {
@@ -586,6 +694,18 @@ fn _write_file_internal(
                 ),
             };
         }
+    }
+
+    if !io_uring_available(1024)? {
+        return write_file_blocking(
+            source,
+            filename,
+            total_size,
+            block_size,
+            io_mode_read,
+            io_mode_write,
+            generated_pattern,
+        );
     }
 
     let random_block = if source.is_none() {

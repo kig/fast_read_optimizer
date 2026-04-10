@@ -49,7 +49,7 @@ fn buf_writer_batches_chunks_into_output_file() {
         .write(true)
         .open(&path)
         .unwrap();
-    let writer = BufWriter::with_capacity(2, file, 2, 4096).unwrap();
+    let mut writer = BufWriter::with_capacity(2, file, 2, 4096).unwrap();
 
     writer.write_all(&vec![b'a'; 3000]).unwrap();
     writer.write_all(&vec![b'b'; 5000]).unwrap();

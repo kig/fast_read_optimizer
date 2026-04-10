@@ -1,4 +1,5 @@
 use super::*;
+use std::io::BufRead;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptMode {
@@ -10,29 +11,29 @@ enum PromptMode {
 fn mark_removed(path: &Path, is_dir: bool, verbose: bool) {
     if verbose {
         if is_dir {
-            println!("removed directory '{}'", path.display());
+            fro::cio_println!("removed directory '{}'", path.display());
         } else {
-            println!("removed '{}'", path.display());
+            fro::cio_println!("removed '{}'", path.display());
         }
     }
 }
 
 fn print_rm_help(program: &str) {
-    println!(
+    fro::cio_println!(
         "Usage: {program} [-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
     );
-    println!("Remove files or directories.");
-    println!();
-    println!("  -d, --dir          remove empty directories");
-    println!("  -f, --force        ignore missing files and allow zero operands");
-    println!("  -i                 prompt before every removal");
-    println!(
+    fro::cio_println!("Remove files or directories.");
+    fro::cio_println!();
+    fro::cio_println!("  -d, --dir          remove empty directories");
+    fro::cio_println!("  -f, --force        ignore missing files and allow zero operands");
+    fro::cio_println!("  -i                 prompt before every removal");
+    fro::cio_println!(
         "  -I                 prompt once before removing more than three files or recursively"
     );
-    println!("      --interactive[=WHEN] prompt according to WHEN: never, once, or always");
-    println!("  -r, -R, --recursive remove directories and their contents recursively");
-    println!("  -v, --verbose      print a line for each removed path");
-    println!("  -h, --help         display this help and exit");
+    fro::cio_println!("      --interactive[=WHEN] prompt according to WHEN: never, once, or always");
+    fro::cio_println!("  -r, -R, --recursive remove directories and their contents recursively");
+    fro::cio_println!("  -v, --verbose      print a line for each removed path");
+    fro::cio_println!("  -h, --help         display this help and exit");
 }
 
 fn parse_interactive_when(value: &str) -> io::Result<PromptMode> {
@@ -48,13 +49,14 @@ fn parse_interactive_when(value: &str) -> io::Result<PromptMode> {
 }
 
 fn prompt_user(question: &str) -> io::Result<bool> {
-    let mut stderr = io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096)?;
     stderr.write_all(question.as_bytes())?;
     stderr.flush()?;
     drop(stderr);
 
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    let mut stdin = std::io::BufReader::new(fro::command_io::stdin_file()?);
+    stdin.read_line(&mut answer)?;
     let trimmed = answer.trim_start();
     Ok(matches!(trimmed.as_bytes().first(), Some(b'y' | b'Y')))
 }
@@ -203,7 +205,7 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
         if force {
             return Ok(0);
         }
-        eprintln!(
+        fro::cio_eprintln!(
             "Usage: {} [-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
             program
         );

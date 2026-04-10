@@ -50,7 +50,7 @@ fn escaped_hash_sum_display(label: &str, zero_terminated: bool) -> (bool, String
 }
 
 fn regular_stdin_path() -> io::Result<Option<String>> {
-    if fd_is_regular(libc::STDIN_FILENO)? {
+    if fd_is_regular(fro::command_io::stdin_fd())? {
         Ok(Some("/proc/self/fd/0".to_string()))
     } else {
         Ok(None)
@@ -378,8 +378,8 @@ pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Res
     let options = parse_hash_sum_options(args)?;
     if options.tag_with_check {
         let program = hash_sum_program_name(algorithm);
-        eprintln!("{program}: the --tag option is meaningless when verifying checksums");
-        eprintln!("Try '{program} --help' for more information.");
+        fro::cio_eprintln!("{program}: the --tag option is meaningless when verifying checksums");
+        fro::cio_eprintln!("Try '{program} --help' for more information.");
         return Ok(1);
     }
     if options.check {

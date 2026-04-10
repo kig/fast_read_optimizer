@@ -124,19 +124,19 @@ pub(crate) fn bench_base64_decode_detect_fallback(
 }
 
 fn print_base64_help() {
-    println!("Usage: base64 [OPTION]... [FILE]");
-    println!("Base64 encode or decode FILE, or standard input, to standard output.");
-    println!();
-    println!("  -d, --decode          decode data");
-    println!("  -i, --ignore-garbage  when decoding, ignore non-alphabet characters");
-    println!(
+    fro::cio_println!("Usage: base64 [OPTION]... [FILE]");
+    fro::cio_println!("Base64 encode or decode FILE, or standard input, to standard output.");
+    fro::cio_println!();
+    fro::cio_println!("  -d, --decode          decode data");
+    fro::cio_println!("  -i, --ignore-garbage  when decoding, ignore non-alphabet characters");
+    fro::cio_println!(
         "  -w, --wrap=COLS       wrap encoded lines after COLS characters (default 76, 0 disables)"
     );
-    println!("      --auto            choose I/O mode automatically");
-    println!("      --direct          force direct I/O where supported");
-    println!("      --no-direct       force page-cache I/O");
-    println!("      --help            display this help and exit");
-    println!("      --version         output version information and exit");
+    fro::cio_println!("      --auto            choose I/O mode automatically");
+    fro::cio_println!("      --direct          force direct I/O where supported");
+    fro::cio_println!("      --no-direct       force page-cache I/O");
+    fro::cio_println!("      --help            display this help and exit");
+    fro::cio_println!("      --version         output version information and exit");
 }
 
 fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32>> {
@@ -162,8 +162,8 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
             "-w" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("base64: option requires an argument -- 'w'");
-                    eprintln!("Try 'base64 --help' for more information.");
+                    fro::cio_eprintln!("base64: option requires an argument -- 'w'");
+                    fro::cio_eprintln!("Try 'base64 --help' for more information.");
                     return Ok(Err(1));
                 }
                 wrap_cols = parse_base64_wrap(&args[i]).map_err(|message| {
@@ -173,8 +173,8 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
             "--wrap" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("base64: option '--wrap' requires an argument");
-                    eprintln!("Try 'base64 --help' for more information.");
+                    fro::cio_eprintln!("base64: option '--wrap' requires an argument");
+                    fro::cio_eprintln!("Try 'base64 --help' for more information.");
                     return Ok(Err(1));
                 }
                 wrap_cols = parse_base64_wrap(&args[i]).map_err(|message| {
@@ -193,8 +193,8 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
             }
             "-" => files.push(args[i].clone()),
             other if other.starts_with('-') => {
-                eprintln!("base64: unrecognized option '{other}'");
-                eprintln!("Try 'base64 --help' for more information.");
+                fro::cio_eprintln!("base64: unrecognized option '{other}'");
+                fro::cio_eprintln!("Try 'base64 --help' for more information.");
                 return Ok(Err(1));
             }
             _ => files.push(args[i].clone()),
@@ -203,8 +203,8 @@ fn parse_base64_options(args: &[String]) -> io::Result<Result<Base64Options, i32
     }
 
     if files.len() > 1 {
-        eprintln!("base64: extra operand ‘{}’", files[1]);
-        eprintln!("Try 'base64 --help' for more information.");
+        fro::cio_eprintln!("base64: extra operand ‘{}’", files[1]);
+        fro::cio_eprintln!("Try 'base64 --help' for more information.");
         return Ok(Err(1));
     }
 
@@ -916,7 +916,7 @@ pub(crate) fn bench_base64_encode(
     let iterations_per_second = iterations as f64 / elapsed;
     let gb_per_second = (iterations as f64 * BASE64_BENCH_INPUT_SIZE as f64) / elapsed / 1e9;
 
-    println!(
+    fro::cio_println!(
         "Base64 encode kernel [{}] {} iterations of {} -> {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
         selected_kernel.bench_name(),
         iterations,
@@ -966,7 +966,7 @@ pub(crate) fn bench_base64_decode(
     let iterations_per_second = iterations as f64 / elapsed;
     let gb_per_second = (iterations as f64 * decoded.len() as f64) / elapsed / 1e9;
 
-    println!(
+    fro::cio_println!(
         "Base64 decode kernel [{}] {} iterations of {} -> {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
         selected_kernel.bench_name(),
         iterations,

@@ -440,7 +440,7 @@ pub(crate) fn run_recursive_move(ctx: RecursiveCopyContext, verbose: bool) -> io
 
     let bytes_moved = stats.bytes_moved.load(Ordering::Relaxed);
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "recursive move: dirs_created={}, dirs_removed={}, files_moved={}, symlinks_moved={}, bytes_moved={}",
             stats.dirs_created.load(Ordering::Relaxed),
             stats.dirs_removed.load(Ordering::Relaxed),

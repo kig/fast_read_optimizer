@@ -1,12 +1,16 @@
+extern crate self as fro;
+
 mod api;
 mod blake3_hash;
 mod cksum_hash;
+pub mod command_io;
 mod common;
 pub mod dd_tool;
 mod file_hash;
 mod io_util;
 mod mincore;
 pub mod test_sizing;
+mod uring_util;
 mod verified_copy;
 
 pub mod block_hash;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::uring_util::io_uring_available;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -68,6 +69,23 @@ pub fn copy_file_range_with_strategy_and_progress(
 ) -> io::Result<u64> {
     match copy_strategy {
         CopyStrategy::Auto | CopyStrategy::Threaded => {
+            if !io_uring_available(1024)? {
+                #[cfg(test)]
+                record_copy_backend(source, filename, RecordedCopyBackend::Blocking);
+                return copy_file_range_blocking_with_progress(
+                    source,
+                    filename,
+                    source_offset,
+                    dest_offset,
+                    copy_size,
+                    truncate_target,
+                    block_size_p,
+                    block_size_d,
+                    io_mode_read,
+                    io_mode_write,
+                    progress_count,
+                );
+            }
             #[cfg(test)]
             record_copy_backend(source, filename, RecordedCopyBackend::Threaded);
             copy_file_range_threaded(

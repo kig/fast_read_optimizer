@@ -1,6 +1,8 @@
 use super::*;
 use std::os::unix::fs::FileExt;
 
+const CMP_SMALL_REGULAR_FAST_PATH_LIMIT: u64 = 128 * 1024;
+
 fn count_newlines_in_range(
     path: &str,
     io_mode: IOMode,
@@ -84,6 +86,15 @@ fn cmp_read_byte_at(path: &str, offset: u64) -> io::Result<u8> {
     let mut byte = [0u8; 1];
     file.read_exact_at(&mut byte, offset)?;
     Ok(byte[0])
+}
+
+fn cmp_read_small_range(path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = vec![0_u8; len];
+    if len > 0 {
+        file.read_exact_at(&mut bytes, offset)?;
+    }
+    Ok(bytes)
 }
 
 fn cmp_eof_line(newlines_before_eof: u64, ends_with_newline: bool) -> (u64, &'static str) {
@@ -171,6 +182,174 @@ fn invalid_cmp_skip_spec(value: &str) -> io::Error {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmp_finish_with_loaded_bytes(
+    files: &[String],
+    first_bytes: &[u8],
+    second_bytes: &[u8],
+    first_remaining: u64,
+    second_remaining: u64,
+    shared_remaining: u64,
+    quiet: bool,
+    verbose: bool,
+    print_bytes: bool,
+    limit: Option<u64>,
+    started_at: Option<std::time::Instant>,
+) -> io::Result<i32> {
+    if verbose {
+        let compare_len = first_bytes.len() as u64;
+        let byte_width = cmp_decimal_width(compare_len);
+        let mut had_mismatch = false;
+        for (idx, (&left, &right)) in first_bytes.iter().zip(second_bytes.iter()).enumerate() {
+            if left != right {
+                had_mismatch = true;
+                if print_bytes {
+                    fro::cio_println!(
+                        "{:>width$} {:>3o} {:<4} {:>3o} {}",
+                        idx + 1,
+                        left,
+                        cmp_render_byte_char(left),
+                        right,
+                        cmp_render_byte_char(right),
+                        width = byte_width
+                    );
+                } else {
+                    fro::cio_println!(
+                        "{:>width$} {:>3o} {:>3o}",
+                        idx + 1,
+                        left,
+                        right,
+                        width = byte_width
+                    );
+                }
+            }
+        }
+        if first_remaining != second_remaining
+            && limit.map_or(true, |limit| limit > shared_remaining)
+        {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            fro::cio_eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
+            return Ok(1);
+        }
+        if let Some(started_at) = started_at {
+            report_gbps("cmp", compare_len, started_at);
+        }
+        return Ok(if had_mismatch { 1 } else { 0 });
+    }
+
+    if let Some(index) = first_bytes
+        .iter()
+        .zip(second_bytes.iter())
+        .position(|(&left, &right)| left != right)
+    {
+        if !quiet {
+            let line = 1 + memchr_iter(b'\n', &first_bytes[..index]).count() as u64;
+            if print_bytes {
+                let left = first_bytes[index];
+                let right = second_bytes[index];
+                fro::cio_println!(
+                    "{} {} differ: byte {}, line {} is {:>3o} {} {:>3o} {}",
+                    files[0],
+                    files[1],
+                    index + 1,
+                    line,
+                    left,
+                    cmp_render_byte_char(left),
+                    right,
+                    cmp_render_byte_char(right)
+                );
+            } else {
+                fro::cio_println!(
+                    "{} {} differ: byte {}, line {}",
+                    files[0],
+                    files[1],
+                    index + 1,
+                    line
+                );
+            }
+        }
+        return Ok(1);
+    }
+
+    if first_remaining != second_remaining && limit.map_or(true, |limit| limit > shared_remaining) {
+        if !quiet {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            let eof_bytes = if first_remaining < second_remaining {
+                first_bytes
+            } else {
+                second_bytes
+            };
+            let newlines_before_eof = memchr_iter(b'\n', eof_bytes).count() as u64;
+            let ends_with_newline = eof_bytes.last() == Some(&b'\n');
+            let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
+            fro::cio_eprintln!(
+                "cmp: EOF on {} after byte {}, {} {}",
+                eof_file, shared_remaining, phrase, line
+            );
+        }
+        return Ok(1);
+    }
+
+    if let Some(started_at) = started_at {
+        report_gbps("cmp", first_bytes.len() as u64, started_at);
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmp_try_small_regular_fast_path(
+    files: &[String],
+    io_mode: IOMode,
+    compare_len: u64,
+    first_skip: u64,
+    second_skip: u64,
+    first_remaining: u64,
+    second_remaining: u64,
+    shared_remaining: u64,
+    quiet: bool,
+    verbose: bool,
+    print_bytes: bool,
+    limit: Option<u64>,
+    started_at: Option<std::time::Instant>,
+    first_is_regular: bool,
+    second_is_regular: bool,
+) -> io::Result<Option<i32>> {
+    if io_mode == IOMode::Direct
+        || compare_len > CMP_SMALL_REGULAR_FAST_PATH_LIMIT
+        || !first_is_regular
+        || !second_is_regular
+    {
+        return Ok(None);
+    }
+
+    let compare_len_usize = usize::try_from(compare_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize"))?;
+    let first_bytes = cmp_read_small_range(&files[0], first_skip, compare_len_usize)?;
+    let second_bytes = cmp_read_small_range(&files[1], second_skip, compare_len_usize)?;
+    cmp_finish_with_loaded_bytes(
+        files,
+        &first_bytes,
+        &second_bytes,
+        first_remaining,
+        second_remaining,
+        shared_remaining,
+        quiet,
+        verbose,
+        print_bytes,
+        limit,
+        started_at,
+    )
+    .map(Some)
+}
+
 pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut io_mode = IOMode::Auto;
@@ -246,13 +425,15 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         ));
     }
     if !cmp_flags_are_compatible(quiet, verbose) {
-        eprintln!("cmp: options -l and -s are incompatible");
-        eprintln!("cmp: Try 'cmp --help' for more information.");
+        fro::cio_eprintln!("cmp: options -l and -s are incompatible");
+        fro::cio_eprintln!("cmp: Try 'cmp --help' for more information.");
         return Ok(2);
     }
 
-    let first_len = fs::metadata(&files[0])?.len();
-    let second_len = fs::metadata(&files[1])?.len();
+    let first_meta = fs::metadata(&files[0])?;
+    let second_meta = fs::metadata(&files[1])?;
+    let first_len = first_meta.len();
+    let second_len = second_meta.len();
     let first_remaining = cmp_remaining_len_after_skip(first_len, first_skip);
     let second_remaining = cmp_remaining_len_after_skip(second_len, second_skip);
     let shared_remaining = first_remaining.min(second_remaining);
@@ -272,9 +453,29 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             } else {
                 &files[1]
             };
-            eprintln!("cmp: EOF on {} which is empty", eof_file);
+            fro::cio_eprintln!("cmp: EOF on {} which is empty", eof_file);
         }
         return Ok(1);
+    }
+
+    if let Some(code) = cmp_try_small_regular_fast_path(
+        &files,
+        io_mode,
+        compare_len,
+        first_skip,
+        second_skip,
+        first_remaining,
+        second_remaining,
+        shared_remaining,
+        quiet,
+        verbose,
+        print_bytes,
+        limit,
+        started_at,
+        first_meta.file_type().is_file(),
+        second_meta.file_type().is_file(),
+    )? {
+        return Ok(code);
     }
 
     if verbose {
@@ -301,7 +502,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             if left != right {
                 had_mismatch = true;
                 if print_bytes {
-                    println!(
+                    fro::cio_println!(
                         "{:>width$} {:>3o} {:<4} {:>3o} {}",
                         idx + 1,
                         left,
@@ -311,7 +512,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
                         width = byte_width
                     );
                 } else {
-                    println!(
+                    fro::cio_println!(
                         "{:>width$} {:>3o} {:>3o}",
                         idx + 1,
                         left,
@@ -329,7 +530,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             } else {
                 &files[1]
             };
-            eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
+            fro::cio_eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
             return Ok(1);
         }
         if let Some(started_at) = started_at {
@@ -370,7 +571,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             if print_bytes {
                 let left = cmp_read_byte_at(&files[0], first_skip + mismatch - 1)?;
                 let right = cmp_read_byte_at(&files[1], second_skip + mismatch - 1)?;
-                println!(
+                fro::cio_println!(
                     "{} {} differ: byte {}, line {} is {:>3o} {} {:>3o} {}",
                     files[0],
                     files[1],
@@ -382,7 +583,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
                     cmp_render_byte_char(right)
                 );
             } else {
-                println!(
+                fro::cio_println!(
                     "{} {} differ: byte {}, line {}",
                     files[0],
                     files[1],
@@ -423,7 +624,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
                 memchr_iter(b'\n', &bytes[slice_start..slice_end]).count() as u64;
             let ends_with_newline = slice_end > slice_start && bytes[slice_end - 1] == b'\n';
             let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
-            eprintln!(
+            fro::cio_eprintln!(
                 "cmp: EOF on {} after byte {}, {} {}",
                 eof_file, shared_remaining, phrase, line
             );
@@ -525,6 +726,7 @@ mod tests {
         cmp_byte_display_parts, cmp_decimal_width, cmp_effective_compare_len,
         cmp_effective_compare_len_with_skips, cmp_eof_line, cmp_flags_are_compatible,
         cmp_remaining_len_after_skip, cmp_render_byte_char, parse_cmp_limit, parse_cmp_skip_spec,
+        CMP_SMALL_REGULAR_FAST_PATH_LIMIT,
     };
 
     #[test]
@@ -614,5 +816,11 @@ mod tests {
         assert_eq!(cmp_render_byte_char(0), "^@");
         assert_eq!(cmp_render_byte_char(127), "^?");
         assert_eq!(cmp_render_byte_char(255), "M-^?");
+    }
+
+    #[test]
+    fn cmp_small_regular_fast_path_limit_is_tiny_file_sized() {
+        assert!(CMP_SMALL_REGULAR_FAST_PATH_LIMIT >= 4 * 1024);
+        assert!(CMP_SMALL_REGULAR_FAST_PATH_LIMIT <= 1024 * 1024);
     }
 }

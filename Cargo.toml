@@ -41,3 +41,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 inherits = "release"
 debug = true # Necessary for good symbols in perf
 lto = false  # Avoid LTO for more readable profiles
+
+[[bin]]
+name = "fro-ipc-server"
+path = "src/fro_ipc_server_main.rs"

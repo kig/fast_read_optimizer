@@ -248,7 +248,7 @@ pub(crate) fn bench_tar_archive_variant(
             let start = std::time::Instant::now();
             build_tar_archive_into_output(&entries, &planned_tasks, output, &config, io_mode_read)?;
             let elapsed = start.elapsed().as_secs_f64();
-            println!(
+            fro::cio_println!(
                 "bench-tar-archive ram {} bytes in {:.4} s, {:.3} GiB/s",
                 payload_bytes,
                 elapsed,
@@ -295,7 +295,7 @@ pub(crate) fn bench_tar_archive_variant(
             let sync_start = std::time::Instant::now();
             sync_path(target)?;
             let sync_elapsed = sync_start.elapsed().as_secs_f64();
-            println!(
+            fro::cio_println!(
                 "bench-tar-archive ram-write build={:.4}s ({:.3} GiB/s payload) write={:.4}s ({:.3} GiB/s archive) sync={:.4}s total={:.4}s",
                 build_elapsed,
                 payload_bytes as f64 / build_elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0),
@@ -366,7 +366,7 @@ pub(crate) fn bench_tar_archive_variant(
             let sync_start = std::time::Instant::now();
             sync_path(target)?;
             let sync_elapsed = sync_start.elapsed().as_secs_f64();
-            println!(
+            fro::cio_println!(
                 "bench-tar-archive mmap-file build={:.4}s ({:.3} GiB/s payload) msync={:.4}s sync={:.4}s total={:.4}s",
                 build_elapsed,
                 payload_bytes as f64 / build_elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0),

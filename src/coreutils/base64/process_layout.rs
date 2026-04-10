@@ -1,7 +1,6 @@
 use super::*;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RegularDecodeLayout {
@@ -59,7 +58,7 @@ pub(super) fn regular_input_path(input: &StreamInput) -> io::Result<Option<Strin
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => Ok(Some(path.clone())),
         StreamInput::Stdin { .. } => {
-            let stdin_fd = io::stdin().as_raw_fd();
+            let stdin_fd = fro::command_io::stdin_fd();
             if !is_regular_fd(stdin_fd) {
                 return Ok(None);
             }
@@ -182,7 +181,7 @@ pub(super) fn decode_input_can_use_fast_path(input: &StreamInput) -> io::Result<
             Ok(detect_regular_decode_layout(path)? == RegularDecodeLayout::Clean)
         }
         StreamInput::Stdin { .. } => {
-            let stdin_fd = io::stdin().as_raw_fd();
+            let stdin_fd = fro::command_io::stdin_fd();
             if !is_regular_fd(stdin_fd) {
                 return Ok(true);
             }

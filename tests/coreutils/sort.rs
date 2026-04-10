@@ -17,6 +17,18 @@ fn run_fro_env(command: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
     cmd.output().expect("failed to run fro coreutils command")
 }
 
+fn run_fro_capture_env(command: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fro"));
+    cmd.arg(command)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("failed to run fro coreutils command")
+}
+
 fn run_fro_with_stdin_env(
     command: &str,
     args: &[&str],
@@ -520,6 +532,31 @@ fn sort_numeric_output_file_matches_system_and_suppresses_stdout() {
     assert_eq!(
         fs::read(&fro_output).unwrap(),
         fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
+fn sort_tiny_page_cache_fast_path_skips_config_creation() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-tiny-fast-path");
+    let input = tmp.join("tiny.txt");
+    let config = tmp.join("would-be-created.json");
+    fs::write(&input, b"beta\nalpha\n").unwrap();
+
+    let output = run_fro_capture_env(
+        "sort",
+        &["--no-direct", input.to_str().unwrap()],
+        &[("FRO_CONFIG", config.to_str().unwrap())],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"alpha\nbeta\n");
+    assert!(
+        !config.exists(),
+        "tiny sort fast path should not create a config file"
     );
 }
 

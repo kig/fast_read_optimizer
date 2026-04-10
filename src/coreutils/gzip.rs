@@ -391,7 +391,7 @@ fn open_decompress_sink(path: Option<&Path>, force: bool) -> io::Result<Decompre
 }
 
 fn stdout_file() -> io::Result<File> {
-    let fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    let fd = unsafe { libc::dup(fro::command_io::stdout_fd()) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -399,7 +399,7 @@ fn stdout_file() -> io::Result<File> {
 }
 
 fn stdin_file() -> io::Result<File> {
-    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+    let fd = unsafe { libc::dup(fro::command_io::stdin_fd()) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

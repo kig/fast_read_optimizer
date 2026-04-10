@@ -49,7 +49,7 @@ const HEAD_SMALL_STREAM_LINE_CUTOFF: u64 = 64;
 const OBSOLETE_HEAD_BLOCK_MULTIPLIER: u64 = 512;
 
 fn regular_stdin_path() -> io::Result<Option<&'static str>> {
-    if fd_is_regular(libc::STDIN_FILENO)? {
+    if fd_is_regular(fro::command_io::stdin_fd())? {
         Ok(Some("/proc/self/fd/0"))
     } else {
         Ok(None)
@@ -319,7 +319,7 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<Option<u
         StreamInput::File(path) if is_regular_input_path(path)? => {
             let copied = copy_path_range_to_fd_with_progress(
                 path,
-                libc::STDOUT_FILENO,
+                fro::command_io::stdout_fd(),
                 ByteRange::up_to(bytes),
                 &mut noop,
             )?;
@@ -328,16 +328,16 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<Option<u
         }
         StreamInput::Stdin { .. } => {
             if let Some(copied) = copy_fd_range_to_fd_with_progress(
-                libc::STDIN_FILENO,
-                libc::STDOUT_FILENO,
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
                 ByteRange::up_to(bytes),
                 &mut noop,
             )? {
                 return Ok(Some(copied));
             }
             Ok(copy_fd_to_fd_splice_limited_counted(
-                libc::STDIN_FILENO,
-                libc::STDOUT_FILENO,
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
                 bytes,
                 &mut noop,
             )?
@@ -349,7 +349,7 @@ fn write_head_bytes_fast(input: &StreamInput, bytes: u64) -> io::Result<Option<u
                 let file = std::fs::File::open(path)?;
                 return Ok(copy_fd_to_fd_splice_limited_counted(
                     file.as_raw_fd(),
-                    libc::STDOUT_FILENO,
+                    fro::command_io::stdout_fd(),
                     bytes,
                     &mut noop,
                 )?
@@ -468,18 +468,18 @@ fn write_head_lines_small_stdin_fast(
     let mut remaining_lines = remaining_lines;
     let mut grew_pipes = false;
     loop {
-        let read = read_raw_fd(libc::STDIN_FILENO, &mut buffer)?;
+        let read = read_raw_fd(fro::command_io::stdin_fd(), &mut buffer)?;
         if read == 0 {
             return Ok(());
         }
         let block = &buffer[..read];
         if let Some(prefix_len) = head_line_prefix_len(block, &mut remaining_lines, terminator) {
-            return write_raw_fd_all(libc::STDOUT_FILENO, &block[..prefix_len]);
+            return write_raw_fd_all(fro::command_io::stdout_fd(), &block[..prefix_len]);
         }
-        write_raw_fd_all(libc::STDOUT_FILENO, block)?;
+        write_raw_fd_all(fro::command_io::stdout_fd(), block)?;
         if !grew_pipes {
-            grow_pipe_best_effort(libc::STDIN_FILENO)?;
-            grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+            grow_pipe_best_effort(fro::command_io::stdin_fd())?;
+            grow_pipe_best_effort(fro::command_io::stdout_fd())?;
             grew_pipes = true;
         }
     }

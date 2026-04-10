@@ -336,8 +336,7 @@ pub(super) fn list_tar_archive_reader<R: Read + ?Sized>(
     archive_path: &Path,
     verbose: bool,
 ) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
     visit_tar_archive(reader, archive_path, |entry, _reader| {
         if verbose {
             write_verbose_entry(&mut stdout, &entry)?;
@@ -483,6 +482,8 @@ fn copy_archive_member_to_file(
     Ok(())
 }
 
+const TAR_LOW_LATENCY_EXTRACT_ENTRY_THRESHOLD: u64 = 256 * 1024;
+
 pub(super) fn extract_tar_archive(
     archive_path: &Path,
     destination: Option<&Path>,
@@ -509,8 +510,7 @@ pub(super) fn extract_tar_archive(
         ));
     }
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
     let mut directory_entries = Vec::new();
     let mut created_dirs = HashSet::new();
     let config = config::load_config(None);
@@ -546,7 +546,11 @@ pub(super) fn extract_tar_archive(
                     ));
                 }
                 ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
-                copy_archive_member_to_file(archive_path, &target_path, &entry, &config)?;
+                if entry.size <= TAR_LOW_LATENCY_EXTRACT_ENTRY_THRESHOLD {
+                    copy_reader_member_to_file(&mut file, &target_path, entry.size)?;
+                } else {
+                    copy_archive_member_to_file(archive_path, &target_path, &entry, &config)?;
+                }
                 apply_regular_file_metadata(&target_path, &entry)?;
             }
             b'5' => {
@@ -629,8 +633,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
         ));
     }
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
     let mut directory_entries = Vec::new();
     let mut created_dirs = HashSet::new();
     visit_tar_archive(reader, archive_path, |entry, reader| {

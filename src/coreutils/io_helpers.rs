@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn print_coreutils_version(invoked: &str) {
-    println!("{invoked} (fro coreutils) {FRO_VERSION}");
+    fro::cio_println!("{invoked} (fro coreutils) {FRO_VERSION}");
 }
 pub(crate) fn permission_denied_components(kind: io::ErrorKind, raw_os_error: Option<i32>) -> bool {
     matches!(kind, io::ErrorKind::PermissionDenied)
@@ -13,7 +13,7 @@ pub(crate) fn is_permission_denied(err: &io::Error) -> bool {
 }
 
 pub(crate) fn write_warning_line(tool: &str, path: &Path, err: &io::Error, message: &str) {
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096).unwrap();
     let _ = writeln!(stderr, "{tool}: {message} '{}': {err}", path.display());
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn parse_io_mode(args: &[String]) -> io::Result<(IOMode, Vec<String>)
 
 pub(crate) fn report_gbps(command: &str, bytes: u64, started_at: std::time::Instant) {
     let elapsed = started_at.elapsed().as_secs_f64().max(1e-9);
-    eprintln!(
+    fro::cio_eprintln!(
         "{command} {bytes} bytes in {:.4} s, {:.1} GB/s",
         elapsed,
         bytes as f64 / elapsed / 1e9
@@ -94,7 +94,7 @@ pub(crate) fn ensure_files(
     usage: &str,
 ) -> io::Result<Vec<String>> {
     if files.is_empty() {
-        eprintln!("Usage: {} {}", program, usage);
+        fro::cio_eprintln!("Usage: {} {}", program, usage);
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "missing file operand",
@@ -169,15 +169,12 @@ pub(crate) fn is_regular_fd(fd: std::os::unix::io::RawFd) -> bool {
 
 #[allow(dead_code)]
 pub(crate) fn is_stdout_file() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
-    is_regular_fd(stdout_fd)
+    is_regular_fd(fro::command_io::stdout_fd())
 }
 
 #[allow(dead_code)]
 pub(crate) fn is_stdout_dev_null() -> bool {
-    use std::io::stdout;
-    let stdout_fd = stdout().as_raw_fd();
+    let stdout_fd = fro::command_io::stdout_fd();
     unsafe {
         let mut stdout_stat: libc::stat = std::mem::zeroed();
         let mut dev_null_stat: libc::stat = std::mem::zeroed();
@@ -450,7 +447,7 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
             return Ok(None);
         }
         grow_pipe_best_effort(src_fd)?;
-        grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+        grow_pipe_best_effort(fro::command_io::stdout_fd())?;
         let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
         let dev_null_fd = dev_null.as_raw_fd();
         let mut buffered = 0u64;
@@ -488,7 +485,7 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
                 continue;
             }
             if moved == 0 {
-                let emitted = splice_all(pipe_read, libc::STDOUT_FILENO, buffered)?;
+                let emitted = splice_all(pipe_read, fro::command_io::stdout_fd(), buffered)?;
                 return Ok(Some(emitted));
             }
             let err = io::Error::last_os_error();
@@ -568,13 +565,13 @@ pub(crate) fn copy_pipe_tail_to_stdout_large(
     let start = (write_pos + window_len - emit_len) % window_len;
     if start + emit_len <= window_len {
         write_raw_fd_all(
-            libc::STDOUT_FILENO,
+            fro::command_io::stdout_fd(),
             &window.as_slice()[start..start + emit_len],
         )?;
     } else {
-        write_raw_fd_all(libc::STDOUT_FILENO, &window.as_slice()[start..])?;
+        write_raw_fd_all(fro::command_io::stdout_fd(), &window.as_slice()[start..])?;
         let split = emit_len - (window_len - start);
-        write_raw_fd_all(libc::STDOUT_FILENO, &window.as_slice()[..split])?;
+        write_raw_fd_all(fro::command_io::stdout_fd(), &window.as_slice()[..split])?;
     }
     Ok(Some(emit_len as u64))
 }
@@ -763,17 +760,25 @@ where
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
             let file = std::fs::File::open(path)?;
-            copy_regular_fd_to_fd_sendfile_counted(file.as_raw_fd(), libc::STDOUT_FILENO, progress)
+            copy_regular_fd_to_fd_sendfile_counted(
+                file.as_raw_fd(),
+                fro::command_io::stdout_fd(),
+                progress,
+            )
         }
         StreamInput::Stdin { .. } => {
             if let Some(bytes) = copy_regular_fd_to_fd_sendfile_counted(
-                libc::STDIN_FILENO,
-                libc::STDOUT_FILENO,
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
                 progress,
             )? {
                 return Ok(Some(bytes));
             }
-            copy_fd_to_fd_splice_counted(libc::STDIN_FILENO, libc::STDOUT_FILENO, progress)
+            copy_fd_to_fd_splice_counted(
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
+                progress,
+            )
         }
         StreamInput::File(path) => {
             let file_type = fs::metadata(path)?.file_type();
@@ -781,7 +786,7 @@ where
                 let file = std::fs::File::open(path)?;
                 return copy_fd_to_fd_splice_counted(
                     file.as_raw_fd(),
-                    libc::STDOUT_FILENO,
+                    fro::command_io::stdout_fd(),
                     progress,
                 );
             }

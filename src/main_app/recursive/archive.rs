@@ -21,6 +21,7 @@ const TAR_FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
 const TAR_SMALL_SLAB_TARGET_BYTES: usize = 512 * 1024;
 const TAR_SMALL_WRITE_WORKERS: usize = 4;
 const TAR_SMALL_WRITE_QD: usize = 4;
+const TAR_LOW_LATENCY_TOTAL_BYTES_THRESHOLD: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 enum TarEntryKind {
@@ -94,6 +95,44 @@ pub(crate) fn create_uncompressed_tar(
     verbose: bool,
 ) -> io::Result<u64> {
     let (entries, total_size) = collect_tar_manifest(source, output)?;
+    create_uncompressed_tar_entries(output, verbose, entries, total_size)
+}
+
+pub(crate) fn create_uncompressed_tar_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+    verbose: bool,
+) -> io::Result<u64> {
+    let (entries, total_size) = collect_tar_manifest_from(source_arg, source_fs, output)?;
+    create_uncompressed_tar_entries(output, verbose, entries, total_size)
+}
+
+fn create_uncompressed_tar_entries(
+    output: &Path,
+    verbose: bool,
+    entries: Vec<TarEntry>,
+    total_size: u64,
+) -> io::Result<u64> {
+    if total_size <= TAR_LOW_LATENCY_TOTAL_BYTES_THRESHOLD {
+        let mut output_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(output)?;
+        let written = write_tar_stream(&entries, &mut output_file)?;
+        output_file.sync_all()?;
+        sync_path(output)?;
+        sync_parent_directory(output)?;
+        if verbose {
+            fro::cio_eprintln!(
+                "tar create (low-latency): entries={}, total_size={}",
+                entries.len(),
+                written
+            );
+        }
+        return Ok(written);
+    }
     let planned_tasks = plan_tar_tasks(&entries);
     if output == Path::new("/dev/null") {
         return stream_tar_to_dev_null(&entries, &planned_tasks, verbose);
@@ -244,7 +283,7 @@ pub(crate) fn create_uncompressed_tar(
     sync_path(output)?;
     sync_parent_directory(output)?;
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "tar create: entries={}, total_size={}",
             entries.len(),
             total_size
@@ -327,6 +366,25 @@ fn write_tar_stream<W: Write + ?Sized>(entries: &[TarEntry], writer: &mut W) -> 
 
 pub(crate) fn create_gzip_tar(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
     let (entries, logical_size) = collect_tar_manifest(source, output)?;
+    create_gzip_tar_entries(output, verbose, entries, logical_size)
+}
+
+pub(crate) fn create_gzip_tar_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+    verbose: bool,
+) -> io::Result<u64> {
+    let (entries, logical_size) = collect_tar_manifest_from(source_arg, source_fs, output)?;
+    create_gzip_tar_entries(output, verbose, entries, logical_size)
+}
+
+fn create_gzip_tar_entries(
+    output: &Path,
+    verbose: bool,
+    entries: Vec<TarEntry>,
+    logical_size: u64,
+) -> io::Result<u64> {
     let output_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -342,7 +400,7 @@ pub(crate) fn create_gzip_tar(source: &Path, output: &Path, verbose: bool) -> io
     sync_parent_directory(output)?;
     let archive_bytes = output_file.metadata()?.len();
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "tar create (gzip): entries={}, tar_bytes={}, archive_bytes={}, manifest_total={}",
             entries.len(),
             tar_bytes,
@@ -355,6 +413,25 @@ pub(crate) fn create_gzip_tar(source: &Path, output: &Path, verbose: bool) -> io
 
 pub(crate) fn create_zstd_tar(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
     let (entries, logical_size) = collect_tar_manifest(source, output)?;
+    create_zstd_tar_entries(output, verbose, entries, logical_size)
+}
+
+pub(crate) fn create_zstd_tar_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+    verbose: bool,
+) -> io::Result<u64> {
+    let (entries, logical_size) = collect_tar_manifest_from(source_arg, source_fs, output)?;
+    create_zstd_tar_entries(output, verbose, entries, logical_size)
+}
+
+fn create_zstd_tar_entries(
+    output: &Path,
+    verbose: bool,
+    entries: Vec<TarEntry>,
+    logical_size: u64,
+) -> io::Result<u64> {
     let output_file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -371,7 +448,7 @@ pub(crate) fn create_zstd_tar(source: &Path, output: &Path, verbose: bool) -> io
     sync_parent_directory(output)?;
     let archive_bytes = output_file.metadata()?.len();
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "tar create (zstd): entries={}, tar_bytes={}, archive_bytes={}, manifest_total={}",
             entries.len(),
             tar_bytes,
@@ -432,6 +509,22 @@ pub(crate) fn create_tar_archive(
         TarCompression::None => create_uncompressed_tar(source, output, verbose),
         TarCompression::Gzip => create_gzip_tar(source, output, verbose),
         TarCompression::Zstd => create_zstd_tar(source, output, verbose),
+    }
+}
+
+pub(crate) fn create_tar_archive_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<u64> {
+    match compression {
+        TarCompression::None => {
+            create_uncompressed_tar_from(source_arg, source_fs, output, verbose)
+        }
+        TarCompression::Gzip => create_gzip_tar_from(source_arg, source_fs, output, verbose),
+        TarCompression::Zstd => create_zstd_tar_from(source_arg, source_fs, output, verbose),
     }
 }
 

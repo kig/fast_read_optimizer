@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LARGE_FILE_DIR_REL="assets/large"
+LARGE_FILE_MANIFEST_REL="${LARGE_FILE_DIR_REL}/bench-files.txt"
+
+write_zero_file_mib() {
+    local path="$1"
+    local size_mib="$2"
+    /usr/bin/dd if=/dev/zero of="$path" bs=1M count="$size_mib" status=none
+}
+
 generate_seed_workload() {
     local seed_dir="$1"
     local module_count=36
     local group_count=6
+    local asset_dir
 
     mkdir -p "$seed_dir"
     /usr/bin/find "$seed_dir" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf -- {} +
-    mkdir -p "$seed_dir/project/common/config" "$seed_dir/project/modules" "$seed_dir/project/packaging/groups"
+    mkdir -p \
+        "$seed_dir/project/common/config" \
+        "$seed_dir/project/modules" \
+        "$seed_dir/project/packaging/groups" \
+        "$seed_dir/project/${LARGE_FILE_DIR_REL}"
 
     cat >"$seed_dir/project/common/config/base.env" <<'BASE'
 PROJECT_NAME=fro-shell-bench
@@ -103,6 +117,26 @@ EOF_LIB
         group_index=$((((i - 1) % group_count) + 1))
         printf '%s\n' "$module" >>"$seed_dir/project/packaging/groups/bundle-$(printf '%02d' "$group_index").list"
     done
+
+    asset_dir="$seed_dir/project/${LARGE_FILE_DIR_REL}"
+    cat >"$seed_dir/project/${LARGE_FILE_MANIFEST_REL}" <<'EOF_LARGE'
+large-01.bin
+large-02.bin
+medium-01.bin
+medium-02.bin
+medium-03.bin
+medium-04.bin
+medium-05.bin
+medium-06.bin
+EOF_LARGE
+    write_zero_file_mib "$asset_dir/large-01.bin" 4096
+    write_zero_file_mib "$asset_dir/large-02.bin" 4096
+    write_zero_file_mib "$asset_dir/medium-01.bin" 112
+    write_zero_file_mib "$asset_dir/medium-02.bin" 128
+    write_zero_file_mib "$asset_dir/medium-03.bin" 144
+    write_zero_file_mib "$asset_dir/medium-04.bin" 160
+    write_zero_file_mib "$asset_dir/medium-05.bin" 176
+    write_zero_file_mib "$asset_dir/medium-06.bin" 192
 }
 
 prepare_workspace() {
@@ -181,6 +215,51 @@ run_build_slice() {
     done <"$build_root/manifests/module-list.txt"
 
     find "$bundle_dir" -type f | sort >"$build_root/manifests/bundle-files.txt"
+}
+
+run_large_io_slice() {
+    local project_root="$1"
+    local build_root="$2"
+    local package_root="$3"
+    local asset_root manifest large_build_root file file_name
+
+    asset_root="$project_root/${LARGE_FILE_DIR_REL}"
+    manifest="$project_root/${LARGE_FILE_MANIFEST_REL}"
+    large_build_root="$build_root/large"
+    mkdir -p \
+        "$large_build_root/checksums" \
+        "$large_build_root/copies" \
+        "$package_root/packages" \
+        "$package_root/lists" \
+        "$package_root/reports"
+
+    cp "$asset_root/large-01.bin" "$large_build_root/copies/large-01.copy.tmp"
+    mv "$large_build_root/copies/large-01.copy.tmp" "$large_build_root/copies/large-01.copy"
+    cp "$asset_root/medium-03.bin" "$large_build_root/copies/medium-03.copy.tmp"
+    mv "$large_build_root/copies/medium-03.copy.tmp" "$large_build_root/copies/medium-03.copy"
+
+    while read -r file_name; do
+        file="$asset_root/$file_name"
+        cksum "$file" >"$large_build_root/checksums/${file_name}.cksum.tmp"
+        mv \
+            "$large_build_root/checksums/${file_name}.cksum.tmp" \
+            "$large_build_root/checksums/${file_name}.cksum"
+    done <"$manifest"
+
+    (
+        cd "$project_root/assets"
+        tar -cf "$package_root/packages/large-assets.tar" large
+    )
+    tar -tf "$package_root/packages/large-assets.tar" | sort >"$package_root/lists/large-assets.contents.tmp"
+    head -n 10 "$package_root/lists/large-assets.contents.tmp" >"$package_root/reports/large-assets.head.tmp"
+    tail -n 10 "$package_root/lists/large-assets.contents.tmp" >"$package_root/reports/large-assets.tail.tmp"
+    wc -l "$package_root/lists/large-assets.contents.tmp" >"$package_root/reports/large-assets.count.tmp"
+    cat \
+        "$package_root/reports/large-assets.head.tmp" \
+        "$package_root/reports/large-assets.tail.tmp" \
+        "$package_root/reports/large-assets.count.tmp" >"$package_root/reports/large-assets.report.tmp"
+    mv "$package_root/lists/large-assets.contents.tmp" "$package_root/lists/large-assets.contents"
+    mv "$package_root/reports/large-assets.report.tmp" "$package_root/reports/large-assets.report"
 }
 
 run_package_slice() {

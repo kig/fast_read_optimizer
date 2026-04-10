@@ -247,7 +247,7 @@ fn overwrite_full_file(path: &Path, size: u64, io_mode: IOMode, random: bool) ->
 
 fn print_shred_pass(path: &Path, pass_index: usize, total_passes: usize, random: bool) {
     let label = if random { "random" } else { "000000" };
-    eprintln!(
+    fro::cio_eprintln!(
         "shred: {}: pass {}/{} ({label})...",
         path.display(),
         pass_index,
@@ -261,7 +261,7 @@ fn write_shred_error(path: &Path, err: &io::Error, action: &str) {
         io::ErrorKind::NotFound => "No such file or directory".to_string(),
         _ => err.to_string(),
     };
-    eprintln!("shred: {}: {action}: {detail}", path.display());
+    fro::cio_eprintln!("shred: {}: {action}: {detail}", path.display());
 }
 
 fn is_shred_permission_error(err: &io::Error) -> bool {

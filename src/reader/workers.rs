@@ -1,5 +1,74 @@
 use super::execution::{should_use_direct_io, submit_read, submit_read_with_probe, wait_for_ready};
 use super::*;
+use crate::io_util::note_direct_unaligned_fallback;
+use crate::uring_util::io_uring_available;
+
+fn read_exact_range_blocking(
+    file: &File,
+    file_direct: &File,
+    output: &mut [u8],
+    start_offset: u64,
+    block_size: u64,
+    use_direct: bool,
+) -> std::io::Result<u64> {
+    let mut filled = 0usize;
+    let chunk_size = block_size.max(4096);
+    while filled < output.len() {
+        let chunk_len = (output.len() - filled).min(chunk_size as usize);
+        let offset = start_offset + filled as u64;
+        let aligned_read = (offset % 4096 == 0) && (chunk_len as u64 == chunk_size);
+        if use_direct && !aligned_read {
+            note_direct_unaligned_fallback("read", offset, chunk_len);
+        }
+        let source = if use_direct && aligned_read {
+            file_direct
+        } else {
+            file
+        };
+        let read = source.read_at(&mut output[filled..filled + chunk_len], offset)?;
+        if read != chunk_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "short blocking read at offset {}: expected {} bytes, got {}",
+                    offset, chunk_len, read
+                ),
+            ));
+        }
+        filled += read;
+    }
+    Ok(filled as u64)
+}
+
+fn load_file_to_shared_buffer_blocking(
+    filename: &str,
+    params: ResolvedReadParams,
+    file_len: usize,
+    options: ReadToMemoryOptions,
+) -> std::io::Result<LoadedFile> {
+    let mut data = AlignedBuffer::new_uninit(file_len)?;
+    if options.use_hugepages_for_len(file_len) {
+        madvise_best_effort(
+            data.as_mut_slice().as_mut_ptr().cast(),
+            file_len.max(1),
+            libc::MADV_HUGEPAGE,
+        )?;
+    }
+    let (file, file_direct) = open_reader_files(filename, params.use_direct)?;
+    let bytes_read = read_exact_range_blocking(
+        &file,
+        &file_direct,
+        data.as_mut_slice(),
+        0,
+        params.block_size,
+        params.use_direct,
+    )?;
+    Ok(LoadedFile {
+        data: LoadedData::Aligned(data),
+        bytes_read,
+        params,
+    })
+}
 
 #[allow(dead_code)]
 pub(super) fn thread_reader(
@@ -403,6 +472,9 @@ pub(super) fn load_file_to_shared_buffer(
     file_len: usize,
     options: ReadToMemoryOptions,
 ) -> std::io::Result<LoadedFile> {
+    if !io_uring_available(1024)? {
+        return load_file_to_shared_buffer_blocking(filename, params, file_len, options);
+    }
     let mut data = AlignedBuffer::new_uninit(file_len)?;
     if options.use_hugepages_for_len(file_len) {
         madvise_best_effort(
@@ -482,6 +554,35 @@ pub(super) fn measure_file_load_multiple_targets(
     file_size: u64,
 ) -> std::io::Result<u64> {
     let spans = block_spans_for_threads(file_size, params.block_size, params.num_threads as usize);
+    if !io_uring_available(1024)? {
+        let read_count = Arc::new(AtomicU64::new(0));
+        let mut threads = Vec::new();
+        for span in spans {
+            let read_count = Arc::clone(&read_count);
+            let filename = filename.to_string();
+            threads.push(std::thread::spawn(move || -> std::io::Result<()> {
+                let mut target = AlignedBuffer::new_uninit(span.len)?;
+                let (file, file_direct) = open_reader_files(&filename, params.use_direct)?;
+                let bytes = read_exact_range_blocking(
+                    &file,
+                    &file_direct,
+                    target.as_mut_slice(),
+                    span.start_offset,
+                    params.block_size,
+                    params.use_direct,
+                )?;
+                read_count.fetch_add(bytes, Ordering::SeqCst);
+                black_box(target);
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread.join().map_err(|_| {
+                std::io::Error::other("multi-target read worker thread panicked")
+            })??;
+        }
+        return Ok(read_count.load(Ordering::SeqCst));
+    }
     let read_count = Arc::new(AtomicU64::new(0));
     let mut threads = Vec::new();
 

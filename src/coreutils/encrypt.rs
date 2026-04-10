@@ -56,24 +56,24 @@ pub(super) fn run_decrypt(args: &[String]) -> io::Result<i32> {
 fn print_encrypt_help(decrypt: bool) {
     let command = if decrypt { "decrypt" } else { "encrypt" };
     let action = if decrypt { "Decrypt" } else { "Encrypt" };
-    println!(
+    fro::cio_println!(
         "Usage: {command} --passphrase-file PATH [--cipher {AES_256_CTR_NAME}] [-o FILE] [INPUT]"
     );
-    println!("{action} data using OpenSSL-compatible `enc -aes-256-ctr -pbkdf2 -salt` output.");
-    println!();
-    println!("  --passphrase-file PATH  read the passphrase from PATH");
-    println!("  --cipher NAME           only {AES_256_CTR_NAME} is supported");
-    println!("  -o, --output FILE       write to FILE instead of standard output");
-    println!("      --help              display this help and exit");
-    println!("      --version           output version information and exit");
-    println!();
-    println!("Notes:");
-    println!("  - Regular-file inputs are processed in 512 KiB blocks with parallel workers.");
-    println!("  - fro derives the OpenSSL key/IV with PBKDF2-HMAC-SHA256 (10,000 iterations).");
-    println!("  - Output begins with the standard `Salted__` header plus the 8-byte salt.");
-    println!("  - No trailing b3sum is emitted: appending bytes would change the ciphertext and break `openssl enc` compatibility.");
-    println!("  - aes-256-ctr is unauthenticated, so a wrong passphrase may yield garbage plaintext without an explicit error.");
-    println!("  - Input defaults to standard input when INPUT is omitted or is -.");
+    fro::cio_println!("{action} data using OpenSSL-compatible `enc -aes-256-ctr -pbkdf2 -salt` output.");
+    fro::cio_println!();
+    fro::cio_println!("  --passphrase-file PATH  read the passphrase from PATH");
+    fro::cio_println!("  --cipher NAME           only {AES_256_CTR_NAME} is supported");
+    fro::cio_println!("  -o, --output FILE       write to FILE instead of standard output");
+    fro::cio_println!("      --help              display this help and exit");
+    fro::cio_println!("      --version           output version information and exit");
+    fro::cio_println!();
+    fro::cio_println!("Notes:");
+    fro::cio_println!("  - Regular-file inputs are processed in 512 KiB blocks with parallel workers.");
+    fro::cio_println!("  - fro derives the OpenSSL key/IV with PBKDF2-HMAC-SHA256 (10,000 iterations).");
+    fro::cio_println!("  - Output begins with the standard `Salted__` header plus the 8-byte salt.");
+    fro::cio_println!("  - No trailing b3sum is emitted: appending bytes would change the ciphertext and break `openssl enc` compatibility.");
+    fro::cio_println!("  - aes-256-ctr is unauthenticated, so a wrong passphrase may yield garbage plaintext without an explicit error.");
+    fro::cio_println!("  - Input defaults to standard input when INPUT is omitted or is -.");
 }
 
 fn parse_encrypt_options(
@@ -93,14 +93,14 @@ fn parse_encrypt_options(
                 return Ok(Err(0));
             }
             "--version" => {
-                println!("{command} {}", env!("CARGO_PKG_VERSION"));
+                fro::cio_println!("{command} {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Err(0));
             }
             "--passphrase-file" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{command}: option requires an argument -- 'passphrase-file'");
-                    eprintln!("Try '{command} --help' for more information.");
+                    fro::cio_eprintln!("{command}: option requires an argument -- 'passphrase-file'");
+                    fro::cio_eprintln!("Try '{command} --help' for more information.");
                     return Ok(Err(1));
                 }
                 passphrase_file = Some(args[i].clone());
@@ -108,8 +108,8 @@ fn parse_encrypt_options(
             "--cipher" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{command}: option requires an argument -- 'cipher'");
-                    eprintln!("Try '{command} --help' for more information.");
+                    fro::cio_eprintln!("{command}: option requires an argument -- 'cipher'");
+                    fro::cio_eprintln!("Try '{command} --help' for more information.");
                     return Ok(Err(1));
                 }
                 cipher = args[i].clone();
@@ -117,21 +117,21 @@ fn parse_encrypt_options(
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{command}: option requires an argument -- 'output'");
-                    eprintln!("Try '{command} --help' for more information.");
+                    fro::cio_eprintln!("{command}: option requires an argument -- 'output'");
+                    fro::cio_eprintln!("Try '{command} --help' for more information.");
                     return Ok(Err(1));
                 }
                 output = Some(args[i].clone());
             }
             "--auto" | "--direct" | "--no-direct" => {
-                eprintln!("{command}: I/O mode flags are not supported for encrypt/decrypt");
-                eprintln!("Try '{command} --help' for more information.");
+                fro::cio_eprintln!("{command}: I/O mode flags are not supported for encrypt/decrypt");
+                fro::cio_eprintln!("Try '{command} --help' for more information.");
                 return Ok(Err(1));
             }
             "-" => files.push(args[i].clone()),
             other if other.starts_with('-') => {
-                eprintln!("{command}: unrecognized option '{other}'");
-                eprintln!("Try '{command} --help' for more information.");
+                fro::cio_eprintln!("{command}: unrecognized option '{other}'");
+                fro::cio_eprintln!("Try '{command} --help' for more information.");
                 return Ok(Err(1));
             }
             _ => files.push(args[i].clone()),
@@ -140,14 +140,14 @@ fn parse_encrypt_options(
     }
 
     if files.len() > 1 {
-        eprintln!("{command}: extra operand ‘{}’", files[1]);
-        eprintln!("Try '{command} --help' for more information.");
+        fro::cio_eprintln!("{command}: extra operand ‘{}’", files[1]);
+        fro::cio_eprintln!("Try '{command} --help' for more information.");
         return Ok(Err(1));
     }
 
     let Some(passphrase_file) = passphrase_file else {
-        eprintln!("{command}: missing required option '--passphrase-file'");
-        eprintln!("Try '{command} --help' for more information.");
+        fro::cio_eprintln!("{command}: missing required option '--passphrase-file'");
+        fro::cio_eprintln!("Try '{command} --help' for more information.");
         return Ok(Err(1));
     };
 

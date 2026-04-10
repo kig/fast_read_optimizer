@@ -109,7 +109,7 @@ where
             "missing checksum file operand",
         ));
     }
-    let out = stdout_buf_writer()?;
+    let mut out = stdout_buf_writer()?;
     let mut had_failure = false;
     let mut had_checksum_failure = false;
     let mut had_valid_line = false;
@@ -124,7 +124,7 @@ where
             let Some(entry) = parse_line(line) else {
                 malformed_lines += 1;
                 if hash_check_should_report_malformed_line(options.warn, options.status_only) {
-                    eprintln!(
+                    fro::cio_eprintln!(
                         "{program}: {}: {}: improperly formatted {check_name} checksum line",
                         input_label(input),
                         line_no + 1
@@ -144,7 +144,7 @@ where
                     if hash_check_should_print_result(false, options.quiet, options.status_only) {
                         out.write_all(format!("{display_path}: FAILED open or read\n").as_bytes())?;
                     }
-                    eprintln!("{program}: {display_path}: No such file or directory");
+                    fro::cio_eprintln!("{program}: {display_path}: No such file or directory");
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -169,7 +169,7 @@ where
     }
     out.into_inner()?;
     if let Some(input_label) = no_valid_input {
-        eprintln!(
+        fro::cio_eprintln!(
             "{program}: {input_label}: no properly formatted {check_name} checksum lines found"
         );
         return Ok(1);
@@ -181,7 +181,7 @@ where
         } else {
             "lines are"
         };
-        eprintln!("{program}: WARNING: {malformed_lines} {phrase} improperly formatted");
+        fro::cio_eprintln!("{program}: WARNING: {malformed_lines} {phrase} improperly formatted");
     }
     if unread_files != 0 && !options.status_only {
         let phrase = if unread_files == 1 {
@@ -189,13 +189,13 @@ where
         } else {
             "listed files could not be read"
         };
-        eprintln!("{program}: WARNING: {unread_files} {phrase}");
+        fro::cio_eprintln!("{program}: WARNING: {unread_files} {phrase}");
     }
     if had_checksum_failure && !options.status_only {
-        eprintln!("{program}: WARNING: 1 computed checksum did NOT match");
+        fro::cio_eprintln!("{program}: WARNING: 1 computed checksum did NOT match");
     }
     if no_verified_files && !options.status_only {
-        eprintln!(
+        fro::cio_eprintln!(
             "{program}: {}: no file was verified",
             input_label(&inputs[0])
         );

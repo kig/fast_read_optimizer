@@ -111,7 +111,7 @@ fn open_stream_input_file(input: &StreamInput) -> io::Result<File> {
     match input {
         StreamInput::File(path) => File::open(path),
         StreamInput::Stdin { .. } => {
-            let dupfd = unsafe { libc::dup(libc::STDIN_FILENO) };
+            let dupfd = unsafe { libc::dup(fro::command_io::stdin_fd()) };
             if dupfd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -590,7 +590,7 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
             report_gbps("base64", processed_bytes, started_at);
         }
         if invalid {
-            eprintln!("base64: invalid input");
+            fro::cio_eprintln!("base64: invalid input");
             return Ok(1);
         }
         return Ok(0);
@@ -617,7 +617,7 @@ fn run_base64_io(options: Base64Options) -> io::Result<i32> {
     }
 
     if invalid {
-        eprintln!("base64: invalid input");
+        fro::cio_eprintln!("base64: invalid input");
         return Ok(1);
     }
     Ok(0)

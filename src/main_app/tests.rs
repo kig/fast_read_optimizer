@@ -4,8 +4,8 @@ use crate::main_app::cli;
 use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
     describe_copy_path, should_prefer_cached_diff_overwrite,
-    should_prefer_cached_read_direct_write, target_is_similar_size, HeuristicCopyPlan,
-    ResolvedCopyExecution,
+    should_prefer_cached_read_direct_write, should_prefer_low_latency_copy_file_range_single,
+    target_is_similar_size, HeuristicCopyPlan, ResolvedCopyExecution,
 };
 use crate::main_app::recursive::move_dir;
 use crate::main_app::tuning::{
@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static COPY_PATH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn heuristic_plan(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
     source_cached: bool,
     target_cached: bool,
     source_len: Option<u64>,
@@ -34,6 +36,12 @@ fn heuristic_plan(
         } else {
             HeuristicCopyPlan::CopyFileRangeSingle
         }
+    } else if should_prefer_low_latency_copy_file_range_single(
+        &source_path.to_string_lossy(),
+        &target_path.to_string_lossy(),
+        source_len,
+    ) {
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
     } else if should_prefer_cached_read_direct_write(source_cached, source_len, target_len) {
         HeuristicCopyPlan::CachedReadDirectWrite
     } else {
@@ -214,22 +222,39 @@ fn zero_length_source_is_only_similar_to_zero_length_target() {
 
 #[test]
 fn heuristic_plan_prefers_diff_overwrite_then_copy_file_range_single_fallback() {
+    let root = unique_temp_dir("fro-copy-heuristic");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&source, b"payload").unwrap();
     assert_eq!(
-        heuristic_plan(true, true, Some(1024), Some(900), true),
+        heuristic_plan(&source, &target, true, true, Some(1024), Some(900), true),
         HeuristicCopyPlan::DiffOverwrite
     );
     assert_eq!(
-        heuristic_plan(true, true, Some(1024), Some(900), false),
+        heuristic_plan(&source, &target, true, true, Some(1024), Some(900), false),
         HeuristicCopyPlan::CopyFileRangeSingle
     );
     assert_eq!(
-        heuristic_plan(true, false, Some(1024), Some(900), true),
-        HeuristicCopyPlan::CachedReadDirectWrite
+        heuristic_plan(&source, &target, true, false, Some(1024), Some(900), true),
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
     );
     assert_eq!(
-        heuristic_plan(false, false, Some(1024), Some(900), true),
+        heuristic_plan(&source, &target, false, false, Some(1024), Some(900), true),
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+    );
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(256 * 1024 + 1),
+            Some(900),
+            true
+        ),
         HeuristicCopyPlan::DirectReadDirectWrite
     );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -492,6 +517,38 @@ fn cp_archive_recursive_keeps_threaded_copy_backend() {
     let source_mtime = fs::metadata(&source_file).unwrap().mtime();
     let copied_mtime = fs::metadata(&copied).unwrap().mtime();
     assert_eq!(copied_mtime, source_mtime);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_falls_back_when_io_uring_setup_is_unavailable() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-fallback");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&source, b"fallback-copy-payload").unwrap();
+
+    let forced = set_env_var(crate::uring_util::FORCE_NO_IO_URING_ENV, Some("1"));
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(cli::TestCopyRunOptions {
+        source: source.to_string_lossy().into_owned(),
+        target: target.to_string_lossy().into_owned(),
+        recursive: false,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve: false,
+        cp_no_dereference: false,
+    })
+    .unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var(crate::uring_util::FORCE_NO_IO_URING_ENV, forced);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&target).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Blocking]);
 
     let _ = fs::remove_dir_all(root);
 }

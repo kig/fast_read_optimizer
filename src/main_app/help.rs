@@ -18,7 +18,7 @@ pub(super) fn is_version_flag(arg: &str) -> bool {
     arg == "--version"
 }
 pub(super) fn print_version(program: &str) {
-    println!("{program} {FRO_VERSION}");
+    fro::cio_println!("{program} {FRO_VERSION}");
 }
 pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
     if let Some(help) = hash::command_help(name) {
@@ -866,30 +866,30 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
 }
 
 pub(super) fn print_command_help(program: &str, help: CommandHelp) {
-    println!("{} - {}", help.name, help.summary);
-    println!();
-    println!("USAGE:");
-    println!("  {} {}", program, help.usage);
+    fro::cio_println!("{} - {}", help.name, help.summary);
+    fro::cio_println!();
+    fro::cio_println!("USAGE:");
+    fro::cio_println!("  {} {}", program, help.usage);
     if !help.notes.is_empty() {
-        println!();
-        println!("NOTES:");
+        fro::cio_println!();
+        fro::cio_println!("NOTES:");
         for note in help.notes {
-            println!("  - {}", note);
+            fro::cio_println!("  - {}", note);
         }
     }
     if let Some(lines) = help_section_lines(help.name) {
-        println!();
-        println!("COMPAT:");
+        fro::cio_println!();
+        fro::cio_println!("COMPAT:");
         for line in lines {
-            println!("  - {}", line);
+            fro::cio_println!("  - {}", line);
         }
     }
     if !help.examples.is_empty() {
-        println!();
-        println!("EXAMPLES:");
+        fro::cio_println!();
+        fro::cio_println!("EXAMPLES:");
         for (description, command) in help.examples {
-            println!("  {}", description);
-            println!("    {} {}", program, command);
+            fro::cio_println!("  {}", description);
+            fro::cio_println!("    {} {}", program, command);
         }
     }
 }
@@ -909,33 +909,33 @@ pub(crate) fn print_direct_command_help(command_name: &str, help_name: &str) -> 
         return false;
     };
     let display_name = rewrite_help_command(help.name, help.name, command_name);
-    println!("{display_name} - {}", help.summary);
-    println!();
-    println!("USAGE:");
-    println!(
+    fro::cio_println!("{display_name} - {}", help.summary);
+    fro::cio_println!();
+    fro::cio_println!("USAGE:");
+    fro::cio_println!(
         "  {}",
         rewrite_help_command(help.usage, help.name, command_name)
     );
     if !help.notes.is_empty() {
-        println!();
-        println!("NOTES:");
+        fro::cio_println!();
+        fro::cio_println!("NOTES:");
         for note in help.notes {
-            println!("  - {}", note);
+            fro::cio_println!("  - {}", note);
         }
     }
     if let Some(lines) = help_section_lines(help_name) {
-        println!();
-        println!("COMPAT:");
+        fro::cio_println!();
+        fro::cio_println!("COMPAT:");
         for line in lines {
-            println!("  - {}", line);
+            fro::cio_println!("  - {}", line);
         }
     }
     if !help.examples.is_empty() {
-        println!();
-        println!("EXAMPLES:");
+        fro::cio_println!();
+        fro::cio_println!("EXAMPLES:");
         for (description, command) in help.examples {
-            println!("  {}", description);
-            println!(
+            fro::cio_println!("  {}", description);
+            fro::cio_println!(
                 "    {}",
                 rewrite_help_command(command, help.name, command_name)
             );
@@ -945,16 +945,16 @@ pub(crate) fn print_direct_command_help(command_name: &str, help_name: &str) -> 
 }
 
 pub(super) fn print_general_help(program: &str) {
-    println!("fast_read_optimizer (fro)");
-    println!(
+    fro::cio_println!("fast_read_optimizer (fro)");
+    fro::cio_println!(
         "High-throughput Linux file IO utilities with companion benchmark and optimizer tooling."
     );
-    println!();
-    println!("USAGE:");
-    println!("  {} <command> [options]", program);
-    println!("  {} <command> --help", program);
-    println!();
-    println!("Utilities:");
+    fro::cio_println!();
+    fro::cio_println!("USAGE:");
+    fro::cio_println!("  {} <command> [options]", program);
+    fro::cio_println!("  {} <command> --help", program);
+    fro::cio_println!();
+    fro::cio_println!("Utilities:");
     for (name, summary) in [
         ("cat", "print files using the fro read path"),
         ("base64", "encode or decode base64 data"),
@@ -1044,59 +1044,59 @@ pub(super) fn print_general_help(program: &str) {
             "repair corrupted blocks from one or more replicas",
         ),
     ] {
-        println!("  {:<16} {}", name, summary);
+        fro::cio_println!("  {:<16} {}", name, summary);
     }
-    println!();
-    println!("Benchmarks:");
-    println!("  read               measure striped file read throughput");
-    println!("  dual-read-bench    benchmark the read pressure of diff");
-    println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
-    println!("  file-list-read-bench benchmark aggregate read throughput from a file manifest");
-    println!(
+    fro::cio_println!();
+    fro::cio_println!("Benchmarks:");
+    fro::cio_println!("  read               measure striped file read throughput");
+    fro::cio_println!("  dual-read-bench    benchmark the read pressure of diff");
+    fro::cio_println!("  recursive-read-bench benchmark aggregate read throughput of a tree");
+    fro::cio_println!("  file-list-read-bench benchmark aggregate read throughput from a file manifest");
+    fro::cio_println!(
         "  file-list-read-uring-bench sweep io_uring aggregate throughput from a file manifest"
     );
-    println!("  file-list-read-open-read-close-sweep compare manifest reader variants across file-count prefixes");
-    println!(
+    fro::cio_println!("  file-list-read-open-read-close-sweep compare manifest reader variants across file-count prefixes");
+    fro::cio_println!(
         "  manifest-recursive-copy-bench benchmark manifest-driven recursive copy phase timing"
     );
-    println!("  split-manifest-recursive-copy-bench benchmark split manifest-build recursive copy timing");
-    println!("  bench-recursive-small-file-threads sweep recursive small-file worker counts and save hot/cold per mount");
-    println!("  bench-read-sweep  sweep read variants across file sizes");
-    println!("  fro-optimize       tune configs for one or more commands / mounts");
-    println!("  fro-benchmark      run the regression benchmark suite");
-    println!("  bench-diff         in-memory diff microbenchmark");
-    println!("  bench-memcpy       in-memory memcpy microbenchmark");
-    println!("  bench-tar-archive  benchmark tar assembly into RAM / RAM+write / mmap file");
-    println!("  bench-base64-encode base64 encode kernel microbenchmark");
-    println!("  bench-base64-decode base64 decode kernel microbenchmark");
-    println!("  bench-base64-wrapped-encode wrapped base64 encode path microbenchmark");
-    println!("  bench-base64-wrapped-decode wrapped base64 decode path microbenchmark");
-    println!("  bench-mmap-write   mmap write microbenchmark");
-    println!("  bench-write        plain write microbenchmark");
-    println!();
-    println!("Common flags:");
-    println!("  --auto | --no-direct | --direct");
-    println!("  --auto-write | --no-direct-write | --direct-write");
-    println!("  --no-fallback     disable external fallback for unsupported multicall flags");
-    println!("  -n <iterations>    use -n 1 for one measured run with current tuned params");
-    println!("  -s, --save         save tuned params when forcing --direct or --no-direct");
-    println!("  -c, --config PATH  override config path");
-    println!("  -v, --verbose      print more about the current run");
-    println!();
-    println!("Coreutils compatibility names:");
-    println!(
+    fro::cio_println!("  split-manifest-recursive-copy-bench benchmark split manifest-build recursive copy timing");
+    fro::cio_println!("  bench-recursive-small-file-threads sweep recursive small-file worker counts and save hot/cold per mount");
+    fro::cio_println!("  bench-read-sweep  sweep read variants across file sizes");
+    fro::cio_println!("  fro-optimize       tune configs for one or more commands / mounts");
+    fro::cio_println!("  fro-benchmark      run the regression benchmark suite");
+    fro::cio_println!("  bench-diff         in-memory diff microbenchmark");
+    fro::cio_println!("  bench-memcpy       in-memory memcpy microbenchmark");
+    fro::cio_println!("  bench-tar-archive  benchmark tar assembly into RAM / RAM+write / mmap file");
+    fro::cio_println!("  bench-base64-encode base64 encode kernel microbenchmark");
+    fro::cio_println!("  bench-base64-decode base64 decode kernel microbenchmark");
+    fro::cio_println!("  bench-base64-wrapped-encode wrapped base64 encode path microbenchmark");
+    fro::cio_println!("  bench-base64-wrapped-decode wrapped base64 decode path microbenchmark");
+    fro::cio_println!("  bench-mmap-write   mmap write microbenchmark");
+    fro::cio_println!("  bench-write        plain write microbenchmark");
+    fro::cio_println!();
+    fro::cio_println!("Common flags:");
+    fro::cio_println!("  --auto | --no-direct | --direct");
+    fro::cio_println!("  --auto-write | --no-direct-write | --direct-write");
+    fro::cio_println!("  --no-fallback     disable external fallback for unsupported multicall flags");
+    fro::cio_println!("  -n <iterations>    use -n 1 for one measured run with current tuned params");
+    fro::cio_println!("  -s, --save         save tuned params when forcing --direct or --no-direct");
+    fro::cio_println!("  -c, --config PATH  override config path");
+    fro::cio_println!("  -v, --verbose      print more about the current run");
+    fro::cio_println!();
+    fro::cio_println!("Coreutils compatibility names:");
+    fro::cio_println!(
         "  cp cmp dd fgrep find du rm mv sort tar cat base64 encrypt decrypt head tac tail wc cksum b3sum b2sum md5sum sha224sum sha256sum sha384sum sha512sum shred"
     );
-    println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
-    println!();
-    println!("Related tools:");
-    println!("  ./target/release/fro-optimize --help");
-    println!("  ./target/release/fro-benchmark --help");
-    println!();
-    println!(
+    fro::cio_println!("  (use as `fro <name> ...` or invoke via argv[0] multicall)");
+    fro::cio_println!();
+    fro::cio_println!("Related tools:");
+    fro::cio_println!("  ./target/release/fro-optimize --help");
+    fro::cio_println!("  ./target/release/fro-benchmark --help");
+    fro::cio_println!();
+    fro::cio_println!(
         "Config resolution (when -c is not provided): $FRO_CONFIG, then ~/.fro/fro.json, then /etc/fro.json"
     );
-    println!(
+    fro::cio_println!(
         "Fallback logging: set $FRO_LOG_FALLBACKS=1 to log each external delegation on stderr"
     );
 }

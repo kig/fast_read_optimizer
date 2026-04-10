@@ -55,7 +55,7 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
         )?;
         let elapsed = start.elapsed().as_secs_f64();
         rows.push((threads, bytes, elapsed));
-        println!(
+        fro::cio_println!(
             "result\tcache={}\tthreads={}\ttime={:.4}s\tgbps={:.3}",
             if is_hot { "hot" } else { "cold" },
             threads,
@@ -67,7 +67,7 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
         .iter()
         .min_by(|a, b| a.2.total_cmp(&b.2))
         .ok_or_else(|| io::Error::other("recursive small-file thread sweep produced no results"))?;
-    println!(
+    fro::cio_println!(
         "bench-recursive-small-file-threads best cache={} threads={} {:.4}s {:.3} GB/s",
         if is_hot { "hot" } else { "cold" },
         best.0,
@@ -83,7 +83,7 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
         }
         config.update_recursive_small_file_threads_for_path(mount_path, tuned);
         config.save();
-        println!(
+        fro::cio_println!(
             "saved recursive_small_file_threads for {}: hot={}, cold={}",
             mount_path, tuned.hot, tuned.cold
         );
@@ -260,7 +260,7 @@ pub(in crate::main_app) fn bench_recursive_read(
     }
     let elapsed = start.elapsed().as_secs_f64();
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s ({:.1} files/s)",
             total_bytes,
             total_files,
@@ -269,7 +269,7 @@ pub(in crate::main_app) fn bench_recursive_read(
             total_files as f64 / elapsed.max(1e-9)
         );
     } else {
-        println!(
+        fro::cio_println!(
             "recursive-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
             total_bytes,
             total_files,

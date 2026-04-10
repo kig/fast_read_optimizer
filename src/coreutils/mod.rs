@@ -266,7 +266,7 @@ fn run_external_fallback(
         let (program, command_args) = candidate.build(invoked, args);
         let child = match Command::new(&program)
             .args(&command_args)
-            .stdin(Stdio::inherit())
+            .stdin(Stdio::from(fro::command_io::stdin_file()?))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -283,18 +283,18 @@ fn run_external_fallback(
         }
         if fallback_logging_enabled() {
             match failure_reason {
-                Some(reason) => eprintln!(
+                Some(reason) => fro::cio_eprintln!(
                     "fro: fallback {} -> {} {:?} ({})",
                     invoked, program, command_args, reason
                 ),
-                None => eprintln!(
+                None => fro::cio_eprintln!(
                     "fro: fallback {} -> {} {:?}",
                     invoked, program, command_args
                 ),
             }
         }
-        io::stdout().write_all(&output.stdout)?;
-        io::stderr().write_all(&output.stderr)?;
+        fro::command_io::stdout_file()?.write_all(&output.stdout)?;
+        fro::command_io::stderr_file()?.write_all(&output.stderr)?;
         return Ok(Some(output.status.code().unwrap_or(1)));
     }
     Ok(None)

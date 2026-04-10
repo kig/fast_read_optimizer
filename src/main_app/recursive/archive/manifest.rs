@@ -33,11 +33,19 @@ pub(super) fn collect_tar_manifest(
     source: &Path,
     output: &Path,
 ) -> io::Result<(Vec<TarEntry>, u64)> {
-    let source_meta = fs::symlink_metadata(source)?;
+    collect_tar_manifest_from(source, source, output)
+}
+
+pub(super) fn collect_tar_manifest_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+) -> io::Result<(Vec<TarEntry>, u64)> {
+    let source_meta = fs::symlink_metadata(source_fs)?;
     let source_abs = if source_meta.file_type().is_dir() {
-        source.canonicalize()?
+        source_fs.canonicalize()?
     } else {
-        paths::prospective_absolute_path(source)?
+        paths::prospective_absolute_path(source_fs)?
     };
     let output_abs = paths::prospective_absolute_path(output)?;
     if source_meta.file_type().is_dir() && output_abs.starts_with(&source_abs) {
@@ -45,7 +53,7 @@ pub(super) fn collect_tar_manifest(
             io::ErrorKind::InvalidInput,
             format!(
                 "refusing to archive directory {} into itself via {}",
-                source.display(),
+                source_arg.display(),
                 output.display()
             ),
         ));
@@ -59,7 +67,7 @@ pub(super) fn collect_tar_manifest(
 
     let mut entries = Vec::new();
     let mut next_offset = 0_u64;
-    let root_name = file_name_bytes(source)?;
+    let root_name = file_name_bytes(source_arg)?;
     let root_name_path = PathBuf::from(std::ffi::OsString::from_vec(root_name.clone()));
     let root_mtime = source_meta.mtime().max(0) as u64;
 
@@ -78,7 +86,7 @@ pub(super) fn collect_tar_manifest(
             TarEntryKind::Directory,
             &mut next_offset,
         );
-        let mut stack = vec![(source.to_path_buf(), root_name_path)];
+        let mut stack = vec![(source_fs.to_path_buf(), root_name_path)];
         while let Some((dir_path, archive_prefix)) = stack.pop() {
             let mut entries_in_dir =
                 fs::read_dir(&dir_path)?.collect::<Result<Vec<_>, io::Error>>()?;
@@ -152,7 +160,7 @@ pub(super) fn collect_tar_manifest(
             source_meta.gid(),
             root_mtime,
             TarEntryKind::Symlink {
-                target: fs::read_link(source)?.as_os_str().as_bytes().to_vec(),
+                target: fs::read_link(source_fs)?.as_os_str().as_bytes().to_vec(),
             },
             &mut next_offset,
         );
@@ -166,7 +174,7 @@ pub(super) fn collect_tar_manifest(
             root_mtime,
             TarEntryKind::RegularFile {
                 size: source_meta.len(),
-                source_path: source.to_path_buf(),
+                source_path: source_fs.to_path_buf(),
             },
             &mut next_offset,
         );

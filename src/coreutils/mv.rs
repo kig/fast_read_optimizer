@@ -127,7 +127,7 @@ fn move_file_cross_fs(source: &Path, target: &Path) -> io::Result<()> {
 
 fn move_directory_cross_fs(source: &Path, target: &Path, verbose: bool) -> io::Result<()> {
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "mv cross-fs: starting recursive move '{}' -> '{}'",
             source.display(),
             target.display()
@@ -141,7 +141,7 @@ fn move_directory_cross_fs(source: &Path, target: &Path, verbose: bool) -> io::R
         verbose,
     )?;
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "mv cross-fs: recursive move complete '{}'",
             source.display()
         );
@@ -183,14 +183,14 @@ fn move_path(
     match fs::rename(source, target) {
         Ok(()) => {
             if verbose {
-                println!("renamed '{}' -> '{}'", source.display(), target.display());
+                fro::cio_println!("renamed '{}' -> '{}'", source.display(), target.display());
             }
             Ok(())
         }
         Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
             let metadata = fs::symlink_metadata(source)?;
             if verbose {
-                eprintln!(
+                fro::cio_eprintln!(
                     "mv cross-fs fallback: '{}' -> '{}'",
                     source.display(),
                     target.display()
@@ -204,7 +204,7 @@ fn move_path(
                 move_file_cross_fs(source, target)?;
             }
             if verbose {
-                println!("renamed '{}' -> '{}'", source.display(), target.display());
+                fro::cio_println!("renamed '{}' -> '{}'", source.display(), target.display());
             }
             Ok(())
         }
@@ -298,13 +298,13 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     }
 
     if explicit_target_directory.is_some() && no_target_directory {
-        eprintln!("mv: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        fro::cio_eprintln!("mv: cannot combine --target-directory (-t) and --no-target-directory (-T)");
         return Ok(1);
     }
 
     let (destination, source_paths) = if let Some(target_directory) = explicit_target_directory {
         if paths.is_empty() {
-            eprintln!(
+            fro::cio_eprintln!(
                 "Usage: {} [-f] [-n] [-u] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
@@ -319,12 +319,12 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
         )
     } else {
         if no_target_directory && paths.len() > 2 {
-            eprintln!("mv: extra operand '{}'", paths[2]);
-            eprintln!("Try 'mv --help' for more information.");
+            fro::cio_eprintln!("mv: extra operand '{}'", paths[2]);
+            fro::cio_eprintln!("Try 'mv --help' for more information.");
             return Ok(1);
         }
         if paths.len() < 2 {
-            eprintln!(
+            fro::cio_eprintln!(
                 "Usage: {} [-f] [-n] [-u] [-v] [-T] [-t DIRECTORY] <source>... <target>",
                 program
             );
@@ -361,7 +361,7 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
             }
         };
         if no_target_directory && destination_is_dir && !source_meta.file_type().is_dir() {
-            eprintln!(
+            fro::cio_eprintln!(
                 "mv: cannot overwrite directory '{}' with non-directory",
                 destination.display()
             );

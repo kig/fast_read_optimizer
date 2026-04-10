@@ -50,7 +50,7 @@ const TAIL_PIPE_WINDOW_MIN_CAPACITY: usize = 64 << 10;
 const TAIL_STDIN_PREBUFFER_LIMIT: usize = 64 << 10;
 
 fn regular_stdin_path() -> io::Result<Option<&'static str>> {
-    if fd_is_regular(libc::STDIN_FILENO)? {
+    if fd_is_regular(fro::command_io::stdin_fd())? {
         Ok(Some("/proc/self/fd/0"))
     } else {
         Ok(None)
@@ -270,7 +270,7 @@ fn try_write_tail_regular_path_fast(path: &str, start_offset: u64) -> io::Result
     let mut noop = |_bytes: u64| Ok(());
     let copied = copy_path_range_to_fd_with_progress(
         path,
-        libc::STDOUT_FILENO,
+        fro::command_io::stdout_fd(),
         ByteRange::starting_at(start_offset),
         &mut noop,
     )?;
@@ -492,15 +492,15 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
     let prebuffer_limit = TAIL_STDIN_PREBUFFER_LIMIT
         .max(count as usize)
         .min(TAIL_PIPE_WINDOW_SIZE);
-    if window.read_from_raw_fd_until(libc::STDIN_FILENO, prebuffer_limit)? {
-        window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+    if window.read_from_raw_fd_until(fro::command_io::stdin_fd(), prebuffer_limit)? {
+        window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
         return Ok(true);
     }
 
     let mut pipe_fds = [0; 2];
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
-        window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+        window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
+        window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
         return Ok(true);
     }
     let pipe_read = pipe_fds[0];
@@ -511,12 +511,12 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
             .saturating_add(4096);
         let actual_size = pipe_size_best_effort(pipe_write, desired)?;
         if actual_size as u64 <= count {
-            window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
-            window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+            window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
+            window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
             return Ok(true);
         }
-        grow_pipe_best_effort(libc::STDIN_FILENO)?;
-        grow_pipe_best_effort(libc::STDOUT_FILENO)?;
+        grow_pipe_best_effort(fro::command_io::stdin_fd())?;
+        grow_pipe_best_effort(fro::command_io::stdout_fd())?;
         let mut buffered = window.write_last_to_raw_fd(pipe_write, count)?;
         let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
         let dev_null_fd = dev_null.as_raw_fd();
@@ -525,8 +525,8 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
             if free_space == 0 {
                 let drop_len = buffered.saturating_sub(count);
                 if drop_len == 0 {
-                    window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
-                    window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+                    window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
+                    window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
                     return Ok(true);
                 }
                 let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
@@ -542,7 +542,7 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
             let read_len = free_space.min(TAIL_PIPE_WINDOW_SIZE as u64) as usize;
             let moved = unsafe {
                 libc::splice(
-                    libc::STDIN_FILENO,
+                    fro::command_io::stdin_fd(),
                     std::ptr::null_mut(),
                     pipe_write,
                     std::ptr::null_mut(),
@@ -568,15 +568,15 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
                 continue;
             }
             if moved == 0 {
-                let emitted = splice_all(pipe_read, libc::STDOUT_FILENO, buffered)?;
+                let emitted = splice_all(pipe_read, fro::command_io::stdout_fd(), buffered)?;
                 return Ok(emitted == buffered);
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR | libc::EAGAIN) => continue,
                 Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
-                    window.read_from_raw_fd_until(libc::STDIN_FILENO, usize::MAX)?;
-                    window.write_last_to_raw_fd(libc::STDOUT_FILENO, count)?;
+                    window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
+                    window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
                     return Ok(true);
                 }
                 _ => return Err(err),
@@ -599,7 +599,7 @@ fn try_write_tail_pipe_bytes_fast(input: &StreamInput, count: u64) -> io::Result
             let copied = if count <= TAIL_PIPE_WINDOW_SIZE as u64 {
                 return try_write_tail_stdin_small_prefetched(count);
             } else {
-                copy_pipe_tail_to_stdout_large(libc::STDIN_FILENO, count)?
+                copy_pipe_tail_to_stdout_large(fro::command_io::stdin_fd(), count)?
             };
             Ok(copied.is_some())
         }
@@ -665,7 +665,7 @@ fn write_tail_windowed<W: Write>(
     match mode {
         TailMode::Bytes(TailCount::FromEnd(count)) => match input {
             StreamInput::Stdin { .. } => {
-                grow_pipe_best_effort(libc::STDIN_FILENO)?;
+                grow_pipe_best_effort(fro::command_io::stdin_fd())?;
                 let mut reader = stdin_buf_reader()?;
                 return write_tail_bytes_windowed_from_reader(out, &mut reader, count);
             }
@@ -793,9 +793,11 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                 }
             }
             StreamInput::File(path) => {
-                if let TailMode::Bytes(TailCount::FromEnd(count)) = mode {
-                    let file_type = std::fs::metadata(path)?.file_type();
-                    if file_type.is_fifo() && !report_throughput {
+                let file_type = std::fs::metadata(path)?.file_type();
+                match mode {
+                    TailMode::Bytes(TailCount::FromEnd(count))
+                        if file_type.is_fifo() && !report_throughput =>
+                    {
                         if let Some(out) = out.as_mut() {
                             out.flush()?;
                         }
@@ -804,31 +806,21 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                             write_tail_windowed(out, input, io_mode, mode, terminator)?;
                         }
                         count
-                    } else if file_type.is_fifo() {
+                    }
+                    TailMode::Bytes(TailCount::FromEnd(_))
+                    | TailMode::Lines(TailCount::FromEnd(_)) => {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
                         write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
-                    } else if matches!(
-                        mode,
-                        TailMode::Bytes(TailCount::FromEnd(_))
-                            | TailMode::Lines(TailCount::FromEnd(_))
-                    ) {
-                        let out = out.get_or_insert(stdout_buf_writer()?);
-                        let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
-                        counted.bytes_written()
-                    } else {
+                    }
+                    TailMode::Bytes(TailCount::FromStart(_))
+                    | TailMode::Lines(TailCount::FromStart(_)) => {
                         let out = out.get_or_insert(stdout_buf_writer()?);
                         let mut counted = CountingWrite::new(out);
                         write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
                         counted.bytes_written()
                     }
-                } else {
-                    let out = out.get_or_insert(stdout_buf_writer()?);
-                    let mut counted = CountingWrite::new(out);
-                    write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
-                    counted.bytes_written()
                 }
             }
         };

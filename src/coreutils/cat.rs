@@ -205,7 +205,9 @@ fn cat_execution_backend(input: &StreamInput, args: &CatArgs) -> io::Result<CatE
             Ok(CatExecutionBackend::FastCopyToStdout)
         }
         StreamInput::Stdin { .. } => {
-            if fd_is_regular(libc::STDIN_FILENO)? || fd_is_fifo(libc::STDIN_FILENO)? {
+            if fd_is_regular(fro::command_io::stdin_fd())?
+                || fd_is_fifo(fro::command_io::stdin_fd())?
+            {
                 Ok(CatExecutionBackend::FastCopyToStdout)
             } else {
                 Ok(CatExecutionBackend::BufferedCopy)

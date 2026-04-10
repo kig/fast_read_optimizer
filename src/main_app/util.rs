@@ -73,14 +73,14 @@ pub(super) fn format_bytes_compact(size: u64) -> String {
 }
 
 pub(super) fn print_verify_report(report: &block_hash::VerifyReport) {
-    println!(
+    fro::cio_println!(
         "verify: loaded {}/3 hash replicas, ok_blocks={}, bad_blocks={}",
         report.loaded_manifests,
         report.ok_blocks,
         report.bad_blocks.len()
     );
     for issue in &report.bad_blocks {
-        println!(
+        fro::cio_println!(
             "block {}: {}",
             issue.block_index,
             issue.decision.status_message()

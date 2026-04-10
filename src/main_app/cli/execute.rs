@@ -63,7 +63,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         let config = config::load_config(config_path.as_deref());
         match config_subcommand.as_deref() {
             Some("print") => {
-                println!("{}", config.to_pretty_json()?);
+                fro::cio_println!("{}", config.to_pretty_json()?);
                 return Ok(0);
             }
             Some("explain") => {
@@ -73,7 +73,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                         "config explain requires --for <path>",
                     )
                 })?;
-                println!(
+                fro::cio_println!(
                     "{}",
                     serde_json::to_string_pretty(&config.explain_for_path(target))
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
@@ -177,7 +177,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let verbose = cli_verbose || mode == "read" || mode == "write";
     let internal_verbose = verbose && !cp_compat;
     if internal_verbose {
-        eprintln!("Opening file {} for {}", filename, mode);
+        fro::cio_eprintln!("Opening file {} for {}", filename, mode);
     }
 
     let mut exit_code = 0;
@@ -305,7 +305,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     io_mode,
                 )?;
                 if iterations == 1 {
-                    println!("{}  {}", manifest.hash_of_hashes, filename);
+                    fro::cio_println!("{}  {}", manifest.hash_of_hashes, filename);
                 }
                 Ok(manifest.bytes_hashed)
             } else {
@@ -321,7 +321,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     p[5] as usize,
                     io_mode,
                 )?;
-                println!(
+                fro::cio_println!(
                     "wrote {} {:?} hash blocks ({} bytes each) to {}.[0-2].json",
                     manifest.block_hashes.len(),
                     manifest.hash_type,
@@ -365,7 +365,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 io_mode,
                 recover_mode,
             )?;
-            println!(
+            fro::cio_println!(
                 "recover: repaired_blocks={}, repaired_files={}, sidecars_refreshed={}, failed_blocks={}, used_fast_path={}, fell_back_to_full_scan={}",
                 report.repaired_blocks,
                 report.repaired_files,
@@ -375,7 +375,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 report.fell_back_to_full_scan
             );
             for issue in &report.failed_blocks {
-                println!(
+                fro::cio_println!(
                     "file {} ({}), block {}: {}",
                     issue.file_index,
                     issue.file_path,
@@ -384,12 +384,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 );
             }
             if !report.failed_blocks.is_empty() {
-                println!(
+                fro::cio_println!(
                     "recover could not fully repair all requested files; add more clean replicas or inspect the failed block reasons above"
                 );
                 exit_code = 1;
             } else if report.repaired_blocks == 0 {
-                println!("recover: no block writes were needed");
+                fro::cio_println!("recover: no block writes were needed");
             }
             Ok(report.bytes_hashed)
         } else if mode == "write" {
@@ -410,12 +410,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     match fs::symlink_metadata(target_dir) {
                         Ok(metadata) if metadata.file_type().is_dir() => {}
                         Ok(_) => {
-                            eprintln!("cp: target '{}' is not a directory", target_dir);
+                            fro::cio_eprintln!("cp: target '{}' is not a directory", target_dir);
                             exit_code = 1;
                             return Ok(0);
                         }
                         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                            eprintln!(
+                            fro::cio_eprintln!(
                                 "cp: failed to access '{}': No such file or directory",
                                 target_dir
                             );
@@ -515,7 +515,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             && fs::symlink_metadata(target_path)
                                 .is_ok_and(|metadata| metadata.file_type().is_dir())
                         {
-                            eprintln!(
+                            fro::cio_eprintln!(
                                 "cp: cannot overwrite directory '{}' with non-directory",
                                 target_path.display()
                             );
@@ -582,9 +582,9 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             )?;
                             if cli_verbose {
                                 if cp_compat {
-                                    println!("'{}' -> '{}'", src, copied_target_path.display());
+                                    fro::cio_println!("'{}' -> '{}'", src, copied_target_path.display());
                                 } else {
-                                    eprintln!(
+                                    fro::cio_eprintln!(
                                         "{}",
                                         describe_copy_path(
                                             resolved_copy,
@@ -614,7 +614,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                     !no_lock,
                                 )?;
                                 if !quiet {
-                                    eprintln!(
+                                    fro::cio_eprintln!(
                                     "copy verify: success; verified_blocks={}, repaired_blocks={}, used_recovery={}, hash_type={:?}, sidecars_written={}",
                                     report.verified_blocks,
                                     report.repaired_blocks,
@@ -719,7 +719,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 }
                                 guard.ensure_source_unchanged()?;
                                 if !quiet {
-                                    eprintln!("copy verify-diff: success");
+                                    fro::cio_eprintln!("copy verify-diff: success");
                                 }
                                 copied
                             } else if via_memory {
@@ -821,7 +821,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                 }
                 Ok(total_copied)
             } else {
-                eprintln!("Copy is missing a destination path.");
+                fro::cio_eprintln!("Copy is missing a destination path.");
                 Ok(1)
             }
         } else if mode == "diff" || mode == "dual-read-bench" {
@@ -830,7 +830,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
             let s2 = std::fs::metadata(&filename)?.len();
             if s1 != s2 {
                 if internal_verbose {
-                    eprintln!("Files have different sizes: {} != {}", s1, s2);
+                    fro::cio_eprintln!("Files have different sizes: {} != {}", s1, s2);
                 }
                 if mode == "diff" {
                     exit_code = 1;
@@ -875,7 +875,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     _ => "forced direct I/O",
                 };
                 for line in tracker.take_warning_lines(request_label) {
-                    eprintln!("{line}");
+                    fro::cio_eprintln!("{line}");
                 }
             }
         }
@@ -919,7 +919,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         )?;
         let bytes = std::fs::metadata(&filename)?.len();
         let elapsed = start.elapsed().as_secs_f64();
-        eprintln!(
+        fro::cio_eprintln!(
             "{} {} bytes in {:.4} s, {:.1} GB/s, {:?}",
             mode,
             bytes,

@@ -53,7 +53,7 @@ fn read_files0_inputs<R: Read>(reader: &mut R, reject_stdin_name: bool) -> io::R
         requested_count += 1;
         if name == b"-" {
             if reject_stdin_name {
-                eprintln!("wc: when reading file names from stdin, no file name of '-' allowed");
+                fro::cio_eprintln!("wc: when reading file names from stdin, no file name of '-' allowed");
                 exit_code = 1;
             } else {
                 inputs.push(StreamInput::Stdin {
@@ -81,18 +81,18 @@ fn wc_inputs_from_args(
 ) -> io::Result<Result<WcInputs, i32>> {
     if let Some(files0_from) = files0_from {
         if !files.is_empty() {
-            eprintln!("wc: extra operand '{}'", files[0]);
-            eprintln!("file operands cannot be combined with --files0-from");
-            eprintln!("Try 'wc --help' for more information.");
+            fro::cio_eprintln!("wc: extra operand '{}'", files[0]);
+            fro::cio_eprintln!("file operands cannot be combined with --files0-from");
+            fro::cio_eprintln!("Try 'wc --help' for more information.");
             return Ok(Err(1));
         }
         if files0_from == "-" {
-            return read_files0_inputs(&mut std::io::stdin(), true).map(Ok);
+            return read_files0_inputs(&mut fro::command_io::stdin_file()?, true).map(Ok);
         }
         let mut list_file = match std::fs::File::open(&files0_from) {
             Ok(file) => file,
             Err(err) => {
-                eprintln!(
+                fro::cio_eprintln!(
                     "wc: cannot open '{}' for reading: {}",
                     files0_from,
                     wc_os_error_message(&err)
@@ -148,7 +148,12 @@ fn wc_totals_for_input(
                 wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
             }
             StreamInput::Stdin { .. } => {
-                wc_totals_from_fd_parallel(&mut std::io::stdin(), options, config, io_mode)
+                wc_totals_from_fd_parallel(
+                    &mut fro::command_io::stdin_file()?,
+                    options,
+                    config,
+                    io_mode,
+                )
             }
         },
     }
@@ -247,8 +252,8 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
             "--files0-from" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("wc: option '--files0-from' requires an argument");
-                    eprintln!("Try 'wc --help' for more information.");
+                    fro::cio_eprintln!("wc: option '--files0-from' requires an argument");
+                    fro::cio_eprintln!("Try 'wc --help' for more information.");
                     return Ok(1);
                 }
                 files0_from = Some(args[i].clone());
@@ -314,7 +319,7 @@ pub(super) fn run_wc(args: &[String]) -> io::Result<i32> {
         let totals = match wc_totals_for_input(&input, options, &config, io_mode) {
             Ok(totals) => totals,
             Err(err) => {
-                eprintln!(
+                fro::cio_eprintln!(
                     "wc: {}: {}",
                     wc_error_label(&input),
                     wc_os_error_message(&err)

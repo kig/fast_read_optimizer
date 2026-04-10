@@ -36,7 +36,7 @@ fn report_progress(
     *last_report = now;
     *last_reported_bytes = bytes;
     let elapsed = now.duration_since(start);
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096)?;
     writeln!(
         stderr,
         "{} bytes\t{}\t{:.3}s",
@@ -48,7 +48,7 @@ fn report_progress(
 
 fn finish_progress(bytes: u64, start: Instant) -> io::Result<()> {
     let elapsed = Instant::now().duration_since(start);
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096)?;
     writeln!(
         stderr,
         "{} bytes\t{}\t{:.3}s",
@@ -59,7 +59,7 @@ fn finish_progress(bytes: u64, start: Instant) -> io::Result<()> {
 }
 
 fn fallback_copy_with_progress(input: &StreamInput, io_mode: IOMode) -> io::Result<u64> {
-    let out = stdout_buf_writer()?;
+    let mut out = stdout_buf_writer()?;
     let mut total = 0u64;
     let start = Instant::now();
     let mut last_report = start;

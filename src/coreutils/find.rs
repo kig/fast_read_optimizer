@@ -3,18 +3,16 @@ use std::sync::Mutex;
 
 const FIND_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 const FIND_STDOUT_BUFFER_BYTES: usize = 2 << 20;
+const FIND_SERIAL_ROOT_ENTRY_THRESHOLD: usize = 64;
 
 struct FindOutput {
-    inner: Mutex<std::io::BufWriter<std::io::Stdout>>,
+    inner: Mutex<std::io::BufWriter<std::fs::File>>,
 }
 
 impl FindOutput {
     fn stdout() -> Self {
         Self {
-            inner: Mutex::new(std::io::BufWriter::with_capacity(
-                FIND_STDOUT_BUFFER_BYTES,
-                std::io::stdout(),
-            )),
+            inner: Mutex::new(fro::command_io::stdout_buf_writer(FIND_STDOUT_BUFFER_BYTES).unwrap()),
         }
     }
 
@@ -182,6 +180,8 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
     let queue = Arc::new(WorkQueue::default());
     let stop = Arc::new(AtomicBool::new(false));
     let had_warnings = Arc::new(AtomicBool::new(false));
+    let mut serial_task = None;
+    let serial_candidate = roots.len() == 1;
 
     for root in roots {
         let path = PathBuf::from(root);
@@ -198,20 +198,29 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
             write_find_path(&output, &path, plan.output_delimiter)?;
         }
         if metadata.file_type().is_dir() && plan.should_descend(0) {
-            queue.enqueue_one(FindTask {
+            let task = FindTask {
                 dir: path,
                 depth: 0,
-            });
+            };
+            if serial_candidate && find_should_use_serial_walk(&task.dir)? {
+                serial_task = Some(task);
+            } else {
+                queue.enqueue_one(task);
+            }
         }
     }
 
-    run_parallel_work_queue(queue, stop, worker_count, {
-        let output = output.clone();
-        let had_warnings = had_warnings.clone();
-        move |start_dir, queue, stop| {
-            walk_find_subtree(start_dir, queue, &output, stop, &had_warnings, &plan)
-        }
-    })?;
+    if let Some(task) = serial_task {
+        walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan)?;
+    } else {
+        run_parallel_work_queue(queue, stop, worker_count, {
+            let output = output.clone();
+            let had_warnings = had_warnings.clone();
+            move |start_dir, queue, stop| {
+                walk_find_subtree(start_dir, queue, &output, stop, &had_warnings, &plan)
+            }
+        })?;
+    }
     let output = Arc::into_inner(output)
         .ok_or_else(|| io::Error::other("find output writer still has active references"))?;
     output.flush()?;
@@ -220,6 +229,13 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
     } else {
         0
     })
+}
+
+fn find_should_use_serial_walk(root: &Path) -> io::Result<bool> {
+    Ok(fs::read_dir(root)?
+        .take(FIND_SERIAL_ROOT_ENTRY_THRESHOLD + 1)
+        .count()
+        <= FIND_SERIAL_ROOT_ENTRY_THRESHOLD)
 }
 
 fn walk_find_subtree(
@@ -286,6 +302,71 @@ fn walk_find_subtree(
         }
         if let Some(local_dir) = child_dirs.pop() {
             queue.enqueue(child_dirs);
+            stack.push(local_dir);
+        }
+    }
+    output.write_all(&chunk)
+}
+
+fn walk_find_subtree_serial(
+    start_dir: FindTask,
+    output: &FindOutput,
+    had_warnings: &AtomicBool,
+    plan: &FindPlan,
+) -> io::Result<()> {
+    let mut stack = vec![start_dir];
+    let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
+    let mut path_bytes = Vec::new();
+    while let Some(task) = stack.pop() {
+        let dir = task.dir;
+        let child_depth = task.depth + 1;
+        let mut child_dirs = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("find", &dir, &err, "cannot read directory");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("find", &dir, &err, "cannot read directory");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let file_name = entry.file_name();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if is_permission_denied(&err) => {
+                    let path = child_find_path(&dir, &file_name);
+                    write_warning_line("find", &path, &err, "cannot access");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if plan.matches_child(&dir, &file_name, file_type, child_depth, &mut path_bytes) {
+                append_find_child_path(&mut chunk, &dir, &file_name, plan.output_delimiter);
+                if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
+                    output.write_all(&chunk)?;
+                    chunk.clear();
+                }
+            }
+            if file_type.is_dir() && plan.should_descend(child_depth) {
+                child_dirs.push(FindTask {
+                    dir: child_find_path(&dir, &file_name),
+                    depth: child_depth,
+                });
+            }
+        }
+        if let Some(local_dir) = child_dirs.pop() {
+            stack.extend(child_dirs);
             stack.push(local_dir);
         }
     }
@@ -429,20 +510,20 @@ fn is_find_expression_token(arg: &str) -> bool {
 }
 
 fn print_find_help(program: &str) {
-    println!(
+    fro::cio_println!(
         "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
     );
-    println!("Walk directory trees and print matching paths.");
-    println!();
-    println!("  -maxdepth N        descend at most N levels below each starting path");
-    println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
-    println!("  -name PATTERN      match the final path component using shell glob syntax");
-    println!("  -iname PATTERN     like -name, but match ASCII case-insensitively");
-    println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
-    println!("  -ipath PATTERN     like -path, but match ASCII case-insensitively");
-    println!("  -print             print each matching path followed by a newline (default)");
-    println!("  -print0            print each matching path followed by NUL");
-    println!("  -h, --help         display this help and exit");
+    fro::cio_println!("Walk directory trees and print matching paths.");
+    fro::cio_println!();
+    fro::cio_println!("  -maxdepth N        descend at most N levels below each starting path");
+    fro::cio_println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
+    fro::cio_println!("  -name PATTERN      match the final path component using shell glob syntax");
+    fro::cio_println!("  -iname PATTERN     like -name, but match ASCII case-insensitively");
+    fro::cio_println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
+    fro::cio_println!("  -ipath PATTERN     like -path, but match ASCII case-insensitively");
+    fro::cio_println!("  -print             print each matching path followed by a newline (default)");
+    fro::cio_println!("  -print0            print each matching path followed by NUL");
+    fro::cio_println!("  -h, --help         display this help and exit");
 }
 
 fn write_find_path(output: &FindOutput, path: &Path, output_delimiter: u8) -> io::Result<()> {

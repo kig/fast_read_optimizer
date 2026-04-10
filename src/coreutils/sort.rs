@@ -710,55 +710,55 @@ fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
 }
 
 fn print_sort_help(program: &str) {
-    println!("sort - Sort newline-delimited records (or NUL-delimited with -z)");
-    println!();
-    println!("Usage: {program} [OPTION]... [FILE]...");
-    println!();
-    println!(
+    fro::cio_println!("sort - Sort newline-delimited records (or NUL-delimited with -z)");
+    fro::cio_println!();
+    fro::cio_println!("Usage: {program} [OPTION]... [FILE]...");
+    fro::cio_println!();
+    fro::cio_println!(
         "This bounded slice sorts locale-independent byte, numeric, general-numeric, human-numeric, month, or version records, using newlines by default and NULs with -z."
     );
-    println!(
+    fro::cio_println!(
         "It currently supports the default case plus -g/-h/-M/-n/-V, -z, reverse/unique, merge/check, and -o output."
     );
-    println!();
-    println!("Supported options:");
-    println!("  -c, --check          check whether one input is already sorted");
-    println!("  -g, --general-numeric-sort");
-    println!("                       compare leading C-locale floating-point prefixes");
-    println!("  -h, --human-numeric-sort");
-    println!("                       compare leading numbers grouped by human suffix family");
-    println!("  -m, --merge          merge already sorted inputs without resorting");
-    println!("  -M, --month-sort     compare leading month abbreviations like GNU sort -M");
-    println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
-    println!("  -r, --reverse        reverse the result of comparisons");
-    println!("  -u, --unique         output only the first of an equal run");
-    println!("  -V, --version-sort   compare digit runs with GNU version-order semantics");
-    println!("  -z, --zero-terminated  use NUL as the input and output record terminator");
-    println!("  -o FILE              write result to FILE after reading all input");
-    println!("      --output=FILE    same as -o FILE");
-    println!("  -T DIR               write spill files under DIR when out-of-core merge is needed");
-    println!("      --temporary-directory=DIR");
-    println!("                       same as -T DIR");
-    println!("      --auto           choose direct IO automatically for regular files");
-    println!("      --direct         force direct IO for regular files when possible");
-    println!("      --no-direct      force page-cache IO for regular files");
-    println!("      --report-gbps    print aggregate input throughput to stderr");
-    println!("      --help           display this help and exit");
-    println!();
-    println!("Notes:");
-    println!("  - Use '-' once to read stdin.");
-    println!("  - Use '--' before file names that start with '-'.");
-    println!("  - Bytewise in-memory sorting uses a StringZilla argsort fast path.");
-    println!("  - Inputs larger than available memory spill sorted runs and merge them.");
-    println!("  - -T only matters when spill temp files are actually created.");
-    println!("  - -m reuses the spill/merge backend on already sorted inputs.");
-    println!("  - -c validates one input stream and exits 1 on the first disorder.");
-    println!("  - -g uses C-locale strtod-style prefixes; NaNs sort after non-numbers and before infinities.");
-    println!("  - -h compares the leading numeric prefix plus an optional K/M/G/T/P/E/Z/Y suffix family.");
-    println!("  - -M looks at the first nonblank three-letter month abbreviation and treats other lines as invalid month keys.");
-    println!("  - -V uses GNU/libc version-order comparisons while preserving the existing spill, merge, and check backend.");
-    println!("  - Unsupported GNU sort features currently return an error:");
-    println!("    key selection (-k) and locale collation.");
+    fro::cio_println!();
+    fro::cio_println!("Supported options:");
+    fro::cio_println!("  -c, --check          check whether one input is already sorted");
+    fro::cio_println!("  -g, --general-numeric-sort");
+    fro::cio_println!("                       compare leading C-locale floating-point prefixes");
+    fro::cio_println!("  -h, --human-numeric-sort");
+    fro::cio_println!("                       compare leading numbers grouped by human suffix family");
+    fro::cio_println!("  -m, --merge          merge already sorted inputs without resorting");
+    fro::cio_println!("  -M, --month-sort     compare leading month abbreviations like GNU sort -M");
+    fro::cio_println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
+    fro::cio_println!("  -r, --reverse        reverse the result of comparisons");
+    fro::cio_println!("  -u, --unique         output only the first of an equal run");
+    fro::cio_println!("  -V, --version-sort   compare digit runs with GNU version-order semantics");
+    fro::cio_println!("  -z, --zero-terminated  use NUL as the input and output record terminator");
+    fro::cio_println!("  -o FILE              write result to FILE after reading all input");
+    fro::cio_println!("      --output=FILE    same as -o FILE");
+    fro::cio_println!("  -T DIR               write spill files under DIR when out-of-core merge is needed");
+    fro::cio_println!("      --temporary-directory=DIR");
+    fro::cio_println!("                       same as -T DIR");
+    fro::cio_println!("      --auto           choose direct IO automatically for regular files");
+    fro::cio_println!("      --direct         force direct IO for regular files when possible");
+    fro::cio_println!("      --no-direct      force page-cache IO for regular files");
+    fro::cio_println!("      --report-gbps    print aggregate input throughput to stderr");
+    fro::cio_println!("      --help           display this help and exit");
+    fro::cio_println!();
+    fro::cio_println!("Notes:");
+    fro::cio_println!("  - Use '-' once to read stdin.");
+    fro::cio_println!("  - Use '--' before file names that start with '-'.");
+    fro::cio_println!("  - Bytewise in-memory sorting uses a StringZilla argsort fast path.");
+    fro::cio_println!("  - Inputs larger than available memory spill sorted runs and merge them.");
+    fro::cio_println!("  - -T only matters when spill temp files are actually created.");
+    fro::cio_println!("  - -m reuses the spill/merge backend on already sorted inputs.");
+    fro::cio_println!("  - -c validates one input stream and exits 1 on the first disorder.");
+    fro::cio_println!("  - -g uses C-locale strtod-style prefixes; NaNs sort after non-numbers and before infinities.");
+    fro::cio_println!("  - -h compares the leading numeric prefix plus an optional K/M/G/T/P/E/Z/Y suffix family.");
+    fro::cio_println!("  - -M looks at the first nonblank three-letter month abbreviation and treats other lines as invalid month keys.");
+    fro::cio_println!("  - -V uses GNU/libc version-order comparisons while preserving the existing spill, merge, and check backend.");
+    fro::cio_println!("  - Unsupported GNU sort features currently return an error:");
+    fro::cio_println!("    key selection (-k) and locale collation.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -927,7 +927,7 @@ fn report_sort_disorder(
     disorder: &external::SortCheckFailure,
     terminator: RecordTerminator,
 ) -> io::Result<()> {
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096)?;
     write!(stderr, "sort: {label}:{}: disorder: ", disorder.line_number)?;
     stderr.write_all(String::from_utf8_lossy(&disorder.line).as_bytes())?;
     if terminator == RecordTerminator::Nul {
@@ -983,8 +983,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             "-z" | "--zero-terminated" if !end_flags => terminator = RecordTerminator::Nul,
             "-o" | "--output" if !end_flags => {
                 let Some(path) = args.get(idx + 1) else {
-                    eprintln!("sort: option requires an argument -- 'o'");
-                    eprintln!("Try 'sort --help' for more information.");
+                    fro::cio_eprintln!("sort: option requires an argument -- 'o'");
+                    fro::cio_eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
                 };
                 output_path = Some(path.clone());
@@ -992,8 +992,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             }
             "-T" | "--temporary-directory" if !end_flags => {
                 let Some(path) = args.get(idx + 1) else {
-                    eprintln!("sort: option requires an argument -- 'T'");
-                    eprintln!("Try 'sort --help' for more information.");
+                    fro::cio_eprintln!("sort: option requires an argument -- 'T'");
+                    fro::cio_eprintln!("Try 'sort --help' for more information.");
                     return Ok(2);
                 };
                 temporary_directory = Some(path.clone());
@@ -1046,8 +1046,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                                 output_path = Some(other[value_start..].to_string());
                             } else {
                                 let Some(path) = args.get(idx + 1) else {
-                                    eprintln!("sort: option requires an argument -- 'o'");
-                                    eprintln!("Try 'sort --help' for more information.");
+                                    fro::cio_eprintln!("sort: option requires an argument -- 'o'");
+                                    fro::cio_eprintln!("Try 'sort --help' for more information.");
                                     return Ok(2);
                                 };
                                 output_path = Some(path.clone());
@@ -1061,8 +1061,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                                 temporary_directory = Some(other[value_start..].to_string());
                             } else {
                                 let Some(path) = args.get(idx + 1) else {
-                                    eprintln!("sort: option requires an argument -- 'T'");
-                                    eprintln!("Try 'sort --help' for more information.");
+                                    fro::cio_eprintln!("sort: option requires an argument -- 'T'");
+                                    fro::cio_eprintln!("Try 'sort --help' for more information.");
                                     return Ok(2);
                                 };
                                 temporary_directory = Some(path.clone());
@@ -1098,11 +1098,11 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     }
 
     if check && files.len() > 1 {
-        eprintln!("sort: extra operand '{}' not allowed with -c", files[1]);
+        fro::cio_eprintln!("sort: extra operand '{}' not allowed with -c", files[1]);
         return Ok(2);
     }
     if check && output_path.is_some() {
-        eprintln!("sort: options '-co' are incompatible");
+        fro::cio_eprintln!("sort: options '-co' are incompatible");
         return Ok(2);
     }
 
@@ -1113,8 +1113,8 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
         .count()
         > 1
     {
-        eprintln!("sort: repeated '-' operands are not supported");
-        eprintln!("Try 'sort --help' for more information.");
+        fro::cio_eprintln!("sort: repeated '-' operands are not supported");
+        fro::cio_eprintln!("Try 'sort --help' for more information.");
         return Ok(2);
     }
 
@@ -1129,7 +1129,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 result.total_bytes
             }
             Err(err) => {
-                eprintln!("sort: {err}");
+                fro::cio_eprintln!("sort: {err}");
                 return Ok(2);
             }
         }
@@ -1161,12 +1161,12 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             Err(err) => {
                 if let Some(path) = output_path.as_deref() {
                     if err.kind() == io::ErrorKind::PermissionDenied {
-                        eprintln!("sort: cannot write '{path}': {err}");
+                        fro::cio_eprintln!("sort: cannot write '{path}': {err}");
                     } else {
-                        eprintln!("sort: {err}");
+                        fro::cio_eprintln!("sort: {err}");
                     }
                 } else {
-                    eprintln!("sort: {err}");
+                    fro::cio_eprintln!("sort: {err}");
                 }
                 return Ok(2);
             }

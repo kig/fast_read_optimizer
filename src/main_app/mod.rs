@@ -337,7 +337,7 @@ impl ThroughputSampler {
                     let window_gbps = delta_bytes as f64 / window_secs / 1e9;
                     let avg_gbps = bytes_now as f64 / total_secs / 1e9;
                     let unit_rate = delta_units as f64 / window_secs;
-                    let mut stderr = std::io::stderr().lock();
+                    let mut stderr = fro::command_io::stderr_buf_writer(4096)?;
                     writeln!(
                         stderr,
                         "{label} sample t={:.3}s bytes={} {}={} window={:.3} GB/s avg={:.3} GB/s {unit_label}/s={:.1}",
@@ -450,6 +450,16 @@ pub(crate) fn create_tar_archive(
     recursive::archive::create_tar_archive(source, output, verbose, compression)
 }
 
+pub(crate) fn create_tar_archive_from(
+    source_arg: &Path,
+    source_fs: &Path,
+    output: &Path,
+    verbose: bool,
+    compression: TarCompression,
+) -> io::Result<u64> {
+    recursive::archive::create_tar_archive_from(source_arg, source_fs, output, verbose, compression)
+}
+
 pub(crate) fn list_tar_archive(
     path: &Path,
     verbose: bool,
@@ -485,4 +495,8 @@ pub(crate) fn bench_tar_archive(
 
 pub(super) fn main() {
     cli::main();
+}
+
+pub(crate) fn run_with_args(raw_args: Vec<String>) -> io::Result<i32> {
+    cli::try_main_from(raw_args)
 }

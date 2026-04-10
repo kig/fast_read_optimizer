@@ -18,11 +18,26 @@ if [[ "$MODE" == "fro" ]]; then
     export PATH="/opt/fro-coreutils/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     export FRO_LOG_FALLBACKS="${FRO_LOG_FALLBACKS:-1}"
     export FRO_CALL_LOG="${OUTPUT_DIR}/fro-calls.log"
+    export FRO_IPC_TIMING_LOG="${OUTPUT_DIR}/fro-ipc-timings.log"
     : >"$FRO_CALL_LOG"
+    : >"$FRO_IPC_TIMING_LOG"
+    /bin/rm -f /tmp/fro-ipc.sock
+    /usr/local/bin/fro-ipc-server >/dev/null 2>>"$LOG_FILE" &
+    FRO_IPC_SERVER_PID=$!
+    trap 'kill "$FRO_IPC_SERVER_PID" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 100); do
+        [[ -S /tmp/fro-ipc.sock ]] && break
+        /bin/sleep 0.01
+    done
+    if [[ ! -S /tmp/fro-ipc.sock ]]; then
+        echo "fro IPC server failed to start" >&2
+        exit 1
+    fi
 else
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     unset FRO_LOG_FALLBACKS || true
     unset FRO_CALL_LOG || true
+    unset FRO_IPC_TIMING_LOG || true
 fi
 
 source /opt/fro-bench/shell-workload.sh
@@ -61,6 +76,8 @@ if [[ "$MODE" == "seed" ]]; then
     generate_seed_workload "$SEED_DIR"
     write_key seed_file_count "$(/usr/bin/find "$SEED_DIR/project" -type f | /usr/bin/wc -l | tr -d ' ')"
     write_key seed_module_count "$(/usr/bin/find "$SEED_DIR/project/modules" -mindepth 1 -maxdepth 1 -type d | /usr/bin/wc -l | tr -d ' ')"
+    write_key seed_large_file_count "$(/usr/bin/find "$SEED_DIR/project/assets/large" -maxdepth 1 -type f -name '*.bin' | /usr/bin/wc -l | tr -d ' ')"
+    write_key seed_large_total_bytes "$(/usr/bin/du -sb "$SEED_DIR/project/assets/large" | /usr/bin/awk '{print $1}')"
     /bin/cat "$SUMMARY_FILE"
     exit 0
 fi
@@ -74,6 +91,7 @@ overall_start="$(date +%s.%N)"
 measure_phase prep prepare_workspace "$SEED_DIR" "$WORK_DIR"
 measure_phase configure run_configure_slice "$WORK_DIR/project" "$WORK_DIR/build"
 measure_phase build run_build_slice "$WORK_DIR/project" "$WORK_DIR/build"
+measure_phase largeio run_large_io_slice "$WORK_DIR/project" "$WORK_DIR/build" "$WORK_DIR/package"
 measure_phase package run_package_slice "$WORK_DIR/project" "$WORK_DIR/build" "$WORK_DIR/package"
 measure_phase verify run_verify_slice "$WORK_DIR/package" "$WORK_DIR/verify"
 measure_phase cleanup run_cleanup_slice "$WORK_DIR"
@@ -96,5 +114,29 @@ if [[ -n "${FRO_CALL_LOG:-}" ]]; then
         | /usr/bin/sort -k2 > "${OUTPUT_DIR}/fro-call-counts.txt"
 fi
 write_key fro_call_count "$fro_call_count"
+
+if [[ -n "${FRO_IPC_TIMING_LOG:-}" ]]; then
+    fro_timing_count="$(/usr/bin/wc -l < "$FRO_IPC_TIMING_LOG" | tr -d ' ')"
+    awk '
+        {
+            cmd = $1
+            nanos = $2 + 0
+            count[cmd]++
+            total[cmd] += nanos
+            if (nanos > max[cmd]) max[cmd] = nanos
+        }
+        END {
+            for (cmd in count) {
+                printf "%s %d %.6f %.6f %.6f\n",
+                    cmd,
+                    count[cmd],
+                    total[cmd] / 1000000.0,
+                    (total[cmd] / count[cmd]) / 1000000.0,
+                    max[cmd] / 1000000.0
+            }
+        }
+    ' "$FRO_IPC_TIMING_LOG" | /usr/bin/sort -k4,4nr > "${OUTPUT_DIR}/fro-call-timing-summary.txt"
+    write_key fro_timing_count "$fro_timing_count"
+fi
 
 /bin/cat "$SUMMARY_FILE"

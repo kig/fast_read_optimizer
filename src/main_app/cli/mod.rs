@@ -4,7 +4,11 @@ mod args;
 mod execute;
 
 pub(super) fn try_main() -> io::Result<i32> {
-    match args::parse_cli()? {
+    try_main_from(std::env::args().collect())
+}
+
+pub(super) fn try_main_from(raw_args: Vec<String>) -> io::Result<i32> {
+    match args::parse_cli_from(raw_args)? {
         args::ParseOutcome::Early(code) => Ok(code),
         args::ParseOutcome::Parsed(parsed) => execute::run(parsed),
     }
@@ -91,7 +95,7 @@ pub(super) fn main() {
             if is_broken_pipe_error(&err) {
                 std::process::exit(0);
             }
-            let _ = writeln!(io::stderr().lock(), "Error: {}", err);
+            fro::cio_eprintln!("Error: {}", err);
             std::process::exit(1);
         }
         Err(payload) => {

@@ -17,7 +17,7 @@ pub(crate) fn run_split_manifest_recursive_copy(
     verbose: bool,
 ) -> io::Result<u64> {
     let result = run_split_manifest_recursive_copy_with_result(ctx, verbose)?;
-    println!(
+    fro::cio_println!(
         "split-manifest-recursive-copy {} bytes across {} files: dirs={} symlinks={} small={} large={} manifest_phase={:.4}s copy_phase={:.4}s total={:.4}s file_gbps={:.3}",
         result.bytes_copied,
         result.files_copied,
@@ -189,7 +189,7 @@ pub(super) fn run_split_manifest_recursive_copy_with_result(
         total_secs: overall_start.elapsed().as_secs_f64(),
     };
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "split-manifest recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, small_tasks={}, large_tasks={}, bytes_copied={}, manifest_phase={:.4}s, copy_phase={:.4}s",
             result.dirs_created,
             result.files_copied,

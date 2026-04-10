@@ -93,7 +93,7 @@ fn maybe_print_verbose_copy(
     target_path: &Path,
 ) {
     if verbose && cp_compat {
-        println!("'{}' -> '{}'", source_path.display(), target_path.display());
+        fro::cio_println!("'{}' -> '{}'", source_path.display(), target_path.display());
     }
 }
 
@@ -879,7 +879,7 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
     }
     let bytes_copied = stats.bytes_copied.load(Ordering::Relaxed);
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "recursive copy: dirs_created={}, files_copied={}, symlinks_created={}, bytes_copied={}",
             stats.dirs_created.load(Ordering::Relaxed),
             stats.files_copied.load(Ordering::Relaxed),
@@ -887,7 +887,7 @@ pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io
             bytes_copied
         );
         #[cfg(feature = "read-phase-timing")]
-        eprintln!("{}", lane_counters.snapshot_line());
+        fro::cio_eprintln!("{}", lane_counters.snapshot_line());
     }
     Ok(bytes_copied)
 }

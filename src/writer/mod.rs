@@ -10,7 +10,7 @@ use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
@@ -56,8 +56,15 @@ pub struct SequentialWriter {
 }
 
 pub struct BufWriter {
-    tx: SyncSender<BufWriteRequest>,
-    finish_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    inner: BufWriterInner,
+}
+
+enum BufWriterInner {
+    Threaded {
+        tx: SyncSender<BufWriteRequest>,
+        finish_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    },
+    Direct(std::io::BufWriter<File>),
 }
 
 enum BufWriteRequest {
@@ -292,16 +299,12 @@ impl Write for SequentialWriter {
 
 impl BufWriter {
     pub fn stdout(qd: usize, block_size: u64, channel_depth: usize) -> io::Result<Self> {
-        // SAFETY: `dup` creates a new owned fd for stdout, which we validate before handing off
-        // to `File`.
-        let stdout_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        if stdout_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `stdout_fd` came from `dup` above and is uniquely owned here.
-        let file = unsafe { File::from_raw_fd(stdout_fd) };
+        let file = fro::command_io::stdout_file()?;
         let _ = qd;
-        Self::with_capacity(channel_depth, file, 1, block_size)
+        let capacity = channel_depth.max(1) * aligned_block_size(block_size as usize);
+        Ok(Self {
+            inner: BufWriterInner::Direct(std::io::BufWriter::with_capacity(capacity, file)),
+        })
     }
 
     #[allow(dead_code)]
@@ -316,58 +319,87 @@ impl BufWriter {
         block_size: u64,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<BufWriteRequest>(channel_capacity.max(1));
+        let (init_tx, init_rx) = mpsc::sync_channel::<io::Result<()>>(1);
         let finish_handle = std::thread::spawn(move || -> io::Result<()> {
-            let mut writer = SequentialWriter::from_file(file, qd, block_size)?;
+            let mut writer = match SequentialWriter::from_file(file, qd, block_size) {
+                Ok(writer) => {
+                    let _ = init_tx.send(Ok(()));
+                    writer
+                }
+                Err(err) => {
+                    let init_err = io::Error::new(err.kind(), err.to_string());
+                    let _ = init_tx.send(Err(init_err));
+                    return Err(err);
+                }
+            };
             run_buf_writer_loop(&mut writer, rx)
         });
+        init_rx
+            .recv()
+            .map_err(|err| io::Error::other(err.to_string()))??;
         Ok(Self {
-            tx,
-            finish_handle: Some(finish_handle),
+            inner: BufWriterInner::Threaded {
+                tx,
+                finish_handle: Some(finish_handle),
+            },
         })
     }
 
-    pub fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
         self.write_vec(buf.to_vec())
     }
 
-    pub fn write_vec(&self, buf: Vec<u8>) -> io::Result<()> {
+    pub fn write_vec(&mut self, buf: Vec<u8>) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
-        self.tx
-            .send(BufWriteRequest::Data(buf))
-            .map_err(|err| io::Error::other(err.to_string()))
+        match &mut self.inner {
+            BufWriterInner::Threaded { tx, .. } => tx
+                .send(BufWriteRequest::Data(buf))
+                .map_err(|err| io::Error::other(err.to_string())),
+            BufWriterInner::Direct(writer) => writer.write_all(&buf),
+        }
     }
 
-    pub fn flush_shared(&self) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
-            .send(BufWriteRequest::Flush(reply_tx))
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        reply_rx
-            .recv()
-            .map_err(|err| io::Error::other(err.to_string()))?
+    pub fn flush_shared(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            BufWriterInner::Threaded { tx, .. } => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                tx.send(BufWriteRequest::Flush(reply_tx))
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                reply_rx
+                    .recv()
+                    .map_err(|err| io::Error::other(err.to_string()))?
+            }
+            BufWriterInner::Direct(writer) => writer.flush(),
+        }
     }
 
     pub fn into_inner(mut self) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
-            .send(BufWriteRequest::Shutdown(reply_tx))
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        let shutdown_result = reply_rx
-            .recv()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        let handle = self
-            .finish_handle
-            .take()
-            .ok_or_else(|| io::Error::other("buf writer already finished"))?;
-        shutdown_result?;
-        handle
-            .join()
-            .map_err(|_| io::Error::other("buf writer thread panicked"))?
+        match &mut self.inner {
+            BufWriterInner::Threaded { tx, finish_handle } => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                tx.send(BufWriteRequest::Shutdown(reply_tx))
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                let shutdown_result = reply_rx
+                    .recv()
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                let handle = finish_handle
+                    .take()
+                    .ok_or_else(|| io::Error::other("buf writer already finished"))?;
+                shutdown_result?;
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("buf writer thread panicked"))?
+            }
+            BufWriterInner::Direct(writer) => {
+                writer.flush()?;
+                Ok(())
+            }
+        }
     }
 }
 

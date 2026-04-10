@@ -178,8 +178,8 @@ pub(super) fn infer_cache_strategy(
 }
 
 pub(super) fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
-    println!();
-    println!("summary\tcache\tsize\tfastest-variant\tfastest-path\tgbps");
+    fro::cio_println!();
+    fro::cio_println!("summary\tcache\tsize\tfastest-variant\tfastest-path\tgbps");
     for cache_state in [ReadSweepCacheState::Cold, ReadSweepCacheState::Hot] {
         let mut sizes = rows
             .iter()
@@ -194,7 +194,7 @@ pub(super) fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
                 .filter(|row| row.cache_state == cache_state && row.size == size)
                 .max_by(|a, b| a.gbps.partial_cmp(&b.gbps).unwrap())
             {
-                println!(
+                fro::cio_println!(
                     "summary\t{}\t{}\t{}\t{}\t{:.6}",
                     cache_state.label(),
                     size,
@@ -208,15 +208,15 @@ pub(super) fn print_read_sweep_summary(rows: &[ReadSweepRow]) {
 }
 
 pub(super) fn print_read_sweep_strategy(strategy: ReadAutoStrategy) {
-    println!();
-    println!("strategy\tstate\tsmall-path\tlarge-path\tcutoff-bytes");
-    println!(
+    fro::cio_println!();
+    fro::cio_println!("strategy\tstate\tsmall-path\tlarge-path\tcutoff-bytes");
+    fro::cio_println!(
         "strategy\thot\t{}\t{}\t{}",
         path_kind_label(strategy.hot_small_path),
         path_kind_label(strategy.hot_large_path),
         strategy.hot_large_min_bytes
     );
-    println!(
+    fro::cio_println!(
         "strategy\tcold\t{}\t{}\t{}",
         path_kind_label(strategy.cold_small_path),
         path_kind_label(strategy.cold_large_path),
@@ -266,7 +266,7 @@ pub(super) fn print_read_sweep_table(rows: &[ReadSweepRow]) {
         .map(|col| rendered.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
     for row in rendered {
-        println!(
+        fro::cio_println!(
             "{}",
             row.iter()
                 .enumerate()
@@ -350,7 +350,7 @@ pub(super) fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Res
                         params: result.params,
                         phase_timings: result.phase_timings,
                     });
-                    println!(
+                    fro::cio_println!(
                         "result\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}",
                         cache_state.label(),
                         size,
@@ -372,16 +372,16 @@ pub(super) fn run_bench_read_sweep(config: &mut config::LoadedConfig) -> io::Res
                 .then(a.size.cmp(&b.size))
                 .then(a.variant.label().cmp(b.variant.label()))
         });
-        println!();
+        fro::cio_println!();
         print_read_sweep_table(&rows);
         if rows.iter().any(|row| row.phase_timings.enabled()) {
-            println!();
-            println!(
+            fro::cio_println!();
+            fro::cio_println!(
                 "phases\tcache\tsize\tvariant\tthreads-created\tfirst-submit\tfirst-completion\twrapup-start\tjoin-done"
             );
             for row in rows.iter().filter(|row| row.phase_timings.enabled()) {
                 let timings = row.phase_timings;
-                println!(
+                fro::cio_println!(
                     "phases\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     row.cache_state.label(),
                     row.size,

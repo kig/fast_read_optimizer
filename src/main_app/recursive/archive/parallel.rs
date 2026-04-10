@@ -11,7 +11,7 @@ impl TarParallelSampler {
                 let sendfile = counters.sendfile_streams_inflight.load(Ordering::Relaxed);
                 let mt_jobs = counters.mt_copy_jobs_inflight.load(Ordering::Relaxed);
                 let mt_threads = counters.mt_copy_threads_inflight.load(Ordering::Relaxed);
-                eprintln!(
+                fro::cio_eprintln!(
                     "{label} parallel: small_slab_tasks={small_tasks}, small_slab_entries={small_entries}, sendfile_streams={sendfile}, mt_copy_jobs={mt_jobs}, mt_copy_threads={mt_threads}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -382,7 +382,7 @@ pub(super) fn stream_tar_to_dev_null(
     write_all(&mut dev_null, &zero_blocks)?;
     total_bytes = total_bytes.saturating_add(TAR_EOF_BLOCKS);
     if verbose {
-        eprintln!("tar create: streamed {} bytes to /dev/null", total_bytes);
+        fro::cio_eprintln!("tar create: streamed {} bytes to /dev/null", total_bytes);
     }
     if let Some(sampler) = parallel_sampler {
         sampler.finish()?;

@@ -8,6 +8,7 @@ use super::workers::{
     thread_map_blocks, thread_visit_blocks,
 };
 use super::*;
+use crate::uring_util::io_uring_available;
 
 #[allow(dead_code)]
 pub fn load_file_to_memory(
@@ -308,6 +309,27 @@ where
             .collect::<Vec<_>>(),
     );
     let mapper = Arc::new(mapper);
+    if !io_uring_available(1024)? {
+        let result_slots = Arc::clone(&results);
+        let metrics = visit_file_blocks_simple(filename, params, move |block| {
+            let value = mapper(block)?;
+            *result_slots[block.block_index].lock().unwrap() = Some(value);
+            Ok(())
+        })?;
+        let mut blocks = Vec::with_capacity(block_count);
+        for (block_index, slot) in results.iter().enumerate() {
+            let value = slot.lock().unwrap().take().ok_or_else(|| {
+                std::io::Error::other(format!("missing mapped result for block {}", block_index))
+            })?;
+            blocks.push(value);
+        }
+        return Ok(MappedBlocks {
+            blocks,
+            bytes_read: metrics.bytes_read,
+            file_size: metrics.file_size,
+            params,
+        });
+    }
 
     let mut threads = vec![];
     for thread_id in 0..params.num_threads {
@@ -410,6 +432,46 @@ where
             })
         }
         ResolvedReadExecution::Threaded(params) => {
+            if !io_uring_available(1024)? {
+                let file_size = std::fs::metadata(filename)?.len();
+                if file_size == 0 {
+                    return Ok(MappedBlocks {
+                        blocks: Vec::new(),
+                        bytes_read: 0,
+                        file_size,
+                        params,
+                    });
+                }
+                let block_count = file_size.div_ceil(params.block_size) as usize;
+                let mapper = Arc::new(mapper);
+                let results = Arc::new(
+                    (0..block_count)
+                        .map(|_| Mutex::new(None))
+                        .collect::<Vec<_>>(),
+                );
+                let result_slots = Arc::clone(&results);
+                let metrics = visit_file_blocks_simple(filename, params, move |block| {
+                    let value = mapper(block)?;
+                    *result_slots[block.block_index].lock().unwrap() = Some(value);
+                    Ok(())
+                })?;
+                let mut blocks = Vec::with_capacity(block_count);
+                for (block_index, slot) in results.iter().enumerate() {
+                    let value = slot.lock().unwrap().take().ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "missing mapped result for block {}",
+                            block_index
+                        ))
+                    })?;
+                    blocks.push(value);
+                }
+                return Ok(MappedBlocks {
+                    blocks,
+                    bytes_read: metrics.bytes_read,
+                    file_size: metrics.file_size,
+                    params,
+                });
+            }
             let file_size = std::fs::metadata(filename)?.len();
             let block_count = if file_size == 0 {
                 0
@@ -535,6 +597,9 @@ where
     let read_count = Arc::new(AtomicU64::new(0));
     let visitor = Arc::new(visitor);
     let timing_probe = Arc::new(ReadPhaseTimingProbe::new());
+    if !io_uring_available(1024)? {
+        return visit_file_blocks_simple(filename, params, move |block| visitor(block));
+    }
 
     let mut threads = vec![];
     for thread_id in 0..params.num_threads {

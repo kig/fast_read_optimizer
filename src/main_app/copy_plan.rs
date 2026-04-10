@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedCopyExecution {
@@ -13,10 +14,13 @@ pub(super) struct ResolvedCopyExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HeuristicCopyPlan {
     DiffOverwrite,
+    LowLatencyCopyFileRangeSingle,
     CachedReadDirectWrite,
     DirectReadDirectWrite,
     CopyFileRangeSingle,
 }
+
+const LOW_LATENCY_COPY_FILE_RANGE_SINGLE_THRESHOLD: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CopyRewriteMode {
@@ -124,6 +128,12 @@ pub(super) fn resolve_copy_execution(
                 } else {
                     HeuristicCopyPlan::CopyFileRangeSingle
                 }
+            } else if should_prefer_low_latency_copy_file_range_single(
+                source_path,
+                path,
+                source_len,
+            ) {
+                HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
             } else if should_prefer_cached_read_direct_write(source_cached, source_len, target_len)
             {
                 HeuristicCopyPlan::CachedReadDirectWrite
@@ -139,6 +149,14 @@ pub(super) fn resolve_copy_execution(
                     diff_overwrite: true,
                     full_rewrite: false,
                     path_label: "auto diff-overwrite",
+                },
+                HeuristicCopyPlan::LowLatencyCopyFileRangeSingle => ResolvedCopyExecution {
+                    copy_strategy: CopyStrategy::CopyFileRangeSingle,
+                    io_mode_read: common::IOMode::PageCache,
+                    io_mode_write: common::IOMode::PageCache,
+                    diff_overwrite: false,
+                    full_rewrite: false,
+                    path_label: "auto low-latency copy_file_range single",
                 },
                 HeuristicCopyPlan::CachedReadDirectWrite => ResolvedCopyExecution {
                     copy_strategy: CopyStrategy::Threaded,
@@ -237,6 +255,45 @@ pub(super) fn should_prefer_cached_read_direct_write(
     target_len: Option<u64>,
 ) -> bool {
     source_cached && target_is_similar_size(source_len, target_len)
+}
+
+fn low_latency_copy_file_range_single_threshold() -> u64 {
+    std::env::var("FRO_COPY_LOW_LATENCY_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(LOW_LATENCY_COPY_FILE_RANGE_SINGLE_THRESHOLD)
+}
+
+fn same_device_for_copy_file_range(source_path: &str, target_path: &str) -> bool {
+    let Ok(source_meta) = std::fs::metadata(source_path) else {
+        return false;
+    };
+    if !source_meta.file_type().is_file() {
+        return false;
+    }
+    let target_path = std::path::Path::new(target_path);
+    if let Ok(target_meta) = std::fs::metadata(target_path) {
+        return target_meta.file_type().is_file() && target_meta.dev() == source_meta.dev();
+    }
+    let Some(parent) = target_path.parent() else {
+        return false;
+    };
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+    parent_meta.is_dir() && parent_meta.dev() == source_meta.dev()
+}
+
+pub(super) fn should_prefer_low_latency_copy_file_range_single(
+    source_path: &str,
+    target_path: &str,
+    source_len: Option<u64>,
+) -> bool {
+    let Some(source_len) = source_len else {
+        return false;
+    };
+    source_len <= low_latency_copy_file_range_single_threshold()
+        && same_device_for_copy_file_range(source_path, target_path)
 }
 
 pub(super) fn io_mode_label(io_mode: common::IOMode) -> &'static str {

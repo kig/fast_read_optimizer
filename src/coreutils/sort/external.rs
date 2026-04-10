@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SORT_MEM_LIMIT_ENV: &str = "FRO_SORT_MAX_IN_MEMORY_BYTES";
 const SORT_MIN_SPILL_CHUNK_BYTES: u64 = 8 << 20;
+const SORT_TINY_REGULAR_FAST_PATH_BYTES: u64 = 64 << 10;
 const SORT_STREAM_BLOCK_SIZE: usize = 2 << 20;
 
 pub(super) struct SortCheckFailure {
@@ -31,8 +32,11 @@ pub(super) fn sort_inputs(
     output_path: Option<&str>,
     temporary_directory: Option<&Path>,
 ) -> io::Result<u64> {
-    let memory_budget = sort_memory_budget_bytes()?;
     if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
+        if tiny_regular_sort_fast_path_enabled(total_bytes, io_mode, output_path) {
+            return sort_inputs_tiny_regular_fast(inputs, mode, unique, reverse, terminator);
+        }
+        let memory_budget = sort_memory_budget_bytes()?;
         if total_bytes <= memory_budget {
             return sort_inputs_in_memory(
                 inputs,
@@ -44,7 +48,19 @@ pub(super) fn sort_inputs(
                 output_path,
             );
         }
+        return sort_inputs_streamed(
+            inputs,
+            io_mode,
+            mode,
+            unique,
+            reverse,
+            terminator,
+            output_path,
+            memory_budget,
+            temporary_directory,
+        );
     }
+    let memory_budget = sort_memory_budget_bytes()?;
     sort_inputs_streamed(
         inputs,
         io_mode,
@@ -56,6 +72,60 @@ pub(super) fn sort_inputs(
         memory_budget,
         temporary_directory,
     )
+}
+
+fn tiny_regular_sort_fast_path_enabled(
+    total_bytes: u64,
+    io_mode: IOMode,
+    output_path: Option<&str>,
+) -> bool {
+    total_bytes <= SORT_TINY_REGULAR_FAST_PATH_BYTES
+        && output_path.is_none()
+        && io_mode != IOMode::Direct
+}
+
+fn sort_inputs_tiny_regular_fast(
+    inputs: &[StreamInput],
+    mode: SortMode,
+    unique: bool,
+    reverse: bool,
+    terminator: RecordTerminator,
+) -> io::Result<u64> {
+    let mut total_bytes = 0u64;
+    let mut storage = Vec::new();
+    let mut lines = Vec::new();
+    let mut next_sequence = 0u64;
+    for input in inputs {
+        let StreamInput::File(path) = input else {
+            return Err(io::Error::other(
+                "tiny sort fast path requires regular files",
+            ));
+        };
+        let bytes = fs::read(path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot read '{}': {err}", sort_input_label(input)),
+            )
+        })?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("sort input byte count overflow"))?;
+        append_input_lines(
+            &mut storage,
+            &mut lines,
+            &bytes,
+            &mut next_sequence,
+            terminator,
+        )?;
+    }
+    finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse)?;
+    let mut out = StdBufWriter::with_capacity(
+        SORT_STREAM_BLOCK_SIZE,
+        fro::command_io::stdout_file()?,
+    );
+    write_sorted_lines(&mut out, &lines, &storage, terminator)
+        .map_err(|err| io::Error::new(err.kind(), format!("write failed: {err}")))?;
+    Ok(total_bytes)
 }
 
 fn sort_inputs_in_memory(
@@ -344,8 +414,10 @@ where
         write_fn(&mut out)
             .map_err(|err| io::Error::new(err.kind(), format!("cannot write '{path}': {err}")))
     } else {
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::with_capacity(SORT_STREAM_BLOCK_SIZE, stdout.lock());
+        let mut out = std::io::BufWriter::with_capacity(
+            SORT_STREAM_BLOCK_SIZE,
+            fro::command_io::stdout_file()?,
+        );
         write_fn(&mut out).map_err(|err| io::Error::new(err.kind(), format!("write failed: {err}")))
     }
 }

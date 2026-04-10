@@ -48,12 +48,12 @@ fn parse_du_max_depth(value: &str) -> Result<usize, String> {
 }
 
 fn write_du_stderr_line(message: &str) {
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096).unwrap();
     let _ = writeln!(stderr, "du: {message}");
 }
 
 fn write_du_try_help() {
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = fro::command_io::stderr_buf_writer(4096).unwrap();
     let _ = writeln!(stderr, "Try 'du --help' for more information.");
 }
 
@@ -369,12 +369,19 @@ fn walk_du_subtree(
     Ok(())
 }
 
+const DU_MAX_WORKERS: usize = 8;
+const DU_SERIAL_ROOT_ENTRY_THRESHOLD: usize = 64;
+
+fn du_parallel_worker_count_for(available_parallelism: usize) -> usize {
+    available_parallelism.max(1).min(DU_MAX_WORKERS)
+}
+
 fn parallel_du_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .max(1)
+    du_parallel_worker_count_for(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
 }
 
 fn append_du_output(
@@ -394,8 +401,6 @@ fn append_du_output(
         return Ok(root_kib);
     }
 
-    let dir_queue = Arc::new(WorkQueue::default());
-    let stop = Arc::new(AtomicBool::new(false));
     let state = Arc::new(DuSharedState {
         nodes: Mutex::new(vec![DuNode {
             path: path.to_path_buf(),
@@ -411,28 +416,43 @@ fn append_du_output(
         }]),
         lines: Mutex::new(Vec::new()),
     });
-    dir_queue.enqueue_one(DuTraversalTask {
+    let root_task = DuTraversalTask {
         path: path.to_path_buf(),
         node_id: 0,
         depth: 0,
-    });
-    run_parallel_work_queue(dir_queue, stop.clone(), parallel_du_worker_count(), {
-        let state = state.clone();
-        let had_warnings = had_warnings.clone();
-        move |task, dir_queue, stop| {
-            walk_du_subtree(
-                task,
-                dir_queue,
-                &state,
-                stop,
-                &had_warnings,
-                summarize,
-                all,
-                separate_dirs,
-                max_depth,
-            )
-        }
-    })?;
+    };
+    if du_should_use_serial_walk(path)? {
+        walk_du_subtree_serial(
+            root_task,
+            &state,
+            &had_warnings,
+            summarize,
+            all,
+            separate_dirs,
+            max_depth,
+        )?;
+    } else {
+        let dir_queue = Arc::new(WorkQueue::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        dir_queue.enqueue_one(root_task);
+        run_parallel_work_queue(dir_queue, stop.clone(), parallel_du_worker_count(), {
+            let state = state.clone();
+            let had_warnings = had_warnings.clone();
+            move |task, dir_queue, stop| {
+                walk_du_subtree(
+                    task,
+                    dir_queue,
+                    &state,
+                    stop,
+                    &had_warnings,
+                    summarize,
+                    all,
+                    separate_dirs,
+                    max_depth,
+                )
+            }
+        })?;
+    }
 
     let state = Arc::into_inner(state)
         .ok_or_else(|| io::Error::other("du shared state still has active references"))?;
@@ -442,6 +462,117 @@ fn append_du_output(
     }
     let total_kib = state.nodes.into_inner().unwrap()[0].total_kib;
     Ok(total_kib)
+}
+
+fn du_should_use_serial_walk(root: &Path) -> io::Result<bool> {
+    Ok(fs::read_dir(root)?
+        .take(DU_SERIAL_ROOT_ENTRY_THRESHOLD + 1)
+        .count()
+        <= DU_SERIAL_ROOT_ENTRY_THRESHOLD)
+}
+
+fn walk_du_subtree_serial(
+    start: DuTraversalTask,
+    state: &DuSharedState,
+    had_warnings: &AtomicBool,
+    summarize: bool,
+    all: bool,
+    separate_dirs: bool,
+    max_depth: Option<usize>,
+) -> io::Result<()> {
+    let mut stack = vec![start];
+    while let Some(task) = stack.pop() {
+        let mut dir = match DirHandle::open(&task.path) {
+            Ok(dir) => dir,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("du", &task.path, &err, "cannot read directory");
+                had_warnings.store(true, Ordering::SeqCst);
+                {
+                    let mut nodes = state.nodes.lock().unwrap();
+                    nodes[task.node_id].scanned = true;
+                }
+                finish_du_node(task.node_id, state, separate_dirs);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let dirfd = dir.fd();
+        let mut child_dirs = Vec::new();
+        let mut file_lines = Vec::new();
+        let mut file_total_kib = 0u64;
+        loop {
+            let entry = match dir.next_entry() {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("du", &task.path, &err, "cannot read directory");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            let child_path = task.path.join(&entry.name);
+            let stat = match fstatat_no_follow(dirfd, &entry.name) {
+                Ok(stat) => stat,
+                Err(err) if is_permission_denied(&err) => {
+                    write_warning_line("du", &child_path, &err, "cannot access");
+                    had_warnings.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let kib = disk_usage_kib(stat.st_blocks as u64);
+            if stat_is_dir(&stat) {
+                let child_depth = task.depth + 1;
+                let child_id = {
+                    let mut nodes = state.nodes.lock().unwrap();
+                    let child_id = nodes.len();
+                    nodes.push(DuNode {
+                        path: child_path.clone(),
+                        total_kib: kib,
+                        exclusive_kib: kib,
+                        parent: Some(task.node_id),
+                        pending_children: 0,
+                        pending_file_stats: 0,
+                        scanned: false,
+                        own_stat_done: true,
+                        completed: false,
+                        emit: !summarize && du_depth_included(child_depth, max_depth),
+                    });
+                    child_id
+                };
+                child_dirs.push(DuTraversalTask {
+                    path: child_path,
+                    node_id: child_id,
+                    depth: child_depth,
+                });
+            } else {
+                file_total_kib += kib;
+                if all && du_depth_included(task.depth + 1, max_depth) {
+                    file_lines.push(DuLine {
+                        path: child_path,
+                        kib,
+                    });
+                }
+            }
+        }
+        {
+            let mut nodes = state.nodes.lock().unwrap();
+            nodes[task.node_id].pending_children += child_dirs.len();
+            nodes[task.node_id].total_kib += file_total_kib;
+            nodes[task.node_id].exclusive_kib += file_total_kib;
+            nodes[task.node_id].scanned = true;
+        }
+        if !file_lines.is_empty() {
+            state.lines.lock().unwrap().extend(file_lines);
+        }
+        if let Some(local_dir) = child_dirs.pop() {
+            stack.extend(child_dirs);
+            stack.push(local_dir);
+        }
+        finish_du_node(task.node_id, state, separate_dirs);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -539,6 +670,14 @@ mod du_tests {
         assert!(!du_node_ready(true, true, 1, 0, false));
         assert!(!du_node_ready(true, true, 0, 1, false));
         assert!(!du_node_ready(true, true, 0, 0, true));
+    }
+
+    #[test]
+    fn du_parallel_worker_count_is_bounded_for_tiny_walks() {
+        assert_eq!(du_parallel_worker_count_for(0), 1);
+        assert_eq!(du_parallel_worker_count_for(1), 1);
+        assert_eq!(du_parallel_worker_count_for(4), 4);
+        assert_eq!(du_parallel_worker_count_for(32), DU_MAX_WORKERS);
     }
 }
 
@@ -795,7 +934,7 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
         }
     }
 
-    let out = stdout_buf_writer()?;
+    let mut out = stdout_buf_writer()?;
     let had_warnings = Arc::new(AtomicBool::new(false));
     let mut grand_total_kib = 0_u64;
     for path in paths {

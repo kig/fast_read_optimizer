@@ -166,7 +166,7 @@ pub(super) fn print_manifest_read_sweep_results(results: &[ManifestReadSweepResu
         .map(|index| rows.iter().map(|row| row[index].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
     for row in rows {
-        println!(
+        fro::cio_println!(
             "{}",
             row.iter()
                 .enumerate()
@@ -303,7 +303,7 @@ pub(crate) fn bench_file_list_read(
     let total_files = stats.files_read.load(Ordering::Relaxed) as usize;
     let elapsed = start.elapsed().as_secs_f64();
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "file-list-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s ({:.1} files/s)",
             total_bytes,
             total_files,
@@ -312,7 +312,7 @@ pub(crate) fn bench_file_list_read(
             total_files as f64 / elapsed.max(1e-9)
         );
     } else {
-        println!(
+        fro::cio_println!(
             "file-list-read-bench {} bytes across {} files in {:.4} s, {:.1} GB/s",
             total_bytes,
             total_files,
@@ -346,7 +346,7 @@ pub(crate) fn bench_file_list_read_uring(
             use_direct,
             verbose,
         )?;
-        eprintln!(
+        fro::cio_eprintln!(
             "result\tinflight/thread={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
             result.inflight_per_thread,
             result.elapsed_secs,
@@ -360,7 +360,7 @@ pub(crate) fn bench_file_list_read_uring(
         .iter()
         .min_by(|a, b| a.elapsed_secs.total_cmp(&b.elapsed_secs))
         .ok_or_else(|| io::Error::other("file-list io_uring sweep produced no results"))?;
-    println!(
+    fro::cio_println!(
         "file-list-read-uring-bench best inflight/thread={} {} bytes across {} files in {:.4} s, {:.3} GB/s ({:.1} files/s)",
         best.inflight_per_thread,
         best.total_bytes,
@@ -397,7 +397,7 @@ pub(crate) fn bench_file_list_read_open_read_close_sweep(
     for prefix_files in prefix_sweep {
         let prefix = load_manifest_prefix(&files, prefix_files);
         let st = run_manifest_blocking_once(prefix.clone(), 1, use_direct)?;
-        eprintln!(
+        fro::cio_eprintln!(
             "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
             st.prefix_files,
             st.variant.label(),
@@ -409,7 +409,7 @@ pub(crate) fn bench_file_list_read_open_read_close_sweep(
 
         for threads in MANIFEST_MT_BLOCKING_THREADS {
             let result = run_manifest_blocking_once(prefix.clone(), threads, use_direct)?;
-            eprintln!(
+            fro::cio_eprintln!(
                 "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
                 result.prefix_files,
                 result.variant.label(),
@@ -422,7 +422,7 @@ pub(crate) fn bench_file_list_read_open_read_close_sweep(
 
         for qd in MANIFEST_ST_URING_QDS {
             let result = run_manifest_uring_once(prefix.clone(), 1, qd, use_direct)?;
-            eprintln!(
+            fro::cio_eprintln!(
                 "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
                 result.prefix_files,
                 result.variant.label(),
@@ -435,7 +435,7 @@ pub(crate) fn bench_file_list_read_open_read_close_sweep(
 
         for (threads, qd) in MANIFEST_MT_URING_CONFIGS {
             let result = run_manifest_uring_once(prefix.clone(), threads, qd, use_direct)?;
-            eprintln!(
+            fro::cio_eprintln!(
                 "result\tprefix={}\tvariant={}\ttime={:.4}s\tgbps={:.3}\tfiles/s={:.1}",
                 result.prefix_files,
                 result.variant.label(),
@@ -453,7 +453,7 @@ pub(crate) fn bench_file_list_read_open_read_close_sweep(
         .filter(|result| result.prefix_files == files.len())
         .min_by(|a, b| a.elapsed_secs.total_cmp(&b.elapsed_secs))
         .ok_or_else(|| io::Error::other("manifest open-read-close sweep produced no results"))?;
-    println!(
+    fro::cio_println!(
         "file-list-read-open-read-close-sweep best prefix_files={} variant={} {} bytes across {} files in {:.4} s, {:.3} GB/s ({:.1} files/s)",
         best.prefix_files,
         best.variant.label(),

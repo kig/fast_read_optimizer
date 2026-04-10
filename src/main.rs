@@ -11,6 +11,7 @@ mod optimizer;
 mod reader;
 #[allow(dead_code)]
 mod stream;
+mod uring_util;
 mod verified_copy;
 mod writer;
 

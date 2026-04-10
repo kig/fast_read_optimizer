@@ -46,7 +46,7 @@ pub(super) fn raise_nofile_soft_limit(verbose: bool) {
     if get_result != 0 {
         if verbose {
             let err = io::Error::last_os_error();
-            eprintln!("warning: failed to read RLIMIT_NOFILE: {err}");
+            fro::cio_eprintln!("warning: failed to read RLIMIT_NOFILE: {err}");
         }
         return;
     }
@@ -60,7 +60,7 @@ pub(super) fn raise_nofile_soft_limit(verbose: bool) {
     let set_result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) };
     if set_result != 0 && verbose {
         let err = io::Error::last_os_error();
-        eprintln!(
+        fro::cio_eprintln!(
             "warning: failed to raise RLIMIT_NOFILE from {} to {}: {err}",
             limits.rlim_cur, limits.rlim_max
         );
@@ -257,7 +257,7 @@ pub(super) fn run_file_list_uring_bench_once(
     let start = std::time::Instant::now();
     let sample_counters = Arc::new(ThroughputSampleCounters::default());
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "file-list-read-uring-bench run threads={} inflight/thread={} direct={}",
             FILE_LIST_URING_THREAD_COUNT, inflight_per_thread, use_direct
         );
@@ -346,7 +346,7 @@ pub(super) fn print_file_list_uring_sweep_results(results: &[FileListUringSweepR
         .map(|index| rows.iter().map(|row| row[index].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
     for row in rows {
-        println!(
+        fro::cio_println!(
             "{}",
             row.iter()
                 .enumerate()

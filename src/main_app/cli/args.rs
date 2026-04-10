@@ -84,7 +84,10 @@ fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
 }
 
 pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
-    let raw_args: Vec<String> = env::args().collect();
+    parse_cli_from(env::args().collect())
+}
+
+pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> {
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
         return Ok(ParseOutcome::Early(code));
     }
@@ -106,8 +109,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         if let Some(help) = command_help(args[1].as_str()) {
             print_command_help(args[0].as_str(), help);
         } else {
-            eprintln!("Unknown command: {}", args[1]);
-            println!();
+            fro::cio_eprintln!("Unknown command: {}", args[1]);
+            fro::cio_println!();
             print_general_help(args[0].as_str());
         }
         return Ok(ParseOutcome::Early(0));
@@ -202,8 +205,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 if let Some(help) = command_help(args[1].as_str()) {
                     print_command_help(args[0].as_str(), help);
                 } else {
-                    eprintln!("Unknown command: {}", args[1]);
-                    println!();
+                    fro::cio_eprintln!("Unknown command: {}", args[1]);
+                    fro::cio_println!();
                     print_general_help(args[0].as_str());
                 }
                 return Ok(ParseOutcome::Early(0));
@@ -231,7 +234,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 i += 1;
                 if i < args.len() {
                     bench_size = parse_size(args[i].as_str()).or_else(|| {
-                        eprintln!("Invalid --size: {}", args[i]);
+                        fro::cio_eprintln!("Invalid --size: {}", args[i]);
                         None
                     });
                     if bench_size.is_none() {
@@ -249,7 +252,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                         base64_decode_kernel =
                             coreutils::parse_base64_decode_kernel(args[i].as_str())?;
                     } else {
-                        eprintln!("--variant is only supported for bench-base64-encode/decode");
+                        fro::cio_eprintln!("--variant is only supported for bench-base64-encode/decode");
                         return Ok(ParseOutcome::Early(1));
                     }
                 }
@@ -299,7 +302,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 i += 1;
                 if i < args.len() {
                     manual_read_overrides.block_size = parse_size(args[i].as_str()).or_else(|| {
-                        eprintln!("Invalid --blocksize: {}", args[i]);
+                        fro::cio_eprintln!("Invalid --blocksize: {}", args[i]);
                         None
                     });
                     if manual_read_overrides.block_size.is_none() {
@@ -310,7 +313,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                 i += 1;
                 if i < args.len() {
                     create_size = parse_size(args[i].as_str()).or_else(|| {
-                        eprintln!("Invalid --create size: {}", args[i]);
+                        fro::cio_eprintln!("Invalid --create size: {}", args[i]);
                         None
                     });
                     if create_size.is_none() {
@@ -436,8 +439,8 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
                         return Ok(ParseOutcome::Early(code));
                     }
                 }
-                eprintln!("Unknown flag for {}: {}", args[0], args[i]);
-                println!();
+                fro::cio_eprintln!("Unknown flag for {}: {}", args[0], args[i]);
+                fro::cio_println!();
                 if let Some(help) = command_help(args[0].as_str()) {
                     print_command_help(args[0].as_str(), help);
                 }
@@ -535,7 +538,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     }
     if mode == "bench-mmap-write" {
         if filename.is_empty() {
-            println!("Filename missing");
+            fro::cio_println!("Filename missing");
             return Ok(ParseOutcome::Early(1));
         }
         writer::bench_mmap_write(&filename);
@@ -543,7 +546,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     }
     if mode == "bench-write" {
         if filename.is_empty() {
-            println!("Filename missing");
+            fro::cio_println!("Filename missing");
             return Ok(ParseOutcome::Early(1));
         }
         writer::bench_write(&filename);
@@ -551,11 +554,11 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     }
     if mode == "bench-tar-archive" {
         if filename.is_empty() {
-            println!("Variant missing");
+            fro::cio_println!("Variant missing");
             return Ok(ParseOutcome::Early(1));
         }
         if extra_paths.is_empty() {
-            println!("Source path missing");
+            fro::cio_println!("Source path missing");
             return Ok(ParseOutcome::Early(1));
         }
     }
@@ -564,7 +567,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         match config_subcommand.as_deref() {
             Some("print") => {
                 if config_target.is_some() || !extra_paths.is_empty() {
-                    println!(
+                    fro::cio_println!(
                         "config print does not take a path; use fro config explain --for <path>"
                     );
                     return Ok(ParseOutcome::Early(1));
@@ -572,16 +575,16 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
             }
             Some("explain") => {
                 if config_target.is_none() {
-                    println!("config explain requires --for <path>");
+                    fro::cio_println!("config explain requires --for <path>");
                     return Ok(ParseOutcome::Early(1));
                 }
                 if !extra_paths.is_empty() {
-                    println!("config explain accepts only one target path");
+                    fro::cio_println!("config explain accepts only one target path");
                     return Ok(ParseOutcome::Early(1));
                 }
             }
             Some(other) => {
-                println!("Unknown config subcommand: {other}");
+                fro::cio_println!("Unknown config subcommand: {other}");
                 return Ok(ParseOutcome::Early(1));
             }
             None => {
@@ -642,37 +645,37 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     }
 
     if filename.is_empty() && !(mode == "copy" && cp_target_directory.is_some()) {
-        println!("Filename missing");
+        fro::cio_println!("Filename missing");
         return Ok(ParseOutcome::Early(1));
     }
     if to_memory && mode != "read" {
-        println!("--to-memory is only supported for read");
+        fro::cio_println!("--to-memory is only supported for read");
         return Ok(ParseOutcome::Early(1));
     }
     if auto_lift && mode != "read" && mode != "grep" {
-        println!("--auto-lift is only supported for read and grep");
+        fro::cio_println!("--auto-lift is only supported for read and grep");
         return Ok(ParseOutcome::Early(1));
     }
     if auto_lift && to_memory {
-        println!("--auto-lift is not supported with read --to-memory");
+        fro::cio_println!("--auto-lift is not supported with read --to-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if auto_lift && io_mode != common::IOMode::Auto {
-        println!("--auto-lift chooses between direct and page-cache itself; do not combine it with --auto, --no-direct, or --direct");
+        fro::cio_println!("--auto-lift chooses between direct and page-cache itself; do not combine it with --auto, --no-direct, or --direct");
         return Ok(ParseOutcome::Early(1));
     }
     if to_memory_mode != ReadToMemoryMode::Auto && !to_memory {
-        println!(
+        fro::cio_println!(
             "--paged-shared-buffer, --mmap, --mmap-read-pages, and --multiple-target-buffers require read --to-memory"
         );
         return Ok(ParseOutcome::Early(1));
     }
     if matches!(to_memory_options.hugepages, HugepageAdvice::Disabled) && !to_memory {
-        println!("--disable-hugepages requires read --to-memory");
+        fro::cio_println!("--disable-hugepages requires read --to-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if to_memory_options.measure_unmap_time && !to_memory {
-        println!("--measure-unmap-time requires read --to-memory");
+        fro::cio_println!("--measure-unmap-time requires read --to-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if matches!(
@@ -680,7 +683,7 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         ReadToMemoryMode::Mmap | ReadToMemoryMode::MmapReadPages
     ) && io_mode == common::IOMode::Direct
     {
-        println!("--mmap and --mmap-read-pages are not supported with --direct");
+        fro::cio_println!("--mmap and --mmap-read-pages are not supported with --direct");
         return Ok(ParseOutcome::Early(1));
     }
     if manual_read_overrides.any()
@@ -691,15 +694,15 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         && mode != "file-list-read-open-read-close-sweep"
         && mode != "manifest-recursive-copy-bench"
     {
-        println!("--threads, --qd, and --blocksize overrides are only supported for read-style benchmarks");
+        fro::cio_println!("--threads, --qd, and --blocksize overrides are only supported for read-style benchmarks");
         return Ok(ParseOutcome::Early(1));
     }
     if via_memory && mode != "copy" {
-        println!("--via-memory is only supported for copy");
+        fro::cio_println!("--via-memory is only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if recursive_copy && mode != "copy" {
-        println!("--recursive is only supported for copy");
+        fro::cio_println!("--recursive is only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if (force_copy_file_range
@@ -708,13 +711,13 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         || force_reflink)
         && mode != "copy"
     {
-        println!(
+        fro::cio_println!(
             "--copy-file-range, --copy-file-range-single, --threaded-copy, and --reflink are only supported for copy"
         );
         return Ok(ParseOutcome::Early(1));
     }
     if (verify_copy || verify_copy_diff) && mode != "copy" {
-        println!("--verify and --verify-diff are only supported for copy");
+        fro::cio_println!("--verify and --verify-diff are only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if usize::from(force_copy_file_range)
@@ -723,127 +726,127 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         + usize::from(force_reflink)
         > 1
     {
-        println!(
+        fro::cio_println!(
             "--copy-file-range, --copy-file-range-single, --threaded-copy, and --reflink cannot be combined"
         );
         return Ok(ParseOutcome::Early(1));
     }
     if no_lock && mode != "copy" {
-        println!("--no-lock is only supported for copy");
+        fro::cio_println!("--no-lock is only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if keep_target_size && mode != "copy" {
-        println!("--keep-target-size is only supported for copy");
+        fro::cio_println!("--keep-target-size is only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if (force_diff_copy || force_full_copy) && mode != "copy" {
-        println!("--diff and --full are only supported for copy");
+        fro::cio_println!("--diff and --full are only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if force_diff_copy && force_full_copy {
-        println!("copy --diff and --full cannot be combined");
+        fro::cio_println!("copy --diff and --full cannot be combined");
         return Ok(ParseOutcome::Early(1));
     }
     if verify_copy && verify_copy_diff {
-        println!("--verify and --verify-diff cannot be used together");
+        fro::cio_println!("--verify and --verify-diff cannot be used together");
         return Ok(ParseOutcome::Early(1));
     }
     if persist_verification_hashes && !verify_copy {
-        println!("--hash is only supported for copy --verify");
+        fro::cio_println!("--hash is only supported for copy --verify");
         return Ok(ParseOutcome::Early(1));
     }
     if via_memory && save_config {
-        println!("copy --via-memory does not support --save; tune read and write separately");
+        fro::cio_println!("copy --via-memory does not support --save; tune read and write separately");
         return Ok(ParseOutcome::Early(1));
     }
     if keep_target_size && (via_memory || verify_copy || verify_copy_diff) {
-        println!("copy --keep-target-size is only supported for plain streaming copy");
+        fro::cio_println!("copy --keep-target-size is only supported for plain streaming copy");
         return Ok(ParseOutcome::Early(1));
     }
     if force_diff_copy && (via_memory || verify_copy || verify_copy_diff) {
-        println!("copy --diff is only supported for plain streaming copy");
+        fro::cio_println!("copy --diff is only supported for plain streaming copy");
         return Ok(ParseOutcome::Early(1));
     }
     if force_diff_copy && (force_copy_file_range || force_copy_file_range_single || force_reflink) {
-        println!("copy --diff cannot be combined with --copy-file-range, --copy-file-range-single, or --reflink");
+        fro::cio_println!("copy --diff cannot be combined with --copy-file-range, --copy-file-range-single, or --reflink");
         return Ok(ParseOutcome::Early(1));
     }
     if force_copy_file_range && via_memory {
-        println!("copy --copy-file-range cannot be used with --via-memory");
+        fro::cio_println!("copy --copy-file-range cannot be used with --via-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if force_copy_file_range_single && via_memory {
-        println!("copy --copy-file-range-single cannot be used with --via-memory");
+        fro::cio_println!("copy --copy-file-range-single cannot be used with --via-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if force_threaded_copy && via_memory {
-        println!("copy --threaded-copy cannot be used with --via-memory");
+        fro::cio_println!("copy --threaded-copy cannot be used with --via-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if force_reflink && via_memory {
-        println!("copy --reflink cannot be used with --via-memory");
+        fro::cio_println!("copy --reflink cannot be used with --via-memory");
         return Ok(ParseOutcome::Early(1));
     }
     if (verify_copy || verify_copy_diff) && save_config {
-        println!(
+        fro::cio_println!(
             "copy verification modes do not support --save; tune copy and verification separately"
         );
         return Ok(ParseOutcome::Early(1));
     }
     if force_copy_file_range_single && save_config {
-        println!("copy --copy-file-range-single does not support --save; benchmark it with -n 1");
+        fro::cio_println!("copy --copy-file-range-single does not support --save; benchmark it with -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if force_diff_copy && save_config {
-        println!("copy --diff does not support --save; benchmark it with -n 1");
+        fro::cio_println!("copy --diff does not support --save; benchmark it with -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if force_reflink && save_config {
-        println!("copy --reflink does not support --save; benchmark it with -n 1");
+        fro::cio_println!("copy --reflink does not support --save; benchmark it with -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if (verify_copy || verify_copy_diff) && iterations > 1 {
-        println!("copy verification modes require -n 1");
+        fro::cio_println!("copy verification modes require -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if recursive_copy && iterations > 1 {
-        println!("copy --recursive currently requires -n 1");
+        fro::cio_println!("copy --recursive currently requires -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if force_reflink && iterations > 1 {
-        println!("copy --reflink requires -n 1");
+        fro::cio_println!("copy --reflink requires -n 1");
         return Ok(ParseOutcome::Early(1));
     }
     if force_copy_file_range_single && iterations > 1 {
-        println!("copy --copy-file-range-single benchmarks the fixed one-call path; use --copy-file-range to optimize the tunable multi-call mode");
+        fro::cio_println!("copy --copy-file-range-single benchmarks the fixed one-call path; use --copy-file-range to optimize the tunable multi-call mode");
         return Ok(ParseOutcome::Early(1));
     }
     if verify_copy_diff && hash_base.is_some() {
-        println!("copy --verify-diff does not use --hash-base");
+        fro::cio_println!("copy --verify-diff does not use --hash-base");
         return Ok(ParseOutcome::Early(1));
     }
     if (force_copy_file_range || force_copy_file_range_single)
         && (io_mode == common::IOMode::Direct || io_mode_write == common::IOMode::Direct)
     {
-        println!("copy --copy-file-range and --copy-file-range-single do not support direct read/write modes");
+        fro::cio_println!("copy --copy-file-range and --copy-file-range-single do not support direct read/write modes");
         return Ok(ParseOutcome::Early(1));
     }
     if force_reflink
         && (io_mode == common::IOMode::Direct || io_mode_write == common::IOMode::Direct)
     {
-        println!("copy --reflink does not support direct read/write modes");
+        fro::cio_println!("copy --reflink does not support direct read/write modes");
         return Ok(ParseOutcome::Early(1));
     }
     if recursive_copy && via_memory {
-        println!("copy --recursive does not support --via-memory yet");
+        fro::cio_println!("copy --recursive does not support --via-memory yet");
         return Ok(ParseOutcome::Early(1));
     }
     if recursive_copy && (verify_copy || verify_copy_diff) {
-        println!("copy --recursive does not support verification modes yet");
+        fro::cio_println!("copy --recursive does not support verification modes yet");
         return Ok(ParseOutcome::Early(1));
     }
     if recursive_copy && save_config {
-        println!("copy --recursive does not support --save yet");
+        fro::cio_println!("copy --recursive does not support --save yet");
         return Ok(ParseOutcome::Early(1));
     }
     if (cp_no_clobber
@@ -854,32 +857,32 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
         || cp_no_dereference)
         && mode != "copy"
     {
-        println!("cp compatibility flags are only supported for copy");
+        fro::cio_println!("cp compatibility flags are only supported for copy");
         return Ok(ParseOutcome::Early(1));
     }
     if cp_target_directory.is_some() && cp_no_target_directory {
-        eprintln!("cp: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        fro::cio_eprintln!("cp: cannot combine --target-directory (-t) and --no-target-directory (-T)");
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "copy" && cp_target_directory.is_some() && source.is_none() {
-        eprintln!("cp: missing file operand");
-        eprintln!("Try 'cp --help' for more information.");
+        fro::cio_eprintln!("cp: missing file operand");
+        fro::cio_eprintln!("Try 'cp --help' for more information.");
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "recover" && extra_paths.is_empty() {
-        println!("At least one recovery copy is required");
+        fro::cio_println!("At least one recovery copy is required");
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "manifest-recursive-copy-bench" && extra_paths.len() != 2 {
-        println!("manifest-recursive-copy-bench requires <manifest> <source_root> <target_root>");
+        fro::cio_println!("manifest-recursive-copy-bench requires <manifest> <source_root> <target_root>");
         return Ok(ParseOutcome::Early(1));
     }
     if mode != "write" && create_size.is_some() {
-        println!("--create is only supported for write");
+        fro::cio_println!("--create is only supported for write");
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "recover" && recover_fast_requested && recover_in_place_all_requested {
-        println!("--fast and --in-place-all cannot be used together");
+        fro::cio_println!("--fast and --in-place-all cannot be used together");
         return Ok(ParseOutcome::Early(1));
     }
 

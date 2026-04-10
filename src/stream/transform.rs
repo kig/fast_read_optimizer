@@ -235,10 +235,10 @@ fn regular_input_path(input: TransformInputSpec<'_>) -> io::Result<Option<String
 }
 
 fn regular_stdin_path() -> io::Result<Option<String>> {
-    if !is_regular_fd(libc::STDIN_FILENO) {
+    if !is_regular_fd(fro::command_io::stdin_fd()) {
         return Ok(None);
     }
-    let read_path_buf = fs::read_link(format!("/proc/self/fd/{}", libc::STDIN_FILENO))?;
+    let read_path_buf = fs::read_link(format!("/proc/self/fd/{}", fro::command_io::stdin_fd()))?;
     let read_path = read_path_buf.to_str().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "stdin path is not valid UTF-8")
     })?;
@@ -248,14 +248,16 @@ fn regular_stdin_path() -> io::Result<Option<String>> {
 fn output_is_regular_like(output: TransformOutputSpec<'_>) -> io::Result<bool> {
     Ok(match output {
         TransformOutputSpec::Path(path) => path != "-",
-        TransformOutputSpec::Stdout => is_regular_fd(libc::STDOUT_FILENO) || is_stdout_dev_null()?,
+        TransformOutputSpec::Stdout => {
+            is_regular_fd(fro::command_io::stdout_fd()) || is_stdout_dev_null()?
+        }
     })
 }
 
 fn open_transform_input(input: TransformInputSpec<'_>) -> io::Result<File> {
     match input {
         TransformInputSpec::Path(path) => File::open(path),
-        TransformInputSpec::Stdin => dup_fd_as_file(libc::STDIN_FILENO),
+        TransformInputSpec::Stdin => dup_fd_as_file(fro::command_io::stdin_fd()),
     }
 }
 
@@ -267,7 +269,7 @@ fn open_transform_output(output: TransformOutputSpec<'_>) -> io::Result<File> {
             .truncate(true)
             .open(path),
         TransformOutputSpec::Path(_) | TransformOutputSpec::Stdout => {
-            dup_fd_as_file(libc::STDOUT_FILENO)
+            dup_fd_as_file(fro::command_io::stdout_fd())
         }
     }
 }
@@ -298,7 +300,7 @@ fn is_stdout_dev_null() -> io::Result<bool> {
     unsafe {
         let mut stdout_stat: libc::stat = std::mem::zeroed();
         let mut dev_null_stat: libc::stat = std::mem::zeroed();
-        if libc::fstat(libc::STDOUT_FILENO, &mut stdout_stat) != 0 {
+        if libc::fstat(fro::command_io::stdout_fd(), &mut stdout_stat) != 0 {
             return Err(io::Error::last_os_error());
         }
         let path = b"/dev/null\0".as_ptr() as *const libc::c_char;

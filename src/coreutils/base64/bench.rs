@@ -27,7 +27,7 @@ pub(crate) fn bench_base64_wrapped_encode(iterations: u64, wrap_cols: usize) -> 
     let elapsed = start.elapsed().as_secs_f64();
     let iterations_per_second = iterations as f64 / elapsed;
     let gb_per_second = (iterations as f64 * BASE64_BENCH_INPUT_SIZE as f64) / elapsed / 1e9;
-    println!(
+    fro::cio_println!(
         "Base64 wrapped encode [{} cols] {} iterations of {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
         wrap_cols, iterations, BASE64_BENCH_INPUT_SIZE, elapsed, iterations_per_second, gb_per_second
     );
@@ -61,7 +61,7 @@ pub(crate) fn bench_base64_wrapped_decode(iterations: u64, ignore_garbage: bool)
     let elapsed = start.elapsed().as_secs_f64();
     let iterations_per_second = iterations as f64 / elapsed;
     let gb_per_second = (iterations as f64 * decoded.len() as f64) / elapsed / 1e9;
-    println!(
+    fro::cio_println!(
         "Base64 wrapped decode [{}] {} iterations of {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
         if ignore_garbage { "ignore-garbage" } else { "whitespace-only" },
         iterations,
@@ -108,7 +108,7 @@ pub(crate) fn bench_base64_decode_detect_fallback(
     let elapsed = start.elapsed().as_secs_f64();
     let iterations_per_second = iterations as f64 / elapsed;
     let gb_per_second = (iterations as f64 * decoded.len() as f64) / elapsed / 1e9;
-    println!(
+    fro::cio_println!(
         "Base64 decode detect+fallback [{}] {} iterations of {} bytes in {:.4} s, {:.0} it/s, {:.1} GB/s per core",
         kernel.bench_name(),
         iterations,

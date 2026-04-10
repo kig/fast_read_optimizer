@@ -209,7 +209,7 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
 
     let bytes_removed = stats.bytes_removed.load(Ordering::Relaxed);
     if verbose {
-        eprintln!(
+        fro::cio_eprintln!(
             "recursive delete: dirs_removed={}, files_removed={}, symlinks_removed={}, bytes_removed={}",
             stats.dirs_removed.load(Ordering::Relaxed),
             stats.files_removed.load(Ordering::Relaxed),

@@ -9,6 +9,11 @@ Ecosystem goal: Online database of device/array/filesystem/cpu -> optimal IO set
 
 Priority guide: favor work that pushes shared read/copy/write/tree-walk primitives closer to RAM/NVMe ceilings, then spend parity effort on the highest-observed commands. The current `cmd_counts_nz.txt` signal puts the main utility focus on `cat` (1916), `rm` (1223), `find` (724), `cp` (400), `wc` (331), `sort` (282), `mv` (278), `head` (238), `tail` (198), `dd` (193), `md5sum` (111), and `du` (29). `base64` (4) stays relevant mainly when it improves reusable transform-style I/O helpers.
 
+- coreutils: low-latency start for small inputs (ST, single syscall-style), scale throughput with evidence.
+- evaluate and use fast libs: StringZilla, simdutf, mgzip/pgzip, rapidgzip, pzstd, fd, rg
+- match system coreutils on small data, go faster on large files and dir trees
+
+
 ### P0: shared fast-I/O work with the broadest payoff
 
 - [ ] Make the library primitives the default acceleration path for the multicall surface and future tools, especially the shared read/copy/write/range helpers behind `cat`, `cp`, `mv`, `dd`, `head`, `tail`, `wc`, and checksum tools.
@@ -24,6 +29,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [x] A bounded GNU interactive slice landed for `rm -i`, `rm -I`, and `rm --interactive[=WHEN]`, bringing the tracked `rm` row to `7/7` while keeping non-interactive flows on the existing fast path.
 - [ ] `find` / `du`: keep pushing the directory-walk scheduler and metadata batching, because traversal wins compound into multiple multicall tools.
   - [ ] Fast traversal of every byte in a directory tree.
+  - [ ] Active tiny-input latency wave: isolate tiny-tree startup/scheduling cost from large-tree throughput and keep only measured wins for `du`.
   - [ ] Revisit `io_uring` dirwalk once the environment exposes `IORING_OP_GETDENTS` / usable Rust bindings.
     - Current blocker: this host's `/usr/include/linux/io_uring.h` and the pinned `io-uring` / `iou` crate surfaces do not expose the opcode yet.
     - Current best-known fallback is split scheduling: coarse subtree traversal for `find`, and coarse traversal plus wide stat workers for `du`.
@@ -33,8 +39,13 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
   - [x] Unsupported multicall/coreutils flags now fall back externally instead of hard-failing: `fgrep` first tries `rg --fixed-strings`, then `coreutils <cmd>`, then the system command; other bounded coreutils commands try `coreutils <cmd>` and then the system command, and `cp` unknown-flag parsing now reuses the same fallback chain from the alias parser. Use `--no-fallback` to force local failure during tests, and set `FRO_LOG_FALLBACKS=1` to log each delegated path while auditing a real system workload.
   - [ ] `mv`: keep the same-fs fast path and cross-fs copy+remove path healthy; treat the observed ZFS-specific anomaly as background investigation, not active front-of-queue work.
 - [ ] `sort`: keep extending the bounded newline/NUL-delimited sort backend one compare mode at a time instead of jumping to full GNU semantics; the tracked row is now `11/12`, with `-k` remaining after landing `-z`, `-g/-h`, and the bounded `-M/-V` compare modes.
+  - [ ] Active tiny-file latency wave: measure tiny regular-file sort separately from large in-memory/external sort and keep only bounded startup-friendly wins.
 - [ ] `wc` / checksum family: prioritize the common byte/line/word/count and `md5sum`-style integrity flows that directly reuse fast read/hash primitives; long-tail digest-CLI parity can wait behind those wins.
   - [ ] Latest tiny-file alias sweep still shows the worst low-latency gaps in `cmp`, the digest family (`md5sum`/`sha*sum`/`b2sum`), then `du`, `tac`, and `sort`; `encrypt` / `decrypt` are now effectively at system parity on the measured small-file slice.
+  - [ ] Active tiny-file latency wave: treat `cmp` as the largest tiny-file outlier and keep only measured regular-file fast paths that preserve exact mismatch/EOF reporting.
+  - [ ] Active tiny-file latency wave: split digest-family latency into shared startup cost vs per-digest work and prefer shared reductions over additional wrappers.
+  - [ ] Active tiny-file latency wave: investigate `tac` tiny-file latency separately from stream/FIFO behavior and keep only bounded wins that preserve ordered output.
+  - [ ] Shared next step after the accepted `cmp` / `tac` / `sort` wins: attack the remaining tiny-invocation frontend/startup gap across these commands and the digest family together instead of layering more one-off fast paths.
 
 ### P1: tuning, config selection, and benchmark safety
 
@@ -58,6 +69,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 
 - [ ] Add unit coverage for mount parsing and device signature extraction.
 - [ ] Add golden-file tests for config selection precedence and mount override behavior.
+- [x] Fixed the `fifo::fifo_text_inputs_match_system_output` stall by correcting `tail`'s non-regular `-n` path; `cargo +stable test --quiet` now completes again on this host.
 - [ ] Add property-based model tests for read partitioning, indexed/offset writer ordering, copy equivalence, and hash/verify/recover invariants. Initial property coverage now includes read partitioning reconstruction and offset-writer reference-model checks.
 - [ ] Add fuzz targets for config/manifest parsing plus model-based fuzzing of read/write/copy/hash orchestration on small files.
 - [ ] Run `cargo miri test` regularly on the unsafe buffer/slice paths and add bounded-proof experiments (Kani) for arithmetic and partition helpers. Targeted Miri-safe tests now cover `common::AlignedBuffer` page-backed storage and `reader` destination-slice construction; executing them still requires a nightly toolchain with the `miri` component installed. Current Kani slices prove `io_util::expected_read_len()` matches its `min(file_size - offset, block_size)` contract, rejects offsets past EOF, and is monotonic in offset, and also prove the `find`/`du` permission-classification and `du` node-completion helpers used by the dirwalk error-handling path.

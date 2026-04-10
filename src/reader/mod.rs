@@ -11,7 +11,7 @@ use std::hint::black_box;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -110,14 +110,7 @@ fn choose_path_kind_for_state(
 
 impl BufReader<File> {
     pub fn stdin() -> io::Result<Self> {
-        // SAFETY: `dup` returns a new owned fd referring to stdin; we check for errors before
-        // transferring ownership to `File`.
-        let stdin_fd = unsafe { libc::dup(libc::STDIN_FILENO) };
-        if stdin_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `stdin_fd` came from `dup` above and is uniquely owned here.
-        Ok(Self::new(unsafe { File::from_raw_fd(stdin_fd) }))
+        Ok(Self::new(fro::command_io::stdin_file()?))
     }
 }
 
