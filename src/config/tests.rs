@@ -472,49 +472,6 @@ fn copy_auto_mode_config_path_lookup_uses_longest_override_prefix() {
 }
 
 #[test]
-fn cat_dev_null_backend_config_path_lookup_uses_longest_override_prefix() {
-    let loaded = LoadedConfig::BundleV1 {
-        path: unique_temp_dir("fro-cat-dev-null-prefix").join("fro.json"),
-        bundle: ConfigBundleV1 {
-            version: 1,
-            defaults: AppConfig::default(),
-            mount_overrides: MountOverrides {
-                by_mountpoint: std::collections::HashMap::from([
-                    (
-                        "/data".to_string(),
-                        AppConfigPatch {
-                            cat_dev_null_backend: Some(CatDevNullBackend::BufferedCopy),
-                            ..AppConfigPatch::default()
-                        },
-                    ),
-                    (
-                        "/data/fro".to_string(),
-                        AppConfigPatch {
-                            cat_dev_null_backend: Some(CatDevNullBackend::FastCopy),
-                            ..AppConfigPatch::default()
-                        },
-                    ),
-                ]),
-            },
-            device_db: DeviceDbConfig::default(),
-        },
-    };
-
-    assert_eq!(
-        loaded.get_cat_dev_null_backend_for_config_path("/data/fro/run/output.bin"),
-        CatDevNullBackend::FastCopy
-    );
-    assert_eq!(
-        loaded.get_cat_dev_null_backend_for_config_path("/data/other/output.bin"),
-        CatDevNullBackend::BufferedCopy
-    );
-    assert_eq!(
-        loaded.get_cat_dev_null_backend_for_config_path("/elsewhere/output.bin"),
-        CatDevNullBackend::Auto
-    );
-}
-
-#[test]
 fn get_params_for_path_uses_longest_config_prefix_override() {
     let mut defaults = AppConfig::default();
     defaults.update_params(

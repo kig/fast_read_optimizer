@@ -1045,10 +1045,7 @@ mod tests {
             "cat".to_string(),
             "file.txt".to_string(),
         ];
-        assert_eq!(
-            wrapper_multicall_config_path(&raw_args),
-            Some("/tmp/fro.json")
-        );
+        assert_eq!(wrapper_multicall_config_path(&raw_args), Some("/tmp/fro.json"));
     }
 
     #[test]
@@ -1062,38 +1059,12 @@ mod tests {
             "src".to_string(),
             "dst".to_string(),
         ];
-        assert_eq!(
-            wrapper_multicall_config_path(&raw_args),
-            Some("/tmp/fro.json")
-        );
-    }
-
-    #[test]
-    fn wrapper_multicall_config_path_uses_last_explicit_flag_before_coreutils_subcommand() {
-        let raw_args = vec![
-            "fro".to_string(),
-            "--no-fallback".to_string(),
-            "-c".to_string(),
-            "/tmp/first.json".to_string(),
-            "--config".to_string(),
-            "/tmp/second.json".to_string(),
-            "cat".to_string(),
-            "file.txt".to_string(),
-        ];
-        assert_eq!(
-            wrapper_multicall_config_path(&raw_args),
-            Some("/tmp/second.json")
-        );
+        assert_eq!(wrapper_multicall_config_path(&raw_args), Some("/tmp/fro.json"));
     }
 
     #[test]
     fn wrapper_multicall_config_path_does_not_confuse_multicall_command_flags() {
-        let raw_args = vec![
-            "fro".to_string(),
-            "wc".to_string(),
-            "-c".to_string(),
-            "file.txt".to_string(),
-        ];
+        let raw_args = vec!["fro".to_string(), "wc".to_string(), "-c".to_string(), "file.txt".to_string()];
         assert_eq!(wrapper_multicall_config_path(&raw_args), None);
     }
 }

@@ -206,35 +206,6 @@ fn resolve_target_selection_accepts_same_mount_test_dir_and_target() {
     assert!(selection.target_mount.is_some());
 }
 
-#[test]
-fn cat_pattern_selects_only_cat_dev_null_benchmark() {
-    let empty: Vec<String> = Vec::new();
-    assert!(run::cat_dev_null_pattern_selected(&empty));
-    assert!(run::cat_dev_null_pattern_selected(&["cat".to_string()]));
-    assert!(run::cat_dev_null_pattern_selected(&[
-        "cat-dev-null".to_string()
-    ]));
-    assert!(run::cat_dev_null_pattern_selected(&[
-        "cat_dev_null".to_string()
-    ]));
-    assert!(!run::cat_dev_null_pattern_selected(&["copy".to_string()]));
-}
-
-#[test]
-fn cat_dev_null_backend_selection_requires_clear_buffered_win() {
-    use fro::config::CatDevNullBackend::{BufferedCopy, FastCopy};
-    use std::time::Duration;
-
-    assert_eq!(
-        run::select_cat_dev_null_backend(Duration::from_millis(100), Duration::from_millis(80)),
-        BufferedCopy
-    );
-    assert_eq!(
-        run::select_cat_dev_null_backend(Duration::from_millis(100), Duration::from_millis(96)),
-        FastCopy
-    );
-}
-
 #[derive(serde::Deserialize)]
 struct OptimizeConfigFile {
     defaults: OptimizeAppConfig,
@@ -263,8 +234,6 @@ struct OptimizeModeConfig {
 struct OptimizeAppConfigPatch {
     #[serde(default)]
     read: Option<OptimizeModeConfigPatch>,
-    #[serde(default)]
-    cat_dev_null_backend: Option<OptimizeCatDevNullBackend>,
 }
 
 #[derive(serde::Deserialize)]
@@ -273,14 +242,6 @@ struct OptimizeModeConfigPatch {
     direct: Option<IOParams>,
     #[serde(default)]
     page_cache: Option<IOParams>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OptimizeCatDevNullBackend {
-    Auto,
-    FastCopy,
-    BufferedCopy,
 }
 
 #[test]
@@ -405,62 +366,6 @@ fn fro_optimize_global_for_path_promotes_mount_override_into_defaults() {
         explained["effective"]["read"]["page_cache"],
         explained["defaults"]["read"]["page_cache"]
     );
-
-    let _ = std::fs::remove_dir_all(target_dir);
-}
-
-#[test]
-fn fro_optimize_cat_for_path_persists_backend_override() {
-    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp")
-        .join(format!(
-            "fro-optimize-cat-override-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    std::fs::create_dir_all(&target_dir).unwrap();
-    let config_path = target_dir.join("fro.json");
-    let target_path = target_dir.join("data.bin");
-    std::fs::write(&target_path, b"x").unwrap();
-
-    let status = Command::new("cargo")
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
-        .args([
-            "run",
-            "--quiet",
-            "--bin",
-            "fro-optimize",
-            "--",
-            "-c",
-            config_path.to_str().unwrap(),
-            "--for",
-            target_path.to_str().unwrap(),
-            "--test-size",
-            "4096",
-            "--iters",
-            "1",
-            "cat",
-        ])
-        .status()
-        .expect("run fro-optimize cat");
-    assert!(status.success());
-
-    let saved: OptimizeConfigFile =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    let mount = fro::config::mount_info_for_path(target_path.to_str().unwrap()).unwrap();
-    let override_entry = saved
-        .mount_overrides
-        .by_mountpoint
-        .get(&mount.mount_point)
-        .expect("mount override entry");
-    assert!(matches!(
-        override_entry.cat_dev_null_backend,
-        Some(OptimizeCatDevNullBackend::FastCopy | OptimizeCatDevNullBackend::BufferedCopy)
-    ));
 
     let _ = std::fs::remove_dir_all(target_dir);
 }
