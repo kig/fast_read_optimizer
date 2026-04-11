@@ -1,6 +1,10 @@
 use super::*;
 use crate::io_util::note_direct_unaligned_fallback;
 
+pub(super) fn is_terminal_tail(offset: u64, len: usize, end_offset: u64) -> bool {
+    offset < end_offset && offset.saturating_add(len as u64) >= end_offset
+}
+
 pub(super) fn should_use_direct_io(
     use_direct: bool,
     offset: u64,
@@ -18,7 +22,7 @@ pub(super) fn should_use_direct_io(
         && (offset % 4096 == 0)
         && (len % 4096 == 0)
         && (offset + len as u64 <= file_size);
-    if use_direct && !direct {
+    if use_direct && !direct && !is_terminal_tail(offset, len, file_size) {
         note_direct_unaligned_fallback("read", offset, len);
     }
     direct
@@ -88,6 +92,19 @@ pub(super) fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64
     }
 
     Ok(ready)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_tail;
+
+    #[test]
+    fn terminal_tail_detection_only_matches_final_chunk() {
+        assert!(is_terminal_tail(4096, 4096, 8192));
+        assert!(is_terminal_tail(4096, 8192, 8192));
+        assert!(!is_terminal_tail(0, 4096, 8192));
+        assert!(!is_terminal_tail(8192, 4096, 8192));
+    }
 }
 
 pub(super) fn read_file_single_thread_blocking(

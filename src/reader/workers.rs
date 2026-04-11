@@ -1,4 +1,6 @@
-use super::execution::{should_use_direct_io, submit_read, submit_read_with_probe, wait_for_ready};
+use super::execution::{
+    is_terminal_tail, should_use_direct_io, submit_read, submit_read_with_probe, wait_for_ready,
+};
 use super::*;
 use crate::io_util::note_direct_unaligned_fallback;
 use crate::uring_util::io_uring_available;
@@ -17,7 +19,8 @@ fn read_exact_range_blocking(
         let chunk_len = (output.len() - filled).min(chunk_size as usize);
         let offset = start_offset + filled as u64;
         let aligned_read = (offset % 4096 == 0) && (chunk_len as u64 == chunk_size);
-        if use_direct && !aligned_read {
+        let range_end = start_offset + output.len() as u64;
+        if use_direct && !aligned_read && !is_terminal_tail(offset, chunk_len, range_end) {
             note_direct_unaligned_fallback("read", offset, chunk_len);
         }
         let source = if use_direct && aligned_read {
@@ -577,9 +580,9 @@ pub(super) fn measure_file_load_multiple_targets(
             }));
         }
         for thread in threads {
-            thread.join().map_err(|_| {
-                std::io::Error::other("multi-target read worker thread panicked")
-            })??;
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("multi-target read worker thread panicked"))??;
         }
         return Ok(read_count.load(Ordering::SeqCst));
     }

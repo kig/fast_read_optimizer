@@ -162,6 +162,8 @@ fn read_direct_warns_when_tail_falls_back_to_page_cache() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("forced --direct read used page cache"));
-    assert!(stderr.contains("read offset"));
+    assert!(
+        !stderr.contains("forced --direct read used page cache"),
+        "stderr:\n{stderr}"
+    );
 }

@@ -286,11 +286,7 @@ fn block_device_slaves(sysfs_dir: &Path, roots: &DeviceProbeRoots) -> Vec<BlockD
     entries
         .into_iter()
         .filter_map(|kernel_name| {
-            let devnode = roots
-                .dev_root
-                .join(&kernel_name)
-                .to_string_lossy()
-                .into_owned();
+            let devnode = format!("/dev/{kernel_name}");
             block_device_signature_for_kernel_name(&kernel_name, &devnode, roots)
         })
         .collect()
@@ -486,8 +482,9 @@ fn normalize_existing_path_in_root(path: &Path, root: &Path) -> PathBuf {
 fn canonicalize_dev_path_in_root(path: &str, root: &Path) -> Option<PathBuf> {
     let relative = path.strip_prefix("/dev/")?;
     let canonical = fs::canonicalize(root.join(relative)).ok()?;
-    if canonical.starts_with(root) {
-        let relative = canonical.strip_prefix(root).ok()?;
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if canonical.starts_with(&canonical_root) {
+        let relative = canonical.strip_prefix(&canonical_root).ok()?;
         Some(Path::new("/dev").join(relative))
     } else {
         Some(canonical)

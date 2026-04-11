@@ -28,6 +28,18 @@ fn derive_benchmark_dir_from_target(target: &Path) -> Result<PathBuf, String> {
     })
 }
 
+fn mount_point_for_target_path(target_path: &str) -> Option<String> {
+    let target = Path::new(target_path);
+    if target.exists() {
+        return fro::config::mount_info_for_path(target_path).map(|info| info.mount_point);
+    }
+    target
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .and_then(|ancestor| fro::config::mount_info_for_path(&ancestor.display().to_string()))
+        .map(|info| info.mount_point)
+}
+
 pub(super) fn resolve_target_selection(
     explicit_test_dir: Option<&str>,
     target_path: Option<&str>,
@@ -47,8 +59,7 @@ pub(super) fn resolve_target_selection(
         });
     };
 
-    let target_mount = fro::config::mount_info_for_path(target_path)
-        .map(|info| info.mount_point)
+    let target_mount = mount_point_for_target_path(target_path)
         .ok_or_else(|| format!("Failed to resolve mount info for --for target {target_path}"))?;
     let benchmark_mount = fro::config::mount_info_for_path(&benchmark_dir_string)
         .map(|info| info.mount_point)

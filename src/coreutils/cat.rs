@@ -197,14 +197,18 @@ fn cat_execution_backend(input: &StreamInput, args: &CatArgs) -> io::Result<CatE
     ) {
         return Ok(CatExecutionBackend::OrderedTransform);
     }
-    if args.io_mode == IOMode::Direct {
-        return Ok(CatExecutionBackend::BufferedCopy);
-    }
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
-            Ok(CatExecutionBackend::FastCopyToStdout)
+            if args.io_mode == IOMode::Direct && !fd_is_fifo(fro::command_io::stdout_fd())? {
+                Ok(CatExecutionBackend::BufferedCopy)
+            } else {
+                Ok(CatExecutionBackend::FastCopyToStdout)
+            }
         }
         StreamInput::Stdin { .. } => {
+            if args.io_mode == IOMode::Direct {
+                return Ok(CatExecutionBackend::BufferedCopy);
+            }
             if fd_is_regular(fro::command_io::stdin_fd())?
                 || fd_is_fifo(fro::command_io::stdin_fd())?
             {
@@ -427,12 +431,18 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
         }
         return Ok(());
     }
-    let mut out = None;
+    let mut out: Option<BufWriter> = None;
     for input in inputs {
         let backend = cat_execution_backend(&input, &parsed)?;
         debug_assert_ne!(backend, CatExecutionBackend::OrderedTransform);
         let mut copied = 0_u64;
         if backend == CatExecutionBackend::FastCopyToStdout
+            && {
+                if let Some(out) = out.as_mut() {
+                    out.flush_shared()?;
+                }
+                true
+            }
             && try_fast_copy_to_stdout_counted(&input, io_mode, &mut |bytes| {
                 copied = bytes;
                 Ok(())
