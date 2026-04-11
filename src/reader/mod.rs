@@ -3,7 +3,7 @@ use crate::config::{IOParams, LoadedConfig, MountInfo};
 use crate::io_util::{
     expected_read_len, open_reader_files, validate_read_result, PendingReadSlots,
 };
-use crate::mincore::is_first_page_resident;
+use crate::mincore::is_edge_pages_resident;
 use iou::IoUring;
 use memchr::memmem::Finder;
 use std::fs::File;
@@ -41,8 +41,8 @@ impl<R: Read> BufReader<R> {
     }
 }
 
-fn auto_lift_mode_for_residency(first_page_resident: bool) -> IOMode {
-    if first_page_resident {
+fn auto_lift_mode_for_residency(edge_pages_resident: bool) -> IOMode {
+    if edge_pages_resident {
         IOMode::PageCache
     } else {
         IOMode::Direct
@@ -79,7 +79,7 @@ pub(crate) fn warm_file_page_cache(filename: &str) -> io::Result<u64> {
 }
 
 fn auto_read_cache_state(filename: &str) -> ReadBenchmarkCacheState {
-    match auto_lift_mode_for_residency(is_first_page_resident(filename).unwrap_or(false)) {
+    match auto_lift_mode_for_residency(is_edge_pages_resident(filename).unwrap_or(false)) {
         IOMode::PageCache => ReadBenchmarkCacheState::Hot,
         IOMode::Direct | IOMode::Auto => ReadBenchmarkCacheState::Cold,
     }
@@ -363,7 +363,7 @@ pub fn resolve_to_memory_mode(
             IOMode::Direct => ReadToMemoryMode::PagedSharedBuffer,
             IOMode::PageCache => ReadToMemoryMode::Mmap,
             IOMode::Auto => {
-                if is_first_page_resident(filename).unwrap_or(false) {
+                if is_edge_pages_resident(filename).unwrap_or(false) {
                     ReadToMemoryMode::Mmap
                 } else {
                     ReadToMemoryMode::PagedSharedBuffer
@@ -758,7 +758,7 @@ pub fn resolve_reader_params(
     direct: &IOParams,
     io_mode: IOMode,
 ) -> std::io::Result<ResolvedReadParams> {
-    let file_cached = match is_first_page_resident(filename) {
+    let file_cached = match is_edge_pages_resident(filename) {
         Ok(true) => io_mode != IOMode::Direct,
         _ => io_mode == IOMode::PageCache,
     };

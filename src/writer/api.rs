@@ -651,7 +651,7 @@ fn _write_file_internal(
     let mut threads = vec![];
     let write_count = Arc::new(AtomicU64::new(0));
     let (total_size, _file_cached) = if let Some(s) = source {
-        let file_cached = Ok(true) == is_first_page_resident(s);
+        let file_cached = Ok(true) == is_edge_pages_resident(s);
         let f = File::open(s)?;
         (f.metadata()?.len(), file_cached)
     } else if let Some(size) = create_size {

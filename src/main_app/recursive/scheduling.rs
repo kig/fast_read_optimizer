@@ -68,7 +68,7 @@ pub(crate) fn recursive_small_file_worker_count_for_path(
         return recursive_read_file_worker_count_with_override(Some(threads));
     }
     let tuned = config.get_recursive_small_file_threads_for_path(path);
-    let cache_state = if is_first_page_resident(path).unwrap_or(false) {
+    let cache_state = if is_edge_pages_resident(path).unwrap_or(false) {
         tuned.hot
     } else {
         tuned.cold

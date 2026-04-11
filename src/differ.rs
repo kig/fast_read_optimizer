@@ -1,6 +1,6 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::io_util::{note_direct_unaligned_fallback, open_direct_reader_or_fallback};
-use crate::mincore::is_first_page_resident;
+use crate::mincore::is_edge_pages_resident;
 use iou::IoUring;
 use rand::RngExt;
 use std::fs::File;
@@ -288,7 +288,7 @@ pub fn diff_files_window(
     let mut threads = vec![];
 
     let file_cached =
-        Ok(true) == is_first_page_resident(file1) && Ok(true) == is_first_page_resident(file2);
+        Ok(true) == is_edge_pages_resident(file1) && Ok(true) == is_edge_pages_resident(file2);
     let use_direct = ((!file_cached) && io_mode == IOMode::Auto) || io_mode == IOMode::Direct;
 
     let num_threads = if use_direct {

@@ -9,7 +9,7 @@ use crate::differ::{bench_diff_memory, bench_memcpy_memory, diff_files};
 use crate::io_util::{
     direct_writer_supported, open_reader_files, validate_read_result, CopyOperationGuard,
 };
-use crate::mincore::is_first_page_resident;
+use crate::mincore::is_edge_pages_resident;
 use crate::optimizer::run_optimizer;
 use crate::reader::{
     benchmark_read_variant, load_file_to_memory, measure_file_load_to_memory,

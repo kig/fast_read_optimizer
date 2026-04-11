@@ -34,7 +34,7 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "Use -s together with --direct or --no-direct to save the best result back to config.",
                 "With --direct, fro prints one stderr warning if any requested direct read falls back to page cache because O_DIRECT open failed or a tail/range was unaligned.",
                 "--auto-lift starts cold files on the direct path while a background thread warms the page cache for later iterations in the same process.",
-                "--to-memory defaults to an auto backend: mmap when the first page looks cached, otherwise the direct/shared-buffer loader.",
+                "--to-memory defaults to an auto backend: mmap when both the first and last pages look cached, otherwise the direct/shared-buffer loader.",
                 "--paged-shared-buffer forces the old shared destination-buffer loader for read --to-memory.",
                 "--mmap maps the file instead of reading into a destination buffer; --mmap-read-pages also walks the mapped bytes in userspace.",
                 "--multiple-target-buffers gives each reader thread its own destination buffer with no consolidation step.",

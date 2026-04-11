@@ -24,7 +24,7 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
     let mount_path = path;
     let is_hot = cache_state_override
         .map(|state| state == SmallFileThreadCacheState::Hot)
-        .unwrap_or_else(|| is_first_page_resident(path).unwrap_or(false));
+        .unwrap_or_else(|| is_edge_pages_resident(path).unwrap_or(false));
     match cache_state_override {
         Some(SmallFileThreadCacheState::Hot) => {
             let _ = reader::warm_file_page_cache(path);

@@ -4,7 +4,7 @@ use crate::io_util::{
     checked_posix_fallocate, note_direct_unaligned_fallback, open_direct_reader_or_fallback,
     open_direct_writer_or_fallback,
 };
-use crate::mincore::is_first_page_resident;
+use crate::mincore::is_edge_pages_resident;
 use iou::IoUring;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};

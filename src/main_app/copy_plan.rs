@@ -193,8 +193,8 @@ pub(super) fn inspect_copy_auto_state(
     source_path: &str,
     target_path: &str,
 ) -> (bool, bool, Option<u64>, Option<u64>) {
-    let source_cached = Ok(true) == is_first_page_resident(source_path);
-    let target_cached = Ok(true) == is_first_page_resident(target_path);
+    let source_cached = Ok(true) == is_edge_pages_resident(source_path);
+    let target_cached = Ok(true) == is_edge_pages_resident(target_path);
     let source_len = std::fs::metadata(source_path)
         .ok()
         .filter(|meta| meta.file_type().is_file())
