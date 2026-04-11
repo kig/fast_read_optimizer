@@ -441,6 +441,7 @@ pub(crate) fn move_directory_cross_filesystem(
     recursive::move_dir::run_recursive_move(recursive_ctx, verbose)
 }
 
+#[allow(dead_code)]
 pub(crate) fn create_tar_archive(
     source: &Path,
     output: &Path,
@@ -493,10 +494,12 @@ pub(crate) fn bench_tar_archive(
     )
 }
 
+#[allow(dead_code)]
 pub(super) fn main() {
     cli::main();
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_with_args(raw_args: Vec<String>) -> io::Result<i32> {
     cli::try_main_from(raw_args)
 }

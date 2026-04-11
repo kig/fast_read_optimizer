@@ -83,6 +83,7 @@ fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     parse_cli_from(env::args().collect())
 }

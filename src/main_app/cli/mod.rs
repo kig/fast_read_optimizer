@@ -3,6 +3,7 @@ use super::*;
 mod args;
 mod execute;
 
+#[allow(dead_code)]
 pub(super) fn try_main() -> io::Result<i32> {
     try_main_from(std::env::args().collect())
 }
@@ -79,6 +80,7 @@ pub(super) fn run_test_copy(options: TestCopyRunOptions) -> io::Result<i32> {
     })
 }
 
+#[allow(dead_code)]
 pub(super) fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

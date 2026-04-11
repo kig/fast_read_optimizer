@@ -89,6 +89,7 @@ use self::format::*;
 use self::manifest::*;
 use self::parallel::*;
 
+#[allow(dead_code)]
 pub(crate) fn create_uncompressed_tar(
     source: &Path,
     output: &Path,
@@ -364,6 +365,7 @@ fn write_tar_stream<W: Write + ?Sized>(entries: &[TarEntry], writer: &mut W) -> 
     Ok(total_bytes.saturating_add(TAR_EOF_BLOCKS))
 }
 
+#[allow(dead_code)]
 pub(crate) fn create_gzip_tar(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
     let (entries, logical_size) = collect_tar_manifest(source, output)?;
     create_gzip_tar_entries(output, verbose, entries, logical_size)
@@ -411,6 +413,7 @@ fn create_gzip_tar_entries(
     Ok(archive_bytes)
 }
 
+#[allow(dead_code)]
 pub(crate) fn create_zstd_tar(source: &Path, output: &Path, verbose: bool) -> io::Result<u64> {
     let (entries, logical_size) = collect_tar_manifest(source, output)?;
     create_zstd_tar_entries(output, verbose, entries, logical_size)
@@ -499,6 +502,7 @@ pub(crate) fn extract_zstd_tar(
     reader::extract_tar_archive_reader(&mut reader, path, destination, verbose)
 }
 
+#[allow(dead_code)]
 pub(crate) fn create_tar_archive(
     source: &Path,
     output: &Path,
