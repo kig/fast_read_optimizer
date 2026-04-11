@@ -87,7 +87,31 @@ pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     parse_cli_from(env::args().collect())
 }
 
+fn wrapper_multicall_config_path(raw_args: &[String]) -> Option<&str> {
+    let mut config_path: Option<&str> = None;
+    let mut idx = 1usize;
+    while idx < raw_args.len() {
+        match raw_args[idx].as_str() {
+            "--no-fallback" => {
+                idx += 1;
+            }
+            "-c" | "--config" => {
+                idx += 1;
+                config_path = raw_args.get(idx).map(String::as_str);
+                idx += 1;
+            }
+            "cp" => return config_path,
+            other if coreutils::is_coreutils_command(other) => return config_path,
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> {
+    if let Some(path) = wrapper_multicall_config_path(&raw_args) {
+        std::env::set_var("FRO_CONFIG", path);
+    }
     if let Some(code) = coreutils::try_run_multicall(&raw_args)? {
         return Ok(ParseOutcome::Early(code));
     }
@@ -252,7 +276,9 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
                         base64_decode_kernel =
                             coreutils::parse_base64_decode_kernel(args[i].as_str())?;
                     } else {
-                        fro::cio_eprintln!("--variant is only supported for bench-base64-encode/decode");
+                        fro::cio_eprintln!(
+                            "--variant is only supported for bench-base64-encode/decode"
+                        );
                         return Ok(ParseOutcome::Early(1));
                     }
                 }
@@ -756,7 +782,9 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         return Ok(ParseOutcome::Early(1));
     }
     if via_memory && save_config {
-        fro::cio_println!("copy --via-memory does not support --save; tune read and write separately");
+        fro::cio_println!(
+            "copy --via-memory does not support --save; tune read and write separately"
+        );
         return Ok(ParseOutcome::Early(1));
     }
     if keep_target_size && (via_memory || verify_copy || verify_copy_diff) {
@@ -794,7 +822,9 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         return Ok(ParseOutcome::Early(1));
     }
     if force_copy_file_range_single && save_config {
-        fro::cio_println!("copy --copy-file-range-single does not support --save; benchmark it with -n 1");
+        fro::cio_println!(
+            "copy --copy-file-range-single does not support --save; benchmark it with -n 1"
+        );
         return Ok(ParseOutcome::Early(1));
     }
     if force_diff_copy && save_config {
@@ -861,7 +891,9 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         return Ok(ParseOutcome::Early(1));
     }
     if cp_target_directory.is_some() && cp_no_target_directory {
-        fro::cio_eprintln!("cp: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        fro::cio_eprintln!(
+            "cp: cannot combine --target-directory (-t) and --no-target-directory (-T)"
+        );
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "copy" && cp_target_directory.is_some() && source.is_none() {
@@ -874,7 +906,9 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         return Ok(ParseOutcome::Early(1));
     }
     if mode == "manifest-recursive-copy-bench" && extra_paths.len() != 2 {
-        fro::cio_println!("manifest-recursive-copy-bench requires <manifest> <source_root> <target_root>");
+        fro::cio_println!(
+            "manifest-recursive-copy-bench requires <manifest> <source_root> <target_root>"
+        );
         return Ok(ParseOutcome::Early(1));
     }
     if mode != "write" && create_size.is_some() {
@@ -938,7 +972,7 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
 
 #[cfg(test)]
 mod tests {
-    use super::rebuild_cp_fallback_args;
+    use super::{rebuild_cp_fallback_args, wrapper_multicall_config_path};
 
     #[test]
     fn rebuild_cp_fallback_args_normalizes_fro_cp_subcommand() {
@@ -1000,5 +1034,37 @@ mod tests {
                 "dst".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn wrapper_multicall_config_path_extracts_parent_config_for_coreutils_subcommand() {
+        let raw_args = vec![
+            "fro".to_string(),
+            "-c".to_string(),
+            "/tmp/fro.json".to_string(),
+            "cat".to_string(),
+            "file.txt".to_string(),
+        ];
+        assert_eq!(wrapper_multicall_config_path(&raw_args), Some("/tmp/fro.json"));
+    }
+
+    #[test]
+    fn wrapper_multicall_config_path_handles_wrapper_flags_before_command() {
+        let raw_args = vec![
+            "fro".to_string(),
+            "--no-fallback".to_string(),
+            "--config".to_string(),
+            "/tmp/fro.json".to_string(),
+            "cp".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ];
+        assert_eq!(wrapper_multicall_config_path(&raw_args), Some("/tmp/fro.json"));
+    }
+
+    #[test]
+    fn wrapper_multicall_config_path_does_not_confuse_multicall_command_flags() {
+        let raw_args = vec!["fro".to_string(), "wc".to_string(), "-c".to_string(), "file.txt".to_string()];
+        assert_eq!(wrapper_multicall_config_path(&raw_args), None);
     }
 }
