@@ -233,7 +233,10 @@ fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
 
 #[test]
 fn compat_coverage_explicit_gap_rows_match_source_help() {
-    let help_source = include_str!("../src/main_app/help.rs");
+    let help_source = concat!(
+        include_str!("../src/main_app/help.rs"),
+        include_str!("../src/main_app/help/commands.rs")
+    );
     assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
     assert!(help_source.contains("key selection (-k) and locale collation"));
     assert!(help_source.contains("FIXME: Extract currently targets regular-file archives"));

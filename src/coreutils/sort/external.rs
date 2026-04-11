@@ -1,4 +1,8 @@
+mod packed;
+
 use super::*;
+use super::compare::compare_output_lines;
+pub(crate) use packed::{sort_inputs, SortCheckFailure, SortCheckResult};
 use memchr::memchr_iter;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -10,69 +14,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SORT_MEM_LIMIT_ENV: &str = "FRO_SORT_MAX_IN_MEMORY_BYTES";
 const SORT_MIN_SPILL_CHUNK_BYTES: u64 = 8 << 20;
 const SORT_TINY_REGULAR_FAST_PATH_BYTES: u64 = 64 << 10;
+const SORT_DEFAULT_MAX_IN_MEMORY_BYTES: u64 = 64 << 20;
+const SORT_DEFAULT_MAX_STREAMING_MEMORY_BYTES: u64 = 128 << 20;
+const SORT_BYTEWISE_PACKED_FAST_MAX_BYTES: u64 = u32::MAX as u64;
+const SORT_PARALLEL_LINE_BUILD_THRESHOLD_BYTES: u64 = 64 << 20;
+const SORT_PARALLEL_OUTPUT_THRESHOLD_BYTES: u64 = 64 << 20;
+const SORT_PARALLEL_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
+const SORT_PARALLEL_MAX_THREADS: usize = 8;
 const SORT_STREAM_BLOCK_SIZE: usize = 2 << 20;
-
-pub(super) struct SortCheckFailure {
-    pub(super) line_number: u64,
-    pub(super) line: Vec<u8>,
-}
-
-pub(super) struct SortCheckResult {
-    pub(super) total_bytes: u64,
-    pub(super) disorder: Option<SortCheckFailure>,
-}
-
-pub(super) fn sort_inputs(
-    inputs: &[StreamInput],
-    io_mode: IOMode,
-    mode: SortMode,
-    unique: bool,
-    reverse: bool,
-    terminator: RecordTerminator,
-    output_path: Option<&str>,
-    temporary_directory: Option<&Path>,
-) -> io::Result<u64> {
-    if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
-        if tiny_regular_sort_fast_path_enabled(total_bytes, io_mode, output_path) {
-            return sort_inputs_tiny_regular_fast(inputs, mode, unique, reverse, terminator);
-        }
-        let memory_budget = sort_memory_budget_bytes()?;
-        if total_bytes <= memory_budget {
-            return sort_inputs_in_memory(
-                inputs,
-                io_mode,
-                mode,
-                unique,
-                reverse,
-                terminator,
-                output_path,
-            );
-        }
-        return sort_inputs_streamed(
-            inputs,
-            io_mode,
-            mode,
-            unique,
-            reverse,
-            terminator,
-            output_path,
-            memory_budget,
-            temporary_directory,
-        );
-    }
-    let memory_budget = sort_memory_budget_bytes()?;
-    sort_inputs_streamed(
-        inputs,
-        io_mode,
-        mode,
-        unique,
-        reverse,
-        terminator,
-        output_path,
-        memory_budget,
-        temporary_directory,
-    )
-}
 
 fn tiny_regular_sort_fast_path_enabled(
     total_bytes: u64,
@@ -119,10 +68,8 @@ fn sort_inputs_tiny_regular_fast(
         )?;
     }
     finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse)?;
-    let mut out = StdBufWriter::with_capacity(
-        SORT_STREAM_BLOCK_SIZE,
-        fro::command_io::stdout_file()?,
-    );
+    let mut out =
+        StdBufWriter::with_capacity(SORT_STREAM_BLOCK_SIZE, fro::command_io::stdout_file()?);
     write_sorted_lines(&mut out, &lines, &storage, terminator)
         .map_err(|err| io::Error::new(err.kind(), format!("write failed: {err}")))?;
     Ok(total_bytes)
@@ -286,7 +233,13 @@ fn sort_memory_budget_bytes() -> io::Result<u64> {
             )
         });
     }
-    Ok(mem_available_bytes().unwrap_or(u64::MAX))
+    Ok(mem_available_bytes()
+        .unwrap_or(u64::MAX)
+        .min(SORT_DEFAULT_MAX_STREAMING_MEMORY_BYTES))
+}
+
+fn sort_in_memory_limit_bytes(memory_budget: u64) -> u64 {
+    memory_budget.min(SORT_DEFAULT_MAX_IN_MEMORY_BYTES)
 }
 
 fn mem_available_bytes() -> Option<u64> {

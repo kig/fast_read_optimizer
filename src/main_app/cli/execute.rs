@@ -9,6 +9,10 @@ use crate::main_app::recursive::run_recursive_copy;
 use crate::main_app::recursive::split_manifest::run_split_manifest_recursive_copy;
 use std::sync::Arc;
 
+mod config_command;
+
+use config_command::handle_config_command;
+
 pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let ParsedArgs {
         mode,
@@ -60,44 +64,15 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     } = parsed;
 
     if mode == "config" {
-        let config = config::load_config(config_path.as_deref());
-        match config_subcommand.as_deref() {
-            Some("print") => {
-                fro::cio_println!("{}", config.to_pretty_json()?);
-                return Ok(0);
-            }
-            Some("explain") => {
-                let target = config_target.as_deref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "config explain requires --for <path>",
-                    )
-                })?;
-                fro::cio_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&config.explain_for_path(target))
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                );
-                return Ok(0);
-            }
-            Some(other) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown config subcommand: {other}"),
-                ));
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "missing config subcommand",
-                ));
-            }
+        if let Some(code) = handle_config_command(
+            config_path.as_deref(),
+            config_subcommand.as_deref(),
+            config_target.as_deref(),
+        )? {
+            return Ok(code);
         }
     }
 
-    let mode = mode;
-    let filename = filename;
-    let pattern = pattern;
     let context_path = config_target.as_deref().unwrap_or(filename.as_str());
 
     let mut config = config::load_config(config_path.as_deref());
@@ -582,7 +557,11 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             )?;
                             if cli_verbose {
                                 if cp_compat {
-                                    fro::cio_println!("'{}' -> '{}'", src, copied_target_path.display());
+                                    fro::cio_println!(
+                                        "'{}' -> '{}'",
+                                        src,
+                                        copied_target_path.display()
+                                    );
                                 } else {
                                     fro::cio_eprintln!(
                                         "{}",

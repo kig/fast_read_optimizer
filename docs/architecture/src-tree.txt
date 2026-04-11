@@ -1,6 +1,8 @@
 src/
   bin/
     fro_benchmark_impl/
+      test_matrix/
+        recursive_tree_cases.rs
       mod.rs
       run.rs
       test_matrix.rs
@@ -13,6 +15,10 @@ src/
       tests.rs
     fro-benchmark.rs
     fro-optimize.rs
+    md5sum.rs
+    sha256sum.rs
+  bin_support/
+    dedicated_hashsum.rs
   block_hash/
     mod.rs
     ops.rs
@@ -36,6 +42,16 @@ src/
       process.rs
       process_layout.rs
       tests.rs
+    fgrep/
+      tests.rs
+    hash/
+      check.rs
+      cksum.rs
+    sort/
+      external/
+        packed.rs
+      compare.rs
+      external.rs
     wc/
       count.rs
       tests.rs
@@ -46,6 +62,7 @@ src/
     encrypt.rs
     fgrep.rs
     find.rs
+    gzip.rs
     hash.rs
     head.rs
     io_helpers.rs
@@ -54,6 +71,7 @@ src/
     pv.rs
     rm.rs
     shred.rs
+    sort.rs
     tac.rs
     tail.rs
     tar.rs
@@ -61,6 +79,10 @@ src/
     work_queue.rs
   main_app/
     cli/
+      args/
+        tests.rs
+      execute/
+        config_command.rs
       args.rs
       execute.rs
       mod.rs
@@ -69,12 +91,16 @@ src/
       manifest.rs
       read_bench.rs
       uring.rs
+    help/
+      commands.rs
+      hash.rs
     recursive/
       archive/
         bench.rs
         format.rs
         manifest.rs
         parallel.rs
+        reader.rs
       archive.rs
       bench.rs
       delete.rs
@@ -106,17 +132,24 @@ src/
     tests.rs
     transform.rs
   writer/
+    copy_ops/
+      blocking.rs
     api.rs
     copy_ops.rs
+    copy_strategy.rs
     kani_proofs.rs
     mod.rs
     tests.rs
   api.rs
   blake3_hash.rs
+  cksum_hash.rs
+  command_io.rs
   common.rs
   dd_tool.rs
   differ.rs
   file_hash.rs
+  fro_ipc_server_main.rs
+  help_compat.rs
   io_util.rs
   lib.rs
   main.rs
@@ -124,4 +157,5 @@ src/
   optimizer.rs
   stream.rs
   test_sizing.rs
+  uring_util.rs
   verified_copy.rs
