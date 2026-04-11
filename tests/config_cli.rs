@@ -1,6 +1,6 @@
 use fro::config::{
-    load_config, AppConfig, AppConfigPatch, ConfigBundleV1, DeviceDbConfig, IOParams,
-    ModeConfigPatch, MountOverrides, RecursiveSmallFileThreads,
+    load_config, AppConfig, AppConfigPatch, CatDevNullBackend, ConfigBundleV1, DeviceDbConfig,
+    IOParams, ModeConfigPatch, MountOverrides, RecursiveSmallFileThreads,
 };
 use fro::CopyAutoMode;
 use serde_json::Value;
@@ -29,6 +29,26 @@ fn run_fro(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("failed to run fro")
+}
+
+fn run_fro_env(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fro"));
+    cmd.args(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("failed to run fro")
+}
+
+fn set_mount_read_direct_threads(bundle: &mut ConfigBundleV1, mount_point: &str, threads: u64) {
+    bundle
+        .mount_overrides
+        .by_mountpoint
+        .get_mut(mount_point)
+        .and_then(|patch| patch.read.as_mut())
+        .and_then(|patch| patch.direct.as_mut())
+        .expect("missing mount read.direct override")
+        .num_threads = threads;
 }
 
 fn sample_bundle(mount_point: &str) -> ConfigBundleV1 {
@@ -223,6 +243,124 @@ fn config_explain_reports_device_db_match_and_precedence() {
         42
     );
     assert_eq!(explain["effective"]["grep"]["direct"]["num_threads"], 43);
+}
+
+#[test]
+fn config_explain_explicit_config_path_overrides_fro_config_env() {
+    let tmp = unique_temp_dir("fro-config-explain-explicit-precedence");
+    let explicit_cfg = tmp.join("explicit.json");
+    let env_cfg = tmp.join("env.json");
+    let target = tmp.join("data.bin");
+    fs::write(&target, b"hello").unwrap();
+
+    let mount_point = mount_point_for(&target);
+
+    let mut explicit_bundle = sample_bundle(&mount_point);
+    set_mount_read_direct_threads(&mut explicit_bundle, &mount_point, 73);
+    explicit_bundle.defaults.cat_dev_null_backend = CatDevNullBackend::BufferedCopy;
+    fs::write(
+        &explicit_cfg,
+        serde_json::to_string_pretty(&explicit_bundle).unwrap(),
+    )
+    .unwrap();
+
+    let mut env_bundle = sample_bundle(&mount_point);
+    set_mount_read_direct_threads(&mut env_bundle, &mount_point, 41);
+    env_bundle.defaults.cat_dev_null_backend = CatDevNullBackend::FastCopy;
+    fs::write(&env_cfg, serde_json::to_string_pretty(&env_bundle).unwrap()).unwrap();
+
+    let out = run_fro_env(
+        &[
+            "config",
+            "explain",
+            "-c",
+            explicit_cfg.to_str().unwrap(),
+            "--for",
+            target.to_str().unwrap(),
+        ],
+        &[("FRO_CONFIG", env_cfg.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let explain: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        explain["config_path"],
+        Value::String(explicit_cfg.to_string_lossy().into_owned())
+    );
+    assert_eq!(
+        explain["mount_override"]["read"]["direct"]["num_threads"],
+        73
+    );
+    assert_eq!(explain["effective"]["read"]["direct"]["num_threads"], 73);
+    assert_eq!(
+        explain["effective"]["cat_dev_null_backend"],
+        "buffered_copy"
+    );
+}
+
+#[test]
+fn config_explain_uses_fro_config_when_explicit_path_is_absent() {
+    let tmp = unique_temp_dir("fro-config-explain-env-precedence");
+    let env_cfg = tmp.join("env.json");
+    let system_cfg = tmp.join("system.json");
+    let home_dir = tmp.join("home");
+    let home_cfg = home_dir.join(".fro").join("fro.json");
+    let target = tmp.join("data.bin");
+    fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+    fs::write(&target, b"hello").unwrap();
+
+    let mount_point = mount_point_for(&target);
+
+    let mut env_bundle = sample_bundle(&mount_point);
+    set_mount_read_direct_threads(&mut env_bundle, &mount_point, 77);
+    fs::write(&env_cfg, serde_json::to_string_pretty(&env_bundle).unwrap()).unwrap();
+
+    let mut home_bundle = sample_bundle(&mount_point);
+    set_mount_read_direct_threads(&mut home_bundle, &mount_point, 55);
+    fs::write(
+        &home_cfg,
+        serde_json::to_string_pretty(&home_bundle).unwrap(),
+    )
+    .unwrap();
+
+    let mut system_bundle = sample_bundle(&mount_point);
+    set_mount_read_direct_threads(&mut system_bundle, &mount_point, 66);
+    fs::write(
+        &system_cfg,
+        serde_json::to_string_pretty(&system_bundle).unwrap(),
+    )
+    .unwrap();
+
+    let out = run_fro_env(
+        &["config", "explain", "--for", target.to_str().unwrap()],
+        &[
+            ("FRO_CONFIG", env_cfg.to_str().unwrap()),
+            ("FRO_SYSTEM_CONFIG", system_cfg.to_str().unwrap()),
+            ("HOME", home_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let explain: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        explain["config_path"],
+        Value::String(env_cfg.to_string_lossy().into_owned())
+    );
+    assert_eq!(
+        explain["mount_override"]["read"]["direct"]["num_threads"],
+        77
+    );
+    assert_eq!(explain["effective"]["read"]["direct"]["num_threads"], 77);
 }
 
 #[test]

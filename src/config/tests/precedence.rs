@@ -17,6 +17,7 @@ fn precedence_contract_defaults() -> AppConfig {
         block_size: 256 * 1024,
         qd: 3,
     };
+    defaults.cat_dev_null_backend = CatDevNullBackend::Auto;
     defaults.copy_auto_mode = CopyAutoMode::Heuristic;
     defaults.recursive_small_file_threads = RecursiveSmallFileThreads { hot: 4, cold: 6 };
     defaults
@@ -39,6 +40,7 @@ fn write_precedence_device_db(path: &Path, ext4_match: &str, xfs_match: &str) {
                     "grep": {
                         "direct": { "num_threads": 23, "block_size": 1024 * 1024, "qd": 5 }
                     },
+                    "cat_dev_null_backend": "fast_copy",
                     "copy_auto_mode": "direct"
                 }
             },
@@ -80,6 +82,7 @@ fn config_selection_precedence_contract_is_stable() {
                 }),
                 page_cache: None,
             }),
+            cat_dev_null_backend: Some(CatDevNullBackend::BufferedCopy),
             recursive_small_file_threads: Some(RecursiveSmallFileThreads { hot: 17, cold: 19 }),
             ..AppConfigPatch::default()
         },
@@ -114,6 +117,7 @@ fn config_selection_precedence_contract_is_stable() {
         read_direct_threads: u64,
         read_page_cache_threads: u64,
         grep_direct_threads: u64,
+        cat_dev_null_backend: CatDevNullBackend,
         copy_auto_mode: CopyAutoMode,
         recursive_threads: RecursiveSmallFileThreads,
     }
@@ -131,6 +135,7 @@ fn config_selection_precedence_contract_is_stable() {
             read_direct_threads: 11,
             read_page_cache_threads: 12,
             grep_direct_threads: 13,
+            cat_dev_null_backend: CatDevNullBackend::Auto,
             copy_auto_mode: CopyAutoMode::Heuristic,
             recursive_threads: RecursiveSmallFileThreads { hot: 4, cold: 6 },
         },
@@ -146,6 +151,7 @@ fn config_selection_precedence_contract_is_stable() {
             read_direct_threads: 21,
             read_page_cache_threads: 22,
             grep_direct_threads: 23,
+            cat_dev_null_backend: CatDevNullBackend::FastCopy,
             copy_auto_mode: CopyAutoMode::Direct,
             recursive_threads: RecursiveSmallFileThreads { hot: 4, cold: 6 },
         },
@@ -161,6 +167,7 @@ fn config_selection_precedence_contract_is_stable() {
             read_direct_threads: 91,
             read_page_cache_threads: 22,
             grep_direct_threads: 23,
+            cat_dev_null_backend: CatDevNullBackend::BufferedCopy,
             copy_auto_mode: CopyAutoMode::Direct,
             recursive_threads: RecursiveSmallFileThreads { hot: 17, cold: 19 },
         },
@@ -176,6 +183,7 @@ fn config_selection_precedence_contract_is_stable() {
             read_direct_threads: 31,
             read_page_cache_threads: 12,
             grep_direct_threads: 13,
+            cat_dev_null_backend: CatDevNullBackend::Auto,
             copy_auto_mode: CopyAutoMode::CopyFileRange,
             recursive_threads: RecursiveSmallFileThreads { hot: 33, cold: 34 },
         },
@@ -219,6 +227,11 @@ fn config_selection_precedence_contract_is_stable() {
         assert_eq!(
             effective.grep.direct.num_threads, case.grep_direct_threads,
             "{}: grep.direct merge changed",
+            case.name
+        );
+        assert_eq!(
+            effective.cat_dev_null_backend, case.cat_dev_null_backend,
+            "{}: cat_dev_null_backend precedence changed",
             case.name
         );
         assert_eq!(
