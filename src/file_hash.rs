@@ -3,8 +3,10 @@ use crate::config::{load_config, IOParams};
 use crate::{hash_file_blake3, hash_file_crc32, visit_blocks_with_mode, IOMode};
 use openssl::hash::{Hasher, MessageDigest};
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::sync::mpsc;
+
+const HASH_SMALL_FILE_SERIAL_THRESHOLD: u64 = 8 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
@@ -39,11 +41,20 @@ pub fn hash_file(path: &str, algorithm: HashAlgorithm, io_mode: IOMode) -> io::R
         let message_digest = MessageDigest::from_name(name).ok_or_else(|| {
             io::Error::other(format!("OpenSSL digest algorithm not available: {name}"))
         })?;
+        if hash_file_uses_serial_fast_path(path, io_mode)? {
+            return hash_file_ordered_serial(path, message_digest);
+        }
         return hash_file_ordered(path, message_digest, io_mode);
     }
     match algorithm {
         HashAlgorithm::Blake3 => Ok(hash_file_blake3(path, io_mode)?.as_bytes().to_vec()),
-        HashAlgorithm::CRC32 => Ok(hash_file_crc32(path, io_mode)?.to_be_bytes().to_vec()),
+        HashAlgorithm::CRC32 => {
+            if hash_file_uses_serial_fast_path(path, io_mode)? {
+                Ok(hash_file_crc32_serial(path)?.to_be_bytes().to_vec())
+            } else {
+                Ok(hash_file_crc32(path, io_mode)?.to_be_bytes().to_vec())
+            }
+        }
         HashAlgorithm::FroBlockXxh3 => {
             hash_file_block_digest(path, BlockHashAlgorithm::Xxh3, io_mode)
         }
@@ -56,6 +67,48 @@ pub fn hash_file(path: &str, algorithm: HashAlgorithm, io_mode: IOMode) -> io::R
         | HashAlgorithm::Sha256
         | HashAlgorithm::Sha384
         | HashAlgorithm::Sha512 => unreachable!(),
+    }
+}
+
+fn hash_file_uses_serial_fast_path(path: &str, io_mode: IOMode) -> io::Result<bool> {
+    if io_mode == IOMode::Direct {
+        return Ok(false);
+    }
+    Ok(std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() <= HASH_SMALL_FILE_SERIAL_THRESHOLD)
+        .unwrap_or(false))
+}
+
+fn hash_file_ordered_serial(path: &str, message_digest: MessageDigest) -> io::Result<Vec<u8>> {
+    let mut hasher = Hasher::new(message_digest).map_err(io::Error::other)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return hasher
+                .finish()
+                .map_err(io::Error::other)
+                .map(|d| d.to_vec());
+        }
+        hasher.update(&buffer[..read]).map_err(io::Error::other)?;
+    }
+}
+
+fn hash_file_crc32_serial(path: &str) -> io::Result<u32> {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Cksum);
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut total_bytes = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(crate::finalize_cksum_crc(digest.finalize(), total_bytes));
+        }
+        digest.update(&buffer[..read]);
+        total_bytes = total_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("hash byte count overflow"))?;
     }
 }
 

@@ -27,18 +27,13 @@ mod tests {
 
     #[test]
     fn io_uring_setup_fallback_classifies_expected_errno_values() {
-        for errno in [
-            libc::EPERM,
-            libc::EACCES,
-            libc::ENOSYS,
-            libc::EOPNOTSUPP,
-        ] {
-            assert!(io_uring_setup_should_fallback(&io::Error::from_raw_os_error(
-                errno
-            )));
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(io_uring_setup_should_fallback(
+                &io::Error::from_raw_os_error(errno)
+            ));
         }
-        assert!(!io_uring_setup_should_fallback(&io::Error::from_raw_os_error(
-            libc::ENOMEM
-        )));
+        assert!(!io_uring_setup_should_fallback(
+            &io::Error::from_raw_os_error(libc::ENOMEM)
+        ));
     }
 }

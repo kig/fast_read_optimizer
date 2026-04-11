@@ -59,7 +59,9 @@ fn print_encrypt_help(decrypt: bool) {
     fro::cio_println!(
         "Usage: {command} --passphrase-file PATH [--cipher {AES_256_CTR_NAME}] [-o FILE] [INPUT]"
     );
-    fro::cio_println!("{action} data using OpenSSL-compatible `enc -aes-256-ctr -pbkdf2 -salt` output.");
+    fro::cio_println!(
+        "{action} data using OpenSSL-compatible `enc -aes-256-ctr -pbkdf2 -salt` output."
+    );
     fro::cio_println!();
     fro::cio_println!("  --passphrase-file PATH  read the passphrase from PATH");
     fro::cio_println!("  --cipher NAME           only {AES_256_CTR_NAME} is supported");
@@ -68,9 +70,15 @@ fn print_encrypt_help(decrypt: bool) {
     fro::cio_println!("      --version           output version information and exit");
     fro::cio_println!();
     fro::cio_println!("Notes:");
-    fro::cio_println!("  - Regular-file inputs are processed in 512 KiB blocks with parallel workers.");
-    fro::cio_println!("  - fro derives the OpenSSL key/IV with PBKDF2-HMAC-SHA256 (10,000 iterations).");
-    fro::cio_println!("  - Output begins with the standard `Salted__` header plus the 8-byte salt.");
+    fro::cio_println!(
+        "  - Regular-file inputs are processed in 512 KiB blocks with parallel workers."
+    );
+    fro::cio_println!(
+        "  - fro derives the OpenSSL key/IV with PBKDF2-HMAC-SHA256 (10,000 iterations)."
+    );
+    fro::cio_println!(
+        "  - Output begins with the standard `Salted__` header plus the 8-byte salt."
+    );
     fro::cio_println!("  - No trailing b3sum is emitted: appending bytes would change the ciphertext and break `openssl enc` compatibility.");
     fro::cio_println!("  - aes-256-ctr is unauthenticated, so a wrong passphrase may yield garbage plaintext without an explicit error.");
     fro::cio_println!("  - Input defaults to standard input when INPUT is omitted or is -.");
@@ -99,7 +107,9 @@ fn parse_encrypt_options(
             "--passphrase-file" => {
                 i += 1;
                 if i >= args.len() {
-                    fro::cio_eprintln!("{command}: option requires an argument -- 'passphrase-file'");
+                    fro::cio_eprintln!(
+                        "{command}: option requires an argument -- 'passphrase-file'"
+                    );
                     fro::cio_eprintln!("Try '{command} --help' for more information.");
                     return Ok(Err(1));
                 }
@@ -124,7 +134,9 @@ fn parse_encrypt_options(
                 output = Some(args[i].clone());
             }
             "--auto" | "--direct" | "--no-direct" => {
-                fro::cio_eprintln!("{command}: I/O mode flags are not supported for encrypt/decrypt");
+                fro::cio_eprintln!(
+                    "{command}: I/O mode flags are not supported for encrypt/decrypt"
+                );
                 fro::cio_eprintln!("Try '{command} --help' for more information.");
                 return Ok(Err(1));
             }

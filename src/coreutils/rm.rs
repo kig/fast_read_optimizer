@@ -30,7 +30,9 @@ fn print_rm_help(program: &str) {
     fro::cio_println!(
         "  -I                 prompt once before removing more than three files or recursively"
     );
-    fro::cio_println!("      --interactive[=WHEN] prompt according to WHEN: never, once, or always");
+    fro::cio_println!(
+        "      --interactive[=WHEN] prompt according to WHEN: never, once, or always"
+    );
     fro::cio_println!("  -r, -R, --recursive remove directories and their contents recursively");
     fro::cio_println!("  -v, --verbose      print a line for each removed path");
     fro::cio_println!("  -h, --help         display this help and exit");

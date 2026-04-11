@@ -1,4 +1,5 @@
 use super::*;
+use crate::io_util::open_direct_reader_or_fallback;
 
 pub(crate) fn print_coreutils_version(invoked: &str) {
     fro::cio_println!("{invoked} (fro coreutils) {FRO_VERSION}");
@@ -754,12 +755,17 @@ pub(crate) fn try_fast_copy_to_stdout_counted<F>(
 where
     F: FnMut(u64) -> io::Result<()>,
 {
-    if io_mode == IOMode::Direct {
-        return Ok(None);
-    }
     match input {
         StreamInput::File(path) if is_regular_input_path(path)? => {
-            let file = std::fs::File::open(path)?;
+            if io_mode == IOMode::Direct && !fd_is_fifo(fro::command_io::stdout_fd())? {
+                return Ok(None);
+            }
+            let page_cache = std::fs::File::open(path)?;
+            let file = if io_mode == IOMode::Direct {
+                open_direct_reader_or_fallback(path, &page_cache)?
+            } else {
+                page_cache
+            };
             copy_regular_fd_to_fd_sendfile_counted(
                 file.as_raw_fd(),
                 fro::command_io::stdout_fd(),

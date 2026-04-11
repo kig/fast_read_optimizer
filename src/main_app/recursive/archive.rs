@@ -1,12 +1,11 @@
 use super::*;
 use crate::common::{AlignedBuffer, IOMode};
 use crate::config::{self, IOParams};
-use crate::io_util::{sync_parent_directory, sync_path};
 use crate::main_app::TarCompression;
 use crate::writer::{copy_file_range_threaded, OffsetWriter};
 use gzp::{deflate::Mgzip, ZBuilder};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufWriter as StdBufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
@@ -116,18 +115,17 @@ fn create_uncompressed_tar_entries(
     total_size: u64,
 ) -> io::Result<u64> {
     if total_size <= TAR_LOW_LATENCY_TOTAL_BYTES_THRESHOLD {
-        let mut output_file = OpenOptions::new()
+        let output_file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(output)?;
-        let written = write_tar_stream(&entries, &mut output_file)?;
-        output_file.sync_all()?;
-        sync_path(output)?;
-        sync_parent_directory(output)?;
+        let mut writer = StdBufWriter::with_capacity(TAR_COPY_BUFFER_SIZE, output_file);
+        let written = write_tar_stream(&entries, &mut writer)?;
+        writer.flush()?;
         if verbose {
             fro::cio_eprintln!(
-                "tar create (low-latency): entries={}, total_size={}",
+                "tar create (low-latency streaming): entries={}, total_size={}",
                 entries.len(),
                 written
             );
@@ -280,9 +278,6 @@ fn create_uncompressed_tar_entries(
 
     let zero_blocks = [0u8; TAR_EOF_BLOCKS as usize];
     write_all_at(&output_file, total_size - TAR_EOF_BLOCKS, &zero_blocks)?;
-    output_file.sync_all()?;
-    sync_path(output)?;
-    sync_parent_directory(output)?;
     if verbose {
         fro::cio_eprintln!(
             "tar create: entries={}, total_size={}",
@@ -397,9 +392,6 @@ fn create_gzip_tar_entries(
         .from_writer(output_file);
     let tar_bytes = write_tar_stream(&entries, &mut *writer)?;
     let output_file = writer.finish().map_err(gzp_error)?;
-    output_file.sync_all()?;
-    sync_path(output)?;
-    sync_parent_directory(output)?;
     let archive_bytes = output_file.metadata()?.len();
     if verbose {
         fro::cio_eprintln!(
@@ -446,9 +438,6 @@ fn create_zstd_tar_entries(
         .map_err(io::Error::other)?;
     let tar_bytes = write_tar_stream(&entries, &mut writer)?;
     let output_file = writer.finish()?;
-    output_file.sync_all()?;
-    sync_path(output)?;
-    sync_parent_directory(output)?;
     let archive_bytes = output_file.metadata()?.len();
     if verbose {
         fro::cio_eprintln!(

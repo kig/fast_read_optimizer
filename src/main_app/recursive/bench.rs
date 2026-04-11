@@ -85,7 +85,9 @@ pub(in crate::main_app) fn bench_recursive_small_file_threads(
         config.save();
         fro::cio_println!(
             "saved recursive_small_file_threads for {}: hot={}, cold={}",
-            mount_path, tuned.hot, tuned.cold
+            mount_path,
+            tuned.hot,
+            tuned.cold
         );
     }
     Ok(best.1)

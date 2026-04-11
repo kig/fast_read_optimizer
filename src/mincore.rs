@@ -34,7 +34,14 @@ fn resident_probe_offsets(file_len: u64, page_size: usize) -> (u64, Option<u64>)
 fn is_page_resident(fd: RawFd, page_size: usize, offset: u64) -> Result<bool, String> {
     unsafe {
         let offset = i64::try_from(offset).map_err(|_| "mmap offset overflow".to_string())?;
-        let addr = mmap(ptr::null_mut(), page_size, PROT_READ, MAP_SHARED, fd, offset);
+        let addr = mmap(
+            ptr::null_mut(),
+            page_size,
+            PROT_READ,
+            MAP_SHARED,
+            fd,
+            offset,
+        );
         if addr == libc::MAP_FAILED {
             return Err("mmap failed".to_string());
         }

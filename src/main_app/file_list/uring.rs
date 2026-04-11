@@ -62,7 +62,8 @@ pub(super) fn raise_nofile_soft_limit(verbose: bool) {
         let err = io::Error::last_os_error();
         fro::cio_eprintln!(
             "warning: failed to raise RLIMIT_NOFILE from {} to {}: {err}",
-            limits.rlim_cur, limits.rlim_max
+            limits.rlim_cur,
+            limits.rlim_max
         );
     }
 }
@@ -259,7 +260,9 @@ pub(super) fn run_file_list_uring_bench_once(
     if verbose {
         fro::cio_eprintln!(
             "file-list-read-uring-bench run threads={} inflight/thread={} direct={}",
-            FILE_LIST_URING_THREAD_COUNT, inflight_per_thread, use_direct
+            FILE_LIST_URING_THREAD_COUNT,
+            inflight_per_thread,
+            use_direct
         );
     }
     let sampler = if verbose {

@@ -305,6 +305,51 @@ where
     Ok(())
 }
 
+fn visit_tar_archive_seek<R, F>(reader: &mut R, archive_path: &Path, mut visit: F) -> io::Result<()>
+where
+    R: Read + Seek + ?Sized,
+    F: FnMut(&TarArchiveEntry, &mut R) -> io::Result<u64>,
+{
+    loop {
+        let mut header = [0u8; 512];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("truncated tar header in {}", archive_path.display()),
+                ))
+            }
+            Err(err) => return Err(err),
+        }
+
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+
+        let data_offset = reader.stream_position()?;
+        let entry = parse_tar_header(&header, data_offset)?;
+        let consumed = visit(&entry, reader)?;
+        if consumed > entry.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tar visitor consumed more payload bytes than the entry contains",
+            ));
+        }
+        let to_skip = align_up(entry.size, TAR_BLOCK_SIZE).saturating_sub(consumed);
+        if to_skip > 0 {
+            reader.seek(SeekFrom::Current(i64::try_from(to_skip).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("tar skip length does not fit in i64: {to_skip}"),
+                )
+            })?))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn copy_reader_member_to_file<R: Read + ?Sized>(
     reader: &mut R,
     destination_path: &Path,
@@ -349,7 +394,15 @@ pub(super) fn list_tar_archive_reader<R: Read + ?Sized>(
 
 pub(super) fn list_tar_archive(path: &Path, verbose: bool) -> io::Result<()> {
     let mut file = fs::File::open(path)?;
-    list_tar_archive_reader(&mut file, path, verbose)
+    let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
+    visit_tar_archive_seek(&mut file, path, |entry, _reader| {
+        if verbose {
+            write_verbose_entry(&mut stdout, &entry)?;
+        } else {
+            write_plain_entry(&mut stdout, &entry)?;
+        }
+        Ok(0)
+    })
 }
 
 fn sanitized_tar_path(path: &[u8]) -> io::Result<PathBuf> {

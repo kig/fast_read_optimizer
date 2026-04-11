@@ -144,7 +144,11 @@ fn write_file_blocking(
             } else {
                 source_page_cache
             };
-            read_full_at(source_file, written, &mut buffer.as_mut_slice()[..chunk_len])?;
+            read_full_at(
+                source_file,
+                written,
+                &mut buffer.as_mut_slice()[..chunk_len],
+            )?;
         } else {
             fill_generated_pattern(&mut buffer.as_mut_slice()[..chunk_len], generated_pattern);
         }

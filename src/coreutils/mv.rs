@@ -298,7 +298,9 @@ pub(super) fn run_mv(args: &[String]) -> io::Result<i32> {
     }
 
     if explicit_target_directory.is_some() && no_target_directory {
-        fro::cio_eprintln!("mv: cannot combine --target-directory (-t) and --no-target-directory (-T)");
+        fro::cio_eprintln!(
+            "mv: cannot combine --target-directory (-t) and --no-target-directory (-T)"
+        );
         return Ok(1);
     }
 

@@ -139,7 +139,9 @@ pub(crate) fn run_cksum(args: &[String]) -> io::Result<i32> {
             .ok_or_else(|| io::Error::other("cksum byte count overflow"))?;
         match input {
             StreamInput::File(file) => fro::cio_println!("{} {} {}", crc, bytes, file),
-            StreamInput::Stdin { label: Some(label) } => fro::cio_println!("{} {} {}", crc, bytes, label),
+            StreamInput::Stdin { label: Some(label) } => {
+                fro::cio_println!("{} {} {}", crc, bytes, label)
+            }
             StreamInput::Stdin { label: None } => fro::cio_println!("{} {}", crc, bytes),
         }
     }

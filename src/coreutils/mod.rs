@@ -285,11 +285,16 @@ fn run_external_fallback(
             match failure_reason {
                 Some(reason) => fro::cio_eprintln!(
                     "fro: fallback {} -> {} {:?} ({})",
-                    invoked, program, command_args, reason
+                    invoked,
+                    program,
+                    command_args,
+                    reason
                 ),
                 None => fro::cio_eprintln!(
                     "fro: fallback {} -> {} {:?}",
-                    invoked, program, command_args
+                    invoked,
+                    program,
+                    command_args
                 ),
             }
         }

@@ -292,7 +292,10 @@ fn cmp_finish_with_loaded_bytes(
             let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
             fro::cio_eprintln!(
                 "cmp: EOF on {} after byte {}, {} {}",
-                eof_file, shared_remaining, phrase, line
+                eof_file,
+                shared_remaining,
+                phrase,
+                line
             );
         }
         return Ok(1);
@@ -626,7 +629,10 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
             fro::cio_eprintln!(
                 "cmp: EOF on {} after byte {}, {} {}",
-                eof_file, shared_remaining, phrase, line
+                eof_file,
+                shared_remaining,
+                phrase,
+                line
             );
         }
         return Ok(1);

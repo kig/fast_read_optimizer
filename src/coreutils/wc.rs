@@ -53,7 +53,9 @@ fn read_files0_inputs<R: Read>(reader: &mut R, reject_stdin_name: bool) -> io::R
         requested_count += 1;
         if name == b"-" {
             if reject_stdin_name {
-                fro::cio_eprintln!("wc: when reading file names from stdin, no file name of '-' allowed");
+                fro::cio_eprintln!(
+                    "wc: when reading file names from stdin, no file name of '-' allowed"
+                );
                 exit_code = 1;
             } else {
                 inputs.push(StreamInput::Stdin {
@@ -147,14 +149,12 @@ fn wc_totals_for_input(
                 let mut reader = std::fs::File::open(file)?;
                 wc_totals_from_fd_parallel(&mut reader, options, config, io_mode)
             }
-            StreamInput::Stdin { .. } => {
-                wc_totals_from_fd_parallel(
-                    &mut fro::command_io::stdin_file()?,
-                    options,
-                    config,
-                    io_mode,
-                )
-            }
+            StreamInput::Stdin { .. } => wc_totals_from_fd_parallel(
+                &mut fro::command_io::stdin_file()?,
+                options,
+                config,
+                io_mode,
+            ),
         },
     }
 }

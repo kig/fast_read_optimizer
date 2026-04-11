@@ -12,7 +12,9 @@ struct FindOutput {
 impl FindOutput {
     fn stdout() -> Self {
         Self {
-            inner: Mutex::new(fro::command_io::stdout_buf_writer(FIND_STDOUT_BUFFER_BYTES).unwrap()),
+            inner: Mutex::new(
+                fro::command_io::stdout_buf_writer(FIND_STDOUT_BUFFER_BYTES).unwrap(),
+            ),
         }
     }
 
@@ -517,11 +519,15 @@ fn print_find_help(program: &str) {
     fro::cio_println!();
     fro::cio_println!("  -maxdepth N        descend at most N levels below each starting path");
     fro::cio_println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
-    fro::cio_println!("  -name PATTERN      match the final path component using shell glob syntax");
+    fro::cio_println!(
+        "  -name PATTERN      match the final path component using shell glob syntax"
+    );
     fro::cio_println!("  -iname PATTERN     like -name, but match ASCII case-insensitively");
     fro::cio_println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
     fro::cio_println!("  -ipath PATTERN     like -path, but match ASCII case-insensitively");
-    fro::cio_println!("  -print             print each matching path followed by a newline (default)");
+    fro::cio_println!(
+        "  -print             print each matching path followed by a newline (default)"
+    );
     fro::cio_println!("  -print0            print each matching path followed by NUL");
     fro::cio_println!("  -h, --help         display this help and exit");
 }

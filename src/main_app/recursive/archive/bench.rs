@@ -1,5 +1,6 @@
 use super::*;
 use crate::io_util::checked_posix_fallocate;
+use crate::io_util::sync_path;
 use crate::writer::write_buffer;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
