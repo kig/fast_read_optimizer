@@ -8,6 +8,13 @@ use fro::test_sizing::{
     estimate_alloc_bytes, estimate_user_writes, resolve_test_size, FsSizingStats, TestSizeSource,
     TestSizingPolicy,
 };
+use std::io;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+const CAT_DEV_NULL_BENCHMARK_TRIALS: usize = 3;
+const CAT_DEV_NULL_BENCHMARK_MARGIN_NUMERATOR: u128 = 95;
+const CAT_DEV_NULL_BENCHMARK_MARGIN_DENOMINATOR: u128 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TargetSelection {
@@ -73,6 +80,78 @@ pub(super) fn resolve_target_selection(
     })
 }
 
+pub(super) fn cat_dev_null_pattern_selected<S: AsRef<str>>(patterns: &[S]) -> bool {
+    patterns.is_empty()
+        || patterns
+            .iter()
+            .any(|pattern| matches!(pattern.as_ref(), "cat" | "cat-dev-null" | "cat_dev_null"))
+}
+
+fn median_duration(mut samples: Vec<Duration>) -> Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+pub(super) fn select_cat_dev_null_backend(
+    fast_copy_elapsed: Duration,
+    buffered_copy_elapsed: Duration,
+) -> fro::config::CatDevNullBackend {
+    let fast_copy_ns = fast_copy_elapsed.as_nanos();
+    let buffered_copy_ns = buffered_copy_elapsed.as_nanos();
+    if buffered_copy_ns * CAT_DEV_NULL_BENCHMARK_MARGIN_DENOMINATOR
+        < fast_copy_ns * CAT_DEV_NULL_BENCHMARK_MARGIN_NUMERATOR
+    {
+        fro::config::CatDevNullBackend::BufferedCopy
+    } else {
+        fro::config::CatDevNullBackend::FastCopy
+    }
+}
+
+fn write_config_snapshot(path: &Path, config_path: Option<&str>) -> io::Result<()> {
+    let data = fro::config::load_config(config_path).to_pretty_json()?;
+    fs::write(path, data)
+}
+
+fn benchmark_cat_dev_null_backend(
+    fro_exe: &Path,
+    source_file: &str,
+    scratch_config_path: &Path,
+    backend: fro::config::CatDevNullBackend,
+) -> io::Result<Duration> {
+    let scratch_config = scratch_config_path.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 scratch config path")
+    })?;
+    let mut config = fro::config::load_config(Some(scratch_config));
+    config.update_cat_dev_null_backend_for_path(source_file, backend);
+    config.save();
+
+    let mut samples = Vec::with_capacity(CAT_DEV_NULL_BENCHMARK_TRIALS);
+    for _ in 0..CAT_DEV_NULL_BENCHMARK_TRIALS {
+        let start = Instant::now();
+        let status = Command::new(fro_exe)
+            .env("FRO_CONFIG", scratch_config)
+            .arg("cat")
+            .arg("--no-direct")
+            .arg(source_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "cat benchmark failed for backend {:?}",
+                backend
+            )));
+        }
+        samples.push(start.elapsed());
+    }
+
+    Ok(median_duration(samples))
+}
+
+fn gib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
+    bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0 * 1024.0)
+}
+
 pub(super) fn main_impl() {
     let args: Vec<String> = env::args().collect();
     let mut patterns = vec![];
@@ -91,6 +170,7 @@ pub(super) fn main_impl() {
              - --test-size 1GiB         (force fixed size)\n\
              - --max-drive-writes 0.05  (cap total user-data writes per run to ~5% of FS capacity)"
         );
+        println!("cat tunes only the plain regular-file -> /dev/null cat_dev_null_backend knob.");
         println!("--global writes tuned results into config defaults for the selected --for target mount.");
         println!("\n--list-devices prints likely disk-backed mountpoints as JSON and exits.");
         println!("--list-devices-all prints all mountpoints from /proc/self/mountinfo as JSON and exits.");
@@ -259,8 +339,10 @@ pub(super) fn main_impl() {
         let source_file = test_path.join("fro_bench_tmp_source").display().to_string();
         let target_file_dir = test_path.join("fro_bench_tmp_direct").display().to_string();
         let target_file_cache = test_path.join("fro_bench_tmp_cache").display().to_string();
+        let cat_benchmark_config = test_path.join("fro_optimize_cat_dev_null.json");
         let recursive_tree = test_path.join("fro_optimize_recursive_small_tree");
         let recursive_tree_str = recursive_tree.display().to_string();
+        let optimize_cat_dev_null = cat_dev_null_pattern_selected(&patterns);
 
         let mut configs: Vec<Vec<String>> = vec![
             argsv!("read", "-s", "--direct", "-n", &read_iters, &source_file),
@@ -440,7 +522,7 @@ pub(super) fn main_impl() {
             }
         }
 
-        if selected.is_empty() {
+        if selected.is_empty() && !optimize_cat_dev_null {
             eprintln!("No optimizer modes selected.");
             return;
         }
@@ -492,6 +574,10 @@ pub(super) fn main_impl() {
                 }
                 num_full_writes = num_full_writes.saturating_add(n);
             }
+        }
+
+        if optimize_cat_dev_null {
+            need_source = true;
         }
 
         if need_target_dir || need_target_cache {
@@ -649,6 +735,46 @@ pub(super) fn main_impl() {
             }
         }
 
+        if optimize_cat_dev_null {
+            println!("Optimizing: cat /dev/null backend");
+            match write_config_snapshot(&cat_benchmark_config, config_path).and_then(|_| {
+                let fast_copy_elapsed = benchmark_cat_dev_null_backend(
+                    &fro_exe,
+                    &source_file,
+                    &cat_benchmark_config,
+                    fro::config::CatDevNullBackend::FastCopy,
+                )?;
+                write_config_snapshot(&cat_benchmark_config, config_path)?;
+                let buffered_copy_elapsed = benchmark_cat_dev_null_backend(
+                    &fro_exe,
+                    &source_file,
+                    &cat_benchmark_config,
+                    fro::config::CatDevNullBackend::BufferedCopy,
+                )?;
+                Ok((fast_copy_elapsed, buffered_copy_elapsed))
+            }) {
+                Ok((fast_copy_elapsed, buffered_copy_elapsed)) => {
+                    let selected_backend =
+                        select_cat_dev_null_backend(fast_copy_elapsed, buffered_copy_elapsed);
+                    let mut cfg = fro::config::load_config(config_path);
+                    cfg.update_cat_dev_null_backend_for_path(
+                        target_path.unwrap_or(test_dir),
+                        selected_backend,
+                    );
+                    cfg.save();
+                    println!(
+                        "Saved cat /dev/null backend: {:?} (fast_copy={:.2} GiB/s, buffered_copy={:.2} GiB/s)",
+                        selected_backend,
+                        gib_per_sec(size, fast_copy_elapsed),
+                        gib_per_sec(size, buffered_copy_elapsed),
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Warning: cat /dev/null backend optimization failed: {err}");
+                }
+            }
+        }
+
         if selected
             .iter()
             .any(|cfg| cfg.first().is_some_and(|op| op == "copy"))
@@ -677,6 +803,7 @@ pub(super) fn main_impl() {
         let _ = fs::remove_file(source_file);
         let _ = fs::remove_file(target_file_dir);
         let _ = fs::remove_file(target_file_cache);
+        let _ = fs::remove_file(cat_benchmark_config);
         let _ = fs::remove_dir_all(recursive_tree);
 
         let saved_to = config_path.map(|p| p.to_string()).unwrap_or_else(|| {

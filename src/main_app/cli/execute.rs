@@ -59,6 +59,10 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         small_file_thread_cache_state,
     } = parsed;
 
+    if let Some(path) = config_path.as_deref() {
+        std::env::set_var("FRO_CONFIG", path);
+    }
+
     if mode == "config" {
         let config = config::load_config(config_path.as_deref());
         match config_subcommand.as_deref() {
