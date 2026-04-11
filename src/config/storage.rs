@@ -149,6 +149,10 @@ pub(super) fn default_bundle_v1() -> ConfigBundleV1 {
     }
 }
 
+pub(super) fn default_cat_dev_null_backend() -> CatDevNullBackend {
+    CatDevNullBackend::Auto
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let default_direct = IOParams {
@@ -223,6 +227,7 @@ impl Default for AppConfig {
             read_to_memory: default_mode.clone(),
             write: default_write_mode.clone(),
             copy: default_write_mode.clone(),
+            cat_dev_null_backend: default_cat_dev_null_backend(),
             copy_range: default_copy_range,
             copy_auto_mode: CopyAutoMode::Heuristic,
             read_auto_strategy: default_read_auto_strategy(),

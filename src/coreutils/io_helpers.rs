@@ -303,6 +303,40 @@ pub(crate) fn copy_file_like_to_output_counted<W: Write>(
     }
 }
 
+pub(crate) fn copy_file_like_to_stdout_raw_counted(input: &StreamInput) -> io::Result<u64> {
+    let stdout_fd = fro::command_io::stdout_fd();
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut total = 0_u64;
+    match input {
+        StreamInput::File(path) => {
+            let mut reader = std::fs::File::open(path)?;
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(total);
+                }
+                write_raw_fd_all(stdout_fd, &buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
+            }
+        }
+        StreamInput::Stdin { .. } => {
+            let mut reader = stdin_buf_reader()?;
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(total);
+                }
+                write_raw_fd_all(stdout_fd, &buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
+            }
+        }
+    }
+}
+
 pub(crate) fn fd_is_fifo(fd: libc::c_int) -> io::Result<bool> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };

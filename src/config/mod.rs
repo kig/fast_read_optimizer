@@ -23,10 +23,11 @@ pub use self::device::{device_signature_for_path, mount_info_for_path};
 #[cfg(test)]
 use self::storage::clear_default_config_cache_for_tests;
 use self::storage::{
-    default_bundle_v1, default_compute_mode_config, default_copy_auto_mode,
-    default_copy_range_params, default_hash_mode_config, default_read_auto_strategy,
-    default_read_to_memory_mode_config, default_recursive_small_file_threads,
-    default_verify_mode_config, refresh_cached_default_config,
+    default_bundle_v1, default_cat_dev_null_backend, default_compute_mode_config,
+    default_copy_auto_mode, default_copy_range_params, default_hash_mode_config,
+    default_read_auto_strategy, default_read_to_memory_mode_config,
+    default_recursive_small_file_threads, default_verify_mode_config,
+    refresh_cached_default_config,
 };
 
 static MOUNTINFO_WARNING: Once = Once::new();
@@ -52,6 +53,15 @@ pub struct MountInfo {
     pub mount_point: String,
     pub fstype: String,
     pub mount_source: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CatDevNullBackend {
+    #[default]
+    Auto,
+    FastCopy,
+    BufferedCopy,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -110,6 +120,8 @@ pub struct AppConfig {
     pub read_to_memory: ModeConfig,
     pub write: ModeConfig,
     pub copy: ModeConfig,
+    #[serde(default = "default_cat_dev_null_backend")]
+    pub cat_dev_null_backend: CatDevNullBackend,
     #[serde(default = "default_copy_range_params")]
     pub copy_range: IOParams,
     #[serde(default = "default_copy_auto_mode")]
@@ -156,6 +168,7 @@ pub struct AppConfigPatch {
     pub read_to_memory: Option<ModeConfigPatch>,
     pub write: Option<ModeConfigPatch>,
     pub copy: Option<ModeConfigPatch>,
+    pub cat_dev_null_backend: Option<CatDevNullBackend>,
     pub copy_range: Option<IOParams>,
     pub copy_auto_mode: Option<CopyAutoMode>,
     pub read_auto_strategy: Option<ReadAutoStrategy>,
@@ -395,6 +408,10 @@ impl LoadedConfig {
     pub fn get_read_auto_strategy(&self) -> ReadAutoStrategy {
         self.defaults_ref().read_auto_strategy
     }
+    #[allow(dead_code)]
+    pub fn get_cat_dev_null_backend(&self) -> CatDevNullBackend {
+        self.defaults_ref().cat_dev_null_backend
+    }
     pub fn get_params_for_path(&self, mode: &str, direct: bool, path: &str) -> IOParams {
         self.effective_config_for_config_path(path)
             .get_params(mode, direct)
@@ -416,6 +433,17 @@ impl LoadedConfig {
     pub fn get_read_auto_strategy_for_path(&self, path: &str) -> ReadAutoStrategy {
         self.effective_config_for_config_path(path)
             .read_auto_strategy
+    }
+
+    pub fn get_cat_dev_null_backend_for_path(&self, path: &str) -> CatDevNullBackend {
+        self.effective_config_for_config_path(path)
+            .cat_dev_null_backend
+    }
+
+    #[allow(dead_code)]
+    pub fn get_cat_dev_null_backend_for_config_path(&self, path: &str) -> CatDevNullBackend {
+        self.effective_config_for_config_path(path)
+            .cat_dev_null_backend
     }
 
     pub fn get_recursive_small_file_threads_for_path(
@@ -522,6 +550,11 @@ impl LoadedConfig {
     }
 
     #[allow(dead_code)]
+    pub fn update_cat_dev_null_backend(&mut self, backend: CatDevNullBackend) {
+        self.defaults_mut().cat_dev_null_backend = backend;
+    }
+
+    #[allow(dead_code)]
     pub fn update_recursive_small_file_threads(&mut self, threads: RecursiveSmallFileThreads) {
         self.defaults_mut().recursive_small_file_threads = threads;
     }
@@ -574,6 +607,18 @@ impl LoadedConfig {
             entry.read_auto_strategy = Some(strategy);
         } else if let LoadedConfig::Legacy { config, .. } = self {
             config.read_auto_strategy = strategy;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn update_cat_dev_null_backend_for_path(&mut self, path: &str, backend: CatDevNullBackend) {
+        if matches!(self, LoadedConfig::Legacy { .. }) {
+            self.promote_legacy_to_bundle();
+        }
+        if let Some(entry) = self.mount_patch_for_path_mut(path) {
+            entry.cat_dev_null_backend = Some(backend);
+        } else if let LoadedConfig::Legacy { config, .. } = self {
+            config.cat_dev_null_backend = backend;
         }
     }
 
@@ -674,6 +719,9 @@ impl AppConfigPatch {
         }
         if let Some(patch) = &self.copy {
             patch.apply_to(&mut config.copy);
+        }
+        if let Some(backend) = self.cat_dev_null_backend {
+            config.cat_dev_null_backend = backend;
         }
         if let Some(params) = self.copy_range.clone() {
             config.copy_range = params;

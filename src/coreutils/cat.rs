@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::CatDevNullBackend;
 use memchr::memchr_iter;
 
 #[derive(Clone)]
@@ -19,6 +20,76 @@ enum CatExecutionBackend {
     OrderedTransform,
     FastCopyToStdout,
     BufferedCopy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatStdoutSinkKind {
+    DevNull,
+    Pipe,
+    Other,
+}
+
+fn cat_stdout_sink_kind() -> io::Result<CatStdoutSinkKind> {
+    if is_stdout_dev_null() {
+        return Ok(CatStdoutSinkKind::DevNull);
+    }
+    if fd_is_fifo(fro::command_io::stdout_fd())? {
+        return Ok(CatStdoutSinkKind::Pipe);
+    }
+    Ok(CatStdoutSinkKind::Other)
+}
+
+fn cat_dev_null_backend_for_input(
+    input: &StreamInput,
+    sink_kind: CatStdoutSinkKind,
+) -> io::Result<CatDevNullBackend> {
+    if sink_kind != CatStdoutSinkKind::DevNull {
+        return Ok(CatDevNullBackend::Auto);
+    }
+    let StreamInput::File(path) = input else {
+        return Ok(CatDevNullBackend::Auto);
+    };
+    if !is_regular_input_path(path)? {
+        return Ok(CatDevNullBackend::Auto);
+    }
+    Ok(load_config(None).get_cat_dev_null_backend_for_path(path))
+}
+
+fn cat_execution_backend_for_sink(
+    input: &StreamInput,
+    _args: &CatArgs,
+    sink_kind: CatStdoutSinkKind,
+    dev_null_backend: CatDevNullBackend,
+) -> io::Result<CatExecutionBackend> {
+    if sink_kind == CatStdoutSinkKind::DevNull {
+        match dev_null_backend {
+            CatDevNullBackend::FastCopy => return Ok(CatExecutionBackend::FastCopyToStdout),
+            CatDevNullBackend::BufferedCopy => return Ok(CatExecutionBackend::BufferedCopy),
+            CatDevNullBackend::Auto => {}
+        }
+    }
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            Ok(CatExecutionBackend::FastCopyToStdout)
+        }
+        StreamInput::Stdin { .. } => {
+            if fd_is_regular(fro::command_io::stdin_fd())?
+                || fd_is_fifo(fro::command_io::stdin_fd())?
+            {
+                Ok(CatExecutionBackend::FastCopyToStdout)
+            } else {
+                Ok(CatExecutionBackend::BufferedCopy)
+            }
+        }
+        StreamInput::File(path) => {
+            let file_type = fs::metadata(path)?.file_type();
+            if file_type.is_fifo() {
+                Ok(CatExecutionBackend::FastCopyToStdout)
+            } else {
+                Ok(CatExecutionBackend::BufferedCopy)
+            }
+        }
+    }
 }
 
 fn parse_short_cat_flags(arg: &str, parsed: &mut CatArgs) -> io::Result<bool> {
@@ -200,28 +271,9 @@ fn cat_execution_backend(input: &StreamInput, args: &CatArgs) -> io::Result<CatE
     if args.io_mode == IOMode::Direct {
         return Ok(CatExecutionBackend::BufferedCopy);
     }
-    match input {
-        StreamInput::File(path) if is_regular_input_path(path)? => {
-            Ok(CatExecutionBackend::FastCopyToStdout)
-        }
-        StreamInput::Stdin { .. } => {
-            if fd_is_regular(fro::command_io::stdin_fd())?
-                || fd_is_fifo(fro::command_io::stdin_fd())?
-            {
-                Ok(CatExecutionBackend::FastCopyToStdout)
-            } else {
-                Ok(CatExecutionBackend::BufferedCopy)
-            }
-        }
-        StreamInput::File(path) => {
-            let file_type = fs::metadata(path)?.file_type();
-            if file_type.is_fifo() {
-                Ok(CatExecutionBackend::FastCopyToStdout)
-            } else {
-                Ok(CatExecutionBackend::BufferedCopy)
-            }
-        }
-    }
+    let sink_kind = cat_stdout_sink_kind()?;
+    let dev_null_backend = cat_dev_null_backend_for_input(input, sink_kind)?;
+    cat_execution_backend_for_sink(input, args, sink_kind, dev_null_backend)
 }
 
 pub(super) fn cat_short_visual_flag_effect(flag: u8) -> Option<(bool, bool, bool)> {
@@ -428,6 +480,7 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
         return Ok(());
     }
     let mut out = None;
+    let stdout_is_dev_null = is_stdout_dev_null();
     for input in inputs {
         let backend = cat_execution_backend(&input, &parsed)?;
         debug_assert_ne!(backend, CatExecutionBackend::OrderedTransform);
@@ -440,6 +493,10 @@ pub(super) fn run_cat(args: &[String]) -> io::Result<()> {
             .is_some()
         {
             total_bytes += copied;
+            continue;
+        }
+        if stdout_is_dev_null && backend == CatExecutionBackend::BufferedCopy {
+            total_bytes += copy_file_like_to_stdout_raw_counted(&input)?;
             continue;
         }
         let out = out.get_or_insert(stdout_buf_writer()?);
@@ -633,11 +690,13 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::{
-        cat_execution_backend, cat_numbering_step, cat_short_visual_flag_effect,
-        cat_should_number_line, cat_show_ends_rendered_len, cat_show_tabs_rendered_len,
-        cat_squeeze_blank_step, cat_uses_transform_path, cat_visible_byte_rendered_len,
-        parse_cat_args, parse_short_cat_flags, CatArgs, CatExecutionBackend, StreamInput,
+        cat_execution_backend, cat_execution_backend_for_sink, cat_numbering_step,
+        cat_short_visual_flag_effect, cat_should_number_line, cat_show_ends_rendered_len,
+        cat_show_tabs_rendered_len, cat_squeeze_blank_step, cat_uses_transform_path,
+        cat_visible_byte_rendered_len, parse_cat_args, parse_short_cat_flags, CatArgs,
+        CatExecutionBackend, CatStdoutSinkKind, StreamInput,
     };
+    use crate::config::CatDevNullBackend;
     use std::io;
 
     fn cat_test_temp_file(name: &str) -> std::path::PathBuf {
@@ -837,6 +896,62 @@ mod tests {
         assert_eq!(
             cat_execution_backend(&input, &parsed).unwrap(),
             CatExecutionBackend::BufferedCopy
+        );
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn dev_null_override_can_move_plain_cat_off_fast_copy_backend() {
+        let tmp = cat_test_temp_file("fro-cat-dev-null-backend");
+        std::fs::write(&tmp, b"dev-null backend selection\n").unwrap();
+        let file = tmp.display().to_string();
+        let input = StreamInput::File(file.clone());
+        let args = vec!["cat".to_string(), file];
+        let parsed = parse_cat_args(&args).unwrap();
+
+        assert_eq!(
+            cat_execution_backend_for_sink(
+                &input,
+                &parsed,
+                CatStdoutSinkKind::DevNull,
+                CatDevNullBackend::BufferedCopy,
+            )
+            .unwrap(),
+            CatExecutionBackend::BufferedCopy
+        );
+        assert_eq!(
+            cat_execution_backend_for_sink(
+                &input,
+                &parsed,
+                CatStdoutSinkKind::DevNull,
+                CatDevNullBackend::FastCopy,
+            )
+            .unwrap(),
+            CatExecutionBackend::FastCopyToStdout
+        );
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn dev_null_override_does_not_change_pipe_sink_backend() {
+        let tmp = cat_test_temp_file("fro-cat-pipe-backend");
+        std::fs::write(&tmp, b"pipe backend selection\n").unwrap();
+        let file = tmp.display().to_string();
+        let input = StreamInput::File(file.clone());
+        let args = vec!["cat".to_string(), file];
+        let parsed = parse_cat_args(&args).unwrap();
+
+        assert_eq!(
+            cat_execution_backend_for_sink(
+                &input,
+                &parsed,
+                CatStdoutSinkKind::Pipe,
+                CatDevNullBackend::BufferedCopy,
+            )
+            .unwrap(),
+            CatExecutionBackend::FastCopyToStdout
         );
 
         let _ = std::fs::remove_file(tmp);
