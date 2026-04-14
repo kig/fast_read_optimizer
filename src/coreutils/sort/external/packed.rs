@@ -29,7 +29,7 @@ pub(crate) struct SortCheckResult {
 pub(crate) fn sort_inputs(
     inputs: &[StreamInput],
     io_mode: IOMode,
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -40,9 +40,10 @@ pub(crate) fn sort_inputs(
     let in_memory_limit = sort_in_memory_limit_bytes(configured_budget);
     if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
         if tiny_regular_sort_fast_path_enabled(total_bytes, io_mode, output_path) {
-            return sort_inputs_tiny_regular_fast(inputs, mode, unique, reverse, terminator);
+            return sort_inputs_tiny_regular_fast(inputs, comparator, unique, reverse, terminator);
         }
-        if bytewise_packed_fast_path_enabled(inputs, total_bytes, mode, temporary_directory)? {
+        if bytewise_packed_fast_path_enabled(inputs, total_bytes, comparator, temporary_directory)?
+        {
             return sort_inputs_bytewise_packed_fast(
                 inputs,
                 io_mode,
@@ -56,7 +57,7 @@ pub(crate) fn sort_inputs(
             return sort_inputs_in_memory(
                 inputs,
                 io_mode,
-                mode,
+                comparator,
                 unique,
                 reverse,
                 terminator,
@@ -66,7 +67,7 @@ pub(crate) fn sort_inputs(
         return sort_inputs_streamed(
             inputs,
             io_mode,
-            mode,
+            comparator,
             unique,
             reverse,
             terminator,
@@ -78,7 +79,7 @@ pub(crate) fn sort_inputs(
     sort_inputs_streamed(
         inputs,
         io_mode,
-        mode,
+        comparator,
         unique,
         reverse,
         terminator,
@@ -91,10 +92,11 @@ pub(crate) fn sort_inputs(
 pub(super) fn bytewise_packed_fast_path_enabled(
     inputs: &[StreamInput],
     total_bytes: u64,
-    mode: SortMode,
+    comparator: &SortComparator,
     temporary_directory: Option<&Path>,
 ) -> io::Result<bool> {
-    if mode != SortMode::Bytewise
+    if comparator.mode != SortMode::Bytewise
+        || comparator.has_key_selection()
         || total_bytes > SORT_BYTEWISE_PACKED_FAST_MAX_BYTES
         || inputs.len() != 1
         || temporary_directory.is_some()
@@ -326,4 +328,3 @@ fn sort_parallel_threads() -> usize {
         .map(|count| count.get().min(SORT_PARALLEL_MAX_THREADS))
         .unwrap_or(1)
 }
-

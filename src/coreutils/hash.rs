@@ -1,4 +1,6 @@
 use super::*;
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use crc_fast::{CrcAlgorithm as FastCrcAlgorithm, Digest as CrcDigest};
 use fro::finalize_cksum_crc;
 use openssl::hash::Hasher;
@@ -7,6 +9,9 @@ mod check;
 pub(crate) mod cksum;
 
 use self::check::{is_check_behavior_flag, parse_check_options, CheckOptions, ManifestEntry};
+
+const BLAKE2B_DEFAULT_LENGTH_BITS: usize = 512;
+const BLAKE2B_MAX_LENGTH_BITS: usize = 512;
 
 fn hash_sum_needs_escape(label: &str) -> bool {
     label.bytes().any(|byte| matches!(byte, b'\\' | b'\n'))
@@ -124,6 +129,7 @@ struct HashSumOptions {
     io_mode: IOMode,
     report_gbps: bool,
     format: HashSumFormat,
+    blake2_length_bits: usize,
     zero_terminated: bool,
     check: bool,
     tag_with_check: bool,
@@ -131,61 +137,113 @@ struct HashSumOptions {
     inputs: Vec<StreamInput>,
 }
 
-fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
+fn parse_hash_sum_options(args: &[String], algorithm: HashAlgorithm) -> io::Result<HashSumOptions> {
     let mut io_mode = IOMode::Auto;
     let mut report_gbps = false;
     let mut format = HashSumFormat::Default;
+    let mut blake2_length_bits = BLAKE2B_DEFAULT_LENGTH_BITS;
     let mut zero_terminated = false;
     let mut check = false;
     let mut saw_tag = false;
     let mut files = Vec::new();
     let mut parse_options = true;
-    for arg in &args[1..] {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
         if parse_options {
             match arg.as_str() {
                 "--auto" => {
                     io_mode = IOMode::Auto;
+                    index += 1;
                     continue;
                 }
                 "--direct" => {
                     io_mode = IOMode::Direct;
+                    index += 1;
                     continue;
                 }
                 "--no-direct" => {
                     io_mode = IOMode::PageCache;
+                    index += 1;
                     continue;
                 }
                 "--report-gbps" => {
                     report_gbps = true;
+                    index += 1;
                     continue;
                 }
                 "-b" | "--binary" => {
                     format = HashSumFormat::Binary;
+                    index += 1;
                     continue;
                 }
                 "-t" | "--text" => {
                     format = HashSumFormat::Default;
+                    index += 1;
                     continue;
                 }
                 "--tag" => {
                     saw_tag = true;
                     format = HashSumFormat::Tag;
+                    index += 1;
+                    continue;
+                }
+                "-l" if algorithm == HashAlgorithm::Blake2b512 => {
+                    let Some(value) = args.get(index + 1) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "option requires an argument -- 'l'\nTry 'b2sum --help' for more information.",
+                        ));
+                    };
+                    blake2_length_bits = parse_b2sum_length_bits(value)?;
+                    index += 2;
+                    continue;
+                }
+                "--length" if algorithm == HashAlgorithm::Blake2b512 => {
+                    let Some(value) = args.get(index + 1) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "option '--length' requires an argument\nTry 'b2sum --help' for more information.",
+                        ));
+                    };
+                    blake2_length_bits = parse_b2sum_length_bits(value)?;
+                    index += 2;
                     continue;
                 }
                 "-z" | "--zero" => {
                     zero_terminated = true;
+                    index += 1;
                     continue;
                 }
                 "-c" | "--check" => {
                     check = true;
                     format = HashSumFormat::Default;
+                    index += 1;
                     continue;
                 }
                 other if is_check_behavior_flag(other) => {
+                    index += 1;
+                    continue;
+                }
+                other
+                    if algorithm == HashAlgorithm::Blake2b512 && other.starts_with("--length=") =>
+                {
+                    blake2_length_bits = parse_b2sum_length_bits(&other["--length=".len()..])?;
+                    index += 1;
+                    continue;
+                }
+                other
+                    if algorithm == HashAlgorithm::Blake2b512
+                        && other.starts_with("-l")
+                        && other.len() > 2 =>
+                {
+                    blake2_length_bits = parse_b2sum_length_bits(&other[2..])?;
+                    index += 1;
                     continue;
                 }
                 "--" => {
                     parse_options = false;
+                    index += 1;
                     continue;
                 }
                 "-" => {}
@@ -199,11 +257,13 @@ fn parse_hash_sum_options(args: &[String]) -> io::Result<HashSumOptions> {
             }
         }
         files.push(arg.clone());
+        index += 1;
     }
     Ok(HashSumOptions {
         io_mode,
         report_gbps,
         format,
+        blake2_length_bits,
         zero_terminated,
         check,
         tag_with_check: check && saw_tag,
@@ -224,6 +284,20 @@ fn hash_sum_tag_name(algorithm: HashAlgorithm) -> Option<&'static str> {
         | HashAlgorithm::CRC32
         | HashAlgorithm::FroBlockXxh3
         | HashAlgorithm::FroBlockSha256 => None,
+    }
+}
+
+fn hash_sum_tag_label(algorithm: HashAlgorithm, digest_len_bytes: usize) -> Option<String> {
+    match algorithm {
+        HashAlgorithm::Blake2b512 => {
+            let bits = digest_len_bytes * 8;
+            if bits == BLAKE2B_DEFAULT_LENGTH_BITS {
+                Some("BLAKE2b".to_string())
+            } else {
+                Some(format!("BLAKE2b-{bits}"))
+            }
+        }
+        _ => hash_sum_tag_name(algorithm).map(str::to_string),
     }
 }
 
@@ -302,7 +376,7 @@ fn write_hash_sum_line(
         HashSumFormat::Tag => format!(
             "{}{} ({}) = {}",
             if escaped { "\\" } else { "" },
-            hash_sum_tag_name(algorithm).ok_or_else(|| {
+            hash_sum_tag_label(algorithm, digest.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "unsupported tagged digest")
             })?,
             label,
@@ -313,26 +387,141 @@ fn write_hash_sum_line(
     out.write_all(if zero_terminated { b"\0" } else { b"\n" })
 }
 
+fn parse_b2sum_length_bits(value: &str) -> io::Result<usize> {
+    let bits = value.parse::<usize>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid length: ‘{value}’"),
+        )
+    })?;
+    if bits == 0 {
+        return Ok(BLAKE2B_DEFAULT_LENGTH_BITS);
+    }
+    if bits % 8 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid length: ‘{value}’\nlength is not a multiple of 8"),
+        ));
+    }
+    if bits > BLAKE2B_MAX_LENGTH_BITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid length: ‘{value}’\nmaximum digest length for ‘blake2b’ is {BLAKE2B_MAX_LENGTH_BITS} bits"
+            ),
+        ));
+    }
+    Ok(bits)
+}
+
+fn hash_blake2b_input(
+    input: &StreamInput,
+    io_mode: IOMode,
+    digest_len_bytes: usize,
+) -> io::Result<(Vec<u8>, u64)> {
+    let mut hasher = Blake2bVar::new(digest_len_bytes)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
+        hasher.update(block);
+        Ok(())
+    })?;
+    let mut digest = vec![0_u8; digest_len_bytes];
+    hasher
+        .finalize_variable(&mut digest)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+    Ok((digest, bytes))
+}
+
+fn hash_sum_input(
+    input: &StreamInput,
+    algorithm: HashAlgorithm,
+    io_mode: IOMode,
+    blake2_length_bits: usize,
+) -> io::Result<(Vec<u8>, u64)> {
+    if algorithm == HashAlgorithm::Blake2b512 && blake2_length_bits != BLAKE2B_DEFAULT_LENGTH_BITS {
+        return match input {
+            StreamInput::File(file) => hash_blake2b_input(
+                &StreamInput::File(file.clone()),
+                io_mode,
+                blake2_length_bits / 8,
+            ),
+            StreamInput::Stdin { .. } => match regular_stdin_path()? {
+                Some(path) => {
+                    hash_blake2b_input(&StreamInput::File(path), io_mode, blake2_length_bits / 8)
+                }
+                None => hash_blake2b_input(input, io_mode, blake2_length_bits / 8),
+            },
+        };
+    }
+
+    match input {
+        StreamInput::File(file) if is_regular_input_path(file)? => Ok((
+            hash_file(file, algorithm, io_mode)?,
+            fs::metadata(file)?.len(),
+        )),
+        StreamInput::Stdin { .. } => match regular_stdin_path()? {
+            Some(path) => Ok((
+                hash_file(&path, algorithm, io_mode)?,
+                fs::metadata(path)?.len(),
+            )),
+            None => hash_stream_input(input, algorithm, io_mode),
+        },
+        _ => hash_stream_input(input, algorithm, io_mode),
+    }
+}
+
 fn parse_tagged_hash_check_line<'a>(
     line: &'a str,
     algorithm: HashAlgorithm,
-) -> Option<(&'a str, &'a str, bool)> {
+) -> Option<(&'a str, &'a str, bool, usize)> {
     let escaped = line.starts_with('\\');
-    let tag = hash_sum_tag_name(algorithm)?;
     let line = if escaped {
         line.strip_prefix('\\')?
     } else {
         line
     };
-    let rest = line.strip_prefix(tag)?.strip_prefix(" (")?;
+    let (rest, digest_bits) = match algorithm {
+        HashAlgorithm::Blake2b512 => {
+            if let Some(rest) = line.strip_prefix("BLAKE2b (") {
+                (rest, BLAKE2B_DEFAULT_LENGTH_BITS)
+            } else {
+                let rest = line.strip_prefix("BLAKE2b-")?;
+                let (bits_text, rest) = rest.split_once(" (")?;
+                let digest_bits = parse_b2sum_length_bits(bits_text).ok()?;
+                if digest_bits == BLAKE2B_DEFAULT_LENGTH_BITS {
+                    return None;
+                }
+                (rest, digest_bits)
+            }
+        }
+        _ => {
+            let tag = hash_sum_tag_name(algorithm)?;
+            (line.strip_prefix(tag)?.strip_prefix(" (")?, 0)
+        }
+    };
     let (file, digest) = rest.rsplit_once(") = ")?;
-    Some((digest, file, escaped))
+    Some((digest, file, escaped, digest_bits))
+}
+
+fn is_valid_b2sum_digest(digest: &str, expected_bits: Option<usize>) -> bool {
+    let expected_len = expected_bits.map(|bits| bits / 4);
+    !digest.is_empty()
+        && digest.len() % 2 == 0
+        && digest.len() <= BLAKE2B_MAX_LENGTH_BITS / 4
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && expected_len.is_none_or(|expected_len| digest.len() == expected_len)
 }
 
 fn parse_hash_check_line(line: &str, algorithm: HashAlgorithm) -> Option<(String, String)> {
     match hash_check_line_kind(line) {
         HashCheckLineKind::Tagged => {
-            let (digest, file, escaped) = parse_tagged_hash_check_line(line, algorithm)?;
+            let (digest, file, escaped, digest_bits) =
+                parse_tagged_hash_check_line(line, algorithm)?;
+            if algorithm == HashAlgorithm::Blake2b512
+                && !is_valid_b2sum_digest(digest, Some(digest_bits))
+            {
+                return None;
+            }
             let file = if escaped {
                 unescape_hash_sum_label(file)?
             } else {
@@ -348,6 +537,9 @@ fn parse_hash_check_line(line: &str, algorithm: HashAlgorithm) -> Option<(String
             } else {
                 &line[..space_pos]
             };
+            if algorithm == HashAlgorithm::Blake2b512 && !is_valid_b2sum_digest(digest, None) {
+                return None;
+            }
             let file = &line[(space_pos + 2)..];
             let file = if escaped {
                 unescape_hash_sum_label(file)?
@@ -370,12 +562,25 @@ fn run_hash_sum_check(options: &HashSumOptions, algorithm: HashAlgorithm) -> io:
             parse_hash_check_line(line, algorithm)
                 .map(|(expected, path)| ManifestEntry { expected, path })
         },
-        |path| hash_file(path, algorithm, options.io_mode).map(|digest| hex_digest(&digest)),
+        |entry| {
+            if algorithm == HashAlgorithm::Blake2b512 && entry.expected.len() != 128 {
+                let digest_len_bits = entry.expected.len() * 4;
+                let (digest, _) = hash_sum_input(
+                    &StreamInput::File(entry.path.clone()),
+                    algorithm,
+                    options.io_mode,
+                    digest_len_bits,
+                )?;
+                Ok(hex_digest(&digest))
+            } else {
+                hash_file(&entry.path, algorithm, options.io_mode).map(|digest| hex_digest(&digest))
+            }
+        },
     )
 }
 
 pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Result<i32> {
-    let options = parse_hash_sum_options(args)?;
+    let options = parse_hash_sum_options(args, algorithm)?;
     if options.tag_with_check {
         let program = hash_sum_program_name(algorithm);
         fro::cio_eprintln!("{program}: the --tag option is meaningless when verifying checksums");
@@ -393,20 +598,12 @@ pub(super) fn run_hash_sum(args: &[String], algorithm: HashAlgorithm) -> io::Res
             StreamInput::File(file) => Some(file.as_str()),
             StreamInput::Stdin { label } => Some(label.as_deref().unwrap_or("-")),
         };
-        let (digest, bytes) = match &input {
-            StreamInput::File(file) if is_regular_input_path(file)? => (
-                hash_file(file, algorithm, options.io_mode)?,
-                fs::metadata(file)?.len(),
-            ),
-            StreamInput::Stdin { .. } => match regular_stdin_path()? {
-                Some(path) => (
-                    hash_file(&path, algorithm, options.io_mode)?,
-                    fs::metadata(path)?.len(),
-                ),
-                None => hash_stream_input(&input, algorithm, options.io_mode)?,
-            },
-            _ => hash_stream_input(&input, algorithm, options.io_mode)?,
-        };
+        let (digest, bytes) = hash_sum_input(
+            &input,
+            algorithm,
+            options.io_mode,
+            options.blake2_length_bits,
+        )?;
         total_bytes = total_bytes
             .checked_add(bytes)
             .ok_or_else(|| io::Error::other("hash byte count overflow"))?;
@@ -534,7 +731,7 @@ mod tests {
             "-".to_string(),
         ];
 
-        let options = parse_hash_sum_options(&args).unwrap();
+        let options = parse_hash_sum_options(&args, HashAlgorithm::Sha256).unwrap();
         assert!(matches!(options.io_mode, IOMode::Direct));
         assert!(!options.check);
         assert_eq!(
@@ -550,6 +747,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_b2sum_length_bits_accepts_default_and_truncated_ranges() {
+        assert_eq!(
+            parse_b2sum_length_bits("0").unwrap(),
+            BLAKE2B_DEFAULT_LENGTH_BITS
+        );
+        assert_eq!(parse_b2sum_length_bits("8").unwrap(), 8);
+        assert_eq!(parse_b2sum_length_bits("504").unwrap(), 504);
+        assert_eq!(
+            parse_b2sum_length_bits("512").unwrap(),
+            BLAKE2B_DEFAULT_LENGTH_BITS
+        );
+    }
+
+    #[test]
+    fn parse_b2sum_length_bits_rejects_invalid_ranges() {
+        for value in ["", "foo", "-8"] {
+            assert_eq!(
+                parse_b2sum_length_bits(value).unwrap_err().to_string(),
+                format!("invalid length: ‘{value}’")
+            );
+        }
+        assert_eq!(
+            parse_b2sum_length_bits("9").unwrap_err().to_string(),
+            "invalid length: ‘9’\nlength is not a multiple of 8"
+        );
+        assert_eq!(
+            parse_b2sum_length_bits("520").unwrap_err().to_string(),
+            "invalid length: ‘520’\nmaximum digest length for ‘blake2b’ is 512 bits"
+        );
+    }
+
+    #[test]
+    fn parse_hash_sum_options_parses_b2sum_length_forms() {
+        for args in [
+            vec![
+                "b2sum".to_string(),
+                "--length".to_string(),
+                "72".to_string(),
+            ],
+            vec!["b2sum".to_string(), "--length=72".to_string()],
+            vec!["b2sum".to_string(), "-l".to_string(), "72".to_string()],
+            vec!["b2sum".to_string(), "-l72".to_string()],
+        ] {
+            let options = parse_hash_sum_options(&args, HashAlgorithm::Blake2b512).unwrap();
+            assert_eq!(options.blake2_length_bits, 72);
+        }
+    }
+
+    #[test]
     fn parse_hash_check_line_accepts_tagged_lines_for_matching_algorithm() {
         assert_eq!(
             parse_hash_check_line("SHA256 (dir/file).txt) = abc123", HashAlgorithm::Sha256),
@@ -557,10 +803,23 @@ mod tests {
         );
         assert_eq!(
             parse_hash_check_line(
-                "BLAKE2b (hash file.txt) = deadbeef",
+                "BLAKE2b (hash file.txt) = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 HashAlgorithm::Blake2b512
             ),
-            Some(("deadbeef".to_string(), "hash file.txt".to_string()))
+            Some((
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                "hash file.txt".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_hash_check_line(
+                "BLAKE2b-72 (hash file.txt) = 70687daa6157af27dc",
+                HashAlgorithm::Blake2b512
+            ),
+            Some((
+                "70687daa6157af27dc".to_string(),
+                "hash file.txt".to_string()
+            ))
         );
     }
 
@@ -568,6 +827,14 @@ mod tests {
     fn parse_hash_check_line_rejects_tagged_lines_for_other_algorithms() {
         assert_eq!(
             parse_hash_check_line("SHA256 (file.txt) = abc123", HashAlgorithm::Md5),
+            None
+        );
+        assert_eq!(
+            parse_hash_check_line("BLAKE2b (file.txt) = 6b", HashAlgorithm::Blake2b512),
+            None
+        );
+        assert_eq!(
+            parse_hash_check_line("BLAKE2b-16 (file.txt) = 6b", HashAlgorithm::Blake2b512),
             None
         );
     }
@@ -614,6 +881,33 @@ mod tests {
         assert_eq!(
             check::escaped_hash_check_display("dir\\line.txt"),
             "dir\\line.txt"
+        );
+    }
+
+    #[test]
+    fn b2sum_digest_validation_accepts_truncated_lengths() {
+        assert!(is_valid_b2sum_digest("6b", None));
+        assert!(is_valid_b2sum_digest("70687daa6157af27dc", Some(72)));
+        assert!(!is_valid_b2sum_digest("6", None));
+        assert!(!is_valid_b2sum_digest("zz", None));
+        assert!(!is_valid_b2sum_digest(&"a".repeat(130), None));
+    }
+
+    #[test]
+    fn write_hash_sum_line_uses_b2sum_length_suffix_for_tagged_output() {
+        let mut out = Vec::new();
+        write_hash_sum_line(
+            &mut out,
+            HashAlgorithm::Blake2b512,
+            HashSumFormat::Tag,
+            false,
+            &[0x6b],
+            "file.txt",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "BLAKE2b-8 (file.txt) = 6b\n"
         );
     }
 

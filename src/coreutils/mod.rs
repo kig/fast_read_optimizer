@@ -139,8 +139,9 @@ fn is_multicall_help_flag(arg: Option<&String>) -> bool {
     matches!(arg.map(String::as_str), Some("-h" | "--help"))
 }
 
-fn is_multicall_version_flag(arg: Option<&String>) -> bool {
+fn is_multicall_version_flag(invoked: &str, arg: Option<&String>) -> bool {
     matches!(arg.map(String::as_str), Some("--version"))
+        || (invoked == "cmp" && matches!(arg.map(String::as_str), Some("-v")))
 }
 
 fn multicall_short_help_is_real_flag(invoked: &str, arg: Option<&String>) -> bool {
@@ -352,45 +353,70 @@ fn rewrite_cp_command_args(command_args: &[String]) -> Vec<String> {
                 rewritten.push("--cp-no-target-directory".to_string())
             }
             "-u" | "--update" => rewritten.push("--cp-update".to_string()),
-            "-p" | "--preserve" => rewritten.push("--cp-preserve".to_string()),
-            "-P" | "--no-dereference" => rewritten.push("--cp-no-dereference".to_string()),
-            long if cp_preserve_attr_list_supported(long) => {
-                rewritten.push("--cp-preserve".to_string())
+            "-p" | "--preserve" => {
+                rewritten.push("--cp-preserve-mode".to_string());
+                rewritten.push("--cp-preserve-timestamps".to_string());
             }
-            short if short.starts_with('-') && !short.starts_with("--") && short.len() > 2 => {
-                if let Some((expanded, consumed_next)) =
-                    rewrite_cp_short_flag_cluster(short, command_args.get(index + 1))
+            "-P" | "--no-dereference" => rewritten.push("--cp-no-dereference".to_string()),
+            "-L" | "--dereference" => rewritten.push("--cp-dereference".to_string()),
+            _ => {
+                if let Some((preserve_mode, preserve_timestamps)) = cp_preserve_attr_list_flags(arg)
                 {
-                    rewritten.extend(expanded);
-                    index += 1 + usize::from(consumed_next);
-                    continue;
+                    if preserve_mode {
+                        rewritten.push("--cp-preserve-mode".to_string());
+                    }
+                    if preserve_timestamps {
+                        rewritten.push("--cp-preserve-timestamps".to_string());
+                    }
+                } else if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+                    if let Some((expanded, consumed_next)) =
+                        rewrite_cp_short_flag_cluster(arg, command_args.get(index + 1))
+                    {
+                        rewritten.extend(expanded);
+                        index += 1 + usize::from(consumed_next);
+                        continue;
+                    } else {
+                        rewritten.push(arg.clone());
+                    }
                 } else {
                     rewritten.push(arg.clone());
                 }
             }
-            _ => rewritten.push(arg.clone()),
         }
         index += 1;
     }
     rewritten
 }
 
-fn cp_preserve_attr_list_supported(arg: &str) -> bool {
+fn cp_preserve_attr_list_flags(arg: &str) -> Option<(bool, bool)> {
     let Some(attrs) = arg.strip_prefix("--preserve=") else {
-        return false;
+        return None;
     };
     if attrs.is_empty() {
-        return false;
+        return None;
     }
+    if attrs == "all" {
+        return Some((true, true));
+    }
+    let mut preserve_mode = false;
+    let mut preserve_timestamps = false;
     let mut saw_timestamps = false;
     for attr in attrs.split(',') {
         match attr {
-            "timestamps" => saw_timestamps = true,
-            "mode" | "ownership" => {}
-            _ => return false,
+            "timestamps" => {
+                preserve_timestamps = true;
+                saw_timestamps = true;
+            }
+            "mode" => preserve_mode = true,
+            "ownership" => {}
+            _ => return None,
         }
     }
-    saw_timestamps
+    if preserve_mode || saw_timestamps {
+        Some((preserve_mode, preserve_timestamps))
+    } else {
+        None
+    }
 }
 
 fn rewrite_cp_short_flag_cluster(
@@ -405,8 +431,13 @@ fn rewrite_cp_short_flag_cluster(
             'n' => rewritten.push("--cp-no-clobber".to_string()),
             'T' => rewritten.push("--cp-no-target-directory".to_string()),
             'u' => rewritten.push("--cp-update".to_string()),
-            'p' => rewritten.push("--cp-preserve".to_string()),
+            'a' => rewritten.push("-a".to_string()),
+            'p' => {
+                rewritten.push("--cp-preserve-mode".to_string());
+                rewritten.push("--cp-preserve-timestamps".to_string());
+            }
             'P' => rewritten.push("--cp-no-dereference".to_string()),
+            'L' => rewritten.push("--cp-dereference".to_string()),
             'r' => rewritten.push("-r".to_string()),
             'R' => rewritten.push("-R".to_string()),
             'v' => rewritten.push("-v".to_string()),
@@ -440,7 +471,7 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
             crate::main_app::print_direct_command_help(&invoked, help_name);
             return Ok(Some(0));
         }
-        if is_multicall_version_flag(sanitized_args.get(1)) {
+        if is_multicall_version_flag(&invoked, sanitized_args.get(1)) {
             print_coreutils_version(&invoked);
             return Ok(Some(0));
         }
@@ -458,15 +489,41 @@ mod tests {
             "--preserve=timestamps".to_string(),
             "--preserve=mode,timestamps".to_string(),
             "--preserve=timestamps,ownership".to_string(),
+            "--preserve=all".to_string(),
             "src".to_string(),
             "dst".to_string(),
         ]);
         assert_eq!(
             rewritten,
             vec![
-                "--cp-preserve".to_string(),
-                "--cp-preserve".to_string(),
-                "--cp-preserve".to_string(),
+                "--cp-preserve-timestamps".to_string(),
+                "--cp-preserve-mode".to_string(),
+                "--cp-preserve-timestamps".to_string(),
+                "--cp-preserve-timestamps".to_string(),
+                "--cp-preserve-mode".to_string(),
+                "--cp-preserve-timestamps".to_string(),
+                "src".to_string(),
+                "dst".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_cp_supports_mode_only_and_dereference_flags() {
+        let rewritten = rewrite_cp_command_args(&[
+            "--preserve=mode".to_string(),
+            "-aL".to_string(),
+            "-L".to_string(),
+            "src".to_string(),
+            "dst".to_string(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "--cp-preserve-mode".to_string(),
+                "-a".to_string(),
+                "--cp-dereference".to_string(),
+                "--cp-dereference".to_string(),
                 "src".to_string(),
                 "dst".to_string(),
             ]
@@ -476,16 +533,16 @@ mod tests {
     #[test]
     fn rewrite_cp_leaves_unsupported_preserve_attr_lists_untouched() {
         let rewritten = rewrite_cp_command_args(&[
-            "--preserve=mode".to_string(),
             "--preserve=context".to_string(),
+            "--preserve=links".to_string(),
             "src".to_string(),
             "dst".to_string(),
         ]);
         assert_eq!(
             rewritten,
             vec![
-                "--preserve=mode".to_string(),
                 "--preserve=context".to_string(),
+                "--preserve=links".to_string(),
                 "src".to_string(),
                 "dst".to_string(),
             ]
@@ -600,7 +657,7 @@ fn run_named_command(
         crate::main_app::print_direct_command_help(invoked, invoked);
         return Ok(Some(0));
     }
-    if is_multicall_version_flag(args.get(1)) {
+    if is_multicall_version_flag(invoked, args.get(1)) {
         print_coreutils_version(invoked);
         return Ok(Some(0));
     }

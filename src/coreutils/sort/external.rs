@@ -1,9 +1,9 @@
 mod packed;
 
-use super::*;
 use super::compare::compare_output_lines;
-pub(crate) use packed::{sort_inputs, SortCheckFailure, SortCheckResult};
+use super::*;
 use memchr::memchr_iter;
+pub(crate) use packed::{sort_inputs, SortCheckFailure, SortCheckResult};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
@@ -35,7 +35,7 @@ fn tiny_regular_sort_fast_path_enabled(
 
 fn sort_inputs_tiny_regular_fast(
     inputs: &[StreamInput],
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -67,7 +67,7 @@ fn sort_inputs_tiny_regular_fast(
             terminator,
         )?;
     }
-    finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse)?;
+    finalize_sorted_lines(&mut lines, &storage, comparator, unique, reverse)?;
     let mut out =
         StdBufWriter::with_capacity(SORT_STREAM_BLOCK_SIZE, fro::command_io::stdout_file()?);
     write_sorted_lines(&mut out, &lines, &storage, terminator)
@@ -78,7 +78,7 @@ fn sort_inputs_tiny_regular_fast(
 fn sort_inputs_in_memory(
     inputs: &[StreamInput],
     io_mode: IOMode,
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -106,7 +106,7 @@ fn sort_inputs_in_memory(
             terminator,
         )?;
     }
-    finalize_sorted_lines(&mut lines, &storage, mode, unique, reverse)?;
+    finalize_sorted_lines(&mut lines, &storage, comparator, unique, reverse)?;
     with_output_writer(output_path, io_mode, |out| {
         write_sorted_lines(out, &lines, &storage, terminator)
     })?;
@@ -116,7 +116,7 @@ fn sort_inputs_in_memory(
 fn sort_inputs_streamed(
     inputs: &[StreamInput],
     io_mode: IOMode,
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -126,7 +126,7 @@ fn sort_inputs_streamed(
 ) -> io::Result<u64> {
     let chunk_target = spill_chunk_target_bytes(memory_budget);
     let mut spill = SpillSorter::new(
-        mode,
+        comparator,
         unique,
         reverse,
         terminator,
@@ -153,7 +153,7 @@ fn sort_inputs_streamed(
 pub(super) fn merge_presorted_inputs(
     inputs: &[StreamInput],
     io_mode: IOMode,
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -179,7 +179,14 @@ pub(super) fn merge_presorted_inputs(
         temp_files.paths.push(path);
     }
     with_output_writer(output_path, io_mode, |out| {
-        merge_sorted_chunks(out, &temp_files.paths, mode, unique, reverse, terminator)
+        merge_sorted_chunks(
+            out,
+            &temp_files.paths,
+            comparator,
+            unique,
+            reverse,
+            terminator,
+        )
     })?;
     Ok(total_bytes)
 }
@@ -187,12 +194,12 @@ pub(super) fn merge_presorted_inputs(
 pub(super) fn check_input_sorted(
     input: &StreamInput,
     io_mode: IOMode,
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
 ) -> io::Result<SortCheckResult> {
-    let mut checker = SortCheckState::new(mode, unique, reverse, terminator);
+    let mut checker = SortCheckState::new(comparator, unique, reverse, terminator);
     let disorder_result = |total_bytes, err: io::Error| {
         if let Some(disorder) = err
             .get_ref()
@@ -264,7 +271,7 @@ fn spill_chunk_target_bytes(memory_budget: u64) -> usize {
 }
 
 struct SortCheckState {
-    mode: SortMode,
+    comparator: SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -274,9 +281,14 @@ struct SortCheckState {
 }
 
 impl SortCheckState {
-    fn new(mode: SortMode, unique: bool, reverse: bool, terminator: RecordTerminator) -> Self {
+    fn new(
+        comparator: &SortComparator,
+        unique: bool,
+        reverse: bool,
+        terminator: RecordTerminator,
+    ) -> Self {
         Self {
-            mode,
+            comparator: comparator.clone(),
             unique,
             reverse,
             terminator,
@@ -311,8 +323,9 @@ impl SortCheckState {
             .ok_or_else(|| io::Error::other("sort check line count overflow"))?;
         let current = std::mem::take(&mut self.carry);
         if let Some(previous) = self.previous.as_deref() {
-            let compare = compare_line_bytes(previous, &current, self.mode, self.reverse);
-            let strict_duplicate = self.unique && same_sort_key(previous, &current, self.mode);
+            let compare = compare_line_bytes(previous, &current, &self.comparator, self.reverse);
+            let strict_duplicate =
+                self.unique && same_sort_key(previous, &current, &self.comparator);
             if compare == Ordering::Greater || strict_duplicate {
                 return Err(io::Error::other(SortCheckDisorder {
                     line_number: self.line_number,
@@ -376,7 +389,7 @@ where
 }
 
 struct SpillSorter {
-    mode: SortMode,
+    comparator: SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -391,7 +404,7 @@ struct SpillSorter {
 
 impl SpillSorter {
     fn new(
-        mode: SortMode,
+        comparator: &SortComparator,
         unique: bool,
         reverse: bool,
         terminator: RecordTerminator,
@@ -399,7 +412,7 @@ impl SpillSorter {
         temporary_directory: Option<&Path>,
     ) -> Self {
         Self {
-            mode,
+            comparator: comparator.clone(),
             unique,
             reverse,
             terminator,
@@ -450,7 +463,7 @@ impl SpillSorter {
         finalize_sorted_lines(
             &mut self.lines,
             &self.storage,
-            self.mode,
+            &self.comparator,
             self.unique,
             self.reverse,
         )?;
@@ -477,7 +490,7 @@ impl SpillSorter {
             finalize_sorted_lines(
                 &mut self.lines,
                 &self.storage,
-                self.mode,
+                &self.comparator,
                 self.unique,
                 self.reverse,
             )?;
@@ -494,7 +507,7 @@ impl SpillSorter {
             merge_sorted_chunks(
                 out,
                 &temp_files.paths,
-                self.mode,
+                &self.comparator,
                 self.unique,
                 self.reverse,
                 self.terminator,
@@ -669,7 +682,7 @@ struct ChunkRecord {
 struct HeapItem {
     record: ChunkRecord,
     chunk_index: usize,
-    mode: SortMode,
+    comparator: SortComparator,
     unique: bool,
     reverse: bool,
 }
@@ -681,7 +694,7 @@ impl Ord for HeapItem {
             self.record.sequence,
             &other.record.line,
             other.record.sequence,
-            self.mode,
+            &self.comparator,
             self.unique,
             self.reverse,
         )
@@ -698,7 +711,7 @@ impl PartialOrd for HeapItem {
 fn merge_sorted_chunks(
     out: &mut dyn Write,
     paths: &[PathBuf],
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
     terminator: RecordTerminator,
@@ -713,7 +726,7 @@ fn merge_sorted_chunks(
             heap.push(HeapItem {
                 record,
                 chunk_index,
-                mode,
+                comparator: comparator.clone(),
                 unique,
                 reverse,
             });
@@ -724,7 +737,7 @@ fn merge_sorted_chunks(
     let mut last_written: Option<Vec<u8>> = None;
     while let Some(item) = heap.pop() {
         let should_write = match &last_written {
-            Some(previous) if unique => !same_sort_key(previous, &item.record.line, mode),
+            Some(previous) if unique => !same_sort_key(previous, &item.record.line, comparator),
             _ => true,
         };
         if should_write {
@@ -737,7 +750,7 @@ fn merge_sorted_chunks(
             heap.push(HeapItem {
                 record,
                 chunk_index: item.chunk_index,
-                mode,
+                comparator: comparator.clone(),
                 unique,
                 reverse,
             });

@@ -122,6 +122,74 @@ fn digest_family_format_flags_match_system_output() {
 }
 
 #[test]
+fn b2sum_length_flags_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-b2sum-length");
+    let path = tmp.join("hash file.txt");
+    fs::write(
+        &path,
+        (0..65599)
+            .map(|i| ((i * 17 + 5) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for compat_flags in [
+        vec!["--length=8"],
+        vec!["-l8"],
+        vec!["-l", "72"],
+        vec!["--length", "0"],
+        vec!["--tag", "--length=72"],
+        vec!["-z", "--length=16"],
+    ] {
+        for io_flags in io_flag_sets() {
+            let mut fro_args = io_flags.clone();
+            fro_args.extend(compat_flags.iter().copied());
+            fro_args.push(path.to_str().unwrap());
+            let mut sys_args = compat_flags.clone();
+            sys_args.push(path.to_str().unwrap());
+            assert_same_result(
+                run_fro("b2sum", &fro_args),
+                run_system("b2sum", &sys_args),
+                &format!("b2sum {:?} {:?}", io_flags, compat_flags),
+            );
+        }
+    }
+}
+
+#[test]
+fn b2sum_truncated_manifests_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-b2sum-length-check");
+    let path = tmp.join("hash file.txt");
+    fs::write(
+        &path,
+        (0..8193)
+            .map(|i| ((i * 61 + 7) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    for compat_flags in [vec!["--length=72"], vec!["--tag", "--length=72"]] {
+        let manifest = tmp.join(format!("{}.txt", compat_flags.join("_").replace('-', "")));
+        let mut sys_args = compat_flags.clone();
+        sys_args.push(path.to_str().unwrap());
+        let generated = run_system("b2sum", &sys_args);
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        fs::write(&manifest, &generated.stdout).unwrap();
+
+        let args = ["-c", manifest.to_str().unwrap()];
+        assert_same_result(
+            run_fro("b2sum", &args),
+            run_system("b2sum", &args),
+            &format!("b2sum truncated check {:?}", compat_flags),
+        );
+    }
+}
+
+#[test]
 fn digest_family_double_dash_treats_following_operands_as_files() {
     let tmp = unique_temp_dir("fro-coreutils-digest-double-dash");
     let dash_path = tmp.join("-leading-dash.txt");

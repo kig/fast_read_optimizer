@@ -236,6 +236,52 @@ fn write_count_line<W: Write>(
     Ok(())
 }
 
+fn count_literal_matching_lines(data: &[u8], pattern: &[u8], options: FgrepOptions) -> (bool, u64) {
+    let finder = (!pattern.is_empty()).then(|| Finder::new(pattern));
+    let mut matched_any = false;
+    let mut match_count = 0_u64;
+    let mut line_start = 0usize;
+
+    for rel_end in memchr_iter(b'\n', data) {
+        let line_end = rel_end + 1;
+        let is_match = pattern.is_empty()
+            || finder
+                .as_ref()
+                .is_some_and(|finder| finder.find(&data[line_start..line_end]).is_some());
+        if fgrep_select_line(is_match, options) {
+            matched_any = true;
+            match_count += 1;
+        }
+        line_start = line_end;
+    }
+
+    if line_start < data.len() {
+        let is_match = pattern.is_empty()
+            || finder
+                .as_ref()
+                .is_some_and(|finder| finder.find(&data[line_start..]).is_some());
+        if fgrep_select_line(is_match, options) {
+            matched_any = true;
+            match_count += 1;
+        }
+    }
+
+    (matched_any, match_count)
+}
+
+fn write_count_literal_matching_lines<W: Write>(
+    out: &mut W,
+    file: &str,
+    data: &[u8],
+    pattern: &[u8],
+    multi_file: bool,
+    options: FgrepOptions,
+) -> io::Result<bool> {
+    let (matched_any, match_count) = count_literal_matching_lines(data, pattern, options);
+    write_count_line(out, Some(file), match_count, multi_file)?;
+    Ok(matched_any)
+}
+
 fn finish_pending_line<W: Write>(
     out: &mut W,
     label: Option<&str>,
@@ -782,6 +828,31 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
         match &input {
             StreamInput::File(file) if is_regular_input_path(file)? => match regular_file_path {
                 FgrepRegularFilePath::LiteralSearchOffsets => {
+                    if options.count_only {
+                        if let Some(data) = try_load_small_regular_file_bytes(file, io_mode)? {
+                            total_bytes += data.len() as u64;
+                            matched_any |= write_count_literal_matching_lines(
+                                &mut out,
+                                file,
+                                data.as_slice(),
+                                pattern.raw.as_slice(),
+                                multi_file,
+                                options,
+                            )?;
+                            continue;
+                        }
+                        let data = load_file_bytes(file, io_mode, "read_to_memory")?;
+                        total_bytes += data.data.len() as u64;
+                        matched_any |= write_count_literal_matching_lines(
+                            &mut out,
+                            file,
+                            data.data.as_slice(),
+                            pattern.raw.as_slice(),
+                            multi_file,
+                            options,
+                        )?;
+                        continue;
+                    }
                     if let Some(data) = try_load_small_regular_file_bytes(file, io_mode)? {
                         total_bytes += data.len() as u64;
                         matched_any |= write_filtered_lines(

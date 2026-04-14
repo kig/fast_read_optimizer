@@ -94,6 +94,10 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("human-numeric"));
     assert!(stdout.contains("numeric"));
     assert!(stdout.contains("--check"));
+    assert!(stdout.contains("--check=diagnose-first"));
+    assert!(stdout.contains("--check=quiet"));
+    assert!(stdout.contains("--check=silent"));
+    assert!(stdout.contains("-C"));
     assert!(stdout.contains("--general-numeric-sort"));
     assert!(stdout.contains("--human-numeric-sort"));
     assert!(stdout.contains("--merge"));
@@ -103,14 +107,35 @@ fn sort_help_mentions_bounded_bytewise_slice() {
     assert!(stdout.contains("--version-sort"));
     assert!(stdout.contains("--zero-terminated"));
     assert!(stdout.contains("--numeric-sort"));
+    assert!(stdout.contains("--key=KEY"));
     assert!(stdout.contains("--output=FILE"));
     assert!(stdout.contains("--temporary-directory"));
+    assert!(stdout.contains("--help shows this message and exits."));
+    assert!(stdout.contains("--version prints the fro sort version string and exits."));
     assert!(stdout.contains("Unsupported GNU sort features"));
-    assert!(stdout.contains("key selection"));
     assert!(stdout.contains("locale collation"));
+    assert!(stdout.contains("per-key modifiers"));
+    assert!(!stdout.contains("--field-separator"));
+    assert!(!stdout.contains("--ignore-leading-blanks"));
+    assert!(!stdout.contains("--ignore-case"));
+    assert!(!stdout.contains("--ignore-nonprinting"));
+    assert!(!stdout.contains("--parallel"));
+    assert!(!stdout.contains("--files0-from"));
     assert!(!stdout.contains("zero-terminated records and locale collation"));
     assert!(!stdout.contains("temp-file controls"));
     assert!(!stdout.contains("merge/check modes"));
+}
+
+#[test]
+fn sort_version_prints_version_string() {
+    let output = run_fro("sort", &["--version"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        format!("sort (fro coreutils) {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -664,16 +689,71 @@ fn sort_zero_terminated_output_merge_and_check_match_system() {
 }
 
 #[test]
-fn sort_unsupported_key_flag_falls_back_to_system_sort() {
-    let tmp = unique_temp_dir("fro-coreutils-sort-key-fallback");
-    let input = tmp.join("input.txt");
-    fs::write(&input, b"beta 2\nalpha 1\n").unwrap();
+fn sort_key_matches_system_for_files_and_stdin() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-key");
+    let a = tmp.join("a.txt");
+    let b = tmp.join("b.txt");
+    fs::write(&a, b"beta 2 b\nalpha 10 z\nalpha 2 a\nbeta 10 y\n").unwrap();
+    fs::write(&b, b"alpha 2 z\nalpha 02 y\nbeta 2 a\n").unwrap();
 
-    assert_same_result(
-        run_fro("sort", &["-k", "1,1", input.to_str().unwrap()]),
-        run_system_sort(&["-k", "1,1", input.to_str().unwrap()]),
-        "sort unsupported key fallback",
-    );
+    for io_flags in io_flag_sets() {
+        for sort_flags in [
+            vec!["-k", "1,1"],
+            vec!["-k2,2"],
+            vec!["--key=2.2,2.2"],
+            vec!["-k", "2,2", "-k", "3,3"],
+            vec!["-n", "-k", "2,2"],
+            vec!["-nu", "-k2,2"],
+            vec!["-r", "--key=2,2", "--key=3,3"],
+        ] {
+            for files in [
+                vec![a.to_str().unwrap()],
+                vec![a.to_str().unwrap(), b.to_str().unwrap()],
+            ] {
+                let mut fro_args = io_flags.clone();
+                fro_args.extend(sort_flags.iter().copied());
+                fro_args.extend(files.iter().copied());
+                assert_same_result(
+                    run_fro("sort", &fro_args),
+                    run_system_sort(
+                        &sort_flags
+                            .iter()
+                            .copied()
+                            .chain(files.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ),
+                    &format!("sort key {:?}", fro_args),
+                );
+            }
+        }
+    }
+
+    for sort_flags in [
+        vec!["-k", "2,2"],
+        vec!["-k2,2", "-k3,3"],
+        vec!["-n", "-k", "2,2"],
+        vec!["-u", "--key=2,2"],
+    ] {
+        let mut fro_stdin_args = sort_flags.clone();
+        fro_stdin_args.push("-");
+        assert_same_result(
+            run_fro_with_stdin(
+                "sort",
+                &fro_stdin_args,
+                b"beta 2 b\nalpha 10 z\nalpha 2 a\nbeta 10 y\nalpha 2 z\n",
+            ),
+            run_system_sort_with_stdin(
+                sort_flags
+                    .iter()
+                    .copied()
+                    .chain(["-"])
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                b"beta 2 b\nalpha 10 z\nalpha 2 a\nbeta 10 y\nalpha 2 z\n",
+            ),
+            &format!("sort key stdin {:?}", fro_stdin_args),
+        );
+    }
 }
 
 #[test]
@@ -768,7 +848,12 @@ fn sort_check_matches_system_status_and_diagnostics() {
         for sort_flags in [
             vec!["-c", sorted.to_str().unwrap()],
             vec!["--check", unsorted.to_str().unwrap()],
+            vec!["--check=diagnose-first", unsorted.to_str().unwrap()],
+            vec!["-C", unsorted.to_str().unwrap()],
+            vec!["--check=quiet", unsorted.to_str().unwrap()],
+            vec!["--check=silent", unsorted.to_str().unwrap()],
             vec!["-cr", unsorted.to_str().unwrap()],
+            vec!["-Cn", numeric.to_str().unwrap()],
             vec!["-cn", numeric.to_str().unwrap()],
             vec!["-cnu", numeric_dup.to_str().unwrap()],
         ] {
@@ -786,6 +871,11 @@ fn sort_check_matches_system_status_and_diagnostics() {
         run_fro_with_stdin("sort", &["-c", "-"], b"beta\nalpha\n"),
         run_system_sort_with_stdin(&["-c", "-"], b"beta\nalpha\n"),
         "sort check stdin",
+    );
+    assert_same_result(
+        run_fro_with_stdin("sort", &["-C", "-"], b"beta\nalpha\n"),
+        run_system_sort_with_stdin(&["-C", "-"], b"beta\nalpha\n"),
+        "sort check silent stdin",
     );
 }
 

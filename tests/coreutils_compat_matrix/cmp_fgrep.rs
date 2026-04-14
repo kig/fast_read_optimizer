@@ -432,3 +432,155 @@ fn cmp_print_bytes_flags_match_system_output() {
         }
     }
 }
+
+#[test]
+fn cmp_recursive_reports_tree_differences_in_sorted_order() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-recursive-diff");
+    let left = tmp.join("left");
+    let right = tmp.join("right");
+    fs::create_dir_all(left.join("sub")).unwrap();
+    fs::create_dir_all(right.join("sub")).unwrap();
+    fs::write(left.join("common.txt"), b"same\n").unwrap();
+    fs::write(right.join("common.txt"), b"same\n").unwrap();
+    fs::write(left.join("diff.txt"), b"alpha\nbeta\n").unwrap();
+    fs::write(right.join("diff.txt"), b"alpha\nzeta\n").unwrap();
+    fs::write(left.join("only-left.txt"), b"left\n").unwrap();
+    fs::write(right.join("only-right.txt"), b"right\n").unwrap();
+    fs::write(left.join("sub").join("nested.txt"), b"nested\n").unwrap();
+    fs::write(right.join("sub").join("nested.txt"), b"changed\n").unwrap();
+
+    let output = run_fro(
+        "cmp",
+        &["-r", left.to_str().unwrap(), right.to_str().unwrap()],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "{} {} differ: byte 7, line 2\nOnly in {}: only-left.txt\nOnly in {}: only-right.txt\n{} {} differ: byte 1, line 1\n",
+            left.join("diff.txt").display(),
+            right.join("diff.txt").display(),
+            left.display(),
+            right.display(),
+            left.join("sub").join("nested.txt").display(),
+            right.join("sub").join("nested.txt").display(),
+        )
+    );
+}
+
+#[test]
+fn cmp_recursive_quiet_stops_after_first_mismatch() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-recursive-quiet");
+    let left = tmp.join("left");
+    let right = tmp.join("right");
+    fs::create_dir_all(&left).unwrap();
+    fs::create_dir_all(&right).unwrap();
+    fs::write(left.join("a.txt"), b"left\n").unwrap();
+    fs::write(right.join("a.txt"), b"right\n").unwrap();
+    fs::write(left.join("z.txt"), b"extra-left\n").unwrap();
+    fs::write(right.join("z.txt"), b"extra-right\n").unwrap();
+
+    let output = run_fro(
+        "cmp",
+        &[
+            "--recursive",
+            "--quiet",
+            left.to_str().unwrap(),
+            right.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cmp_recursive_compares_symlink_targets_without_following_them() {
+    let tmp = unique_temp_dir("fro-coreutils-cmp-recursive-symlink");
+    let left = tmp.join("left");
+    let right = tmp.join("right");
+    fs::create_dir_all(&left).unwrap();
+    fs::create_dir_all(&right).unwrap();
+    symlink("../target-a", left.join("link")).unwrap();
+    symlink("../target-b", right.join("link")).unwrap();
+
+    let output = run_fro(
+        "cmp",
+        &["-r", left.to_str().unwrap(), right.to_str().unwrap()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "cmp: symbolic links {} and {} differ\n",
+            left.join("link").display(),
+            right.join("link").display()
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cmp_help_and_version_surface_stay_wired() {
+    let help = run_fro("cmp", &["--help"]);
+    assert_eq!(
+        help.status.code(),
+        Some(0),
+        "cmp --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr),
+    );
+    assert!(
+        help.stderr.is_empty(),
+        "cmp --help unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&help.stderr),
+    );
+    let help_stdout = String::from_utf8(help.stdout).expect("cmp help should be UTF-8");
+    for token in ["--help", "--version", "-v"] {
+        assert!(
+            help_stdout.contains(token),
+            "cmp --help output should mention {token}:\n{help_stdout}"
+        );
+    }
+
+    let version = run_fro("cmp", &["--version"]);
+    assert_eq!(
+        version.status.code(),
+        Some(0),
+        "cmp --version failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr),
+    );
+    assert!(
+        version.stderr.is_empty(),
+        "cmp --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr),
+    );
+
+    let short_version = run_fro("cmp", &["-v"]);
+    assert_eq!(
+        short_version.status.code(),
+        Some(0),
+        "cmp -v failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&short_version.stdout),
+        String::from_utf8_lossy(&short_version.stderr),
+    );
+    assert!(
+        short_version.stderr.is_empty(),
+        "cmp -v unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&short_version.stderr),
+    );
+    assert_eq!(
+        short_version.stdout, version.stdout,
+        "cmp -v should match cmp --version output"
+    );
+}

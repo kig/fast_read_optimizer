@@ -13,7 +13,7 @@ static FIFO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[path = "helpers/coreutils_parity.rs"]
 mod helpers;
-use helpers::{stream_surfaces, unique_temp_dir, CoreutilsParityFixture};
+use helpers::{stream_surfaces, system_program_path, unique_temp_dir, CoreutilsParityFixture};
 
 fn run_fro(command: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fro"))
@@ -24,10 +24,24 @@ fn run_fro(command: &str, args: &[&str]) -> Output {
 }
 
 fn run_system(program: &str, args: &[&str]) -> Output {
-    Command::new(program)
+    system_command(program)
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+}
+
+fn system_command(program: &str) -> Command {
+    let binary = system_program_path(program);
+    let system_env = system_program_path("env");
+    let binary_dir = binary.parent().unwrap_or_else(|| {
+        panic!(
+            "resolved system binary for {program} has no parent directory: {}",
+            binary.display()
+        )
+    });
+    let mut command = Command::new(system_env);
+    command.env("PATH", binary_dir).arg(program);
+    command
 }
 
 fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
@@ -51,7 +65,7 @@ fn run_fro_with_stdin(command: &str, args: &[&str], stdin_bytes: &[u8]) -> Outpu
 }
 
 fn run_system_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> Output {
-    let mut child = Command::new(program)
+    let mut child = system_command(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -75,7 +89,7 @@ fn run_command_in_dir(
     current_dir: &Path,
     stdin_bytes: Option<&[u8]>,
 ) -> Output {
-    let mut command = Command::new(program);
+    let mut command = system_command(program);
     command.current_dir(current_dir).args(args);
     if let Some(stdin_bytes) = stdin_bytes {
         let mut child = command

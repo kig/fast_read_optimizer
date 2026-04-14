@@ -11,6 +11,7 @@ read-phase-timing = []
 rapidgzip-backend = ["dep:rapidgzip"]
 
 [dependencies]
+blake2 = "0.10"
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
 bytemuck = { version = "1.21", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 crc-fast = "1.10.0"
@@ -23,6 +24,7 @@ memchr = "2.5"
 openssl = "0.10"
 rand = "0.10.0"
 rapidgzip = { version = "1.2.1", optional = true }
+regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
@@ -33,6 +35,9 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 proptest = "1"
+
+[build-dependencies]
+cc = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
@@ -45,3 +50,11 @@ lto = false  # Avoid LTO for more readable profiles
 [[bin]]
 name = "fro-ipc-server"
 path = "src/fro_ipc_server_main.rs"
+
+[profile.release-min]
+inherits = "release"
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

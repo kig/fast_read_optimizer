@@ -87,6 +87,7 @@ struct RecursiveCopyContext {
     verbose: bool,
     cp_compat: bool,
     cp_no_clobber: bool,
+    follow_symlinks: bool,
     preserve_timestamps: bool,
 }
 
@@ -399,6 +400,23 @@ pub(crate) fn remove_path_recursively(path: &Path, verbose: bool) -> io::Result<
     recursive::delete::run_recursive_delete(path, verbose)
 }
 
+pub(crate) fn remove_path_recursively_one_file_system<F>(
+    path: &Path,
+    verbose: bool,
+    root_device: u64,
+    on_skipped_dir: F,
+) -> io::Result<u64>
+where
+    F: Fn(&Path) + Send + Sync + 'static,
+{
+    recursive::delete::run_recursive_delete_one_file_system(
+        path,
+        verbose,
+        root_device,
+        on_skipped_dir,
+    )
+}
+
 pub(crate) fn move_directory_cross_filesystem(
     source_root: &Path,
     target_root: &Path,
@@ -436,6 +454,7 @@ pub(crate) fn move_directory_cross_filesystem(
         verbose,
         cp_compat: false,
         cp_no_clobber: false,
+        follow_symlinks: false,
         preserve_timestamps: false,
     };
     recursive::move_dir::run_recursive_move(recursive_ctx, verbose)

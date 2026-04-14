@@ -43,6 +43,16 @@ cargo install --path .
 
 `fro` also supports a small BusyBox-style multicall surface via `argv[0]`. If you symlink the `fro` binary to names such as `cp`, `cmp`, `fgrep`, `cat`, `tac`, `wc`, `find`, `rm`, `mv`, `tar`, `cksum`, `b3sum`, `b2sum`, `md5sum`, `sha256sum`, or `shred`, it dispatches to the corresponding `fro`-backed implementation.
 
+`cargo build --release` now also emits first-class asm startup runners under `target/release/coreutils/`:
+
+```bash
+ls target/release/coreutils
+# cat  cksum  cmp  cp  fgrep  find  fro  head  mv  rm  tail  wc
+cp target/release/coreutils/* ~/.local/bin/
+```
+
+Those runners handle the tiny inline fast path themselves and otherwise `execve()` a sibling `fro` binary from the same directory. The build artifact directory includes `fro -> ../fro`, so copying `target/release/coreutils/*` into a local bin dir brings along the matching `fro` binary for fallback. On Linux the runner first resolves its own directory via `/proc/self/exe`; if that lookup fails, it falls back to the build-tree `target/<profile>/fro` path baked in at build time.
+
 Current coreutils snapshot on `/data/ilmari_cache/fro-test/coreutils-1g.bin` (1 GiB, best of 3, hot page cache for non-direct runs):
 
 | Tool | `fro` hot-cache GiB/s | `fro` direct GiB/s | system GiB/s | Notes |
@@ -161,6 +171,15 @@ cargo run --quiet --manifest-path janitor/Cargo.toml -- all
 ```
 
 For verification status and the current proof outline, see [`VERIFICATION.md`](VERIFICATION.md). For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
+
+For multicall/coreutils optimization waves, `perf/coreutils_filesize_sweep.py` runs reproducible hyperfine-based sweeps across realistic file-scan and real create/extract/remove propositions on one or more chosen mounts. Example:
+
+```bash
+python3 perf/coreutils_filesize_sweep.py \
+  --mount /data/fro-test \
+  --mount /optane/fro \
+  --surfaces cat cp cksum md5sum sha256sum b3sum base64 fgrep sort tar-create tar-extract rm
+```
 
 ## Examples
 

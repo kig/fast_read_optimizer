@@ -410,3 +410,48 @@ fn wc_max_line_length_matches_system_on_display_width_cases() {
         }
     }
 }
+
+#[test]
+fn wc_help_and_version_surface_stay_wired() {
+    let help = run_fro("wc", &["--help"]);
+    assert_eq!(
+        help.status.code(),
+        Some(0),
+        "wc --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr),
+    );
+    assert!(
+        help.stderr.is_empty(),
+        "wc --help unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&help.stderr),
+    );
+    let help_stdout = String::from_utf8(help.stdout).expect("wc help should be UTF-8");
+    assert!(
+        help_stdout.contains("--help"),
+        "wc --help output should mention --help:\n{help_stdout}"
+    );
+    assert!(
+        help_stdout.contains("--version"),
+        "wc --help output should mention --version:\n{help_stdout}"
+    );
+
+    let version = run_fro("wc", &["--version"]);
+    assert_eq!(
+        version.status.code(),
+        Some(0),
+        "wc --version failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr),
+    );
+    assert!(
+        version.stderr.is_empty(),
+        "wc --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr),
+    );
+    let version_stdout = String::from_utf8(version.stdout).expect("wc version should be UTF-8");
+    assert!(
+        version_stdout.starts_with("wc "),
+        "wc --version should start with the wc command name:\n{version_stdout}"
+    );
+}

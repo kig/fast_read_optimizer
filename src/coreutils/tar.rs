@@ -55,8 +55,8 @@ fn resolve_tar_path(path: &str, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-fn parse_short_tar_flags(
-    arg: &str,
+fn parse_tar_flag_bundle(
+    chars: &[char],
     args: &[String],
     index: &mut usize,
     mode: &mut Option<TarMode>,
@@ -66,7 +66,6 @@ fn parse_short_tar_flags(
     archive: &mut Option<String>,
     extract_dir: &mut Option<String>,
 ) -> io::Result<()> {
-    let chars = arg[1..].chars().collect::<Vec<_>>();
     let mut pos = 0usize;
     while pos < chars.len() {
         match chars[pos] {
@@ -116,6 +115,39 @@ fn parse_short_tar_flags(
         pos += 1;
     }
     Ok(())
+}
+
+fn parse_short_tar_flags(
+    arg: &str,
+    args: &[String],
+    index: &mut usize,
+    mode: &mut Option<TarMode>,
+    verbose: &mut bool,
+    gzip: &mut bool,
+    zstd: &mut bool,
+    archive: &mut Option<String>,
+    extract_dir: &mut Option<String>,
+) -> io::Result<()> {
+    let chars = arg[1..].chars().collect::<Vec<_>>();
+    parse_tar_flag_bundle(
+        &chars,
+        args,
+        index,
+        mode,
+        verbose,
+        gzip,
+        zstd,
+        archive,
+        extract_dir,
+    )
+}
+
+fn is_old_style_tar_flags(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg.chars().any(|ch| matches!(ch, 'c' | 't' | 'x'))
+        && arg
+            .chars()
+            .all(|ch| matches!(ch, 'c' | 't' | 'x' | 'v' | 'z' | 'J' | 'f' | 'C'))
 }
 
 pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
@@ -181,6 +213,25 @@ pub(super) fn run_tar(args: &[String]) -> io::Result<i32> {
         } else if !end_flags && arg.starts_with('-') && arg.len() > 1 {
             parse_short_tar_flags(
                 arg,
+                args,
+                &mut i,
+                &mut mode,
+                &mut verbose,
+                &mut gzip,
+                &mut zstd,
+                &mut archive,
+                &mut extract_dir,
+            )?;
+        } else if !end_flags
+            && mode.is_none()
+            && archive.is_none()
+            && extract_dir.is_none()
+            && paths.is_empty()
+            && is_old_style_tar_flags(arg)
+        {
+            let chars = arg.chars().collect::<Vec<_>>();
+            parse_tar_flag_bundle(
+                &chars,
                 args,
                 &mut i,
                 &mut mode,
@@ -279,6 +330,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn tar_test_temp_dir(name: &str) -> PathBuf {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&base).unwrap();
+        base.join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn resolve_tar_path_uses_cwd_for_relative_paths() {
         let cwd = Path::new("/tmp/fro-tar-cwd");
@@ -294,7 +360,7 @@ mod tests {
 
     #[test]
     fn tar_hidden_cwd_preserves_dot_root_name() {
-        let base = std::env::temp_dir().join(format!("fro-tar-ipc-{}", std::process::id()));
+        let base = tar_test_temp_dir("fro-tar-ipc");
         let source_dir = base.join("src");
         let archive = base.join("out.tar");
         fs::create_dir_all(&source_dir).unwrap();
@@ -317,6 +383,42 @@ mod tests {
         let stdout = String::from_utf8(listing.stdout).unwrap();
         assert!(stdout.contains("./"));
         assert!(stdout.contains("./file.txt"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn tar_old_style_gzip_create_and_extract_work() {
+        let base = tar_test_temp_dir("fro-tar-old-style-gzip");
+        let source_root = base.join("source");
+        let extract_root = base.join("extract");
+        let archive = base.join("foo.tar.gz");
+        let source_dir = source_root.join("foo");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&extract_root).unwrap();
+        fs::write(source_dir.join("file.txt"), b"alpha\nbeta\n").unwrap();
+
+        let create_args = vec![
+            "tar".to_string(),
+            format!("--fro-cwd={}", source_root.display()),
+            "czf".to_string(),
+            archive.to_string_lossy().into_owned(),
+            "foo".to_string(),
+        ];
+        assert_eq!(run_tar(&create_args).unwrap(), 0);
+
+        let extract_args = vec![
+            "tar".to_string(),
+            "xf".to_string(),
+            archive.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            extract_root.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_tar(&extract_args).unwrap(), 0);
+        assert_eq!(
+            fs::read(extract_root.join("foo").join("file.txt")).unwrap(),
+            b"alpha\nbeta\n"
+        );
 
         let _ = fs::remove_dir_all(base);
     }

@@ -25,7 +25,7 @@ fn rm_force_matches_system_for_missing_operands_and_missing_files() {
         .args(["-fv", missing_name, "keep.txt"])
         .output()
         .expect("failed to run fro rm in fixture dir");
-    let sys_out = Command::new("rm")
+    let sys_out = system_command("rm")
         .current_dir(&sys_root)
         .args(["-fv", missing_name, "keep.txt"])
         .output()
@@ -70,6 +70,80 @@ fn cartesian_rm_recursive_matches_system_side_effects() {
 }
 
 #[test]
+fn rm_preserve_root_policy_flags_match_system_for_non_root_recursive_paths() {
+    let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-preserve-root");
+
+    for flags in [
+        vec!["-r", "--preserve-root", "tree"],
+        vec!["-r", "--no-preserve-root", "tree"],
+        vec!["--recursive", "--preserve-root", "tree"],
+        vec!["--recursive", "--no-preserve-root", "tree"],
+    ] {
+        let suffix = flags.join("_").replace('-', "");
+        let fro_root = tmp.join(format!("rm-preserve-fro-{suffix}"));
+        let sys_root = tmp.join(format!("rm-preserve-sys-{suffix}"));
+        for root in [&fro_root, &sys_root] {
+            let nested = root.join("tree/nested");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(root.join("tree/root.txt"), b"alpha\n").unwrap();
+            fs::write(nested.join("leaf.txt"), b"beta\n").unwrap();
+        }
+
+        let fro_out = Command::new(env!("CARGO_BIN_EXE_fro"))
+            .current_dir(&fro_root)
+            .arg("rm")
+            .args(&flags)
+            .output()
+            .expect("failed to run fro rm preserve-root fixture");
+        let sys_out = system_command("rm")
+            .current_dir(&sys_root)
+            .args(&flags)
+            .output()
+            .expect("failed to run system rm preserve-root fixture");
+        assert_same_result(
+            fro_out,
+            sys_out,
+            &format!("rm {:?} non-root recursive removal", flags),
+        );
+        assert_eq!(
+            fro_root.join("tree").exists(),
+            sys_root.join("tree").exists()
+        );
+    }
+}
+
+#[test]
+fn rm_one_file_system_matches_system_on_same_device_recursive_paths() {
+    let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-one-file-system");
+
+    let fro_root = tmp.join("fro");
+    let sys_root = tmp.join("sys");
+    for root in [&fro_root, &sys_root] {
+        let nested = root.join("tree/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("tree/root.txt"), b"alpha\n").unwrap();
+        fs::write(nested.join("leaf.txt"), b"beta\n").unwrap();
+    }
+
+    let fro_out = Command::new(env!("CARGO_BIN_EXE_fro"))
+        .current_dir(&fro_root)
+        .arg("rm")
+        .args(["-r", "--one-file-system", "tree"])
+        .output()
+        .expect("failed to run fro rm --one-file-system fixture");
+    let sys_out = system_command("rm")
+        .current_dir(&sys_root)
+        .args(["-r", "--one-file-system", "tree"])
+        .output()
+        .expect("failed to run system rm --one-file-system fixture");
+    assert_same_result(fro_out, sys_out, "rm --one-file-system same-device removal");
+    assert_eq!(
+        fro_root.join("tree").exists(),
+        sys_root.join("tree").exists()
+    );
+}
+
+#[test]
 fn rm_dir_matches_system_for_empty_and_non_empty_directories() {
     let tmp = unique_temp_dir("fro-coreutils-rm-mv-rm-dir");
 
@@ -95,7 +169,7 @@ fn rm_dir_matches_system_for_empty_and_non_empty_directories() {
         let mut sys_args = flags.clone();
         sys_args.push("empty");
         sys_args.push("nonempty");
-        let sys_out = Command::new("rm")
+        let sys_out = system_command("rm")
             .current_dir(&sys_root)
             .args(&sys_args)
             .output()
@@ -690,6 +764,341 @@ fn mv_no_clobber_and_update_match_system_for_existing_destinations() {
             "{label}: unexpected moved child contents"
         );
     }
+}
+
+#[test]
+fn mv_force_and_interactive_match_system_for_existing_destinations() {
+    let tmp = unique_temp_dir("fro-coreutils-mv-force-interactive");
+
+    let fro_decline = tmp.join("decline-fro");
+    let sys_decline = tmp.join("decline-sys");
+    fs::create_dir_all(&fro_decline).unwrap();
+    fs::create_dir_all(&sys_decline).unwrap();
+    fs::write(fro_decline.join("src.txt"), b"fresh-source").unwrap();
+    fs::write(sys_decline.join("src.txt"), b"fresh-source").unwrap();
+    fs::write(fro_decline.join("dst.txt"), b"keep-target").unwrap();
+    fs::write(sys_decline.join("dst.txt"), b"keep-target").unwrap();
+    let fro_decline_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["mv", "--interactive", "src.txt", "dst.txt"],
+        &fro_decline,
+        Some(b"n\n"),
+    );
+    let sys_decline_out = run_command_in_dir(
+        "mv",
+        &["--interactive", "src.txt", "dst.txt"],
+        &sys_decline,
+        Some(b"n\n"),
+    );
+    assert_same_result(
+        fro_decline_out,
+        sys_decline_out,
+        "mv --interactive decline existing destination",
+    );
+    assert_eq!(
+        snapshot_tree(&fro_decline),
+        snapshot_tree(&sys_decline),
+        "mv --interactive decline tree mismatch",
+    );
+
+    let fro_target_dir = tmp.join("target-directory-fro");
+    let sys_target_dir = tmp.join("target-directory-sys");
+    for root in [&fro_target_dir, &sys_target_dir] {
+        fs::create_dir_all(root.join("dest")).unwrap();
+        fs::write(root.join("entry.txt"), b"fresh-child").unwrap();
+        fs::write(root.join("dest/entry.txt"), b"keep-child").unwrap();
+    }
+    let fro_target_dir_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["mv", "-i", "-t", "dest", "entry.txt"],
+        &fro_target_dir,
+        Some(b"y\n"),
+    );
+    let sys_target_dir_out = run_command_in_dir(
+        "mv",
+        &["-i", "-t", "dest", "entry.txt"],
+        &sys_target_dir,
+        Some(b"y\n"),
+    );
+    assert_same_result(
+        fro_target_dir_out,
+        sys_target_dir_out,
+        "mv -i -t accepted child overwrite",
+    );
+    assert_eq!(
+        snapshot_tree(&fro_target_dir),
+        snapshot_tree(&sys_target_dir),
+        "mv -i -t tree mismatch",
+    );
+
+    for (flags, label, prompt_stdin, expect_source_exists, expected_target) in [
+        (
+            vec!["-if", "src.txt", "dst.txt"],
+            "mv -if last flag wins",
+            None,
+            false,
+            b"fresh-source".as_slice(),
+        ),
+        (
+            vec!["-fi", "src.txt", "dst.txt"],
+            "mv -fi last flag wins",
+            Some(b"n\n".as_slice()),
+            true,
+            b"keep-target".as_slice(),
+        ),
+        (
+            vec!["-i", "--force", "src.txt", "dst.txt"],
+            "mv --force last flag wins",
+            None,
+            false,
+            b"fresh-source".as_slice(),
+        ),
+        (
+            vec!["--force", "-i", "src.txt", "dst.txt"],
+            "mv -i last flag wins",
+            Some(b"n\n".as_slice()),
+            true,
+            b"keep-target".as_slice(),
+        ),
+    ] {
+        let fro_case = tmp.join(format!("force-interactive-fro-{}", label.replace(' ', "-")));
+        let sys_case = tmp.join(format!("force-interactive-sys-{}", label.replace(' ', "-")));
+        fs::create_dir_all(&fro_case).unwrap();
+        fs::create_dir_all(&sys_case).unwrap();
+        fs::write(fro_case.join("src.txt"), b"fresh-source").unwrap();
+        fs::write(sys_case.join("src.txt"), b"fresh-source").unwrap();
+        fs::write(fro_case.join("dst.txt"), b"keep-target").unwrap();
+        fs::write(sys_case.join("dst.txt"), b"keep-target").unwrap();
+
+        let mut fro_args = vec!["mv"];
+        fro_args.extend(flags.iter().copied());
+        let fro_out = run_command_in_dir(
+            env!("CARGO_BIN_EXE_fro"),
+            &fro_args,
+            &fro_case,
+            prompt_stdin,
+        );
+        let sys_out = run_command_in_dir("mv", &flags, &sys_case, prompt_stdin);
+        assert_same_result(fro_out, sys_out, label);
+        assert_eq!(
+            fro_case.join("src.txt").exists(),
+            sys_case.join("src.txt").exists(),
+            "{label}: source existence mismatch",
+        );
+        assert_eq!(
+            fro_case.join("src.txt").exists(),
+            expect_source_exists,
+            "{label}: unexpected source state",
+        );
+        assert_eq!(
+            fs::read(fro_case.join("dst.txt")).unwrap(),
+            fs::read(sys_case.join("dst.txt")).unwrap(),
+            "{label}: target contents mismatch",
+        );
+        assert_eq!(
+            fs::read(fro_case.join("dst.txt")).unwrap(),
+            expected_target,
+            "{label}: unexpected target contents",
+        );
+    }
+}
+
+#[test]
+fn mv_backup_and_suffix_flags_match_system_for_representative_paths() {
+    let tmp = unique_temp_dir("fro-coreutils-mv-backup-suffix");
+
+    for (flags, label, expected_backup_name) in [
+        (vec!["-b"], "simple backup", "dst.txt~"),
+        (
+            vec!["--suffix=.bak"],
+            "suffix implies backup",
+            "dst.txt.bak",
+        ),
+        (vec!["-bS.bak"], "short suffix cluster", "dst.txt.bak"),
+    ] {
+        let fro_case = tmp.join(format!("backup-fro-{}", label.replace(' ', "-")));
+        let sys_case = tmp.join(format!("backup-sys-{}", label.replace(' ', "-")));
+        fs::create_dir_all(&fro_case).unwrap();
+        fs::create_dir_all(&sys_case).unwrap();
+        fs::write(fro_case.join("src.txt"), b"fresh-source").unwrap();
+        fs::write(sys_case.join("src.txt"), b"fresh-source").unwrap();
+        fs::write(fro_case.join("dst.txt"), b"keep-target").unwrap();
+        fs::write(sys_case.join("dst.txt"), b"keep-target").unwrap();
+
+        let mut fro_args = vec!["mv"];
+        fro_args.extend(flags.iter().copied());
+        fro_args.extend(["src.txt", "dst.txt"]);
+        let fro_out = run_command_in_dir(env!("CARGO_BIN_EXE_fro"), &fro_args, &fro_case, None);
+        let sys_out = run_command_in_dir("mv", &fro_args[1..], &sys_case, None);
+        assert_same_result(fro_out, sys_out, label);
+        assert_eq!(
+            snapshot_tree(&fro_case),
+            snapshot_tree(&sys_case),
+            "{label}: tree mismatch"
+        );
+        assert!(
+            fro_case.join(expected_backup_name).exists(),
+            "{label}: expected backup file {expected_backup_name}"
+        );
+    }
+
+    let fro_dir = tmp.join("backup-target-dir-fro");
+    let sys_dir = tmp.join("backup-target-dir-sys");
+    for root in [&fro_dir, &sys_dir] {
+        fs::create_dir_all(root.join("destdir")).unwrap();
+        fs::write(root.join("src.txt"), b"fresh-source").unwrap();
+        fs::write(root.join("destdir/src.txt"), b"keep-target").unwrap();
+    }
+    let fro_dir_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["mv", "-bS.bak", "src.txt", "destdir"],
+        &fro_dir,
+        None,
+    );
+    let sys_dir_out = run_command_in_dir("mv", &["-bS.bak", "src.txt", "destdir"], &sys_dir, None);
+    assert_same_result(fro_dir_out, sys_dir_out, "backup inside target directory");
+    assert_eq!(snapshot_tree(&fro_dir), snapshot_tree(&sys_dir));
+}
+
+#[test]
+fn mv_backup_conflicts_with_no_clobber_like_system() {
+    let tmp = unique_temp_dir("fro-coreutils-mv-backup-no-clobber");
+    let fro_case = tmp.join("fro");
+    let sys_case = tmp.join("sys");
+    fs::create_dir_all(&fro_case).unwrap();
+    fs::create_dir_all(&sys_case).unwrap();
+    fs::write(fro_case.join("src.txt"), b"fresh-source").unwrap();
+    fs::write(sys_case.join("src.txt"), b"fresh-source").unwrap();
+    fs::write(fro_case.join("dst.txt"), b"keep-target").unwrap();
+    fs::write(sys_case.join("dst.txt"), b"keep-target").unwrap();
+
+    assert_same_result(
+        run_command_in_dir(
+            env!("CARGO_BIN_EXE_fro"),
+            &["mv", "-bn", "src.txt", "dst.txt"],
+            &fro_case,
+            None,
+        ),
+        run_command_in_dir("mv", &["-bn", "src.txt", "dst.txt"], &sys_case, None),
+        "mv -bn mutual exclusion",
+    );
+    assert_eq!(snapshot_tree(&fro_case), snapshot_tree(&sys_case));
+}
+
+#[test]
+fn mv_strip_trailing_slashes_matches_system_for_representative_sources() {
+    let tmp = unique_temp_dir("fro-coreutils-mv-strip-trailing-slashes");
+
+    let fro_symlink = tmp.join("symlink-fro");
+    let sys_symlink = tmp.join("symlink-sys");
+    for root in [&fro_symlink, &sys_symlink] {
+        fs::create_dir_all(root.join("real/sub")).unwrap();
+        fs::create_dir_all(root.join("dest")).unwrap();
+        fs::write(root.join("real/sub/file.txt"), b"payload").unwrap();
+        symlink("real", root.join("linkdir")).unwrap();
+    }
+    let fro_symlink_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["mv", "--strip-trailing-slashes", "linkdir/", "dest/"],
+        &fro_symlink,
+        None,
+    );
+    let sys_symlink_out = run_command_in_dir(
+        "mv",
+        &["--strip-trailing-slashes", "linkdir/", "dest/"],
+        &sys_symlink,
+        None,
+    );
+    assert_same_result(
+        fro_symlink_out,
+        sys_symlink_out,
+        "mv --strip-trailing-slashes symlink source",
+    );
+    assert_eq!(snapshot_tree(&fro_symlink), snapshot_tree(&sys_symlink));
+    assert!(
+        fs::symlink_metadata(fro_symlink.join("dest/linkdir"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "strip-trailing-slashes should preserve the symlink move path"
+    );
+
+    let fro_dir = tmp.join("dir-fro");
+    let sys_dir = tmp.join("dir-sys");
+    for root in [&fro_dir, &sys_dir] {
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::create_dir_all(root.join("dest")).unwrap();
+        fs::write(root.join("src/nested/file.txt"), b"dir-payload").unwrap();
+    }
+    let fro_dir_out = run_command_in_dir(
+        env!("CARGO_BIN_EXE_fro"),
+        &["mv", "--strip-trailing-slashes", "-t", "dest/", "src/"],
+        &fro_dir,
+        None,
+    );
+    let sys_dir_out = run_command_in_dir(
+        "mv",
+        &["--strip-trailing-slashes", "-t", "dest/", "src/"],
+        &sys_dir,
+        None,
+    );
+    assert_same_result(
+        fro_dir_out,
+        sys_dir_out,
+        "mv --strip-trailing-slashes directory source",
+    );
+    assert_eq!(snapshot_tree(&fro_dir), snapshot_tree(&sys_dir));
+}
+
+#[test]
+fn mv_help_and_version_surface_stay_wired() {
+    let help = run_fro("mv", &["--help"]);
+    assert_eq!(
+        help.status.code(),
+        Some(0),
+        "mv --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr),
+    );
+    assert!(
+        help.stderr.is_empty(),
+        "mv --help unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&help.stderr),
+    );
+    let help_stdout = String::from_utf8(help.stdout).expect("mv help should be UTF-8");
+    for token in [
+        "--backup",
+        "--suffix",
+        "--strip-trailing-slashes",
+        "--force",
+        "--interactive",
+        "--help",
+        "--version",
+    ] {
+        assert!(
+            help_stdout.contains(token),
+            "mv --help output should mention {token}:\n{help_stdout}"
+        );
+    }
+
+    let version = run_fro("mv", &["--version"]);
+    assert_eq!(
+        version.status.code(),
+        Some(0),
+        "mv --version failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr),
+    );
+    assert!(
+        version.stderr.is_empty(),
+        "mv --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr),
+    );
+    let version_stdout = String::from_utf8(version.stdout).expect("mv version should be UTF-8");
+    assert!(
+        version_stdout.starts_with("mv "),
+        "mv --version should start with the mv command name:\n{version_stdout}"
+    );
 }
 
 #[test]

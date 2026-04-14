@@ -107,30 +107,30 @@ fn compat_coverage_report_matches_snapshot() {
     let expected = "# multicall compat coverage
 # tracked surface = canonical compat items from existing help/parser/tests
 # excluded custom multicalls: b3sum, decrypt, encrypt, gzip, gunzip, pv, zcat
-base64     3/3  100%  remaining: none  help: ok
-b2sum     11/11 100%  remaining: none  help: ok
-cat       10/10 100%  remaining: none  help: ok
-cksum      7/7  100%  remaining: none  help: ok
-cmp        5/5  100%  remaining: none  help: ok
+base64     5/5  100%  remaining: none  help: ok
+b2sum     12/12 100%  remaining: none  help: ok
+cat       12/12 100%  remaining: none  help: ok
+cksum      9/9  100%  remaining: none  help: ok
+cmp        6/6  100%  remaining: none  help: ok
 cp        10/10 100%  remaining: none  help: ok
-dd        14/14 100%  remaining: none  help: ok
-du         6/6  100%  remaining: none  help: ok
+dd        16/16 100%  remaining: none  help: ok
+du        19/19 100%  remaining: none  help: ok
 fgrep      9/9  100%  remaining: none  help: ok
-find       9/9  100%  remaining: none  help: ok
-head       5/5  100%  remaining: none  help: ok
+find      11/11 100%  remaining: none  help: ok
+head       7/7  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
-mv         5/5  100%  remaining: none  help: ok
-rm         7/7  100%  remaining: none  help: ok
+mv        12/12 100%  remaining: none  help: ok
+rm        12/12 100%  remaining: none  help: ok
 sha224sum 11/11 100%  remaining: none  help: ok
 sha256sum 11/11 100%  remaining: none  help: ok
 sha384sum 11/11 100%  remaining: none  help: ok
 sha512sum 11/11 100%  remaining: none  help: ok
-shred      6/6  100%  remaining: none  help: ok
-sort      11/12  92%  remaining: -k  help: ok
-tac        2/2  100%  remaining: none  help: ok
-tail       5/5  100%  remaining: none  help: ok
+shred      9/9  100%  remaining: none  help: ok
+sort      16/16 100%  remaining: none  help: ok
+tac        7/7  100%  remaining: none  help: ok
+tail       7/7  100%  remaining: none  help: ok
 tar        5/5  100%  remaining: none  help: ok
-wc         6/6  100%  remaining: none  help: ok
+wc         8/8  100%  remaining: none  help: ok
 ";
 
     assert_eq!(report, expected);
@@ -143,30 +143,30 @@ fn actual_help_coverage_report_matches_snapshot() {
 
     let expected = "# actual tokenized help coverage
 # rows are tracked multicall commands; coverage = tokenized fro <cmd> --help vs system <cmd> --help on this host
-base64      6/8    75%  remaining: --help, --version
-b2sum      15/19   79%  remaining: --help, --length, --version, -l
-cat        17/19   89%  remaining: --help, --version
-cksum       0/2     0%  remaining: --help, --version
-cmp        11/14   79%  remaining: --help, --version, -v
-cp         22/57   39%  remaining: --attributes-only, --backup, --context, --copy-contents, --dereference, --force, --help, --interactive, --link, --no-preserve, --one-file-system, --parents, --preserve=all, --preserve=links, --reflink=auto, --reflink=never, --remove-destination, --sparse, --sparse=always, --sparse=auto, --sparse=never, --strip-trailing-slashes, --suffix, --symbolic-link, --version, -H, -L, -S, -Z, -b, -d, -f, -i, -l, -x
-dd          0/2     0%  remaining: --help, --version
-du         12/44   27%  remaining: --apparent-size, --block-size, --bytes, --count-links, --dereference, --dereference-args, --exclude, --exclude-from, --files0-from, --help, --inodes, --no-dereference, --null, --one-file-system, --si, --threshold, --time, --time-style, --version, -0, -B, -D, -H, -L, -P, -X, -b, -k, -l, -m, -t, -x
+base64      8/8   100%  remaining: none
+b2sum      19/19  100%  remaining: none
+cat        19/19  100%  remaining: none
+cksum       2/2   100%  remaining: none
+cmp        14/14  100%  remaining: none
+cp         25/57   44%  remaining: --attributes-only, --backup, --context, --copy-contents, --force, --help, --interactive, --link, --no-preserve, --one-file-system, --parents, --preserve=links, --reflink=auto, --reflink=never, --remove-destination, --sparse, --sparse=always, --sparse=auto, --sparse=never, --strip-trailing-slashes, --suffix, --symbolic-link, --version, -H, -S, -Z, -b, -d, -f, -i, -l, -x
+dd          2/2   100%  remaining: none
+du         31/44   70%  remaining: --count-links, --dereference, --exclude, --exclude-from, --files0-from, --inodes, --one-file-system, --time, --time-style, -L, -X, -l, -x
 fgrep      17/87   20%  remaining: --after-context, --basic-regexp, --before-context, --binary, --binary-files, --binary-files=text, --binary-files=without-match, --byte-offset, --color, --colour, --context, --dereference-recursive, --devices, --directories, --directories=recurse, --exclude, --exclude-dir, --exclude-from, --extended-regexp, --files-with-matches, --files-without-match, --group-separator, --help, --include, --initial-tab, --label, --line-buffered, --max-count, --no-filename, --no-group-separator, --no-messages, --null, --null-data, --only-matching, --perl-regexp, --quiet, --recursive, --silent, --text, --version, --with-filename, --word-regexp, -A, -B, -C, -D, -E, -G, -H, -I, -L, -N, -P, -R, -T, -U, -V, -Z, -a, -b, -d, -h, -l, -m, -o, -q, -r, -s, -w, -z
-find        7/78    9%  remaining: --help, --version, -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype
-head       11/15   73%  remaining: --bytes=, --help, --lines=, --version
-md5sum     15/17   88%  remaining: --help, --version
-mv         11/23   48%  remaining: --backup, --context, --force, --help, --interactive, --strip-trailing-slashes, --suffix, --version, -S, -Z, -b, -i
-rm         12/18   67%  remaining: --help, --no-preserve-root, --one-file-system, --preserve-root, --version, -foo
-sha224sum  15/17   88%  remaining: --help, --version
-sha256sum  15/17   88%  remaining: --help, --version
-sha384sum  15/17   88%  remaining: --help, --version
-sha512sum  15/17   88%  remaining: --help, --version
-shred       9/17   53%  remaining: --exact, --help, --iterations, --random-source, --remove, --version, --zero, -x
-sort       25/55   45%  remaining: --batch-size, --buffer-size, --check=diagnose-first, --check=quiet, --check=silent, --compress-program, --debug, --dictionary-order, --field-separator, --files0-from, --help, --ignore-case, --ignore-leading-blanks, --ignore-nonprinting, --key, --parallel, --random-sort, --random-source, --sort, --stable, --version, -C, -R, -S, -b, -d, -f, -i, -s, -t
-tac         0/8     0%  remaining: --before, --help, --regex, --separator, --version, -b, -r, -s
-tail        6/24   25%  remaining: --bytes, --bytes=, --follow, --follow=name, --help, --lines, --lines=, --max-unchanged-stats, --pid, --quiet, --retry, --silent, --sleep-interval, --verbose, --version, -F, -f, -s
+find        9/78   12%  remaining: -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype
+head       15/15  100%  remaining: none
+md5sum      6/6   100%  remaining: none
+mv         21/23   91%  remaining: --context, -Z
+rm         17/18   94%  remaining: -foo
+sha224sum  17/17  100%  remaining: none
+sha256sum   6/6   100%  remaining: none
+sha384sum  17/17  100%  remaining: none
+sha512sum  17/17  100%  remaining: none
+shred      17/17  100%  remaining: none
+sort       32/55   58%  remaining: --batch-size, --buffer-size, --compress-program, --debug, --dictionary-order, --field-separator, --files0-from, --ignore-case, --ignore-leading-blanks, --ignore-nonprinting, --parallel, --random-sort, --random-source, --sort, --stable, -R, -S, -b, -d, -f, -i, -s, -t
+tac         8/8   100%  remaining: none
+tail       15/24   63%  remaining: --follow, --follow=name, --max-unchanged-stats, --pid, --retry, --sleep-interval, -F, -f, -s
 tar        20/230   9%  remaining: --absolute-names, --acls, --add-file, --after-date, --after-date=DATE-OR-FILE, --anchored, --append, --atime-preserve, --auto-compress, --backup, --block-number, --blocking-factor, --bzip2, --catenate, --check-device, --check-links, --checkpoint, --checkpoint-action, --clamp-mtime, --compare, --compress, --concatenate, --confirmation, --delay-directory-restore, --delete, --dereference, --diff, --exclude, --exclude-backups, --exclude-caches, --exclude-caches-all, --exclude-caches-under, --exclude-from, --exclude-ignore, --exclude-ignore-recursive, --exclude-tag, --exclude-tag-all, --exclude-tag-under, --exclude-vcs, --exclude-vcs-ignores, --files-from, --force-local, --format, --format=gnu, --format=posix, --format=v7, --full-time, --get, --group, --group-map, --hard-dereference, --help, --hole-detection, --ignore-case, --ignore-command-error, --ignore-failed-read, --ignore-zeros, --incremental, --index-file, --info-script, --interactive, --keep-directory-symlink, --keep-newer-files, --keep-old-files, --label, --level, --listed-incremental, --lzip, --lzma, --lzop, --mode, --mtime, --mtime=DATE-OR-FILE, --multi-volume, --new-volume-script, --newer, --newer-mtime, --newer=DATE-OR-FILE, --no-acls, --no-anchored, --no-auto-compress, --no-check-device, --no-delay-directory-restore, --no-ignore-case, --no-ignore-command-error, --no-null, --no-overwrite-dir, --no-quote-chars, --no-recursion, --no-same-owner, --no-same-permissions, --no-seek, --no-selinux, --no-unquote, --no-verbatim-files-from, --no-wildcards, --no-wildcards-match-slash, --no-xattrs, --null, --numeric-owner, --occurrence, --old-archive, --one-file-system, --one-top-level, --overwrite, --overwrite-dir, --owner, --owner-map, --pax-option, --pax-option=keyword, --portability, --posix, --preserve-order, --preserve-permissions, --quote-chars, --quoting-style, --quoting-style=escape, --read-full-records, --record-size, --recursion, --recursive-unlink, --remove-files, --restrict, --rmt-command, --rmt-command=, --rsh-command, --rsh-command=, --same-order, --same-owner, --same-permissions, --seek, --selinux, --show-defaults, --show-omitted-dirs, --show-snapshot-field-ranges, --show-stored-names, --show-transformed-names, --skip-old-files, --sort, --sparse, --sparse-version, --starting-file, --starting-file=MEMBER-NAME, --strip-components, --suffix, --tape-length, --test-label, --to-command, --to-stdout, --totals, --touch, --transform, --uncompress, --unlink-first, --unquote, --update, --usage, --use-compress-program, --utc, --verbatim-files-from, --verify, --version, --volno-file, --warning, --wildcards, --wildcards-match-slash, --xattrs, --xattrs-exclude, --xattrs-include, --xform, --xz, -A, -B, -F, -G, -H, -I, -K, -L, -M, -N, -O, -P, -R, -S, -T, -U, -V, -W, -X, -Z, -a, -b, -d, -f-, -g, -h, -i, -j, -k, -l, -m, -n, -o, -p, -r, -s, -u, -w, -xf
-wc         11/13   85%  remaining: --help, --version
+wc         13/13  100%  remaining: none
 ";
 
     assert_eq!(report, expected);
@@ -217,6 +217,463 @@ fn compat_help_superset_matches_tracked_system_flags() {
 }
 
 #[test]
+fn cmp_actual_help_surface_covers_help_and_version() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "cmp");
+    for token in ["--help", "--version", "-v"] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system cmp --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro cmp --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing
+            .iter()
+            .any(|token| token == "--help" || token == "--version" || token == "-v"),
+        "cmp help/version should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn bounded_actual_help_surface_covers_help_and_version() {
+    for command in ["base64", "cat", "cksum", "dd"] {
+        let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), command);
+        assert!(
+            coverage.system_tokens.contains("--help"),
+            "system {command} --help should expose --help"
+        );
+        assert!(
+            coverage.system_tokens.contains("--version"),
+            "system {command} --help should expose --version"
+        );
+        assert!(
+            coverage.fro_tokens.contains("--help"),
+            "fro {command} --help should expose --help"
+        );
+        assert!(
+            coverage.fro_tokens.contains("--version"),
+            "fro {command} --help should expose --version"
+        );
+        let missing = coverage.missing_tokens();
+        assert!(
+            !missing
+                .iter()
+                .any(|token| token == "--help" || token == "--version"),
+            "{command} help/version should not be missing from actual help coverage: {}",
+            missing.join(", ")
+        );
+    }
+}
+
+#[test]
+fn rm_actual_help_surface_covers_help_version_and_root_policy_flags() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "rm");
+    for token in [
+        "--help",
+        "--version",
+        "--one-file-system",
+        "--preserve-root",
+        "--no-preserve-root",
+        "--interactive",
+        "--recursive",
+        "--verbose",
+        "-I",
+        "-d",
+        "-f",
+        "-i",
+        "-r",
+        "-R",
+        "-v",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system rm --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro rm --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "--help"
+                    | "--version"
+                    | "--one-file-system"
+                    | "--preserve-root"
+                    | "--no-preserve-root"
+                    | "--interactive"
+                    | "--recursive"
+                    | "--verbose"
+                    | "-I"
+                    | "-d"
+                    | "-f"
+                    | "-i"
+                    | "-r"
+                    | "-R"
+                    | "-v"
+            )
+        }),
+        "rm tracked help/root-policy tokens should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn wc_actual_help_surface_covers_help_and_version() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "wc");
+    assert!(
+        coverage.system_tokens.contains("--help"),
+        "system wc --help should expose --help"
+    );
+    assert!(
+        coverage.system_tokens.contains("--version"),
+        "system wc --help should expose --version"
+    );
+    assert!(
+        coverage.fro_tokens.contains("--help"),
+        "fro wc --help should expose --help"
+    );
+    assert!(
+        coverage.fro_tokens.contains("--version"),
+        "fro wc --help should expose --version"
+    );
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing
+            .iter()
+            .any(|token| token == "--help" || token == "--version"),
+        "wc help/version should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn find_actual_help_surface_covers_help_and_version() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "find");
+    for token in ["--help", "--version"] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system find --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro find --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing
+            .iter()
+            .any(|token| token == "--help" || token == "--version"),
+        "find help/version should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn du_actual_help_surface_covers_help_and_version() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "du");
+    for token in [
+        "--help",
+        "--version",
+        "--null",
+        "--si",
+        "--no-dereference",
+        "--block-size",
+        "--threshold",
+        "-0",
+        "-B",
+        "-P",
+        "-k",
+        "-m",
+        "-t",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system du --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro du --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "--help"
+                    | "--version"
+                    | "--null"
+                    | "--si"
+                    | "--no-dereference"
+                    | "--block-size"
+                    | "--threshold"
+                    | "-0"
+                    | "-B"
+                    | "-P"
+                    | "-k"
+                    | "-m"
+                    | "-t"
+            )
+        }),
+        "du tracked help tokens should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn head_actual_help_surface_covers_bounded_help_and_version() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "head");
+    for token in [
+        "-n",
+        "--lines",
+        "--lines=",
+        "-c",
+        "--bytes",
+        "--bytes=",
+        "-z",
+        "--zero-terminated",
+        "-q",
+        "--quiet",
+        "--silent",
+        "-v",
+        "--verbose",
+        "--help",
+        "--version",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system head --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro head --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "-n" | "--lines"
+                    | "--lines="
+                    | "-c"
+                    | "--bytes"
+                    | "--bytes="
+                    | "-z"
+                    | "--zero-terminated"
+                    | "-q"
+                    | "--quiet"
+                    | "--silent"
+                    | "-v"
+                    | "--verbose"
+                    | "--help"
+                    | "--version"
+            )
+        }),
+        "head tracked help tokens should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn tac_actual_help_surface_covers_bounded_help_version_and_compat_tokens() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "tac");
+    for token in [
+        "-b",
+        "--before",
+        "-r",
+        "--regex",
+        "-s",
+        "--separator",
+        "--help",
+        "--version",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system tac --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro tac --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "-b" | "--before"
+                    | "-r"
+                    | "--regex"
+                    | "-s"
+                    | "--separator"
+                    | "--help"
+                    | "--version"
+            )
+        }),
+        "tac tracked help tokens should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn tail_actual_help_surface_covers_bounded_count_and_help_tokens() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "tail");
+    for token in [
+        "-n",
+        "--lines",
+        "--lines=",
+        "-c",
+        "--bytes",
+        "--bytes=",
+        "-z",
+        "--zero-terminated",
+        "-q",
+        "--quiet",
+        "--silent",
+        "-v",
+        "--verbose",
+        "--help",
+        "--version",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system tail --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro tail --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    assert!(
+        !missing.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "-n" | "--lines"
+                    | "--lines="
+                    | "-c"
+                    | "--bytes"
+                    | "--bytes="
+                    | "-z"
+                    | "--zero-terminated"
+                    | "-q"
+                    | "--quiet"
+                    | "--silent"
+                    | "-v"
+                    | "--verbose"
+                    | "--help"
+                    | "--version"
+            )
+        }),
+        "tail tracked help tokens should not be missing from actual help coverage: {}",
+        missing.join(", ")
+    );
+}
+
+#[test]
+fn mv_actual_help_surface_covers_supported_overwrite_and_meta_flags() {
+    let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "mv");
+    for token in [
+        "-b",
+        "--backup",
+        "-f",
+        "--force",
+        "-i",
+        "--interactive",
+        "-n",
+        "--no-clobber",
+        "-S",
+        "--suffix",
+        "--strip-trailing-slashes",
+        "-u",
+        "--update",
+        "-v",
+        "--verbose",
+        "-t",
+        "--target-directory",
+        "-T",
+        "--no-target-directory",
+        "--help",
+        "--version",
+    ] {
+        assert!(
+            coverage.system_tokens.contains(token),
+            "system mv --help should expose {token}"
+        );
+        assert!(
+            coverage.fro_tokens.contains(token),
+            "fro mv --help should expose {token}"
+        );
+    }
+    let missing = coverage.missing_tokens();
+    for token in [
+        "--backup",
+        "--suffix",
+        "--strip-trailing-slashes",
+        "--force",
+        "--interactive",
+        "--help",
+        "--version",
+        "-i",
+    ] {
+        assert!(
+            !missing.iter().any(|missing| missing == token),
+            "mv help surface should not miss {token}: {}",
+            missing.join(", ")
+        );
+    }
+}
+
+#[test]
+fn digest_help_surface_covers_help_and_version() {
+    for command in [
+        "b2sum",
+        "md5sum",
+        "sha224sum",
+        "sha256sum",
+        "sha384sum",
+        "sha512sum",
+    ] {
+        let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), command);
+        assert!(
+            coverage.system_tokens.contains("--help"),
+            "system {command} --help should expose --help"
+        );
+        assert!(
+            coverage.system_tokens.contains("--version"),
+            "system {command} --help should expose --version"
+        );
+        assert!(
+            coverage.fro_tokens.contains("--help"),
+            "fro {command} --help should expose --help"
+        );
+        assert!(
+            coverage.fro_tokens.contains("--version"),
+            "fro {command} --help should expose --version"
+        );
+        let missing = coverage.missing_tokens();
+        assert!(
+            !missing
+                .iter()
+                .any(|token| token == "--help" || token == "--version"),
+            "{command} help/version should not be missing from actual help coverage: {}",
+            missing.join(", ")
+        );
+    }
+}
+
+#[test]
 fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
     let cp_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "cp");
     assert!(cp_help.contains("FIXME:"));
@@ -224,7 +681,8 @@ fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
 
     let sort_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "sort");
     assert!(sort_help.contains("FIXME:"));
-    assert!(sort_help.contains("key selection (-k)"));
+    assert!(sort_help.contains("locale collation"));
+    assert!(sort_help.contains("per-key modifiers"));
 
     let tar_help = fro_help_text(env!("CARGO_BIN_EXE_fro"), "tar");
     assert!(tar_help.contains("FIXME:"));
@@ -238,7 +696,8 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
         include_str!("../src/main_app/help/commands.rs")
     );
     assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
-    assert!(help_source.contains("key selection (-k) and locale collation"));
+    assert!(help_source.contains("locale collation and per-key modifiers"));
+    assert!(help_source.contains("--version prints the fro sort version string and exits."));
     assert!(help_source.contains("FIXME: Extract currently targets regular-file archives"));
     assert!(help_source.contains("FIXME: When invoked via the cp multicall alias"));
 

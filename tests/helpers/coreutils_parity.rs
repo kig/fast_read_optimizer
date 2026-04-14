@@ -1,7 +1,10 @@
 #![cfg(unix)]
 
+use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +24,68 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
     ));
     fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    normalize_path(path).starts_with(normalize_path(root))
+}
+
+fn resolve_program_in_path(
+    program: &str,
+    path: &OsStr,
+    blocked_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    env::split_paths(path)
+        .filter(|entry| {
+            !blocked_roots
+                .iter()
+                .any(|root| path_is_under_root(entry, root))
+        })
+        .find_map(|entry| {
+            let candidate = entry.join(program);
+            is_executable_file(&candidate).then_some(candidate)
+        })
+}
+
+pub(crate) fn system_program_path(program: &str) -> PathBuf {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        return program_path.to_path_buf();
+    }
+
+    for dir in [
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ] {
+        let candidate = Path::new(dir).join(program);
+        if is_executable_file(&candidate) {
+            return candidate;
+        }
+    }
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let blocked_roots = vec![repo_root.clone(), repo_root.join("target")];
+    let search_path = env::var_os("PATH").unwrap_or_default();
+    resolve_program_in_path(program, &search_path, &blocked_roots).unwrap_or_else(|| {
+        panic!(
+            "failed to resolve system binary for {program} outside repo-managed paths; PATH={}",
+            PathBuf::from(search_path).display()
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -144,4 +209,31 @@ impl StreamSurface {
 
 pub(crate) fn stream_surfaces() -> [StreamSurface; 2] {
     [StreamSurface::Stdin, StreamSurface::Dash]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn resolve_program_in_path_skips_blocked_entries() {
+        let root = unique_temp_dir("coreutils-system-path-resolution");
+        let blocked = root.join("blocked");
+        let allowed = root.join("allowed");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::create_dir_all(&allowed).unwrap();
+
+        let blocked_tool = blocked.join("sha256sum");
+        let allowed_tool = allowed.join("sha256sum");
+        fs::write(&blocked_tool, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::write(&allowed_tool, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&blocked_tool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&allowed_tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = env::join_paths([blocked.as_path(), allowed.as_path()]).unwrap();
+        let resolved =
+            resolve_program_in_path("sha256sum", &path, std::slice::from_ref(&blocked)).unwrap();
+        assert_eq!(resolved, allowed_tool);
+    }
 }

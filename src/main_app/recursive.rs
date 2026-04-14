@@ -137,6 +137,66 @@ fn collect_recursive_copy_manifest(
                 continue;
             }
             if file_type.is_symlink() {
+                if ctx.follow_symlinks {
+                    let metadata = fs::metadata(&source_path)?;
+                    if metadata.file_type().is_dir() {
+                        let mode = metadata.permissions().mode();
+                        create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
+                        if ctx.preserve_timestamps {
+                            dir_tasks.push(RecursiveDirectoryMetadataTask {
+                                target_path: target_path.clone(),
+                                timestamps: preserved_timestamps_from_metadata(&metadata),
+                            });
+                        }
+                        child_dirs.push(RecursiveDirectoryTask {
+                            source_dir: source_path,
+                            target_dir: target_path,
+                        });
+                        continue;
+                    }
+                    if metadata.file_type().is_file() {
+                        let source_len = metadata.len();
+                        let source_mode = metadata.permissions().mode();
+                        let source_timestamps = preserved_timestamps_from_metadata(&metadata);
+                        if ctx.cp_no_clobber
+                            && skip_copy_destination(&source_path, &target_path, false)?
+                        {
+                            continue;
+                        }
+                        if recursive_copy_uses_small_file_range(ctx, source_len) {
+                            small_tasks.push(RecursiveSmallFileTask {
+                                source_path,
+                                target_path,
+                                source_len,
+                                source_mode,
+                                source_timestamps,
+                                preserve_timestamps: ctx.preserve_timestamps,
+                            });
+                        } else {
+                            let resolved_copy = resolve_recursive_large_copy_execution(
+                                ctx,
+                                &source_path,
+                                &target_path,
+                            )?;
+                            large_tasks.push(RecursiveFileTask {
+                                source_path,
+                                target_path,
+                                source_mode,
+                                source_timestamps,
+                                resolved_copy,
+                                source_parent_dir: None,
+                            });
+                        }
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "recursive copy only supports regular files, directories, and symlinks (saw {})",
+                            source_path.display()
+                        ),
+                    ));
+                }
                 if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
                     continue;
                 }
@@ -560,6 +620,121 @@ fn walk_recursive_copy_subtree(
                 continue;
             }
             if file_type.is_symlink() {
+                if ctx.follow_symlinks {
+                    let metadata = fs::metadata(&source_path)?;
+                    if metadata.file_type().is_dir() {
+                        let mode = metadata.permissions().mode();
+                        create_directory_like(mode, &target_path, stats, Some(sample_counters))?;
+                        if ctx.preserve_timestamps {
+                            dir_metadata_tasks.lock().unwrap().push(
+                                RecursiveDirectoryMetadataTask {
+                                    target_path: target_path.clone(),
+                                    timestamps: preserved_timestamps_from_metadata(&metadata),
+                                },
+                            );
+                        }
+                        child_dirs.push(RecursiveDirectoryTask {
+                            source_dir: source_path,
+                            target_dir: target_path,
+                        });
+                        continue;
+                    }
+                    if !metadata.file_type().is_file() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "recursive copy only supports regular files, directories, and symlinks (saw {})",
+                                source_path.display()
+                            ),
+                        ));
+                    }
+                    let source_len = metadata.len();
+                    let source_mode = metadata.permissions().mode();
+                    let source_timestamps = preserved_timestamps_from_metadata(&metadata);
+                    if ctx.cp_no_clobber
+                        && skip_copy_destination(&source_path, &target_path, false)?
+                    {
+                        continue;
+                    }
+                    let relative_path = source_path
+                        .strip_prefix(&ctx.source_root)
+                        .map_err(|_| io::Error::other("recursive copy path escaped source root"))?
+                        .to_path_buf();
+                    if recursive_copy_uses_small_file_range(ctx, source_len) {
+                        let copied = openat::copy_relative_file_openat(
+                            &relative_path,
+                            source_len,
+                            source_mode,
+                            &source_root_fd,
+                            &target_root_fd,
+                            ctx.relative_copy_method,
+                        )?;
+                        if ctx.preserve_timestamps {
+                            set_path_timestamps(&target_path, source_timestamps, false)?;
+                        }
+                        maybe_print_verbose_copy(
+                            ctx.verbose,
+                            ctx.cp_compat,
+                            &source_path,
+                            &target_path,
+                        );
+                        stats.files_copied.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+                        stats.items_completed.fetch_add(1, Ordering::Relaxed);
+                        sample_counters.bytes.fetch_add(copied, Ordering::Relaxed);
+                        sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "read-phase-timing")]
+                        {
+                            lane_counters.note_queued("small");
+                            lane_counters.note_done("small");
+                        }
+                    } else if recursive_copy_uses_threaded_large_lane(ctx, source_len) {
+                        let resolved_copy = resolve_recursive_large_copy_execution(
+                            ctx,
+                            &source_path,
+                            &target_path,
+                        )?;
+                        large_queue.enqueue(RecursiveFileTask {
+                            source_path,
+                            target_path,
+                            source_mode,
+                            source_timestamps,
+                            resolved_copy,
+                            source_parent_dir: None,
+                        })?;
+                        #[cfg(feature = "read-phase-timing")]
+                        lane_counters.note_queued("large");
+                    } else {
+                        let copied = openat::copy_relative_file_openat(
+                            &relative_path,
+                            source_len,
+                            source_mode,
+                            &source_root_fd,
+                            &target_root_fd,
+                            ctx.relative_copy_method,
+                        )?;
+                        if ctx.preserve_timestamps {
+                            set_path_timestamps(&target_path, source_timestamps, false)?;
+                        }
+                        maybe_print_verbose_copy(
+                            ctx.verbose,
+                            ctx.cp_compat,
+                            &source_path,
+                            &target_path,
+                        );
+                        stats.files_copied.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_copied.fetch_add(copied, Ordering::Relaxed);
+                        stats.items_completed.fetch_add(1, Ordering::Relaxed);
+                        sample_counters.bytes.fetch_add(copied, Ordering::Relaxed);
+                        sample_counters.units.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "read-phase-timing")]
+                        {
+                            lane_counters.note_queued("medium");
+                            lane_counters.note_done("medium");
+                        }
+                    }
+                    continue;
+                }
                 if ctx.cp_no_clobber && skip_copy_destination(&source_path, &target_path, false)? {
                     continue;
                 }
@@ -716,7 +891,11 @@ pub(crate) mod split_manifest;
 mod tests;
 
 pub(super) fn run_recursive_copy(ctx: RecursiveCopyContext, verbose: bool) -> io::Result<u64> {
-    let source_meta = fs::symlink_metadata(&ctx.source_root)?;
+    let source_meta = if ctx.follow_symlinks {
+        fs::metadata(&ctx.source_root)?
+    } else {
+        fs::symlink_metadata(&ctx.source_root)?
+    };
     if !source_meta.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

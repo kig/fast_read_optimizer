@@ -42,3 +42,38 @@ fn cat_dash_can_mix_file_and_stdin_surfaces() {
         );
     }
 }
+
+#[test]
+fn tac_separator_family_matches_system_output_across_surfaces() {
+    let fixture = CoreutilsParityFixture::new("fro-coreutils-tac-separator-matrix");
+    let literal = fixture.root.join("literal.txt");
+    std::fs::write(&literal, b"left::middle::right::").unwrap();
+    let regex = fixture.root.join("regex.txt");
+    std::fs::write(&regex, b"a12b345c").unwrap();
+
+    for args in [
+        vec!["-s", "::", literal.to_str().unwrap()],
+        vec!["-b", "--separator=::", literal.to_str().unwrap()],
+        vec!["-r", "-s", "[0-9][0-9]*", regex.to_str().unwrap()],
+        vec![
+            "-b",
+            "-r",
+            "--separator",
+            "[0-9][0-9]*",
+            regex.to_str().unwrap(),
+        ],
+    ] {
+        assert_same_result(
+            run_fro("tac", &args),
+            run_system("tac", &args),
+            &format!("tac separator matrix {:?}", args),
+        );
+    }
+
+    let stdin = b"left::middle::right";
+    assert_same_result(
+        run_fro_with_stdin("tac", &["-b", "-s", "::"], stdin),
+        run_system_with_stdin("tac", &["-b", "-s", "::"], stdin),
+        "tac separator matrix stdin",
+    );
+}

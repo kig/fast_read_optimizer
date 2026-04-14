@@ -37,4 +37,3 @@ pub(super) fn handle_config_command(
         )),
     }
 }
-

@@ -31,8 +31,10 @@ pub(super) struct ParsedArgs {
     pub(super) cp_target_directory: Option<String>,
     pub(super) cp_no_target_directory: bool,
     pub(super) cp_update: bool,
-    pub(super) cp_preserve: bool,
+    pub(super) cp_preserve_mode: bool,
+    pub(super) cp_preserve_timestamps: bool,
     pub(super) cp_no_dereference: bool,
+    pub(super) cp_dereference: bool,
     pub(super) verbose: bool,
     pub(super) source: Option<String>,
     pub(super) pattern: String,
@@ -179,8 +181,10 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
     let mut cp_target_directory: Option<String> = None;
     let mut cp_no_target_directory = false;
     let mut cp_update = false;
-    let mut cp_preserve = false;
+    let mut cp_preserve_mode = false;
+    let mut cp_preserve_timestamps = false;
     let mut cp_no_dereference = false;
+    let mut cp_dereference = false;
     let mut verbose = false;
     let mut source: Option<String> = None;
     let mut pattern = String::new();
@@ -433,14 +437,22 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
                 cp_no_target_directory = true;
             } else if args[i] == "--cp-update" {
                 cp_update = true;
-            } else if args[i] == "--cp-preserve" {
-                cp_preserve = true;
+            } else if args[i] == "--cp-preserve-mode" {
+                cp_preserve_mode = true;
+            } else if args[i] == "--cp-preserve-timestamps" {
+                cp_preserve_timestamps = true;
             } else if args[i] == "--cp-no-dereference" {
                 cp_no_dereference = true;
+                cp_dereference = false;
+            } else if args[i] == "--cp-dereference" {
+                cp_dereference = true;
+                cp_no_dereference = false;
             } else if mode == "copy" && (args[i] == "-a" || args[i] == "--archive") {
                 recursive_copy = true;
-                cp_preserve = true;
+                cp_preserve_mode = true;
+                cp_preserve_timestamps = true;
                 cp_no_dereference = true;
+                cp_dereference = false;
             } else if args[i] == "-q" || args[i] == "--quiet" {
                 quiet = true;
             } else if args[i] == "-v" || args[i] == "--verbose" {
@@ -651,8 +663,10 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
             cp_target_directory,
             cp_no_target_directory,
             cp_update,
-            cp_preserve,
+            cp_preserve_mode,
+            cp_preserve_timestamps,
             cp_no_dereference,
+            cp_dereference,
             verbose,
             source,
             pattern,
@@ -884,8 +898,10 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         || cp_target_directory.is_some()
         || cp_no_target_directory
         || cp_update
-        || cp_preserve
-        || cp_no_dereference)
+        || cp_preserve_mode
+        || cp_preserve_timestamps
+        || cp_no_dereference
+        || cp_dereference)
         && mode != "copy"
     {
         fro::cio_println!("cp compatibility flags are only supported for copy");
@@ -951,8 +967,10 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
         cp_target_directory,
         cp_no_target_directory,
         cp_update,
-        cp_preserve,
+        cp_preserve_mode,
+        cp_preserve_timestamps,
         cp_no_dereference,
+        cp_dereference,
         verbose,
         source,
         pattern,
@@ -973,4 +991,3 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
 
 #[cfg(test)]
 mod tests;
-

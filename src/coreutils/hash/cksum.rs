@@ -118,8 +118,9 @@ fn run_cksum_check(options: &CksumOptions) -> io::Result<i32> {
         &options.inputs,
         options.check_options,
         parse_cksum_check_line,
-        |path| {
-            let (crc, bytes) = cksum_input(&StreamInput::File(path.to_string()), options.io_mode)?;
+        |entry| {
+            let (crc, bytes) =
+                cksum_input(&StreamInput::File(entry.path.clone()), options.io_mode)?;
             Ok(format!("{crc} {bytes}"))
         },
     )

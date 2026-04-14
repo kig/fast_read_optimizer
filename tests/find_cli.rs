@@ -484,7 +484,7 @@ fn find_print0_matches_system_for_regular_files_ignoring_order() {
 }
 
 #[test]
-fn find_help_mentions_type_and_print0_surface() {
+fn find_help_and_version_surface_stay_wired() {
     let output = run_fro(&["find", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
@@ -492,6 +492,8 @@ fn find_help_mentions_type_and_print0_surface() {
     assert!(stdout.contains(
         "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
     ));
+    assert!(stdout.contains("--help shows this message and exits."));
+    assert!(stdout.contains("--version prints the fro find version string and exits."));
     assert!(stdout.contains("-maxdepth limits descent below each starting path"));
     assert!(stdout.contains("-type supports the common GNU/POSIX letters"));
     assert!(stdout.contains("-name matches only the final path component"));
@@ -500,4 +502,15 @@ fn find_help_mentions_type_and_print0_surface() {
     assert!(stdout.contains("-ipath matches whole emitted paths case-insensitively"));
     assert!(stdout.contains("-print0 emits NUL-delimited paths"));
     assert!(output.stderr.is_empty());
+
+    let version = run_fro(&["find", "--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert!(
+        version.stderr.is_empty(),
+        "find --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let version_stdout = String::from_utf8_lossy(&version.stdout);
+    assert!(version_stdout.starts_with("find "));
+    assert!(version_stdout.contains(env!("CARGO_PKG_VERSION")));
 }

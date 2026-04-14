@@ -7,10 +7,14 @@ fn head_help_mentions_negative_counts_and_headers() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("all but the last"));
     assert!(stdout.contains("--lines"));
+    assert!(stdout.contains("--lines="));
     assert!(stdout.contains("--bytes"));
+    assert!(stdout.contains("--bytes="));
     assert!(stdout.contains("--zero-terminated"));
     assert!(stdout.contains("--quiet"));
     assert!(stdout.contains("--verbose"));
+    assert!(stdout.contains("--help shows this message and exits."));
+    assert!(stdout.contains("--version prints the fro head version string and exits."));
 }
 
 #[test]

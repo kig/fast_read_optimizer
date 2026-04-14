@@ -18,34 +18,52 @@ pub(super) fn run_shred(args: &[String]) -> io::Result<i32> {
     let mut files = Vec::new();
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "-n" => {
+        let arg = args[i].as_str();
+        match arg {
+            "-n" | "--iterations" => {
                 i += 1;
                 let count = args.get(i).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing value for -n")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing value for {arg}"),
+                    )
                 })?;
-                passes = count.parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid pass count")
-                })?;
+                passes = parse_shred_passes(count)?;
             }
             "-s" | "--size" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing value for -s")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing value for {arg}"),
+                    )
                 })?;
                 size = Some(parse_shred_size(value)?);
             }
-            "-z" => zero_last = true,
-            "-u" => remove_after = true,
+            "-z" | "--zero" => zero_last = true,
+            "-u" | "--remove" => remove_after = true,
             "-f" | "--force" => force = true,
             "-v" | "--verbose" => verbose = true,
+            "-x" | "--exact" => {}
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
+            value if value.starts_with("--iterations=") => {
+                passes = parse_shred_passes(&value["--iterations=".len()..])?;
+            }
             value if value.starts_with("--size=") => {
                 size = Some(parse_shred_size(&value["--size=".len()..])?);
             }
-            "--" => {}
+            "--" => {
+                files.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            other if other.starts_with("--") => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported shred flag {other}"),
+                ));
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 for ch in other[1..].chars() {
                     match ch {
@@ -53,6 +71,7 @@ pub(super) fn run_shred(args: &[String]) -> io::Result<i32> {
                         'u' => remove_after = true,
                         'f' => force = true,
                         'v' => verbose = true,
+                        'x' => {}
                         'n' | 's' => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -138,6 +157,12 @@ pub(super) fn run_shred(args: &[String]) -> io::Result<i32> {
         }
     }
     Ok(exit_code)
+}
+
+fn parse_shred_passes(value: &str) -> io::Result<usize> {
+    value
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pass count"))
 }
 
 fn parse_shred_size(value: &str) -> io::Result<u64> {

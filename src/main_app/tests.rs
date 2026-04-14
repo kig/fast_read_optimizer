@@ -5,7 +5,8 @@ use crate::main_app::copy_plan::CopyRewriteMode;
 use crate::main_app::copy_plan::{
     describe_copy_path, should_prefer_cached_diff_overwrite,
     should_prefer_cached_read_direct_write, should_prefer_low_latency_copy_file_range_single,
-    target_is_similar_size, HeuristicCopyPlan, ResolvedCopyExecution,
+    should_prefer_standalone_nvme_copy_file_range_single, target_is_similar_size,
+    HeuristicCopyPlan, ResolvedCopyExecution,
 };
 use crate::main_app::recursive::move_dir;
 use crate::main_app::tuning::{
@@ -14,7 +15,7 @@ use crate::main_app::tuning::{
 use crate::main_app::{RecursiveCopyContext, RelativeCopyMethod};
 use crate::writer::{self, RecordedCopyBackend};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +30,7 @@ fn heuristic_plan(
     source_len: Option<u64>,
     target_len: Option<u64>,
     direct_write_supported: bool,
+    device_signature: Option<&config::DeviceSignature>,
 ) -> HeuristicCopyPlan {
     if should_prefer_cached_diff_overwrite(source_cached, target_cached, source_len, target_len) {
         if direct_write_supported {
@@ -42,10 +44,36 @@ fn heuristic_plan(
         source_len,
     ) {
         HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+    } else if should_prefer_standalone_nvme_copy_file_range_single(
+        &source_path.to_string_lossy(),
+        &target_path.to_string_lossy(),
+        source_len,
+        device_signature,
+    ) {
+        HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle
     } else if should_prefer_cached_read_direct_write(source_cached, source_len, target_len) {
         HeuristicCopyPlan::CachedReadDirectWrite
     } else {
         HeuristicCopyPlan::DirectReadDirectWrite
+    }
+}
+
+fn standalone_nvme_device_signature() -> config::DeviceSignature {
+    config::DeviceSignature {
+        mount_source: "/dev/nvme0n1p1".into(),
+        canonical_source: "/dev/nvme0n1p1".into(),
+        match_keys: vec!["stack=nvme".into(), "leaf.kind=nvme".into()],
+        block_device: Some(config::BlockDeviceSignature {
+            kernel_name: "nvme0n1p1".into(),
+            devnode: "/dev/nvme0n1p1".into(),
+            by_id: Vec::new(),
+            vendor: None,
+            model: None,
+            rotational: Some(false),
+            dm_name: None,
+            md_level: None,
+            slaves: Vec::new(),
+        }),
     }
 }
 
@@ -227,19 +255,55 @@ fn heuristic_plan_prefers_diff_overwrite_then_copy_file_range_single_fallback() 
     let target = root.join("target.txt");
     fs::write(&source, b"payload").unwrap();
     assert_eq!(
-        heuristic_plan(&source, &target, true, true, Some(1024), Some(900), true),
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            true,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
         HeuristicCopyPlan::DiffOverwrite
     );
     assert_eq!(
-        heuristic_plan(&source, &target, true, true, Some(1024), Some(900), false),
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            true,
+            Some(1024),
+            Some(900),
+            false,
+            None
+        ),
         HeuristicCopyPlan::CopyFileRangeSingle
     );
     assert_eq!(
-        heuristic_plan(&source, &target, true, false, Some(1024), Some(900), true),
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            false,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
         HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
     );
     assert_eq!(
-        heuristic_plan(&source, &target, false, false, Some(1024), Some(900), true),
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
         HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
     );
     assert_eq!(
@@ -250,9 +314,33 @@ fn heuristic_plan_prefers_diff_overwrite_then_copy_file_range_single_fallback() 
             false,
             Some(256 * 1024 + 1),
             Some(900),
-            true
+            true,
+            None,
         ),
         HeuristicCopyPlan::DirectReadDirectWrite
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn heuristic_plan_prefers_copy_file_range_single_for_large_standalone_nvme_copies() {
+    let root = unique_temp_dir("fro-copy-heuristic-nvme");
+    let source = root.join("source.bin");
+    let target = root.join("target.bin");
+    fs::write(&source, vec![7_u8; 4096]).unwrap();
+    let device = standalone_nvme_device_signature();
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(64 * 1024 * 1024),
+            None,
+            true,
+            Some(&device),
+        ),
+        HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -365,8 +453,15 @@ fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
         Case {
             name: "preserve-timestamps",
             configure: |args, source, _target| {
-                args.cp_preserve = true;
+                args.cp_preserve_timestamps = true;
                 set_path_mtime(source, 1_234_567_890);
+            },
+        },
+        Case {
+            name: "preserve-mode",
+            configure: |args, source, _target| {
+                args.cp_preserve_mode = true;
+                fs::set_permissions(source, fs::Permissions::from_mode(0o751)).unwrap();
             },
         },
         Case {
@@ -402,8 +497,10 @@ fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
             cp_no_clobber: false,
             cp_no_target_directory: false,
             cp_update: false,
-            cp_preserve: false,
+            cp_preserve_mode: false,
+            cp_preserve_timestamps: false,
             cp_no_dereference: false,
+            cp_dereference: false,
         };
         (case.configure)(&mut args, &source, &target);
 
@@ -424,9 +521,49 @@ fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
             "case {}",
             case.name
         );
+        if case.name == "preserve-mode" {
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o751
+            );
+        }
 
         let _ = fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn cp_existing_directory_target_uses_child_basename_and_keeps_threaded_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-existing-directory-target");
+    let source = root.join("source.txt");
+    let target_dir = root.join("target-dir");
+    let copied = target_dir.join("source.txt");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(&source, b"dir-target-payload").unwrap();
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(cli::TestCopyRunOptions {
+        source: source.to_string_lossy().into_owned(),
+        target: target_dir.to_string_lossy().into_owned(),
+        recursive: false,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: false,
+        cp_no_dereference: false,
+        cp_dereference: false,
+    })
+    .unwrap();
+    let backends = writer::finish_copy_backend_trace();
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -451,8 +588,10 @@ fn cp_recursive_preserve_and_verbose_keep_threaded_copy_backend() {
         cp_no_clobber: false,
         cp_no_target_directory: false,
         cp_update: false,
-        cp_preserve: true,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: true,
         cp_no_dereference: false,
+        cp_dereference: false,
     };
 
     writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
@@ -495,8 +634,10 @@ fn cp_archive_recursive_keeps_threaded_copy_backend() {
         cp_no_clobber: false,
         cp_no_target_directory: false,
         cp_update: false,
-        cp_preserve: true,
+        cp_preserve_mode: true,
+        cp_preserve_timestamps: true,
         cp_no_dereference: true,
+        cp_dereference: false,
     };
 
     writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
@@ -522,6 +663,57 @@ fn cp_archive_recursive_keeps_threaded_copy_backend() {
 }
 
 #[test]
+fn cp_archive_dereference_recursive_keeps_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive-archive-dereference");
+    let source_root = root.join("source");
+    let target_root = root.join("target");
+    fs::create_dir_all(source_root.join("dir")).unwrap();
+    fs::write(
+        source_root.join("dir/payload.bin"),
+        b"recursive-archive-dereference",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("dir", source_root.join("dir-link")).unwrap();
+    std::os::unix::fs::symlink("dir/payload.bin", source_root.join("payload-link")).unwrap();
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: true,
+        cp_preserve_timestamps: true,
+        cp_no_dereference: false,
+        cp_dereference: true,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        fs::read(target_root.join("payload-link")).unwrap(),
+        b"recursive-archive-dereference"
+    );
+    assert!(target_root.join("dir-link").is_dir());
+    assert_eq!(
+        fs::read(target_root.join("dir-link/payload.bin")).unwrap(),
+        b"recursive-archive-dereference"
+    );
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded; 3]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn cp_falls_back_when_io_uring_setup_is_unavailable() {
     let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
     let root = unique_temp_dir("fro-copy-path-fallback");
@@ -539,8 +731,10 @@ fn cp_falls_back_when_io_uring_setup_is_unavailable() {
         cp_no_clobber: false,
         cp_no_target_directory: false,
         cp_update: false,
-        cp_preserve: false,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: false,
         cp_no_dereference: false,
+        cp_dereference: false,
     })
     .unwrap();
     let backends = writer::finish_copy_backend_trace();
@@ -596,6 +790,7 @@ fn recursive_move_keeps_pending_state_until_large_children_finish() {
         verbose: false,
         cp_compat: false,
         cp_no_clobber: false,
+        follow_symlinks: false,
         preserve_timestamps: false,
     };
 

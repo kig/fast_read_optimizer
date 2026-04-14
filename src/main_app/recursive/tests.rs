@@ -53,6 +53,7 @@ fn test_recursive_copy_context(
         verbose: false,
         cp_compat: false,
         cp_no_clobber: false,
+        follow_symlinks: false,
         preserve_timestamps: false,
     }
 }

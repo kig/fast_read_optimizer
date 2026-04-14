@@ -1,7 +1,7 @@
 use super::{
-    compile_patterns, fgrep_line_matches, fgrep_line_matches_any, fgrep_regular_file_path,
-    fgrep_short_flag_effect, parse_fgrep_args, parse_pattern_file_bytes, FgrepOptions,
-    FgrepPattern, FgrepRegularFilePath,
+    compile_patterns, count_literal_matching_lines, fgrep_line_matches, fgrep_line_matches_any,
+    fgrep_regular_file_path, fgrep_short_flag_effect, parse_fgrep_args, parse_pattern_file_bytes,
+    FgrepOptions, FgrepPattern, FgrepRegularFilePath,
 };
 
 fn fgrep_test_temp_file(name: &str) -> std::path::PathBuf {
@@ -253,5 +253,37 @@ fn fgrep_regular_file_path_documents_line_filter_fallbacks() {
     assert_eq!(
         fgrep_regular_file_path(multi_pattern.options, pattern_count),
         FgrepRegularFilePath::LineFilterMultiPattern
+    );
+}
+
+#[test]
+fn count_literal_matching_lines_counts_once_per_matching_line() {
+    let options = FgrepOptions {
+        count_only: true,
+        print_line_numbers: false,
+        line_regexp: false,
+        ignore_case: false,
+        invert_match: false,
+        report_gbps: false,
+    };
+    assert_eq!(
+        count_literal_matching_lines(b"needle needle\nalpha\nneedle\n", b"needle", options),
+        (true, 2)
+    );
+}
+
+#[test]
+fn count_literal_matching_lines_handles_invert_and_trailing_line() {
+    let options = FgrepOptions {
+        count_only: true,
+        print_line_numbers: false,
+        line_regexp: false,
+        ignore_case: false,
+        invert_match: true,
+        report_gbps: false,
+    };
+    assert_eq!(
+        count_literal_matching_lines(b"needle\nalpha\nomega", b"needle", options),
+        (true, 2)
     );
 }

@@ -99,11 +99,13 @@ fn dedicated_hash_bins_expose_help_and_version() {
         let help_text = String::from_utf8_lossy(&help.stdout);
         assert!(help_text.contains("Usage:"));
         assert!(help_text.contains("--direct"));
+        assert!(help_text.contains("-h, --help"));
+        assert!(help_text.contains("--version"));
 
         let version = Command::new(exe).arg("--version").output().unwrap();
         assert!(version.status.success());
         let version_text = String::from_utf8_lossy(&version.stdout);
-        assert!(version_text.contains(name));
+        assert!(version_text.starts_with(&format!("{name} (fro dedicated) ")));
         assert!(version_text.contains(env!("CARGO_PKG_VERSION")));
     }
 }

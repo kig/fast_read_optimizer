@@ -13,6 +13,42 @@ mod config_command;
 
 use config_command::handle_config_command;
 
+fn resolve_cp_file_target_path(
+    source_path: &Path,
+    target_path: &Path,
+    cp_compat: bool,
+    cp_no_target_directory: bool,
+) -> io::Result<PathBuf> {
+    if !cp_compat || cp_no_target_directory {
+        return Ok(target_path.to_path_buf());
+    }
+    if fs::symlink_metadata(target_path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return Ok(target_path.join(source_path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cp source has no final path component",
+            )
+        })?));
+    }
+    Ok(target_path.to_path_buf())
+}
+
+fn preserve_copied_file_metadata(
+    source_path: &Path,
+    target_path: &Path,
+    preserve_mode: bool,
+    preserve_timestamps: bool,
+) -> io::Result<()> {
+    if preserve_mode {
+        let source_mode = fs::metadata(source_path)?.permissions().mode();
+        fs::set_permissions(target_path, fs::Permissions::from_mode(source_mode))?;
+    }
+    if preserve_timestamps {
+        recursive::preserve_file_timestamps(source_path, target_path)?;
+    }
+    Ok(())
+}
+
 pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let ParsedArgs {
         mode,
@@ -44,8 +80,10 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         cp_target_directory,
         cp_no_target_directory,
         cp_update,
-        cp_preserve,
+        cp_preserve_mode,
+        cp_preserve_timestamps,
         cp_no_dereference,
+        cp_dereference,
         verbose,
         source,
         pattern,
@@ -425,7 +463,11 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     let copied = if recursive_copy || mode == "split-manifest-recursive-copy-bench"
                     {
                         let source_root = PathBuf::from(src);
-                        let source_metadata = fs::symlink_metadata(&source_root)?;
+                        let source_metadata = if cp_dereference {
+                            fs::metadata(&source_root)?
+                        } else {
+                            fs::symlink_metadata(&source_root)?
+                        };
                         let target_root = if cp_compat && cp_no_target_directory {
                             PathBuf::from(&target_name)
                         } else if cp_target_directory.is_some() {
@@ -444,7 +486,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 &symlink_stats,
                                 internal_verbose,
                                 cp_compat,
-                                cp_preserve,
+                                cp_preserve_timestamps,
                             )?;
                             0
                         } else {
@@ -474,7 +516,8 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 verbose: internal_verbose,
                                 cp_compat,
                                 cp_no_clobber,
-                                preserve_timestamps: cp_preserve,
+                                follow_symlinks: cp_dereference,
+                                preserve_timestamps: cp_preserve_timestamps,
                             };
                             if mode == "split-manifest-recursive-copy-bench" {
                                 run_split_manifest_recursive_copy(recursive_ctx, internal_verbose)?
@@ -485,6 +528,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                     } else {
                         let source_path = Path::new(src);
                         let target_path = target_path_buf.as_path();
+                        let copied_target_path = resolve_cp_file_target_path(
+                            source_path,
+                            target_path,
+                            cp_compat,
+                            cp_no_target_directory,
+                        )?;
                         if cp_compat
                             && cp_no_target_directory
                             && fs::symlink_metadata(target_path)
@@ -498,36 +547,14 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                             return Ok(0);
                         }
                         if cp_no_clobber {
-                            if skip_copy_destination(source_path, target_path, false)? {
+                            if skip_copy_destination(source_path, &copied_target_path, false)? {
                                 continue;
                             }
                         } else if cp_update
-                            && skip_copy_destination(source_path, target_path, true)?
+                            && skip_copy_destination(source_path, &copied_target_path, true)?
                         {
                             continue;
                         }
-                        let copied_target_path = if cp_compat
-                            && cp_no_dereference
-                            && fs::symlink_metadata(source_path)
-                                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                        {
-                            if cp_no_target_directory {
-                                target_path.to_path_buf()
-                            } else if fs::symlink_metadata(target_path)
-                                .is_ok_and(|metadata| metadata.file_type().is_dir())
-                            {
-                                target_path.join(source_path.file_name().ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "cp source has no final path component",
-                                    )
-                                })?)
-                            } else {
-                                target_path.to_path_buf()
-                            }
-                        } else {
-                            target_path.to_path_buf()
-                        };
                         if cp_compat
                             && cp_no_dereference
                             && fs::symlink_metadata(source_path)
@@ -540,7 +567,7 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 &symlink_stats,
                                 cli_verbose,
                                 cp_compat,
-                                cp_preserve,
+                                cp_preserve_timestamps,
                             )?;
                             0
                         } else {
@@ -602,6 +629,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                     report.hashes_persisted
                                 );
                                 }
+                                preserve_copied_file_metadata(
+                                    source_path,
+                                    &copied_target_path,
+                                    cp_preserve_mode,
+                                    cp_preserve_timestamps,
+                                )?;
                                 report.bytes_copied
                             } else if verify_copy_diff {
                                 let guard = CopyOperationGuard::new(
@@ -700,6 +733,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                 if !quiet {
                                     fro::cio_eprintln!("copy verify-diff: success");
                                 }
+                                preserve_copied_file_metadata(
+                                    source_path,
+                                    &copied_target_path,
+                                    cp_preserve_mode,
+                                    cp_preserve_timestamps,
+                                )?;
                                 copied
                             } else if via_memory {
                                 let guard = CopyOperationGuard::new(
@@ -743,6 +782,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                     resolved_copy.io_mode_write,
                                 )?;
                                 guard.ensure_source_unchanged()?;
+                                preserve_copied_file_metadata(
+                                    source_path,
+                                    &copied_target_path,
+                                    cp_preserve_mode,
+                                    cp_preserve_timestamps,
+                                )?;
                                 copied
                             } else {
                                 let guard = CopyOperationGuard::new(
@@ -786,12 +831,12 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
                                     )?
                                 };
                                 guard.ensure_source_unchanged()?;
-                                if cp_preserve {
-                                    recursive::preserve_file_timestamps(
-                                        source_path,
-                                        &copied_target_path,
-                                    )?;
-                                }
+                                preserve_copied_file_metadata(
+                                    source_path,
+                                    &copied_target_path,
+                                    cp_preserve_mode,
+                                    cp_preserve_timestamps,
+                                )?;
                                 copied
                             }
                         }

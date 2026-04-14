@@ -1,5 +1,32 @@
 use super::*;
 
+fn assert_same_sorted_nul_records(fro: Output, system: Output, label: &str) {
+    assert_eq!(
+        fro.status.code(),
+        system.status.code(),
+        "{label}: status mismatch"
+    );
+    let mut fro_records = fro
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| record.to_vec())
+        .collect::<Vec<_>>();
+    let mut sys_records = system
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| record.to_vec())
+        .collect::<Vec<_>>();
+    fro_records.sort();
+    sys_records.sort();
+    assert_eq!(
+        fro_records, sys_records,
+        "{label}: sorted NUL stdout mismatch"
+    );
+    assert_eq!(fro.stderr, system.stderr, "{label}: stderr mismatch");
+}
+
 #[test]
 fn cartesian_du_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-du-matrix");
@@ -143,6 +170,282 @@ fn du_matches_system_for_symlinks_broken_symlinks_and_fifos() {
             &format!("du special {:?}", du_args),
         );
     }
+}
+
+#[test]
+fn du_dereference_args_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-dereference-args");
+    let real = tmp.join("real");
+    let nested = real.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(real.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x22; 8192]).unwrap();
+
+    let dir_link = tmp.join("real-link");
+    let file_link = tmp.join("file-link");
+    symlink(&real, &dir_link).unwrap();
+    symlink(real.join("root.txt"), &file_link).unwrap();
+
+    for du_args in [
+        vec!["-aH", dir_link.to_str().unwrap()],
+        vec!["--dereference-args", "-a", dir_link.to_str().unwrap()],
+        vec!["-H", file_link.to_str().unwrap()],
+        vec!["-aH", tmp.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du dereference-args {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_explicit_no_dereference_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-no-dereference");
+    let real = tmp.join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("root.txt"), vec![0x11; 4096]).unwrap();
+
+    let dir_link = tmp.join("real-link");
+    symlink(&real, &dir_link).unwrap();
+
+    for du_args in [
+        vec!["-P", dir_link.to_str().unwrap()],
+        vec!["--no-dereference", dir_link.to_str().unwrap()],
+        vec!["-H", "-P", dir_link.to_str().unwrap()],
+        vec!["-P", "-H", dir_link.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du no-dereference {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_block_size_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-block-size");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested/deeper");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(tree.join("nested/child.txt"), vec![0x22; 8192]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 16384]).unwrap();
+
+    for du_args in [
+        vec!["-B", "1", tree.to_str().unwrap()],
+        vec!["-B1K", tree.to_str().unwrap()],
+        vec!["-aB2K", tree.to_str().unwrap()],
+        vec!["--block-size=1", tree.to_str().unwrap()],
+        vec!["--block-size", "512", tree.to_str().unwrap()],
+        vec!["-a", "--block-size=2K", tree.to_str().unwrap()],
+        vec![
+            "--human-readable",
+            "--block-size=1K",
+            tree.to_str().unwrap(),
+        ],
+        vec![
+            "--block-size=1K",
+            "--human-readable",
+            tree.to_str().unwrap(),
+        ],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du block-size {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_display_size_shortcuts_and_si_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-display-size");
+    let tree = tmp.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("regular.bin"), vec![0x11; 1500]).unwrap();
+    let sparse = tree.join("sparse.bin");
+    let file = fs::File::create(&sparse).unwrap();
+    file.set_len(1024 * 1024).unwrap();
+
+    for du_args in [
+        vec!["-k", tree.to_str().unwrap()],
+        vec!["-m", tree.to_str().unwrap()],
+        vec!["--si", tree.to_str().unwrap()],
+        vec!["-b", "-k", sparse.to_str().unwrap()],
+        vec!["-k", "-b", sparse.to_str().unwrap()],
+        vec!["--si", "-B1", tree.to_str().unwrap()],
+        vec!["-B1", "--si", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du display-size {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_apparent_size_and_bytes_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-apparent-size");
+    let tree = tmp.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("regular.bin"), vec![0x11; 3]).unwrap();
+    let sparse = tree.join("sparse.bin");
+    let file = fs::File::create(&sparse).unwrap();
+    file.set_len(1024 * 1024).unwrap();
+    symlink("regular.bin", tree.join("regular-link")).unwrap();
+
+    for du_args in [
+        vec!["--apparent-size", sparse.to_str().unwrap()],
+        vec!["-b", sparse.to_str().unwrap()],
+        vec!["--bytes", tree.to_str().unwrap()],
+        vec!["-ab", tree.to_str().unwrap()],
+        vec!["--apparent-size", "--block-size=1K", tree.to_str().unwrap()],
+        vec!["--bytes", "--human-readable", tree.to_str().unwrap()],
+        vec!["--human-readable", "--bytes", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du apparent-size {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_null_terminated_output_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-null");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x22; 8192]).unwrap();
+
+    for du_args in [
+        vec!["-a0", tree.to_str().unwrap()],
+        vec!["--all", "--null", tree.to_str().unwrap()],
+        vec!["-c0", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_nul_records(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du null {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_threshold_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-threshold");
+    let tree = tmp.join("tree");
+    let nested = tree.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(tree.join("small.bin"), vec![0x11; 3]).unwrap();
+    fs::write(tree.join("medium.bin"), vec![0x22; 4096]).unwrap();
+    let sparse = tree.join("sparse.bin");
+    let file = fs::File::create(&sparse).unwrap();
+    file.set_len(4096).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x33; 3]).unwrap();
+
+    for du_args in [
+        vec!["-a", "-t", "2K", tree.to_str().unwrap()],
+        vec!["-a", "--threshold=2K", tree.to_str().unwrap()],
+        vec!["-a", "-t-2K", tree.to_str().unwrap()],
+        vec!["-ac", "--threshold=3K", tree.to_str().unwrap()],
+        vec![
+            "-a",
+            "--apparent-size",
+            "-B1",
+            "--threshold=2K",
+            tree.to_str().unwrap(),
+        ],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du threshold {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_threshold_errors_match_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-threshold-errors");
+    let tree = tmp.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("file.bin"), vec![0x11; 3]).unwrap();
+
+    for du_args in [
+        vec!["--threshold=bad", tree.to_str().unwrap()],
+        vec!["-t", "-0", tree.to_str().unwrap()],
+    ] {
+        assert_same_result(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du threshold error {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_help_and_version_surface_stay_wired() {
+    let help = run_fro("du", &["--help"]);
+    assert_eq!(
+        help.status.code(),
+        Some(0),
+        "du --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr),
+    );
+    assert!(
+        help.stderr.is_empty(),
+        "du --help unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&help.stderr),
+    );
+    let help_stdout = String::from_utf8(help.stdout).expect("du help should be UTF-8");
+    for token in [
+        "--null",
+        "--threshold",
+        "--bytes",
+        "--apparent-size",
+        "--block-size",
+        "--no-dereference",
+        "--si",
+        "--help",
+        "--version",
+        "-0",
+        "-t",
+        "-k",
+        "-m",
+        "--max-depth",
+    ] {
+        assert!(
+            help_stdout.contains(token),
+            "du --help output should mention {token}:\n{help_stdout}"
+        );
+    }
+
+    let version = run_fro("du", &["--version"]);
+    assert_eq!(
+        version.status.code(),
+        Some(0),
+        "du --version failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr),
+    );
+    assert!(
+        version.stderr.is_empty(),
+        "du --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr),
+    );
+    let version_stdout = String::from_utf8(version.stdout).expect("du version should be UTF-8");
+    assert!(
+        version_stdout.starts_with("du "),
+        "du --version should start with the du command name:\n{version_stdout}"
+    );
 }
 
 #[test]

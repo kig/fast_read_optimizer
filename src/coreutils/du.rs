@@ -4,40 +4,131 @@ fn disk_usage_kib(blocks: u64) -> u64 {
     blocks.div_ceil(2)
 }
 
-fn du_format_kib(kib: u64, human_readable: bool) -> String {
-    if !human_readable {
-        return kib.to_string();
-    }
-    const UNITS: [&str; 8] = ["K", "M", "G", "T", "P", "E", "Z", "Y"];
-    let mut value = kib as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if value >= 10.0 {
-        format!("{}{}", value.ceil() as u64, UNITS[unit])
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
+fn du_bytes_kib(bytes: u64) -> u64 {
+    bytes.div_ceil(1024)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuUsageMode {
+    DiskBlocks,
+    ApparentBytes,
+}
+
+fn du_usage_bytes(amount: u64, usage_mode: DuUsageMode) -> u64 {
+    match usage_mode {
+        DuUsageMode::DiskBlocks => amount.saturating_mul(512),
+        DuUsageMode::ApparentBytes => amount,
     }
 }
 
-fn append_du_line(chunk: &mut Vec<u8>, kib: u64, path: &Path, human_readable: bool) {
-    chunk.extend_from_slice(du_format_kib(kib, human_readable).as_bytes());
+fn du_usage_display_units(amount: u64, usage_mode: DuUsageMode, block_size: u64) -> u64 {
+    (du_usage_bytes(amount, usage_mode) as u128).div_ceil(block_size as u128) as u64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuDisplayFormat {
+    Kib,
+    HumanReadableIec,
+    HumanReadableSi,
+    BlockSize(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuLineTerminator {
+    Newline,
+    Nul,
+}
+
+impl DuLineTerminator {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Newline => b'\n',
+            Self::Nul => b'\0',
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuThreshold {
+    Min(u64),
+    Max(u64),
+}
+
+fn du_format_human_bytes(bytes: u64, unit_base: u64, units: &[&str]) -> String {
+    if bytes < unit_base {
+        return bytes.to_string();
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= unit_base as f64 && unit + 1 < units.len() - 1 {
+        value /= unit_base as f64;
+        unit += 1;
+    }
+    if value >= 10.0 {
+        format!("{}{}", value.ceil() as u64, units[unit])
+    } else {
+        let rounded_up = (value * 10.0).ceil() / 10.0;
+        if rounded_up >= 10.0 {
+            format!("{}{}", rounded_up as u64, units[unit])
+        } else {
+            format!("{rounded_up:.1}{}", units[unit])
+        }
+    }
+}
+
+fn du_format_usage(
+    amount: u64,
+    usage_mode: DuUsageMode,
+    display_format: DuDisplayFormat,
+) -> String {
+    match display_format {
+        DuDisplayFormat::Kib => match usage_mode {
+            DuUsageMode::DiskBlocks => disk_usage_kib(amount).to_string(),
+            DuUsageMode::ApparentBytes => du_bytes_kib(amount).to_string(),
+        },
+        DuDisplayFormat::HumanReadableIec => du_format_human_bytes(
+            du_usage_bytes(amount, usage_mode),
+            1024,
+            &["", "K", "M", "G", "T", "P", "E", "Z", "Y"],
+        ),
+        DuDisplayFormat::HumanReadableSi => du_format_human_bytes(
+            du_usage_bytes(amount, usage_mode),
+            1000,
+            &["", "k", "M", "G", "T", "P", "E", "Z", "Y"],
+        ),
+        DuDisplayFormat::BlockSize(block_size) => {
+            du_usage_display_units(amount, usage_mode, block_size).to_string()
+        }
+    }
+}
+
+fn append_du_line(
+    chunk: &mut Vec<u8>,
+    amount: u64,
+    path: &Path,
+    usage_mode: DuUsageMode,
+    display_format: DuDisplayFormat,
+    line_terminator: DuLineTerminator,
+) {
+    chunk.extend_from_slice(du_format_usage(amount, usage_mode, display_format).as_bytes());
     chunk.push(b'\t');
     chunk.extend_from_slice(path.as_os_str().as_bytes());
-    chunk.push(b'\n');
+    chunk.push(line_terminator.byte());
 }
 
 fn du_depth_included(depth: usize, max_depth: Option<usize>) -> bool {
     max_depth.is_none_or(|limit| depth <= limit)
 }
 
-fn du_display_total_kib(separate_dirs: bool, exclusive_kib: u64, subtree_total_kib: u64) -> u64 {
+fn du_display_total_blocks(
+    separate_dirs: bool,
+    exclusive_blocks: u64,
+    subtree_total_blocks: u64,
+) -> u64 {
     if separate_dirs {
-        exclusive_kib
+        exclusive_blocks
     } else {
-        subtree_total_kib
+        subtree_total_blocks
     }
 }
 
@@ -45,6 +136,69 @@ fn parse_du_max_depth(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|_| format!("invalid maximum depth ‘{value}’"))
+}
+
+fn parse_du_block_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid --block-size argument '{value}'"));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let split = lower
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(lower.len());
+    if split == 0 {
+        return Err(format!("invalid --block-size argument '{value}'"));
+    }
+    let amount = lower[..split]
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --block-size argument '{value}'"))?;
+    let multiplier = match lower[split..].trim() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        _ => return Err(format!("invalid --block-size argument '{value}'")),
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| format!("invalid --block-size argument '{value}'"))
+}
+
+fn parse_du_threshold(value: &str) -> Result<DuThreshold, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid --threshold argument '{value}'"));
+    }
+    let (negative, magnitude) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    let threshold = parse_du_block_size(magnitude)
+        .map_err(|_| format!("invalid --threshold argument '{value}'"))?;
+    Ok(if negative {
+        DuThreshold::Max(threshold)
+    } else {
+        DuThreshold::Min(threshold)
+    })
+}
+
+fn du_threshold_includes(
+    amount: u64,
+    usage_mode: DuUsageMode,
+    threshold: Option<DuThreshold>,
+) -> bool {
+    let bytes = du_usage_bytes(amount, usage_mode);
+    match threshold {
+        Some(DuThreshold::Min(minimum)) => bytes >= minimum,
+        Some(DuThreshold::Max(maximum)) => bytes <= maximum,
+        None => true,
+    }
 }
 
 fn write_du_stderr_line(message: &str) {
@@ -60,17 +214,134 @@ fn write_du_try_help() {
 fn du_apply_short_flag(
     summarize: bool,
     all: bool,
-    human_readable: bool,
+    display_format: DuDisplayFormat,
+    usage_mode: DuUsageMode,
     total: bool,
     separate_dirs: bool,
+    dereference_args: bool,
+    line_terminator: DuLineTerminator,
     flag: u8,
-) -> io::Result<(bool, bool, bool, bool, bool)> {
+) -> io::Result<(
+    bool,
+    bool,
+    DuDisplayFormat,
+    DuUsageMode,
+    bool,
+    bool,
+    bool,
+    DuLineTerminator,
+)> {
     match flag {
-        b's' => Ok((true, all, human_readable, total, separate_dirs)),
-        b'a' => Ok((summarize, true, human_readable, total, separate_dirs)),
-        b'h' => Ok((summarize, all, true, total, separate_dirs)),
-        b'c' => Ok((summarize, all, human_readable, true, separate_dirs)),
-        b'S' => Ok((summarize, all, human_readable, total, true)),
+        b's' => Ok((
+            true,
+            all,
+            display_format,
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'a' => Ok((
+            summarize,
+            true,
+            display_format,
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'h' => Ok((
+            summarize,
+            all,
+            DuDisplayFormat::HumanReadableIec,
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'k' => Ok((
+            summarize,
+            all,
+            DuDisplayFormat::BlockSize(1024),
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'm' => Ok((
+            summarize,
+            all,
+            DuDisplayFormat::BlockSize(1024_u64.pow(2)),
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'c' => Ok((
+            summarize,
+            all,
+            display_format,
+            usage_mode,
+            true,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'S' => Ok((
+            summarize,
+            all,
+            display_format,
+            usage_mode,
+            total,
+            true,
+            dereference_args,
+            line_terminator,
+        )),
+        b'b' => Ok((
+            summarize,
+            all,
+            DuDisplayFormat::BlockSize(1),
+            DuUsageMode::ApparentBytes,
+            total,
+            separate_dirs,
+            dereference_args,
+            line_terminator,
+        )),
+        b'D' | b'H' => Ok((
+            summarize,
+            all,
+            display_format,
+            usage_mode,
+            total,
+            separate_dirs,
+            true,
+            line_terminator,
+        )),
+        b'P' => Ok((
+            summarize,
+            all,
+            display_format,
+            usage_mode,
+            total,
+            separate_dirs,
+            false,
+            line_terminator,
+        )),
+        b'0' => Ok((
+            summarize,
+            all,
+            display_format,
+            usage_mode,
+            total,
+            separate_dirs,
+            dereference_args,
+            DuLineTerminator::Nul,
+        )),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported du flag: -{}", other as char),
@@ -81,13 +352,13 @@ fn du_apply_short_flag(
 #[derive(Clone)]
 struct DuLine {
     path: PathBuf,
-    kib: u64,
+    usage: u64,
 }
 
 struct DuNode {
     path: PathBuf,
-    total_kib: u64,
-    exclusive_kib: u64,
+    total_usage: u64,
+    exclusive_usage: u64,
     parent: Option<usize>,
     pending_children: usize,
     pending_file_stats: usize,
@@ -107,10 +378,16 @@ fn cstring_from_os_str(value: &std::ffi::OsStr) -> io::Result<CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))
 }
 
-fn lstat_no_follow(path: &Path) -> io::Result<libc::stat> {
+fn stat_path(path: &Path, follow_symlinks: bool) -> io::Result<libc::stat> {
     let path = cstring_from_os_str(path.as_os_str())?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe { libc::lstat(path.as_ptr(), stat.as_mut_ptr()) };
+    let rc = unsafe {
+        if follow_symlinks {
+            libc::stat(path.as_ptr(), stat.as_mut_ptr())
+        } else {
+            libc::lstat(path.as_ptr(), stat.as_mut_ptr())
+        }
+    };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -228,18 +505,18 @@ fn finish_du_node(node_id: usize, state: &DuSharedState, separate_dirs: bool) {
             ) {
                 break;
             }
-            let total_kib = nodes[id].total_kib;
-            let display_kib =
-                du_display_total_kib(separate_dirs, nodes[id].exclusive_kib, total_kib);
+            let total_usage = nodes[id].total_usage;
+            let display_usage =
+                du_display_total_blocks(separate_dirs, nodes[id].exclusive_usage, total_usage);
             if nodes[id].emit {
                 completed_lines.push(DuLine {
                     path: nodes[id].path.clone(),
-                    kib: display_kib,
+                    usage: display_usage,
                 });
             }
             nodes[id].completed = true;
             if let Some(parent_id) = nodes[id].parent {
-                nodes[parent_id].total_kib += total_kib;
+                nodes[parent_id].total_usage += total_usage;
                 nodes[parent_id].pending_children =
                     nodes[parent_id].pending_children.saturating_sub(1);
                 if du_node_ready(
@@ -270,6 +547,7 @@ fn walk_du_subtree(
     all: bool,
     separate_dirs: bool,
     max_depth: Option<usize>,
+    usage_mode: DuUsageMode,
 ) -> io::Result<()> {
     let mut stack = vec![start];
     while let Some(task) = stack.pop() {
@@ -293,7 +571,7 @@ fn walk_du_subtree(
         let dirfd = dir.fd();
         let mut child_dirs = Vec::new();
         let mut file_lines = Vec::new();
-        let mut file_total_kib = 0u64;
+        let mut file_total_usage = 0u64;
         loop {
             let entry = match dir.next_entry() {
                 Ok(Some(entry)) => entry,
@@ -315,7 +593,10 @@ fn walk_du_subtree(
                 }
                 Err(err) => return Err(err),
             };
-            let kib = disk_usage_kib(stat.st_blocks as u64);
+            let usage = match usage_mode {
+                DuUsageMode::DiskBlocks => stat.st_blocks as u64,
+                DuUsageMode::ApparentBytes => stat.st_size as u64,
+            };
             if stat_is_dir(&stat) {
                 let child_depth = task.depth + 1;
                 let child_id = {
@@ -323,8 +604,8 @@ fn walk_du_subtree(
                     let child_id = nodes.len();
                     nodes.push(DuNode {
                         path: child_path.clone(),
-                        total_kib: kib,
-                        exclusive_kib: kib,
+                        total_usage: usage,
+                        exclusive_usage: usage,
                         parent: Some(task.node_id),
                         pending_children: 0,
                         pending_file_stats: 0,
@@ -341,11 +622,11 @@ fn walk_du_subtree(
                     depth: child_depth,
                 });
             } else {
-                file_total_kib += kib;
+                file_total_usage += usage;
                 if all && du_depth_included(task.depth + 1, max_depth) {
                     file_lines.push(DuLine {
                         path: child_path,
-                        kib,
+                        usage,
                     });
                 }
             }
@@ -353,8 +634,8 @@ fn walk_du_subtree(
         {
             let mut nodes = state.nodes.lock().unwrap();
             nodes[task.node_id].pending_children += child_dirs.len();
-            nodes[task.node_id].total_kib += file_total_kib;
-            nodes[task.node_id].exclusive_kib += file_total_kib;
+            nodes[task.node_id].total_usage += file_total_usage;
+            nodes[task.node_id].exclusive_usage += file_total_usage;
             nodes[task.node_id].scanned = true;
         }
         if !file_lines.is_empty() {
@@ -390,22 +671,38 @@ fn append_du_output(
     all: bool,
     separate_dirs: bool,
     max_depth: Option<usize>,
-    human_readable: bool,
+    display_format: DuDisplayFormat,
+    usage_mode: DuUsageMode,
+    dereference_args: bool,
+    line_terminator: DuLineTerminator,
+    threshold: Option<DuThreshold>,
     output: &mut Vec<u8>,
     had_warnings: Arc<AtomicBool>,
 ) -> io::Result<u64> {
-    let stat = lstat_no_follow(path)?;
-    let root_kib = disk_usage_kib(stat.st_blocks as u64);
+    let stat = stat_path(path, dereference_args)?;
+    let root_usage = match usage_mode {
+        DuUsageMode::DiskBlocks => stat.st_blocks as u64,
+        DuUsageMode::ApparentBytes => stat.st_size as u64,
+    };
     if !stat_is_dir(&stat) {
-        append_du_line(output, root_kib, path, human_readable);
-        return Ok(root_kib);
+        if du_threshold_includes(root_usage, usage_mode, threshold) {
+            append_du_line(
+                output,
+                root_usage,
+                path,
+                usage_mode,
+                display_format,
+                line_terminator,
+            );
+        }
+        return Ok(root_usage);
     }
 
     let state = Arc::new(DuSharedState {
         nodes: Mutex::new(vec![DuNode {
             path: path.to_path_buf(),
-            total_kib: root_kib,
-            exclusive_kib: root_kib,
+            total_usage: root_usage,
+            exclusive_usage: root_usage,
             parent: None,
             pending_children: 0,
             pending_file_stats: 0,
@@ -430,6 +727,7 @@ fn append_du_output(
             all,
             separate_dirs,
             max_depth,
+            usage_mode,
         )?;
     } else {
         let dir_queue = Arc::new(WorkQueue::default());
@@ -449,6 +747,7 @@ fn append_du_output(
                     all,
                     separate_dirs,
                     max_depth,
+                    usage_mode,
                 )
             }
         })?;
@@ -458,10 +757,19 @@ fn append_du_output(
         .ok_or_else(|| io::Error::other("du shared state still has active references"))?;
     let lines = state.lines.into_inner().unwrap();
     for line in lines {
-        append_du_line(output, line.kib, &line.path, human_readable);
+        if du_threshold_includes(line.usage, usage_mode, threshold) {
+            append_du_line(
+                output,
+                line.usage,
+                &line.path,
+                usage_mode,
+                display_format,
+                line_terminator,
+            );
+        }
     }
-    let total_kib = state.nodes.into_inner().unwrap()[0].total_kib;
-    Ok(total_kib)
+    let total_usage = state.nodes.into_inner().unwrap()[0].total_usage;
+    Ok(total_usage)
 }
 
 fn du_should_use_serial_walk(root: &Path) -> io::Result<bool> {
@@ -479,6 +787,7 @@ fn walk_du_subtree_serial(
     all: bool,
     separate_dirs: bool,
     max_depth: Option<usize>,
+    usage_mode: DuUsageMode,
 ) -> io::Result<()> {
     let mut stack = vec![start];
     while let Some(task) = stack.pop() {
@@ -499,7 +808,7 @@ fn walk_du_subtree_serial(
         let dirfd = dir.fd();
         let mut child_dirs = Vec::new();
         let mut file_lines = Vec::new();
-        let mut file_total_kib = 0u64;
+        let mut file_total_usage = 0u64;
         loop {
             let entry = match dir.next_entry() {
                 Ok(Some(entry)) => entry,
@@ -521,7 +830,10 @@ fn walk_du_subtree_serial(
                 }
                 Err(err) => return Err(err),
             };
-            let kib = disk_usage_kib(stat.st_blocks as u64);
+            let usage = match usage_mode {
+                DuUsageMode::DiskBlocks => stat.st_blocks as u64,
+                DuUsageMode::ApparentBytes => stat.st_size as u64,
+            };
             if stat_is_dir(&stat) {
                 let child_depth = task.depth + 1;
                 let child_id = {
@@ -529,8 +841,8 @@ fn walk_du_subtree_serial(
                     let child_id = nodes.len();
                     nodes.push(DuNode {
                         path: child_path.clone(),
-                        total_kib: kib,
-                        exclusive_kib: kib,
+                        total_usage: usage,
+                        exclusive_usage: usage,
                         parent: Some(task.node_id),
                         pending_children: 0,
                         pending_file_stats: 0,
@@ -547,11 +859,11 @@ fn walk_du_subtree_serial(
                     depth: child_depth,
                 });
             } else {
-                file_total_kib += kib;
+                file_total_usage += usage;
                 if all && du_depth_included(task.depth + 1, max_depth) {
                     file_lines.push(DuLine {
                         path: child_path,
-                        kib,
+                        usage,
                     });
                 }
             }
@@ -559,8 +871,8 @@ fn walk_du_subtree_serial(
         {
             let mut nodes = state.nodes.lock().unwrap();
             nodes[task.node_id].pending_children += child_dirs.len();
-            nodes[task.node_id].total_kib += file_total_kib;
-            nodes[task.node_id].exclusive_kib += file_total_kib;
+            nodes[task.node_id].total_usage += file_total_usage;
+            nodes[task.node_id].exclusive_usage += file_total_usage;
             nodes[task.node_id].scanned = true;
         }
         if !file_lines.is_empty() {
@@ -604,25 +916,61 @@ mod du_tests {
     }
 
     #[test]
-    fn du_format_kib_uses_expected_unit_suffixes() {
-        assert_eq!(du_format_kib(7, false), "7");
-        assert_eq!(du_format_kib(7, true), "7.0K");
-        assert_eq!(du_format_kib(1024, true), "1.0M");
-        assert_eq!(du_format_kib(1536, true), "1.5M");
+    fn du_format_human_bytes_matches_gnu_style_rounding() {
+        let units = ["", "K", "M", "G", "T", "P", "E", "Z", "Y"];
+        assert_eq!(du_format_human_bytes(1, 1024, &units), "1");
+        assert_eq!(du_format_human_bytes(1023, 1024, &units), "1023");
+        assert_eq!(du_format_human_bytes(1024, 1024, &units), "1.0K");
+        assert_eq!(du_format_human_bytes(1025, 1024, &units), "1.1K");
+        assert_eq!(du_format_human_bytes(1536, 1024, &units), "1.5K");
+        assert_eq!(du_format_human_bytes(1024 * 1024, 1024, &units), "1.0M");
+        assert_eq!(du_format_human_bytes(1024 * 1024 + 9, 1024, &units), "1.1M");
+    }
+
+    #[test]
+    fn du_format_human_bytes_supports_si_units() {
+        let units = ["", "k", "M", "G", "T", "P", "E", "Z", "Y"];
+        assert_eq!(du_format_human_bytes(999, 1000, &units), "999");
+        assert_eq!(du_format_human_bytes(1000, 1000, &units), "1.0k");
+        assert_eq!(du_format_human_bytes(4096, 1000, &units), "4.1k");
     }
 
     #[test]
     fn du_apply_short_flag_accepts_combined_supported_flags() {
-        let h = du_apply_short_flag(false, false, false, false, false, b'h').unwrap();
-        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, b'c').unwrap();
-        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, b's').unwrap();
-        assert_eq!(hcs, (true, false, true, true, false));
+        let h = du_apply_short_flag(
+            false,
+            false,
+            DuDisplayFormat::Kib,
+            DuUsageMode::DiskBlocks,
+            false,
+            false,
+            false,
+            DuLineTerminator::Newline,
+            b'h',
+        )
+        .unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, h.5, h.6, h.7, b'c').unwrap();
+        let hcs =
+            du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, hc.5, hc.6, hc.7, b's').unwrap();
+        assert_eq!(
+            hcs,
+            (
+                true,
+                false,
+                DuDisplayFormat::HumanReadableIec,
+                DuUsageMode::DiskBlocks,
+                true,
+                false,
+                false,
+                DuLineTerminator::Newline
+            )
+        );
     }
 
     #[test]
-    fn du_display_total_kib_respects_separate_dirs() {
-        assert_eq!(du_display_total_kib(false, 2, 9), 9);
-        assert_eq!(du_display_total_kib(true, 2, 9), 2);
+    fn du_display_total_blocks_respects_separate_dirs() {
+        assert_eq!(du_display_total_blocks(false, 2, 9), 9);
+        assert_eq!(du_display_total_blocks(true, 2, 9), 2);
     }
 
     #[test]
@@ -640,6 +988,181 @@ mod du_tests {
             parse_du_max_depth("bad").unwrap_err(),
             "invalid maximum depth ‘bad’"
         );
+    }
+
+    #[test]
+    fn parse_du_block_size_accepts_positive_sizes() {
+        assert_eq!(parse_du_block_size("1").unwrap(), 1);
+        assert_eq!(parse_du_block_size("2K").unwrap(), 2048);
+        assert_eq!(parse_du_block_size("3MiB").unwrap(), 3 * 1024 * 1024);
+        assert_eq!(
+            parse_du_block_size("0").unwrap_err(),
+            "invalid --block-size argument '0'"
+        );
+        assert_eq!(
+            parse_du_block_size("bad").unwrap_err(),
+            "invalid --block-size argument 'bad'"
+        );
+    }
+
+    #[test]
+    fn parse_du_threshold_accepts_signed_sizes() {
+        assert_eq!(parse_du_threshold("1").unwrap(), DuThreshold::Min(1));
+        assert_eq!(parse_du_threshold("+2K").unwrap(), DuThreshold::Min(2048));
+        assert_eq!(
+            parse_du_threshold("-3MiB").unwrap(),
+            DuThreshold::Max(3 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_du_threshold("-0").unwrap_err(),
+            "invalid --threshold argument '-0'"
+        );
+        assert_eq!(
+            parse_du_threshold("bad").unwrap_err(),
+            "invalid --threshold argument 'bad'"
+        );
+    }
+
+    #[test]
+    fn du_threshold_includes_uses_measured_usage_bytes() {
+        assert!(du_threshold_includes(
+            2,
+            DuUsageMode::DiskBlocks,
+            Some(DuThreshold::Min(1024))
+        ));
+        assert!(!du_threshold_includes(
+            1,
+            DuUsageMode::DiskBlocks,
+            Some(DuThreshold::Min(1024))
+        ));
+        assert!(du_threshold_includes(
+            2048,
+            DuUsageMode::ApparentBytes,
+            Some(DuThreshold::Max(2048))
+        ));
+        assert!(!du_threshold_includes(
+            2049,
+            DuUsageMode::ApparentBytes,
+            Some(DuThreshold::Max(2048))
+        ));
+    }
+
+    #[test]
+    fn du_format_usage_supports_disk_and_apparent_sizes() {
+        assert_eq!(
+            du_format_usage(8, DuUsageMode::DiskBlocks, DuDisplayFormat::Kib),
+            "4"
+        );
+        assert_eq!(
+            du_format_usage(
+                8,
+                DuUsageMode::DiskBlocks,
+                DuDisplayFormat::HumanReadableIec
+            ),
+            "4.0K"
+        );
+        assert_eq!(
+            du_format_usage(8, DuUsageMode::DiskBlocks, DuDisplayFormat::HumanReadableSi),
+            "4.1k"
+        );
+        assert_eq!(
+            du_format_usage(8, DuUsageMode::DiskBlocks, DuDisplayFormat::BlockSize(512)),
+            "8"
+        );
+        assert_eq!(
+            du_format_usage(8, DuUsageMode::DiskBlocks, DuDisplayFormat::BlockSize(2048)),
+            "2"
+        );
+        assert_eq!(
+            du_format_usage(1536, DuUsageMode::ApparentBytes, DuDisplayFormat::Kib),
+            "2"
+        );
+        assert_eq!(
+            du_format_usage(
+                1536,
+                DuUsageMode::ApparentBytes,
+                DuDisplayFormat::HumanReadableIec
+            ),
+            "1.5K"
+        );
+        assert_eq!(
+            du_format_usage(
+                1536,
+                DuUsageMode::ApparentBytes,
+                DuDisplayFormat::HumanReadableSi
+            ),
+            "1.6k"
+        );
+        assert_eq!(
+            du_format_usage(
+                1536,
+                DuUsageMode::ApparentBytes,
+                DuDisplayFormat::BlockSize(1)
+            ),
+            "1536"
+        );
+    }
+
+    #[test]
+    fn du_bytes_short_flag_enables_apparent_byte_output() {
+        let b = du_apply_short_flag(
+            false,
+            false,
+            DuDisplayFormat::Kib,
+            DuUsageMode::DiskBlocks,
+            false,
+            false,
+            false,
+            DuLineTerminator::Newline,
+            b'b',
+        )
+        .unwrap();
+        assert_eq!(
+            b,
+            (
+                false,
+                false,
+                DuDisplayFormat::BlockSize(1),
+                DuUsageMode::ApparentBytes,
+                false,
+                false,
+                false,
+                DuLineTerminator::Newline
+            )
+        );
+    }
+
+    #[test]
+    fn du_k_and_m_short_flags_override_only_display_units() {
+        let k = du_apply_short_flag(
+            false,
+            false,
+            DuDisplayFormat::HumanReadableIec,
+            DuUsageMode::ApparentBytes,
+            false,
+            false,
+            false,
+            DuLineTerminator::Newline,
+            b'k',
+        )
+        .unwrap();
+        assert_eq!(k.2, DuDisplayFormat::BlockSize(1024));
+        assert_eq!(k.3, DuUsageMode::ApparentBytes);
+
+        let m = du_apply_short_flag(
+            false,
+            false,
+            DuDisplayFormat::Kib,
+            DuUsageMode::DiskBlocks,
+            false,
+            false,
+            false,
+            DuLineTerminator::Newline,
+            b'm',
+        )
+        .unwrap();
+        assert_eq!(m.2, DuDisplayFormat::BlockSize(1024_u64.pow(2)));
+        assert_eq!(m.3, DuUsageMode::DiskBlocks);
     }
 
     #[test]
@@ -687,7 +1210,8 @@ mod kani_proofs {
         hash_check_should_print_result, hash_check_untagged_kind, HashCheckLineKind,
     };
     use super::{
-        du_apply_short_flag, du_display_total_kib, du_node_ready, permission_denied_components,
+        du_apply_short_flag, du_display_total_blocks, du_node_ready, permission_denied_components,
+        DuDisplayFormat, DuLineTerminator, DuUsageMode,
     };
     use std::io;
 
@@ -756,27 +1280,41 @@ mod kani_proofs {
 
     #[kani::proof]
     fn du_short_flag_hcs_sets_expected_state() {
-        let h = du_apply_short_flag(false, false, false, false, false, b'h').unwrap();
-        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, b'c').unwrap();
-        let hcs = du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, b's').unwrap();
+        let h = du_apply_short_flag(
+            false,
+            false,
+            DuDisplayFormat::Kib,
+            DuUsageMode::DiskBlocks,
+            false,
+            false,
+            false,
+            DuLineTerminator::Newline,
+            b'h',
+        )
+        .unwrap();
+        let hc = du_apply_short_flag(h.0, h.1, h.2, h.3, h.4, h.5, h.6, h.7, b'c').unwrap();
+        let hcs =
+            du_apply_short_flag(hc.0, hc.1, hc.2, hc.3, hc.4, hc.5, hc.6, hc.7, b's').unwrap();
         assert!(hcs.0);
         assert!(!hcs.1);
-        assert!(hcs.2);
-        assert!(hcs.3);
-        assert!(!hcs.4);
+        assert_eq!(hcs.2, DuDisplayFormat::HumanReadableIec);
+        assert_eq!(hcs.3, DuUsageMode::DiskBlocks);
+        assert!(hcs.4);
+        assert!(!hcs.5);
+        assert!(!hcs.6);
     }
 
     #[kani::proof]
-    fn du_display_total_kib_matches_flag_formula() {
+    fn du_display_total_blocks_matches_flag_formula() {
         let separate_dirs: bool = kani::any();
-        let exclusive_kib: u64 = kani::any();
-        let subtree_total_kib: u64 = kani::any();
+        let exclusive_blocks: u64 = kani::any();
+        let subtree_total_blocks: u64 = kani::any();
         assert_eq!(
-            du_display_total_kib(separate_dirs, exclusive_kib, subtree_total_kib),
+            du_display_total_blocks(separate_dirs, exclusive_blocks, subtree_total_blocks),
             if separate_dirs {
-                exclusive_kib
+                exclusive_blocks
             } else {
-                subtree_total_kib
+                subtree_total_blocks
             }
         );
     }
@@ -812,10 +1350,14 @@ mod kani_proofs {
 pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
     let mut summarize = false;
     let mut all = false;
-    let mut human_readable = false;
+    let mut display_format = DuDisplayFormat::Kib;
+    let mut usage_mode = DuUsageMode::DiskBlocks;
     let mut total = false;
     let mut separate_dirs = false;
+    let mut dereference_args = false;
+    let mut line_terminator = DuLineTerminator::Newline;
     let mut max_depth = None;
+    let mut threshold = None;
     let mut end_of_options = false;
     let mut paths = Vec::new();
     let mut index = 1usize;
@@ -830,9 +1372,20 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             "--" => end_of_options = true,
             "-s" | "--summarize" => summarize = true,
             "-a" | "--all" => all = true,
-            "-h" | "--human-readable" => human_readable = true,
+            "-b" | "--bytes" => {
+                usage_mode = DuUsageMode::ApparentBytes;
+                display_format = DuDisplayFormat::BlockSize(1);
+            }
+            "-h" | "--human-readable" => display_format = DuDisplayFormat::HumanReadableIec,
+            "-k" => display_format = DuDisplayFormat::BlockSize(1024),
+            "-m" => display_format = DuDisplayFormat::BlockSize(1024_u64.pow(2)),
+            "--apparent-size" => usage_mode = DuUsageMode::ApparentBytes,
             "-c" | "--total" => total = true,
             "-S" | "--separate-dirs" => separate_dirs = true,
+            "-D" | "-H" | "--dereference-args" => dereference_args = true,
+            "-P" | "--no-dereference" => dereference_args = false,
+            "-0" | "--null" => line_terminator = DuLineTerminator::Nul,
+            "--si" => display_format = DuDisplayFormat::HumanReadableSi,
             "--max-depth" | "-d" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -850,12 +1403,78 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
                     }
                 }
             }
+            "--threshold" | "-t" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing value for {arg}"),
+                    ));
+                };
+                match parse_du_threshold(value) {
+                    Ok(parsed) => threshold = Some(parsed),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        return Ok(1);
+                    }
+                }
+            }
+            "--block-size" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing value for --block-size",
+                    ));
+                };
+                match parse_du_block_size(value) {
+                    Ok(size) => display_format = DuDisplayFormat::BlockSize(size),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        return Ok(1);
+                    }
+                }
+            }
+            "-B" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing value for -B",
+                    ));
+                };
+                match parse_du_block_size(value) {
+                    Ok(size) => display_format = DuDisplayFormat::BlockSize(size),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        return Ok(1);
+                    }
+                }
+            }
             other if other.starts_with("--max-depth=") => {
                 match parse_du_max_depth(other.trim_start_matches("--max-depth=")) {
                     Ok(depth) => max_depth = Some(depth),
                     Err(message) => {
                         write_du_stderr_line(&message);
                         write_du_try_help();
+                        return Ok(1);
+                    }
+                }
+            }
+            other if other.starts_with("--block-size=") => {
+                match parse_du_block_size(other.trim_start_matches("--block-size=")) {
+                    Ok(size) => display_format = DuDisplayFormat::BlockSize(size),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
+                        return Ok(1);
+                    }
+                }
+            }
+            other if other.starts_with("--threshold=") => {
+                match parse_du_threshold(other.trim_start_matches("--threshold=")) {
+                    Ok(parsed) => threshold = Some(parsed),
+                    Err(message) => {
+                        write_du_stderr_line(&message);
                         return Ok(1);
                     }
                 }
@@ -889,12 +1508,70 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
                         }
                         break;
                     }
-                    (summarize, all, human_readable, total, separate_dirs) = du_apply_short_flag(
+                    if flag == b'B' {
+                        let value = if short_index + 1 < bytes.len() {
+                            std::str::from_utf8(&bytes[(short_index + 1)..]).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("unsupported du flag: {other}"),
+                                )
+                            })?
+                        } else {
+                            index += 1;
+                            args.get(index).map(String::as_str).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "missing value for -B")
+                            })?
+                        };
+                        match parse_du_block_size(value) {
+                            Ok(size) => display_format = DuDisplayFormat::BlockSize(size),
+                            Err(message) => {
+                                write_du_stderr_line(&message);
+                                return Ok(1);
+                            }
+                        }
+                        break;
+                    }
+                    if flag == b't' {
+                        let value = if short_index + 1 < bytes.len() {
+                            std::str::from_utf8(&bytes[(short_index + 1)..]).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("unsupported du flag: {other}"),
+                                )
+                            })?
+                        } else {
+                            index += 1;
+                            args.get(index).map(String::as_str).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "missing value for -t")
+                            })?
+                        };
+                        match parse_du_threshold(value) {
+                            Ok(parsed) => threshold = Some(parsed),
+                            Err(message) => {
+                                write_du_stderr_line(&message);
+                                return Ok(1);
+                            }
+                        }
+                        break;
+                    }
+                    (
                         summarize,
                         all,
-                        human_readable,
+                        display_format,
+                        usage_mode,
                         total,
                         separate_dirs,
+                        dereference_args,
+                        line_terminator,
+                    ) = du_apply_short_flag(
+                        summarize,
+                        all,
+                        display_format,
+                        usage_mode,
+                        total,
+                        separate_dirs,
+                        dereference_args,
+                        line_terminator,
                         flag,
                     )?;
                     short_index += 1;
@@ -936,20 +1613,29 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
 
     let mut out = stdout_buf_writer()?;
     let had_warnings = Arc::new(AtomicBool::new(false));
-    let mut grand_total_kib = 0_u64;
+    let mut grand_total_blocks = 0_u64;
     for path in paths {
         let mut chunk = Vec::new();
-        let root_total_kib = match append_du_output(
+        let root_total_blocks = match append_du_output(
             Path::new(&path),
             summarize,
             all,
             separate_dirs,
             max_depth,
-            human_readable,
+            display_format,
+            usage_mode,
+            dereference_args,
+            line_terminator,
+            threshold,
             &mut chunk,
             had_warnings.clone(),
         ) {
-            Ok(root_total_kib) => root_total_kib,
+            Ok(root_total_blocks) => root_total_blocks,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                write_warning_line("du", Path::new(&path), &err, "cannot access");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("du", Path::new(&path), &err, "cannot access");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -957,13 +1643,20 @@ pub(super) fn run_du(args: &[String]) -> io::Result<i32> {
             }
             Err(err) => return Err(err),
         };
-        grand_total_kib = grand_total_kib.saturating_add(root_total_kib);
+        grand_total_blocks = grand_total_blocks.saturating_add(root_total_blocks);
         out.write_all(&chunk)?;
     }
     if total {
         let total_path = Path::new("total");
         let mut chunk = Vec::new();
-        append_du_line(&mut chunk, grand_total_kib, total_path, human_readable);
+        append_du_line(
+            &mut chunk,
+            grand_total_blocks,
+            total_path,
+            usage_mode,
+            display_format,
+            line_terminator,
+        );
         out.write_all(&chunk)?;
     }
     out.into_inner()?;

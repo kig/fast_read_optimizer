@@ -40,6 +40,22 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
             &format!("shred zero {:?}", fro_zero_args),
         );
         assert_eq!(fs::read(&fro_zero).unwrap(), fs::read(&sys_zero).unwrap());
+        let fro_zero_long = tmp.join(format!("shred-fro-zero-long-{}.bin", flags.join("_")));
+        let sys_zero_long = tmp.join(format!("shred-sys-zero-long-{}.bin", flags.join("_")));
+        fs::write(&fro_zero_long, vec![0x44; 32768]).unwrap();
+        fs::write(&sys_zero_long, vec![0x44; 32768]).unwrap();
+        let mut fro_zero_long_args = flags.clone();
+        fro_zero_long_args.extend(["--iterations=0", "--zero", fro_zero_long.to_str().unwrap()]);
+        let sys_zero_long_args = ["--iterations=0", "--zero", sys_zero_long.to_str().unwrap()];
+        assert_same_result(
+            run_fro("shred", &fro_zero_long_args),
+            run_system("shred", &sys_zero_long_args),
+            &format!("shred zero long {:?}", fro_zero_long_args),
+        );
+        assert_eq!(
+            fs::read(&fro_zero_long).unwrap(),
+            fs::read(&sys_zero_long).unwrap()
+        );
         let fro_remove = tmp.join(format!("shred-fro-remove-{}.bin", flags.join("_")));
         let sys_remove = tmp.join(format!("shred-sys-remove-{}.bin", flags.join("_")));
         fs::write(&fro_remove, vec![0x99; 32768]).unwrap();
@@ -53,6 +69,28 @@ fn cartesian_cp_and_shred_match_system_side_effects() {
             &format!("shred remove {:?}", fro_remove_args),
         );
         assert_eq!(fro_remove.exists(), sys_remove.exists());
+        let fro_remove_long = tmp.join("shred-fro-remove-long.bin");
+        let sys_remove_long = tmp.join("shred-sys-remove-long.bin");
+        fs::write(&fro_remove_long, vec![0x22; 32768]).unwrap();
+        fs::write(&sys_remove_long, vec![0x22; 32768]).unwrap();
+        let fro_remove_long_args = [
+            "--iterations",
+            "0",
+            "--remove",
+            fro_remove_long.to_str().unwrap(),
+        ];
+        let sys_remove_long_args = [
+            "--iterations",
+            "0",
+            "--remove",
+            sys_remove_long.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("shred", &fro_remove_long_args),
+            run_system("shred", &sys_remove_long_args),
+            &format!("shred remove long {:?}", fro_remove_long_args),
+        );
+        assert_eq!(fro_remove_long.exists(), sys_remove_long.exists());
     }
 }
 
@@ -78,6 +116,34 @@ fn shred_size_verbose_and_force_match_system_side_effects() {
         assert_eq!(
             fs::read(&size_file).unwrap(),
             vec![0, 0, 0, 0, b'4', b'5', b'6', b'7', b'8', b'9']
+        );
+        let exact_file = tmp.join(format!("shred-exact-{suffix}.bin"));
+        fs::write(&exact_file, b"abcdefghij").unwrap();
+        let mut fro_exact_args = flags.clone();
+        fro_exact_args.extend([
+            "--iterations",
+            "0",
+            "--zero",
+            "--exact",
+            "--size=4",
+            exact_file.to_str().unwrap(),
+        ]);
+        let sys_exact_args = [
+            "--iterations",
+            "0",
+            "--zero",
+            "--exact",
+            "--size=4",
+            exact_file.to_str().unwrap(),
+        ];
+        assert_same_result(
+            run_fro("shred", &fro_exact_args),
+            run_system("shred", &sys_exact_args),
+            &format!("shred exact {:?}", fro_exact_args),
+        );
+        assert_eq!(
+            fs::read(&exact_file).unwrap(),
+            vec![0, 0, 0, 0, b'e', b'f', b'g', b'h', b'i', b'j']
         );
         let verbose_file = tmp.join(format!("shred-verbose-{suffix}.bin"));
         fs::write(&verbose_file, b"abcdef").unwrap();

@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Component;
@@ -353,11 +354,11 @@ where
 fn copy_reader_member_to_file<R: Read + ?Sized>(
     reader: &mut R,
     destination_path: &Path,
-    size: u64,
+    entry: &TarArchiveEntry,
+    buffer: &mut [u8],
 ) -> io::Result<()> {
     let mut destination = fs::File::create(destination_path)?;
-    let mut remaining = size;
-    let mut buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
+    let mut remaining = entry.size;
     while remaining > 0 {
         let chunk = remaining.min(buffer.len() as u64) as usize;
         let read = reader.read(&mut buffer[..chunk])?;
@@ -373,6 +374,8 @@ fn copy_reader_member_to_file<R: Read + ?Sized>(
         destination.write_all(&buffer[..read])?;
         remaining = remaining.saturating_sub(read as u64);
     }
+    destination.set_permissions(fs::Permissions::from_mode(entry.mode & 0o7777))?;
+    set_extracted_file_mtime(&destination, entry.mtime)?;
     Ok(())
 }
 
@@ -481,6 +484,31 @@ fn set_extracted_mtime(path: &Path, mtime: u64, nofollow_symlink: bool) -> io::R
     }
 }
 
+fn set_extracted_file_mtime(file: &fs::File, mtime: u64) -> io::Result<()> {
+    let seconds = libc::time_t::try_from(mtime).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tar mtime does not fit in time_t: {mtime}"),
+        )
+    })?;
+    let times = [
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn apply_regular_file_metadata(path: &Path, entry: &TarArchiveEntry) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(entry.mode & 0o7777))?;
     set_extracted_mtime(path, entry.mtime, false)
@@ -566,6 +594,7 @@ pub(super) fn extract_tar_archive(
     let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
     let mut directory_entries = Vec::new();
     let mut created_dirs = HashSet::new();
+    let mut copy_buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
     let config = config::load_config(None);
 
     loop {
@@ -600,11 +629,11 @@ pub(super) fn extract_tar_archive(
                 }
                 ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
                 if entry.size <= TAR_LOW_LATENCY_EXTRACT_ENTRY_THRESHOLD {
-                    copy_reader_member_to_file(&mut file, &target_path, entry.size)?;
+                    copy_reader_member_to_file(&mut file, &target_path, &entry, &mut copy_buffer)?;
                 } else {
                     copy_archive_member_to_file(archive_path, &target_path, &entry, &config)?;
+                    apply_regular_file_metadata(&target_path, &entry)?;
                 }
-                apply_regular_file_metadata(&target_path, &entry)?;
             }
             b'5' => {
                 if !relative_path.as_os_str().is_empty() {
@@ -689,6 +718,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
     let mut stdout = io::BufWriter::with_capacity(64 * 1024, fro::command_io::stdout_file()?);
     let mut directory_entries = Vec::new();
     let mut created_dirs = HashSet::new();
+    let mut copy_buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
     visit_tar_archive(reader, archive_path, |entry, reader| {
         let relative_path = sanitized_tar_path(&entry.path)?;
         let target_path = destination_root.join(&relative_path);
@@ -701,8 +731,7 @@ pub(super) fn extract_tar_archive_reader<R: Read + ?Sized>(
                     ));
                 }
                 ensure_cached_parent_dir(&target_path, &mut created_dirs)?;
-                copy_reader_member_to_file(reader, &target_path, entry.size)?;
-                apply_regular_file_metadata(&target_path, entry)?;
+                copy_reader_member_to_file(reader, &target_path, entry, &mut copy_buffer)?;
                 entry.size
             }
             b'5' => {

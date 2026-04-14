@@ -1,7 +1,20 @@
 use super::*;
 use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 
 const CMP_SMALL_REGULAR_FAST_PATH_LIMIT: u64 = 128 * 1024;
+
+#[derive(Clone, Copy)]
+struct CmpOptions {
+    io_mode: IOMode,
+    quiet: bool,
+    verbose: bool,
+    print_bytes: bool,
+    report_throughput: bool,
+    limit: Option<u64>,
+    first_skip: u64,
+    second_skip: u64,
+}
 
 fn count_newlines_in_range(
     path: &str,
@@ -182,6 +195,72 @@ fn invalid_cmp_skip_spec(value: &str) -> io::Error {
     )
 }
 
+fn cmp_directory_operand(files: &[String]) -> io::Result<Option<String>> {
+    for path in files {
+        if fs::metadata(path)?.file_type().is_dir() {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn cmp_read_sorted_dir_entries(dir: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn cmp_recursive_type_name(file_type: fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "regular file"
+    } else if file_type.is_symlink() {
+        "symbolic link"
+    } else {
+        "special file"
+    }
+}
+
+fn cmp_recursive_print_missing(dir: &Path, name: &std::ffi::OsStr) {
+    fro::cio_println!("Only in {}: {}", dir.display(), Path::new(name).display());
+}
+
+fn cmp_recursive_print_type_mismatch(
+    left: &Path,
+    left_type: fs::FileType,
+    right: &Path,
+    right_type: fs::FileType,
+) {
+    fro::cio_println!(
+        "cmp: {} is a {} while {} is a {}",
+        left.display(),
+        cmp_recursive_type_name(left_type),
+        right.display(),
+        cmp_recursive_type_name(right_type)
+    );
+}
+
+fn cmp_recursive_compare_symlinks(
+    left: &Path,
+    right: &Path,
+    options: CmpOptions,
+) -> io::Result<i32> {
+    let left_target = fs::read_link(left)?;
+    let right_target = fs::read_link(right)?;
+    if left_target == right_target {
+        return Ok(0);
+    }
+    if !options.quiet {
+        fro::cio_println!(
+            "cmp: symbolic links {} and {} differ",
+            left.display(),
+            right.display()
+        );
+    }
+    Ok(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmp_finish_with_loaded_bytes(
     files: &[String],
@@ -353,6 +432,345 @@ fn cmp_try_small_regular_fast_path(
     .map(Some)
 }
 
+fn run_cmp_pair(files: &[String], options: CmpOptions) -> io::Result<(i32, u64)> {
+    let first_meta = fs::metadata(&files[0])?;
+    let second_meta = fs::metadata(&files[1])?;
+    let first_len = first_meta.len();
+    let second_len = second_meta.len();
+    let first_remaining = cmp_remaining_len_after_skip(first_len, options.first_skip);
+    let second_remaining = cmp_remaining_len_after_skip(second_len, options.second_skip);
+    let shared_remaining = first_remaining.min(second_remaining);
+    let compare_len = cmp_effective_compare_len_with_skips(
+        first_len,
+        second_len,
+        options.first_skip,
+        options.second_skip,
+        options.limit,
+    );
+    let started_at = options.report_throughput.then(std::time::Instant::now);
+    if compare_len == 0 {
+        if options.limit == Some(0) || first_remaining == second_remaining {
+            if let Some(started_at) = started_at {
+                report_gbps("cmp", 0, started_at);
+            }
+            return Ok((0, 0));
+        }
+        if !options.quiet {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            fro::cio_eprintln!("cmp: EOF on {} which is empty", eof_file);
+        }
+        return Ok((1, 0));
+    }
+
+    if let Some(code) = cmp_try_small_regular_fast_path(
+        files,
+        options.io_mode,
+        compare_len,
+        options.first_skip,
+        options.second_skip,
+        first_remaining,
+        second_remaining,
+        shared_remaining,
+        options.quiet,
+        options.verbose,
+        options.print_bytes,
+        options.limit,
+        started_at,
+        first_meta.file_type().is_file(),
+        second_meta.file_type().is_file(),
+    )? {
+        return Ok((code, compare_len));
+    }
+
+    if options.verbose {
+        let first = load_file_bytes(&files[0], options.io_mode, "read")?;
+        let second = load_file_bytes(&files[1], options.io_mode, "read")?;
+        let first_start = usize::try_from(options.first_skip)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
+            })?
+            .min(first.data.len());
+        let second_start = usize::try_from(options.second_skip)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
+            })?
+            .min(second.data.len());
+        let compare_len_usize = usize::try_from(compare_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
+        })?;
+        let first_slice = &first.data.as_slice()[first_start..first_start + compare_len_usize];
+        let second_slice = &second.data.as_slice()[second_start..second_start + compare_len_usize];
+        let byte_width = cmp_decimal_width(compare_len);
+        let mut had_mismatch = false;
+        for (idx, (&left, &right)) in first_slice.iter().zip(second_slice.iter()).enumerate() {
+            if left != right {
+                had_mismatch = true;
+                if options.print_bytes {
+                    fro::cio_println!(
+                        "{:>width$} {:>3o} {:<4} {:>3o} {}",
+                        idx + 1,
+                        left,
+                        cmp_render_byte_char(left),
+                        right,
+                        cmp_render_byte_char(right),
+                        width = byte_width
+                    );
+                } else {
+                    fro::cio_println!(
+                        "{:>width$} {:>3o} {:>3o}",
+                        idx + 1,
+                        left,
+                        right,
+                        width = byte_width
+                    );
+                }
+            }
+        }
+        if first_remaining != second_remaining
+            && options.limit.map_or(true, |limit| limit > shared_remaining)
+        {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            fro::cio_eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
+            return Ok((1, compare_len));
+        }
+        if let Some(started_at) = started_at {
+            report_gbps("cmp", compare_len, started_at);
+        }
+        return Ok((if had_mismatch { 1 } else { 0 }, compare_len));
+    }
+
+    let config = load_config(None);
+    let diff_page_cache = config.get_params_for_path("diff", false, &files[0]);
+    let diff_direct = config.get_params_for_path("diff", true, &files[0]);
+    let mismatch = diff_files_window(
+        &files[0],
+        &files[1],
+        options.first_skip,
+        options.second_skip,
+        diff_page_cache.num_threads,
+        diff_page_cache.block_size,
+        diff_page_cache.qd,
+        diff_direct.num_threads,
+        diff_direct.block_size,
+        diff_direct.qd,
+        internal_io_mode(options.io_mode),
+        false,
+        false,
+        Some(compare_len),
+    )?;
+    if mismatch != 0 {
+        if !options.quiet {
+            let index = mismatch as usize - 1;
+            let line = 1 + count_newlines_in_range(
+                &files[0],
+                options.io_mode,
+                "read",
+                options.first_skip,
+                options.first_skip + mismatch - 1,
+            )?;
+            if options.print_bytes {
+                let left = cmp_read_byte_at(&files[0], options.first_skip + mismatch - 1)?;
+                let right = cmp_read_byte_at(&files[1], options.second_skip + mismatch - 1)?;
+                fro::cio_println!(
+                    "{} {} differ: byte {}, line {} is {:>3o} {} {:>3o} {}",
+                    files[0],
+                    files[1],
+                    index + 1,
+                    line,
+                    left,
+                    cmp_render_byte_char(left),
+                    right,
+                    cmp_render_byte_char(right)
+                );
+            } else {
+                fro::cio_println!(
+                    "{} {} differ: byte {}, line {}",
+                    files[0],
+                    files[1],
+                    index + 1,
+                    line
+                );
+            }
+        }
+        return Ok((1, compare_len));
+    }
+
+    if first_remaining != second_remaining
+        && options.limit.map_or(true, |limit| limit > shared_remaining)
+    {
+        if !options.quiet {
+            let eof_file = if first_remaining < second_remaining {
+                &files[0]
+            } else {
+                &files[1]
+            };
+            let eof_skip = if first_remaining < second_remaining {
+                options.first_skip
+            } else {
+                options.second_skip
+            };
+            let eof_len = if first_remaining < second_remaining {
+                first_remaining
+            } else {
+                second_remaining
+            };
+            let data = load_file_bytes(eof_file, options.io_mode, "read")?;
+            let bytes = data.data.as_slice();
+            let slice_start = usize::try_from(eof_skip)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            let slice_end = usize::try_from(eof_skip + eof_len)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            let newlines_before_eof =
+                memchr_iter(b'\n', &bytes[slice_start..slice_end]).count() as u64;
+            let ends_with_newline = slice_end > slice_start && bytes[slice_end - 1] == b'\n';
+            let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
+            fro::cio_eprintln!(
+                "cmp: EOF on {} after byte {}, {} {}",
+                eof_file,
+                shared_remaining,
+                phrase,
+                line
+            );
+        }
+        return Ok((1, compare_len));
+    }
+
+    if let Some(started_at) = started_at {
+        report_gbps("cmp", compare_len, started_at);
+    }
+    Ok((0, compare_len))
+}
+
+fn run_cmp_recursive(files: &[String], options: CmpOptions) -> io::Result<i32> {
+    let left_root = PathBuf::from(&files[0]);
+    let right_root = PathBuf::from(&files[1]);
+    let left_root_type = fs::symlink_metadata(&left_root)?.file_type();
+    let right_root_type = fs::symlink_metadata(&right_root)?.file_type();
+    if !left_root_type.is_dir() || !right_root_type.is_dir() {
+        if left_root_type.is_dir() || right_root_type.is_dir() {
+            fro::cio_eprintln!(
+                "cmp: recursive comparison requires both operands to be directories"
+            );
+            return Ok(2);
+        }
+        return Ok(run_cmp_pair(files, options)?.0);
+    }
+
+    let started_at = options.report_throughput.then(std::time::Instant::now);
+    let mut compared_bytes = 0_u64;
+    let mut mismatch = false;
+    let mut stack = vec![(left_root, right_root)];
+    while let Some((left_dir, right_dir)) = stack.pop() {
+        let left_entries = cmp_read_sorted_dir_entries(&left_dir)?;
+        let right_entries = cmp_read_sorted_dir_entries(&right_dir)?;
+        let mut left_index = 0usize;
+        let mut right_index = 0usize;
+        let mut child_dirs = Vec::new();
+        while left_index < left_entries.len() || right_index < right_entries.len() {
+            match (left_entries.get(left_index), right_entries.get(right_index)) {
+                (Some(left), Some(right)) => {
+                    let left_name = left.file_name();
+                    let right_name = right.file_name();
+                    match left_name.cmp(&right_name) {
+                        std::cmp::Ordering::Less => {
+                            mismatch = true;
+                            if !options.quiet {
+                                cmp_recursive_print_missing(&left_dir, &left_name);
+                            }
+                            left_index += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            mismatch = true;
+                            if !options.quiet {
+                                cmp_recursive_print_missing(&right_dir, &right_name);
+                            }
+                            right_index += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let left_path = left.path();
+                            let right_path = right.path();
+                            let left_type = fs::symlink_metadata(&left_path)?.file_type();
+                            let right_type = fs::symlink_metadata(&right_path)?.file_type();
+                            if left_type.is_dir() && right_type.is_dir() {
+                                child_dirs.push((left_path, right_path));
+                            } else if left_type.is_file() && right_type.is_file() {
+                                let child_files = [
+                                    left_path.to_string_lossy().into_owned(),
+                                    right_path.to_string_lossy().into_owned(),
+                                ];
+                                let (code, bytes) = run_cmp_pair(
+                                    &child_files,
+                                    CmpOptions {
+                                        report_throughput: false,
+                                        ..options
+                                    },
+                                )?;
+                                compared_bytes = compared_bytes.saturating_add(bytes);
+                                mismatch |= code != 0;
+                            } else if left_type.is_symlink() && right_type.is_symlink() {
+                                mismatch |= cmp_recursive_compare_symlinks(
+                                    &left_path,
+                                    &right_path,
+                                    options,
+                                )? != 0;
+                            } else {
+                                mismatch = true;
+                                if !options.quiet {
+                                    cmp_recursive_print_type_mismatch(
+                                        &left_path,
+                                        left_type,
+                                        &right_path,
+                                        right_type,
+                                    );
+                                }
+                            }
+                            left_index += 1;
+                            right_index += 1;
+                        }
+                    }
+                }
+                (Some(left), None) => {
+                    mismatch = true;
+                    if !options.quiet {
+                        cmp_recursive_print_missing(&left_dir, &left.file_name());
+                    }
+                    left_index += 1;
+                }
+                (None, Some(right)) => {
+                    mismatch = true;
+                    if !options.quiet {
+                        cmp_recursive_print_missing(&right_dir, &right.file_name());
+                    }
+                    right_index += 1;
+                }
+                (None, None) => break,
+            }
+            if options.quiet && mismatch {
+                return Ok(1);
+            }
+        }
+        child_dirs.reverse();
+        stack.extend(child_dirs);
+    }
+    if !mismatch {
+        if let Some(started_at) = started_at {
+            report_gbps("cmp", compared_bytes, started_at);
+        }
+        return Ok(0);
+    }
+    Ok(1)
+}
+
 pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let program = args[0].as_str();
     let mut io_mode = IOMode::Auto;
@@ -363,6 +781,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let mut limit = None::<u64>;
     let mut first_skip = 0u64;
     let mut second_skip = 0u64;
+    let mut recursive = false;
     let mut files = Vec::new();
     let mut end_of_options = false;
     let mut i = 1usize;
@@ -378,6 +797,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "-s" | "--quiet" | "--silent" => quiet = true,
+            "-r" | "-R" | "--recursive" => recursive = true,
             "-l" | "--verbose" => verbose = true,
             "-b" | "--print-bytes" => print_bytes = true,
             "--report-gbps" => report_throughput = true,
@@ -419,7 +839,7 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
     let files = ensure_files(
         program,
         files,
-        "[-s|--quiet|--silent] [-l|--verbose] [-b|--print-bytes] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] [--] <file1> <file2>",
+        "[-s|--quiet|--silent] [-r|-R|--recursive] [-l|--verbose] [-b|--print-bytes] [-i SKIP|--ignore-initial=SKIP] [-n LIMIT|--bytes=LIMIT] [--auto|--no-direct|--direct] [--] <file1> <file2>",
     )?;
     if files.len() != 2 {
         return Err(io::Error::new(
@@ -432,216 +852,27 @@ pub(super) fn run_cmp(args: &[String]) -> io::Result<i32> {
         fro::cio_eprintln!("cmp: Try 'cmp --help' for more information.");
         return Ok(2);
     }
-
-    let first_meta = fs::metadata(&files[0])?;
-    let second_meta = fs::metadata(&files[1])?;
-    let first_len = first_meta.len();
-    let second_len = second_meta.len();
-    let first_remaining = cmp_remaining_len_after_skip(first_len, first_skip);
-    let second_remaining = cmp_remaining_len_after_skip(second_len, second_skip);
-    let shared_remaining = first_remaining.min(second_remaining);
-    let compare_len =
-        cmp_effective_compare_len_with_skips(first_len, second_len, first_skip, second_skip, limit);
-    let started_at = report_throughput.then(std::time::Instant::now);
-    if compare_len == 0 {
-        if limit == Some(0) || first_remaining == second_remaining {
-            if let Some(started_at) = started_at {
-                report_gbps("cmp", 0, started_at);
-            }
-            return Ok(0);
+    if !recursive {
+        if let Some(dir) = cmp_directory_operand(&files)? {
+            fro::cio_eprintln!("cmp: {}: Is a directory", dir);
+            return Ok(2);
         }
-        if !quiet {
-            let eof_file = if first_remaining < second_remaining {
-                &files[0]
-            } else {
-                &files[1]
-            };
-            fro::cio_eprintln!("cmp: EOF on {} which is empty", eof_file);
-        }
-        return Ok(1);
     }
-
-    if let Some(code) = cmp_try_small_regular_fast_path(
-        &files,
+    let options = CmpOptions {
         io_mode,
-        compare_len,
-        first_skip,
-        second_skip,
-        first_remaining,
-        second_remaining,
-        shared_remaining,
         quiet,
         verbose,
         print_bytes,
+        report_throughput,
         limit,
-        started_at,
-        first_meta.file_type().is_file(),
-        second_meta.file_type().is_file(),
-    )? {
-        return Ok(code);
-    }
-
-    if verbose {
-        let first = load_file_bytes(&files[0], io_mode, "read")?;
-        let second = load_file_bytes(&files[1], io_mode, "read")?;
-        let first_start = usize::try_from(first_skip)
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
-            })?
-            .min(first.data.len());
-        let second_start = usize::try_from(second_skip)
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
-            })?
-            .min(second.data.len());
-        let compare_len_usize = usize::try_from(compare_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "offset does not fit in usize")
-        })?;
-        let first_slice = &first.data.as_slice()[first_start..first_start + compare_len_usize];
-        let second_slice = &second.data.as_slice()[second_start..second_start + compare_len_usize];
-        let byte_width = cmp_decimal_width(compare_len);
-        let mut had_mismatch = false;
-        for (idx, (&left, &right)) in first_slice.iter().zip(second_slice.iter()).enumerate() {
-            if left != right {
-                had_mismatch = true;
-                if print_bytes {
-                    fro::cio_println!(
-                        "{:>width$} {:>3o} {:<4} {:>3o} {}",
-                        idx + 1,
-                        left,
-                        cmp_render_byte_char(left),
-                        right,
-                        cmp_render_byte_char(right),
-                        width = byte_width
-                    );
-                } else {
-                    fro::cio_println!(
-                        "{:>width$} {:>3o} {:>3o}",
-                        idx + 1,
-                        left,
-                        right,
-                        width = byte_width
-                    );
-                }
-            }
-        }
-        if first_remaining != second_remaining
-            && limit.map_or(true, |limit| limit > shared_remaining)
-        {
-            let eof_file = if first_remaining < second_remaining {
-                &files[0]
-            } else {
-                &files[1]
-            };
-            fro::cio_eprintln!("cmp: EOF on {} after byte {}", eof_file, shared_remaining);
-            return Ok(1);
-        }
-        if let Some(started_at) = started_at {
-            report_gbps("cmp", compare_len, started_at);
-        }
-        return Ok(if had_mismatch { 1 } else { 0 });
-    }
-
-    let config = load_config(None);
-    let diff_page_cache = config.get_params_for_path("diff", false, &files[0]);
-    let diff_direct = config.get_params_for_path("diff", true, &files[0]);
-    let mismatch = diff_files_window(
-        &files[0],
-        &files[1],
         first_skip,
         second_skip,
-        diff_page_cache.num_threads,
-        diff_page_cache.block_size,
-        diff_page_cache.qd,
-        diff_direct.num_threads,
-        diff_direct.block_size,
-        diff_direct.qd,
-        internal_io_mode(io_mode),
-        false,
-        false,
-        Some(compare_len),
-    )?;
-    if mismatch != 0 {
-        if !quiet {
-            let index = mismatch as usize - 1;
-            let line = 1 + count_newlines_in_range(
-                &files[0],
-                io_mode,
-                "read",
-                first_skip,
-                first_skip + mismatch - 1,
-            )?;
-            if print_bytes {
-                let left = cmp_read_byte_at(&files[0], first_skip + mismatch - 1)?;
-                let right = cmp_read_byte_at(&files[1], second_skip + mismatch - 1)?;
-                fro::cio_println!(
-                    "{} {} differ: byte {}, line {} is {:>3o} {} {:>3o} {}",
-                    files[0],
-                    files[1],
-                    index + 1,
-                    line,
-                    left,
-                    cmp_render_byte_char(left),
-                    right,
-                    cmp_render_byte_char(right)
-                );
-            } else {
-                fro::cio_println!(
-                    "{} {} differ: byte {}, line {}",
-                    files[0],
-                    files[1],
-                    index + 1,
-                    line
-                );
-            }
-        }
-        return Ok(1);
+    };
+    if recursive {
+        run_cmp_recursive(&files, options)
+    } else {
+        Ok(run_cmp_pair(&files, options)?.0)
     }
-
-    if first_remaining != second_remaining && limit.map_or(true, |limit| limit > shared_remaining) {
-        if !quiet {
-            let eof_file = if first_remaining < second_remaining {
-                &files[0]
-            } else {
-                &files[1]
-            };
-            let eof_skip = if first_remaining < second_remaining {
-                first_skip
-            } else {
-                second_skip
-            };
-            let eof_len = if first_remaining < second_remaining {
-                first_remaining
-            } else {
-                second_remaining
-            };
-            let data = load_file_bytes(eof_file, io_mode, "read")?;
-            let bytes = data.data.as_slice();
-            let slice_start = usize::try_from(eof_skip)
-                .unwrap_or(bytes.len())
-                .min(bytes.len());
-            let slice_end = usize::try_from(eof_skip + eof_len)
-                .unwrap_or(bytes.len())
-                .min(bytes.len());
-            let newlines_before_eof =
-                memchr_iter(b'\n', &bytes[slice_start..slice_end]).count() as u64;
-            let ends_with_newline = slice_end > slice_start && bytes[slice_end - 1] == b'\n';
-            let (line, phrase) = cmp_eof_line(newlines_before_eof, ends_with_newline);
-            fro::cio_eprintln!(
-                "cmp: EOF on {} after byte {}, {} {}",
-                eof_file,
-                shared_remaining,
-                phrase,
-                line
-            );
-        }
-        return Ok(1);
-    }
-
-    if let Some(started_at) = started_at {
-        report_gbps("cmp", compare_len, started_at);
-    }
-    Ok(0)
 }
 
 #[cfg(kani)]

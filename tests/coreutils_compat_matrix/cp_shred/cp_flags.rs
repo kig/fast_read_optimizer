@@ -118,6 +118,66 @@ fn cp_preserve_timestamps_attr_list_matches_system() {
 }
 
 #[test]
+fn cp_preserve_mode_and_all_match_system_for_single_file_metadata() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let tmp = unique_temp_dir("fro-coreutils-cp-preserve-mode-all");
+
+    for preserve_flag in ["--preserve=mode", "--preserve=all"] {
+        for flags in io_flag_sets() {
+            let suffix = if flags.is_empty() {
+                "auto".to_string()
+            } else {
+                flags.join("_").replace("--", "")
+            };
+            let flag_name = preserve_flag
+                .trim_start_matches('-')
+                .replace('=', "_")
+                .replace(',', "_");
+
+            let source = tmp.join(format!("{flag_name}-source-{suffix}.txt"));
+            let fro_target = tmp.join(format!("{flag_name}-fro-{suffix}.txt"));
+            let sys_target = tmp.join(format!("{flag_name}-sys-{suffix}.txt"));
+            fs::write(&source, b"preserve-mode").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+            set_file_mtime(&source, 1_700_216_000);
+
+            let mut fro_args = flags.clone();
+            fro_args.extend([
+                preserve_flag,
+                source.to_str().unwrap(),
+                fro_target.to_str().unwrap(),
+            ]);
+            let sys_args = [
+                preserve_flag,
+                source.to_str().unwrap(),
+                sys_target.to_str().unwrap(),
+            ];
+            assert_same_result(
+                run_fro("cp", &fro_args),
+                run_system("cp", &sys_args),
+                &format!("cp preserve metadata {:?}", fro_args),
+            );
+            assert_eq!(
+                fs::read(&fro_target).unwrap(),
+                fs::read(&sys_target).unwrap()
+            );
+
+            let fro_meta = fs::metadata(&fro_target).unwrap();
+            let sys_meta = fs::metadata(&sys_target).unwrap();
+            assert_eq!(
+                fro_meta.permissions().mode() & 0o7777,
+                sys_meta.permissions().mode() & 0o7777
+            );
+            if preserve_flag == "--preserve=all" {
+                assert_eq!(fro_meta.mtime(), sys_meta.mtime());
+                assert_eq!(fro_meta.mtime_nsec(), sys_meta.mtime_nsec());
+            }
+        }
+    }
+}
+
+#[test]
 fn cp_archive_matches_system_for_recursive_timestamps() {
     use std::os::unix::fs::MetadataExt;
 
@@ -200,6 +260,56 @@ fn cp_archive_matches_system_for_recursive_timestamps() {
             let sys_link_meta = fs::symlink_metadata(sys_root.join("nested/link-small")).unwrap();
             assert_eq!(fro_link_meta.mtime(), sys_link_meta.mtime());
             assert_eq!(fro_link_meta.mtime_nsec(), sys_link_meta.mtime_nsec());
+        }
+    }
+}
+
+#[test]
+fn cp_dereference_matches_system_for_recursive_symlink_sources() {
+    let tmp = unique_temp_dir("fro-coreutils-cp-dereference");
+
+    for copy_flag in ["-rL", "-aL"] {
+        for flags in io_flag_sets() {
+            let suffix = if flags.is_empty() {
+                "auto".to_string()
+            } else {
+                flags.join("_").replace("--", "")
+            };
+            let flag_name = copy_flag.trim_start_matches('-');
+            let source_root = tmp.join(format!("dereference-src-{flag_name}-{suffix}"));
+            let fro_dest_parent = tmp.join(format!("dereference-fro-{flag_name}-{suffix}"));
+            let sys_dest_parent = tmp.join(format!("dereference-sys-{flag_name}-{suffix}"));
+            fs::create_dir_all(source_root.join("dir")).unwrap();
+            fs::create_dir_all(&fro_dest_parent).unwrap();
+            fs::create_dir_all(&sys_dest_parent).unwrap();
+
+            fs::write(source_root.join("dir/file.txt"), b"linked-data").unwrap();
+            symlink("dir/file.txt", source_root.join("file-link")).unwrap();
+            symlink("dir", source_root.join("dir-link")).unwrap();
+
+            let mut fro_args = flags.clone();
+            fro_args.extend([
+                copy_flag,
+                source_root.to_str().unwrap(),
+                fro_dest_parent.to_str().unwrap(),
+            ]);
+            let sys_args = [
+                copy_flag,
+                source_root.to_str().unwrap(),
+                sys_dest_parent.to_str().unwrap(),
+            ];
+            assert_same_result(
+                run_fro("cp", &fro_args),
+                run_system("cp", &sys_args),
+                &format!("cp dereference recursive {:?}", fro_args),
+            );
+
+            let copied_name = source_root.file_name().unwrap();
+            let fro_root = fro_dest_parent.join(copied_name);
+            let sys_root = sys_dest_parent.join(copied_name);
+            assert_eq!(snapshot_tree(&fro_root), snapshot_tree(&sys_root));
+            assert!(fs::metadata(fro_root.join("file-link")).unwrap().is_file());
+            assert!(fs::metadata(fro_root.join("dir-link")).unwrap().is_dir());
         }
     }
 }

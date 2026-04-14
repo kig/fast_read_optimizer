@@ -136,8 +136,22 @@ fn parse_tail_options(
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "--report-gbps" => report_gbps = true,
-            "-q" => header_mode = HeaderMode::Never,
-            "-v" => header_mode = HeaderMode::Always,
+            "--lines" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for --lines")
+                })?;
+                mode = TailMode::Lines(parse_tail_count(value, "--lines")?);
+            }
+            "--bytes" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for --bytes")
+                })?;
+                mode = TailMode::Bytes(parse_tail_count(value, "--bytes")?);
+            }
+            "--quiet" | "--silent" | "-q" => header_mode = HeaderMode::Never,
+            "--verbose" | "-v" => header_mode = HeaderMode::Always,
             "-z" | "--zero-terminated" => terminator = RecordTerminator::Nul,
             "-n" => {
                 i += 1;
@@ -158,6 +172,12 @@ fn parse_tail_options(
             }
             other if other.starts_with("-c") && other.len() > 2 => {
                 mode = TailMode::Bytes(parse_tail_count(&other[2..], "-c")?);
+            }
+            other if other.starts_with("--lines=") => {
+                mode = TailMode::Lines(parse_tail_count(&other["--lines=".len()..], "--lines")?);
+            }
+            other if other.starts_with("--bytes=") => {
+                mode = TailMode::Bytes(parse_tail_count(&other["--bytes=".len()..], "--bytes")?);
             }
             other if other.starts_with('-') && other != "-" => {
                 for flag in other[1..].chars() {

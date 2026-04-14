@@ -1,9 +1,9 @@
 mod blocking;
 
 use super::*;
+use crate::io_util::checked_posix_fallocate;
 pub(crate) use blocking::copy_file_range_blocking_with_progress;
 use blocking::read_full_at;
-use crate::io_util::checked_posix_fallocate;
 #[cfg(test)]
 use std::sync::Mutex;
 

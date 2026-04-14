@@ -24,8 +24,10 @@ pub(super) struct TestCopyRunOptions {
     pub(super) cp_no_clobber: bool,
     pub(super) cp_no_target_directory: bool,
     pub(super) cp_update: bool,
-    pub(super) cp_preserve: bool,
+    pub(super) cp_preserve_mode: bool,
+    pub(super) cp_preserve_timestamps: bool,
     pub(super) cp_no_dereference: bool,
+    pub(super) cp_dereference: bool,
 }
 
 #[cfg(test)]
@@ -60,8 +62,10 @@ pub(super) fn run_test_copy(options: TestCopyRunOptions) -> io::Result<i32> {
         cp_target_directory: None,
         cp_no_target_directory: options.cp_no_target_directory,
         cp_update: options.cp_update,
-        cp_preserve: options.cp_preserve,
+        cp_preserve_mode: options.cp_preserve_mode,
+        cp_preserve_timestamps: options.cp_preserve_timestamps,
         cp_no_dereference: options.cp_no_dereference,
+        cp_dereference: options.cp_dereference,
         verbose: options.verbose,
         source: Some(options.source),
         pattern: String::new(),

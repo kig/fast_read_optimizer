@@ -176,6 +176,10 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         print_find_help(args[0].as_str());
         return Ok(0);
     }
+    if args.get(1).is_some_and(|arg| arg == "--version") {
+        print_coreutils_version("find");
+        return Ok(0);
+    }
     let (roots, plan) = parse_find_args(args)?;
     let worker_count = parallel_find_worker_count();
     let output = Arc::new(FindOutput::stdout());
@@ -513,7 +517,7 @@ fn is_find_expression_token(arg: &str) -> bool {
 
 fn print_find_help(program: &str) {
     fro::cio_println!(
-        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
+        "Usage: {program} [path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0] [--help] [--version]"
     );
     fro::cio_println!("Walk directory trees and print matching paths.");
     fro::cio_println!();
@@ -530,6 +534,7 @@ fn print_find_help(program: &str) {
     );
     fro::cio_println!("  -print0            print each matching path followed by NUL");
     fro::cio_println!("  -h, --help         display this help and exit");
+    fro::cio_println!("      --version      output version information and exit");
 }
 
 fn write_find_path(output: &FindOutput, path: &Path, output_delimiter: u8) -> io::Result<()> {

@@ -532,7 +532,7 @@ fn copy_recursive_cli_preserves_timestamps_with_cp_preserve() {
         "--no-direct",
         "-n",
         "1",
-        "--cp-preserve",
+        "--cp-preserve-timestamps",
         source_root.to_str().unwrap(),
         fro_dest_parent.to_str().unwrap(),
     ]);

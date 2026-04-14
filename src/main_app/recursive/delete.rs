@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::HashMap;
 
+type DeviceIdResolver = dyn Fn(&Path, &fs::Metadata) -> u64 + Send + Sync;
+type SkippedDirHandler = dyn Fn(&Path) + Send + Sync;
+
 #[derive(Clone)]
 struct RecursiveDeleteDirectoryTask {
     dir: PathBuf,
@@ -64,6 +67,9 @@ fn walk_recursive_delete_subtree(
     pending: &Mutex<HashMap<PathBuf, PendingDeleteDir>>,
     stats: &RecursiveDeleteStats,
     sample_counters: &ThroughputSampleCounters,
+    root_device: Option<u64>,
+    device_id_resolver: &DeviceIdResolver,
+    on_skipped_dir: &SkippedDirHandler,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut stack = vec![start];
@@ -77,6 +83,13 @@ fn walk_recursive_delete_subtree(
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
+                if let Some(root_device) = root_device {
+                    let metadata = entry.metadata()?;
+                    if device_id_resolver(&path, &metadata) != root_device {
+                        on_skipped_dir(&path);
+                        continue;
+                    }
+                }
                 child_dirs.push(RecursiveDeleteDirectoryTask {
                     dir: path,
                     parent_dir: Some(task.dir.clone()),
@@ -130,7 +143,13 @@ fn walk_recursive_delete_subtree(
     Ok(())
 }
 
-pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64> {
+fn run_recursive_delete_with_options(
+    root: &Path,
+    verbose: bool,
+    root_device: Option<u64>,
+    device_id_resolver: Arc<DeviceIdResolver>,
+    on_skipped_dir: Arc<SkippedDirHandler>,
+) -> io::Result<u64> {
     let source_meta = fs::symlink_metadata(root)?;
     if !source_meta.file_type().is_dir() {
         return Err(io::Error::new(
@@ -167,6 +186,8 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
         let stats = stats.clone();
         let stop = stop.clone();
         let sample_counters = sample_counters.clone();
+        let device_id_resolver = device_id_resolver.clone();
+        let on_skipped_dir = on_skipped_dir.clone();
         walk_threads.push(std::thread::spawn(move || -> io::Result<()> {
             while let Some(task) = dir_queue.claim(&stop) {
                 let result = walk_recursive_delete_subtree(
@@ -175,6 +196,9 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
                     pending.as_ref(),
                     &stats,
                     sample_counters.as_ref(),
+                    root_device,
+                    device_id_resolver.as_ref(),
+                    on_skipped_dir.as_ref(),
                     &stop,
                 );
                 dir_queue.complete_claim();
@@ -220,6 +244,34 @@ pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64
     Ok(bytes_removed)
 }
 
+pub(crate) fn run_recursive_delete(root: &Path, verbose: bool) -> io::Result<u64> {
+    run_recursive_delete_with_options(
+        root,
+        verbose,
+        None,
+        Arc::new(|_, metadata| metadata.dev()),
+        Arc::new(|_| {}),
+    )
+}
+
+pub(crate) fn run_recursive_delete_one_file_system<F>(
+    root: &Path,
+    verbose: bool,
+    root_device: u64,
+    on_skipped_dir: F,
+) -> io::Result<u64>
+where
+    F: Fn(&Path) + Send + Sync + 'static,
+{
+    run_recursive_delete_with_options(
+        root,
+        verbose,
+        Some(root_device),
+        Arc::new(|_, metadata| metadata.dev()),
+        Arc::new(on_skipped_dir),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +314,50 @@ mod tests {
 
         assert_eq!(removed_bytes, expected_bytes);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn run_recursive_delete_one_file_system_skips_directories_on_other_devices() {
+        let root = unique_recursive_delete_test_dir("recursive-delete-one-file-system");
+        let skipped = root.join("skipped-mount");
+        let removed = root.join("removed-dir");
+        fs::create_dir_all(skipped.join("nested")).unwrap();
+        fs::create_dir_all(removed.join("nested")).unwrap();
+        fs::write(skipped.join("nested/keep.txt"), b"keep\n").unwrap();
+        fs::write(removed.join("nested/delete.txt"), b"delete\n").unwrap();
+
+        let root_device = fs::metadata(&root).unwrap().dev();
+        let alternate_device = root_device + 1;
+        let skipped_for_resolver = skipped.clone();
+        let skipped_dirs = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let skipped_dirs_for_handler = skipped_dirs.clone();
+        let removed_bytes = run_recursive_delete_with_options(
+            &root,
+            false,
+            Some(root_device),
+            Arc::new(move |path, metadata| {
+                if path == skipped_for_resolver {
+                    alternate_device
+                } else {
+                    metadata.dev()
+                }
+            }),
+            Arc::new(move |path| {
+                skipped_dirs_for_handler
+                    .lock()
+                    .unwrap()
+                    .push(path.to_path_buf());
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(removed_bytes.kind(), io::ErrorKind::DirectoryNotEmpty);
+        assert!(skipped.exists());
+        assert!(!removed.exists());
+        let mut seen = skipped_dirs.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec![skipped]);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

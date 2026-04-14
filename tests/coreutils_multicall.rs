@@ -194,18 +194,31 @@ fn multicall_aliases_cover_existing_copy_diff_and_grep_modes() {
 }
 
 #[test]
-fn multicall_rm_help_and_force_zero_operands_work() {
+fn multicall_rm_help_version_and_force_zero_operands_work() {
     let help = run_fro("rm", &["--help"]);
     let help_stdout = String::from_utf8_lossy(&help.stdout);
     assert_eq!(help.status.code(), Some(0));
     assert!(help_stdout.contains("rm - Remove files or directory trees"));
     assert!(help_stdout.contains(
-        "[-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
+        "[-f] [-i|-I|--interactive[=WHEN]] [--one-file-system] [--preserve-root|--no-preserve-root] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
     ));
     assert!(help_stdout.contains("ignores missing operands and missing files"));
     assert!(help_stdout.contains("-d/--dir removes empty directories"));
     assert!(help_stdout.contains("last conflicting prompt flag wins"));
+    assert!(help_stdout.contains("--one-file-system"));
+    assert!(help_stdout.contains("prompt ordering and preserve-root handling stay unchanged"));
+    assert!(help_stdout.contains("--preserve-root"));
+    assert!(help_stdout.contains("--no-preserve-root"));
+    assert!(help_stdout.contains("--version prints the fro rm version string and exits."));
     assert!(help.stderr.is_empty());
+
+    let version = run_fro("rm", &["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("rm (fro coreutils) {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(version.stderr.is_empty());
 
     assert_success(run_fro("rm", &["-f"]));
 }
@@ -789,6 +802,39 @@ fn multicall_hash_sums_print_expected_digests() {
             path.to_str().unwrap()
         )
     );
+}
+
+#[test]
+fn multicall_b2sum_supports_length_output_and_tagged_checks() {
+    let tmp = unique_temp_dir("fro-coreutils-b2sum-length");
+    let path = tmp.join("hash.bin");
+    let bytes = (0..(128 * 1024 + 11))
+        .map(|i| ((i * 37) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&path, &bytes).unwrap();
+
+    for args in [
+        vec!["--length=8", path.to_str().unwrap()],
+        vec!["-l", "72", path.to_str().unwrap()],
+        vec!["--tag", "--length=72", path.to_str().unwrap()],
+    ] {
+        let fro = assert_success(run_fro("b2sum", &args));
+        let sys = assert_success(run_system("b2sum", &args));
+        assert_eq!(fro.stdout, sys.stdout, "b2sum {:?} stdout mismatch", args);
+        assert_eq!(fro.stderr, sys.stderr, "b2sum {:?} stderr mismatch", args);
+    }
+
+    let manifest = tmp.join("b2sum-length-tagged.txt");
+    let sys = assert_success(run_system(
+        "b2sum",
+        &["--tag", "--length=72", path.to_str().unwrap()],
+    ));
+    fs::write(&manifest, &sys.stdout).unwrap();
+
+    let fro_check = assert_success(run_fro("b2sum", &["-c", manifest.to_str().unwrap()]));
+    let sys_check = assert_success(run_system("b2sum", &["-c", manifest.to_str().unwrap()]));
+    assert_eq!(fro_check.stdout, sys_check.stdout);
+    assert_eq!(fro_check.stderr, sys_check.stderr);
 }
 
 #[test]

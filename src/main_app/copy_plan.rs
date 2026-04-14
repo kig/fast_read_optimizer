@@ -15,12 +15,14 @@ pub(super) struct ResolvedCopyExecution {
 pub(super) enum HeuristicCopyPlan {
     DiffOverwrite,
     LowLatencyCopyFileRangeSingle,
+    StandaloneNvmeCopyFileRangeSingle,
     CachedReadDirectWrite,
     DirectReadDirectWrite,
     CopyFileRangeSingle,
 }
 
 const LOW_LATENCY_COPY_FILE_RANGE_SINGLE_THRESHOLD: u64 = 256 * 1024;
+const STANDALONE_NVME_COPY_FILE_RANGE_SINGLE_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CopyRewriteMode {
@@ -116,6 +118,7 @@ pub(super) fn resolve_copy_execution(
         CopyAutoMode::Heuristic => {
             let (source_cached, target_cached, source_len, target_len) =
                 inspect_copy_auto_state(source_path, path);
+            let device_signature = config.device_signature_for_path(path);
             let plan = if rewrite_mode != CopyRewriteMode::Full
                 && should_prefer_cached_diff_overwrite(
                     source_cached,
@@ -134,6 +137,13 @@ pub(super) fn resolve_copy_execution(
                 source_len,
             ) {
                 HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+            } else if should_prefer_standalone_nvme_copy_file_range_single(
+                source_path,
+                path,
+                source_len,
+                device_signature.as_ref(),
+            ) {
+                HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle
             } else if should_prefer_cached_read_direct_write(source_cached, source_len, target_len)
             {
                 HeuristicCopyPlan::CachedReadDirectWrite
@@ -157,6 +167,14 @@ pub(super) fn resolve_copy_execution(
                     diff_overwrite: false,
                     full_rewrite: false,
                     path_label: "auto low-latency copy_file_range single",
+                },
+                HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle => ResolvedCopyExecution {
+                    copy_strategy: CopyStrategy::CopyFileRangeSingle,
+                    io_mode_read: common::IOMode::PageCache,
+                    io_mode_write: common::IOMode::PageCache,
+                    diff_overwrite: false,
+                    full_rewrite: false,
+                    path_label: "auto standalone-nvme copy_file_range single",
                 },
                 HeuristicCopyPlan::CachedReadDirectWrite => ResolvedCopyExecution {
                     copy_strategy: CopyStrategy::Threaded,
@@ -294,6 +312,26 @@ pub(super) fn should_prefer_low_latency_copy_file_range_single(
     };
     source_len <= low_latency_copy_file_range_single_threshold()
         && same_device_for_copy_file_range(source_path, target_path)
+}
+
+fn is_standalone_nvme_device(device_signature: Option<&config::DeviceSignature>) -> bool {
+    device_signature
+        .and_then(|signature| signature.block_device.as_ref())
+        .is_some_and(|block| block.kernel_name.starts_with("nvme") && block.slaves.is_empty())
+}
+
+pub(super) fn should_prefer_standalone_nvme_copy_file_range_single(
+    source_path: &str,
+    target_path: &str,
+    source_len: Option<u64>,
+    device_signature: Option<&config::DeviceSignature>,
+) -> bool {
+    let Some(source_len) = source_len else {
+        return false;
+    };
+    source_len >= STANDALONE_NVME_COPY_FILE_RANGE_SINGLE_THRESHOLD
+        && same_device_for_copy_file_range(source_path, target_path)
+        && is_standalone_nvme_device(device_signature)
 }
 
 pub(super) fn io_mode_label(io_mode: common::IOMode) -> &'static str {

@@ -101,7 +101,7 @@ pub(super) fn run_manifest_check<P, C>(
 ) -> io::Result<i32>
 where
     P: Fn(&str) -> Option<ManifestEntry>,
-    C: Fn(&str) -> io::Result<String>,
+    C: Fn(&ManifestEntry) -> io::Result<String>,
 {
     if inputs.is_empty() {
         return Err(io::Error::new(
@@ -134,7 +134,7 @@ where
             };
             had_valid_line = true;
             input_had_valid_line = true;
-            let actual = match compute_actual(&entry.path) {
+            let actual = match compute_actual(&entry) {
                 Ok(actual) => actual,
                 Err(err) if options.ignore_missing && is_not_found_error(&err) => continue,
                 Err(err) if is_not_found_error(&err) => {

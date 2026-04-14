@@ -1,4 +1,4 @@
-use super::{SortLineRef, SortMode};
+use super::{SortComparator, SortKeyEnd, SortKeySpec, SortLineRef, SortMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NumericPrefix<'a> {
@@ -553,74 +553,7 @@ pub(super) fn compare_sort_keys(left: &[u8], right: &[u8], mode: SortMode) -> st
     }
 }
 
-pub(super) fn compare_line_refs(
-    left: SortLineRef,
-    right: SortLineRef,
-    storage: &[u8],
-    mode: SortMode,
-    unique: bool,
-) -> std::cmp::Ordering {
-    match mode {
-        SortMode::Bytewise => left
-            .bytes(storage)
-            .cmp(right.bytes(storage))
-            .then_with(|| left.sequence.cmp(&right.sequence)),
-        SortMode::Numeric
-        | SortMode::GeneralNumeric
-        | SortMode::HumanNumeric
-        | SortMode::Month
-        | SortMode::Version => {
-            let key_order = compare_sort_keys(left.bytes(storage), right.bytes(storage), mode);
-            if key_order != std::cmp::Ordering::Equal {
-                return key_order;
-            }
-            if unique {
-                left.sequence.cmp(&right.sequence)
-            } else {
-                left.bytes(storage)
-                    .cmp(right.bytes(storage))
-                    .then_with(|| left.sequence.cmp(&right.sequence))
-            }
-        }
-    }
-}
-
-pub(super) fn compare_output_lines(
-    left: &[u8],
-    left_sequence: u64,
-    right: &[u8],
-    right_sequence: u64,
-    mode: SortMode,
-    _unique: bool,
-    reverse: bool,
-) -> std::cmp::Ordering {
-    let asc = compare_line_bytes(left, right, mode, false)
-        .then_with(|| left_sequence.cmp(&right_sequence));
-    if reverse {
-        asc.reverse()
-    } else {
-        asc
-    }
-}
-
-pub(super) fn compare_line_bytes(
-    left: &[u8],
-    right: &[u8],
-    mode: SortMode,
-    reverse: bool,
-) -> std::cmp::Ordering {
-    let asc = match compare_sort_keys(left, right, mode) {
-        std::cmp::Ordering::Equal if mode != SortMode::Bytewise => left.cmp(right),
-        other => other,
-    };
-    if reverse {
-        asc.reverse()
-    } else {
-        asc
-    }
-}
-
-pub(super) fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
+fn same_single_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
     match mode {
         SortMode::Bytewise => left == right,
         SortMode::Numeric => compare_numeric_lines(left, right) == std::cmp::Ordering::Equal,
@@ -663,3 +596,139 @@ pub(super) fn same_sort_key(left: &[u8], right: &[u8], mode: SortMode) -> bool {
     }
 }
 
+fn is_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn nth_field_bounds(line: &[u8], field: usize) -> Option<(usize, usize)> {
+    let mut idx = 0usize;
+    let mut seen = 0usize;
+    while idx < line.len() {
+        let start = idx;
+        while idx < line.len() && is_blank(line[idx]) {
+            idx += 1;
+        }
+        if idx == line.len() {
+            break;
+        }
+        while idx < line.len() && !is_blank(line[idx]) {
+            idx += 1;
+        }
+        seen += 1;
+        if seen == field {
+            return Some((start, idx));
+        }
+    }
+    None
+}
+
+fn key_range(line: &[u8], key: &SortKeySpec) -> (usize, usize) {
+    let Some((start_field, start_field_end)) = nth_field_bounds(line, key.start.field) else {
+        return (line.len(), line.len());
+    };
+    let start = (start_field + key.start.char_offset).min(start_field_end);
+    let end = match key.end {
+        SortKeyEnd::EndOfLine => line.len(),
+        SortKeyEnd::FieldEnd { field } => nth_field_bounds(line, field)
+            .map(|(_, field_end)| field_end)
+            .unwrap_or(line.len()),
+        SortKeyEnd::Char { field, char_end } => nth_field_bounds(line, field)
+            .map(|(field_start, field_end)| (field_start + char_end).min(field_end))
+            .unwrap_or(line.len()),
+    };
+    (start, end.max(start))
+}
+
+fn key_slice<'a>(line: &'a [u8], key: &SortKeySpec) -> &'a [u8] {
+    let (start, end) = key_range(line, key);
+    &line[start..end]
+}
+
+fn compare_selected_keys(
+    left: &[u8],
+    right: &[u8],
+    comparator: &SortComparator,
+) -> std::cmp::Ordering {
+    if comparator.keys.is_empty() {
+        return compare_sort_keys(left, right, comparator.mode);
+    }
+    for key in &comparator.keys {
+        let order = compare_sort_keys(key_slice(left, key), key_slice(right, key), comparator.mode);
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn same_selected_keys(left: &[u8], right: &[u8], comparator: &SortComparator) -> bool {
+    if comparator.keys.is_empty() {
+        return same_single_sort_key(left, right, comparator.mode);
+    }
+    comparator.keys.iter().all(|key| {
+        same_single_sort_key(key_slice(left, key), key_slice(right, key), comparator.mode)
+    })
+}
+
+pub(super) fn compare_line_refs(
+    left: SortLineRef,
+    right: SortLineRef,
+    storage: &[u8],
+    comparator: &SortComparator,
+    unique: bool,
+) -> std::cmp::Ordering {
+    let key_order = compare_selected_keys(left.bytes(storage), right.bytes(storage), comparator);
+    if key_order != std::cmp::Ordering::Equal {
+        return key_order;
+    }
+    if unique {
+        left.sequence.cmp(&right.sequence)
+    } else {
+        left.bytes(storage)
+            .cmp(right.bytes(storage))
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    }
+}
+
+pub(super) fn compare_output_lines(
+    left: &[u8],
+    left_sequence: u64,
+    right: &[u8],
+    right_sequence: u64,
+    comparator: &SortComparator,
+    _unique: bool,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let asc = compare_line_bytes(left, right, comparator, false)
+        .then_with(|| left_sequence.cmp(&right_sequence));
+    if reverse {
+        asc.reverse()
+    } else {
+        asc
+    }
+}
+
+pub(super) fn compare_line_bytes(
+    left: &[u8],
+    right: &[u8],
+    comparator: &SortComparator,
+    reverse: bool,
+) -> std::cmp::Ordering {
+    let asc = match compare_selected_keys(left, right, comparator) {
+        std::cmp::Ordering::Equal
+            if comparator.mode != SortMode::Bytewise || !comparator.keys.is_empty() =>
+        {
+            left.cmp(right)
+        }
+        other => other,
+    };
+    if reverse {
+        asc.reverse()
+    } else {
+        asc
+    }
+}
+
+pub(super) fn same_sort_key(left: &[u8], right: &[u8], comparator: &SortComparator) -> bool {
+    same_selected_keys(left, right, comparator)
+}

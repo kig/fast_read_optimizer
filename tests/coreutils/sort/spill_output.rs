@@ -15,6 +15,36 @@ fn sort_check_rejects_extra_operands_and_output_flag() {
     let fro = run_fro("sort", &["--check", "-o", "out.txt", a.to_str().unwrap()]);
     let system = run_system_sort(&["--check", "-o", "out.txt", a.to_str().unwrap()]);
     assert_same_result(fro, system, "sort check incompatible output");
+
+    let fro = run_fro("sort", &["-C", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let system = run_system_sort(&["-C", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_same_result(fro, system, "sort silent check extra operand");
+
+    let fro = run_fro(
+        "sort",
+        &["--check=quiet", "-o", "out.txt", a.to_str().unwrap()],
+    );
+    let system = run_system_sort(&["--check=quiet", "-o", "out.txt", a.to_str().unwrap()]);
+    assert_same_result(fro, system, "sort quiet check incompatible output");
+
+    let fro = run_fro("sort", &["-cC", a.to_str().unwrap()]);
+    let system = run_system_sort(&["-cC", a.to_str().unwrap()]);
+    assert_same_result(fro, system, "sort check aliases incompatible");
+
+    let fro = run_fro(
+        "sort",
+        &[
+            "--check=silent",
+            "--check=diagnose-first",
+            a.to_str().unwrap(),
+        ],
+    );
+    let system = run_system_sort(&[
+        "--check=silent",
+        "--check=diagnose-first",
+        a.to_str().unwrap(),
+    ]);
+    assert_same_result(fro, system, "sort long check aliases incompatible");
 }
 
 #[test]
@@ -350,5 +380,68 @@ fn sort_spills_stream_input_when_memory_budget_is_low() {
     assert_eq!(
         fs::read(&fro_output).unwrap(),
         fs::read(&sys_output).unwrap()
+    );
+}
+
+#[test]
+fn sort_key_spill_and_check_match_system() {
+    let tmp = unique_temp_dir("fro-coreutils-sort-key-spill");
+    let input = tmp.join("input.txt");
+    let sorted = tmp.join("sorted.txt");
+    let unsorted = tmp.join("unsorted.txt");
+    let fro_output = tmp.join("fro-output.txt");
+    let sys_output = tmp.join("sys-output.txt");
+
+    let mut bytes = Vec::new();
+    for idx in 0..160000u32 {
+        bytes.extend_from_slice(format!("row {:06} {:06}\n", idx % 97, 160000 - idx).as_bytes());
+    }
+    fs::write(&input, &bytes).unwrap();
+    fs::write(&sorted, b"row 001 001\nrow 001 002\nrow 002 001\n").unwrap();
+    fs::write(&unsorted, b"row 002 001\nrow 001 999\n").unwrap();
+
+    let fro = run_fro_env(
+        "sort",
+        &[
+            "--no-direct",
+            "-k",
+            "2,2",
+            "-k",
+            "3,3",
+            "-o",
+            fro_output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ],
+        &[("FRO_SORT_MAX_IN_MEMORY_BYTES", "65536")],
+    );
+    let system = run_system_sort(&[
+        "-k",
+        "2,2",
+        "-k",
+        "3,3",
+        "-o",
+        sys_output.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(fro.status.code(), system.status.code());
+    assert!(fro.stdout.is_empty());
+    assert_eq!(fro.stderr, system.stderr);
+    assert_eq!(
+        fs::read(&fro_output).unwrap(),
+        fs::read(&sys_output).unwrap()
+    );
+
+    assert_same_result(
+        run_fro(
+            "sort",
+            &["-c", "-k", "2,2", "-k", "3,3", sorted.to_str().unwrap()],
+        ),
+        run_system_sort(&["-c", "-k", "2,2", "-k", "3,3", sorted.to_str().unwrap()]),
+        "sort key check sorted",
+    );
+    assert_same_result(
+        run_fro("sort", &["-c", "-k", "2,2", unsorted.to_str().unwrap()]),
+        run_system_sort(&["-c", "-k", "2,2", unsorted.to_str().unwrap()]),
+        "sort key check unsorted",
     );
 }

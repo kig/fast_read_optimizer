@@ -120,7 +120,11 @@ mod encrypt;
 mod fgrep;
 #[path = "coreutils/head.rs"]
 mod head;
+#[path = "coreutils/shred.rs"]
+mod shred;
 #[path = "coreutils/sort.rs"]
 mod sort;
+#[path = "coreutils/tac.rs"]
+mod tac;
 #[path = "coreutils/tail.rs"]
 mod tail;

@@ -33,6 +33,41 @@ enum SortMode {
     Version,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortKeyPosition {
+    field: usize,
+    char_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKeyEnd {
+    EndOfLine,
+    FieldEnd { field: usize },
+    Char { field: usize, char_end: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SortKeySpec {
+    start: SortKeyPosition,
+    end: SortKeyEnd,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SortComparator {
+    mode: SortMode,
+    keys: Vec<SortKeySpec>,
+}
+
+impl SortComparator {
+    fn new(mode: SortMode, keys: Vec<SortKeySpec>) -> Self {
+        Self { mode, keys }
+    }
+
+    fn has_key_selection(&self) -> bool {
+        !self.keys.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RecordTerminator {
     #[default]
@@ -49,20 +84,60 @@ impl RecordTerminator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortCheckMode {
+    #[default]
+    None,
+    DiagnoseFirst,
+    Silent,
+}
+
+impl SortCheckMode {
+    fn is_enabled(self) -> bool {
+        self != Self::None
+    }
+
+    fn emits_diagnostics(self) -> bool {
+        self == Self::DiagnoseFirst
+    }
+
+    fn short_flag(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::DiagnoseFirst => "-c",
+            Self::Silent => "-C",
+        }
+    }
+}
+
+fn set_sort_check_mode(current: &mut SortCheckMode, next: SortCheckMode) -> io::Result<()> {
+    if *current != SortCheckMode::None && *current != next {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "options '-cC' are incompatible",
+        ));
+    }
+    *current = next;
+    Ok(())
+}
+
 fn print_sort_help(program: &str) {
     fro::cio_println!("sort - Sort newline-delimited records (or NUL-delimited with -z)");
     fro::cio_println!();
     fro::cio_println!("Usage: {program} [OPTION]... [FILE]...");
     fro::cio_println!();
     fro::cio_println!(
-        "This bounded slice sorts locale-independent byte, numeric, general-numeric, human-numeric, month, or version records, using newlines by default and NULs with -z."
+        "This bounded slice sorts locale-independent byte, numeric, general-numeric, human-numeric, month, or version records, with bounded GNU-style -k/--key selection, using newlines by default and NULs with -z."
     );
     fro::cio_println!(
-        "It currently supports the default case plus -g/-h/-M/-n/-V, -z, reverse/unique, merge/check, and -o output."
+        "It currently supports the default case plus bounded -k/--key, -g/-h/-M/-n/-V, -z, reverse/unique, merge/check, and -o output."
     );
     fro::cio_println!();
     fro::cio_println!("Supported options:");
-    fro::cio_println!("  -c, --check          check whether one input is already sorted");
+    fro::cio_println!("  -c, --check, --check=diagnose-first");
+    fro::cio_println!("                       check for sorted input; diagnose first bad line");
+    fro::cio_println!("  -C, --check=quiet, --check=silent");
+    fro::cio_println!("                       like -c, but do not report the first bad line");
     fro::cio_println!("  -g, --general-numeric-sort");
     fro::cio_println!("                       compare leading C-locale floating-point prefixes");
     fro::cio_println!("  -h, --human-numeric-sort");
@@ -74,6 +149,7 @@ fn print_sort_help(program: &str) {
         "  -M, --month-sort     compare leading month abbreviations like GNU sort -M"
     );
     fro::cio_println!("  -n, --numeric-sort   compare leading numeric prefixes in C-locale style");
+    fro::cio_println!("  -k KEY, --key=KEY    sort via bounded GNU-style field ranges");
     fro::cio_println!("  -r, --reverse        reverse the result of comparisons");
     fro::cio_println!("  -u, --unique         output only the first of an equal run");
     fro::cio_println!("  -V, --version-sort   compare digit runs with GNU version-order semantics");
@@ -89,7 +165,8 @@ fn print_sort_help(program: &str) {
     fro::cio_println!("      --direct         force direct IO for regular files when possible");
     fro::cio_println!("      --no-direct      force page-cache IO for regular files");
     fro::cio_println!("      --report-gbps    print aggregate input throughput to stderr");
-    fro::cio_println!("      --help           display this help and exit");
+    fro::cio_println!("      --help           shows this message and exits.");
+    fro::cio_println!("      --version        prints the fro sort version string and exits.");
     fro::cio_println!();
     fro::cio_println!("Notes:");
     fro::cio_println!("  - Use '-' once to read stdin.");
@@ -98,13 +175,15 @@ fn print_sort_help(program: &str) {
     fro::cio_println!("  - Inputs larger than available memory spill sorted runs and merge them.");
     fro::cio_println!("  - -T only matters when spill temp files are actually created.");
     fro::cio_println!("  - -m reuses the spill/merge backend on already sorted inputs.");
-    fro::cio_println!("  - -c validates one input stream and exits 1 on the first disorder.");
+    fro::cio_println!("  - -c/--check=diagnose-first validates one input stream and exits 1 on the first disorder.");
+    fro::cio_println!("  - -C/--check=quiet/--check=silent reuses the same check path but suppresses disorder diagnostics.");
     fro::cio_println!("  - -g uses C-locale strtod-style prefixes; NaNs sort after non-numbers and before infinities.");
     fro::cio_println!("  - -h compares the leading numeric prefix plus an optional K/M/G/T/P/E/Z/Y suffix family.");
     fro::cio_println!("  - -M looks at the first nonblank three-letter month abbreviation and treats other lines as invalid month keys.");
+    fro::cio_println!("  - -k/--key accepts one or more blank-separated field ranges in the form F[.C][,F[.C]], without per-key modifiers or locale collation.");
     fro::cio_println!("  - -V uses GNU/libc version-order comparisons while preserving the existing spill, merge, and check backend.");
     fro::cio_println!("  - Unsupported GNU sort features currently return an error:");
-    fro::cio_println!("    key selection (-k) and locale collation.");
+    fro::cio_println!("    locale collation and per-key modifiers.");
 }
 
 fn sort_input_label(input: &StreamInput) -> &str {
@@ -156,14 +235,14 @@ fn append_input_lines(
 fn sort_line_refs(
     lines: &mut [SortLineRef],
     storage: &[u8],
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
 ) -> io::Result<()> {
     if lines.len() < 2 {
         return Ok(());
     }
-    match mode {
-        SortMode::Bytewise => {
+    match comparator.mode {
+        SortMode::Bytewise if !comparator.has_key_selection() => {
             let snapshot = lines.to_vec();
             let mut order = vec![0 as sz::SortedIdx; snapshot.len()];
             sz::argsort_permutation_by(|idx| snapshot[idx].bytes(storage), &mut order).map_err(
@@ -177,9 +256,10 @@ fn sort_line_refs(
         | SortMode::GeneralNumeric
         | SortMode::HumanNumeric
         | SortMode::Month
-        | SortMode::Version => {
+        | SortMode::Version
+        | SortMode::Bytewise => {
             lines.sort_unstable_by(|left, right| {
-                compare_line_refs(*left, *right, storage, mode, unique)
+                compare_line_refs(*left, *right, storage, comparator, unique)
             });
         }
     }
@@ -189,14 +269,15 @@ fn sort_line_refs(
 fn finalize_sorted_lines(
     lines: &mut Vec<SortLineRef>,
     storage: &[u8],
-    mode: SortMode,
+    comparator: &SortComparator,
     unique: bool,
     reverse: bool,
 ) -> io::Result<()> {
-    sort_line_refs(lines, storage, mode, unique)?;
+    sort_line_refs(lines, storage, comparator, unique)?;
     if unique {
-        lines
-            .dedup_by(|left, right| same_sort_key(left.bytes(storage), right.bytes(storage), mode));
+        lines.dedup_by(|left, right| {
+            same_sort_key(left.bytes(storage), right.bytes(storage), comparator)
+        });
     }
     if reverse {
         lines.reverse();
@@ -206,19 +287,20 @@ fn finalize_sorted_lines(
 
 fn apply_short_sort_flags(
     arg: &str,
-    check: &mut bool,
+    check_mode: &mut SortCheckMode,
     merge: &mut bool,
     mode: &mut SortMode,
     reverse: &mut bool,
     unique: &mut bool,
     terminator: &mut RecordTerminator,
-) -> bool {
+) -> io::Result<bool> {
     if !arg.starts_with('-') || arg.starts_with("--") || arg == "-" {
-        return false;
+        return Ok(false);
     }
     for flag in arg[1..].bytes() {
         match flag {
-            b'c' => *check = true,
+            b'c' => set_sort_check_mode(check_mode, SortCheckMode::DiagnoseFirst)?,
+            b'C' => set_sort_check_mode(check_mode, SortCheckMode::Silent)?,
             b'g' => *mode = SortMode::GeneralNumeric,
             b'h' => *mode = SortMode::HumanNumeric,
             b'M' => *mode = SortMode::Month,
@@ -228,10 +310,105 @@ fn apply_short_sort_flags(
             b'u' => *unique = true,
             b'V' => *mode = SortMode::Version,
             b'z' => *terminator = RecordTerminator::Nul,
-            _ => return false,
+            _ => return Ok(false),
         }
     }
-    true
+    Ok(true)
+}
+
+fn parse_sort_key_position(raw: &str, is_end: bool) -> io::Result<(usize, Option<usize>)> {
+    if raw.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty sort key position",
+        ));
+    }
+    let bytes = raw.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid sort key position '{raw}'"),
+        ));
+    }
+
+    let field = raw[..idx].parse::<usize>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid sort key field in '{raw}': {err}"),
+        )
+    })?;
+    if field == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("sort key fields are 1-based in '{raw}'"),
+        ));
+    }
+
+    let mut char_pos = None;
+    if idx < bytes.len() && bytes[idx] == b'.' {
+        idx += 1;
+        let char_start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if char_start == idx {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid sort key character position in '{raw}'"),
+            ));
+        }
+        let parsed = raw[char_start..idx].parse::<usize>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid sort key character position in '{raw}': {err}"),
+            )
+        })?;
+        if !is_end && parsed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("sort key start character positions are 1-based in '{raw}'"),
+            ));
+        }
+        char_pos = Some(parsed);
+    }
+
+    if idx != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported sort key modifiers in '{raw}'"),
+        ));
+    }
+
+    Ok((field, char_pos))
+}
+
+fn parse_sort_key_spec(raw: &str) -> io::Result<SortKeySpec> {
+    let (start_raw, end_raw) = raw
+        .split_once(',')
+        .map_or((raw, None), |(start, end)| (start, Some(end)));
+    let (start_field, start_char) = parse_sort_key_position(start_raw, false)?;
+    let start = SortKeyPosition {
+        field: start_field,
+        char_offset: start_char.unwrap_or(1) - 1,
+    };
+    let end = match end_raw {
+        None => SortKeyEnd::EndOfLine,
+        Some(raw_end) => {
+            let (end_field, end_char) = parse_sort_key_position(raw_end, true)?;
+            match end_char {
+                None | Some(0) => SortKeyEnd::FieldEnd { field: end_field },
+                Some(char_end) => SortKeyEnd::Char {
+                    field: end_field,
+                    char_end,
+                },
+            }
+        }
+    };
+    Ok(SortKeySpec { start, end })
 }
 
 fn write_sorted_lines<W: Write>(
@@ -297,7 +474,7 @@ fn flush_sort_output_buffer<W: Write + ?Sized>(
 pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut io_mode = IOMode::Auto;
     let mut report_throughput = false;
-    let mut check = false;
+    let mut check_mode = SortCheckMode::None;
     let mut merge = false;
     let mut mode = SortMode::Bytewise;
     let mut reverse = false;
@@ -305,6 +482,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     let mut terminator = RecordTerminator::Newline;
     let mut output_path = None;
     let mut temporary_directory = None;
+    let mut key_specs = Vec::new();
     let mut files = Vec::new();
     let mut end_flags = false;
     let mut idx = 1usize;
@@ -317,12 +495,46 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 print_sort_help(args[0].as_str());
                 return Ok(0);
             }
-            "-c" | "--check" if !end_flags => check = true,
+            "-c" | "--check" if !end_flags => {
+                if let Err(err) = set_sort_check_mode(&mut check_mode, SortCheckMode::DiagnoseFirst)
+                {
+                    fro::cio_eprintln!("sort: {err}");
+                    return Ok(2);
+                }
+            }
+            "-C" | "--check=quiet" | "--check=silent" if !end_flags => {
+                if let Err(err) = set_sort_check_mode(&mut check_mode, SortCheckMode::Silent) {
+                    fro::cio_eprintln!("sort: {err}");
+                    return Ok(2);
+                }
+            }
+            "--check=diagnose-first" if !end_flags => {
+                if let Err(err) = set_sort_check_mode(&mut check_mode, SortCheckMode::DiagnoseFirst)
+                {
+                    fro::cio_eprintln!("sort: {err}");
+                    return Ok(2);
+                }
+            }
             "-g" | "--general-numeric-sort" if !end_flags => mode = SortMode::GeneralNumeric,
             "-h" | "--human-numeric-sort" if !end_flags => mode = SortMode::HumanNumeric,
             "-M" | "--month-sort" if !end_flags => mode = SortMode::Month,
             "-m" | "--merge" if !end_flags => merge = true,
             "-n" | "--numeric-sort" if !end_flags => mode = SortMode::Numeric,
+            "-k" | "--key" if !end_flags => {
+                let Some(spec) = args.get(idx + 1) else {
+                    fro::cio_eprintln!("sort: option requires an argument -- 'k'");
+                    fro::cio_eprintln!("Try 'sort --help' for more information.");
+                    return Ok(2);
+                };
+                match parse_sort_key_spec(spec) {
+                    Ok(parsed) => key_specs.push(parsed),
+                    Err(err) => {
+                        fro::cio_eprintln!("sort: {err}");
+                        return Ok(2);
+                    }
+                }
+                idx += 1;
+            }
             "-r" | "--reverse" if !end_flags => reverse = true,
             "-u" | "--unique" if !end_flags => unique = true,
             "-V" | "--version-sort" if !end_flags => mode = SortMode::Version,
@@ -352,20 +564,36 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             other if !end_flags && other.starts_with("--output=") => {
                 output_path = Some(other["--output=".len()..].to_string());
             }
+            other if !end_flags && other.starts_with("--key=") => {
+                match parse_sort_key_spec(&other["--key=".len()..]) {
+                    Ok(parsed) => key_specs.push(parsed),
+                    Err(err) => {
+                        fro::cio_eprintln!("sort: {err}");
+                        return Ok(2);
+                    }
+                }
+            }
             other if !end_flags && other.starts_with("--temporary-directory=") => {
                 temporary_directory = Some(other["--temporary-directory=".len()..].to_string());
             }
             other
                 if !end_flags
-                    && apply_short_sort_flags(
+                    && match apply_short_sort_flags(
                         other,
-                        &mut check,
+                        &mut check_mode,
                         &mut merge,
                         &mut mode,
                         &mut reverse,
                         &mut unique,
                         &mut terminator,
-                    ) => {}
+                    ) {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(err) => {
+                            fro::cio_eprintln!("sort: {err}");
+                            return Ok(2);
+                        }
+                    } => {}
             other
                 if !end_flags
                     && other.starts_with('-')
@@ -376,12 +604,49 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
                 let mut consumed_next = false;
                 for (pos, flag) in other[1..].char_indices() {
                     match flag {
-                        'c' => check = true,
+                        'c' => {
+                            if let Err(err) =
+                                set_sort_check_mode(&mut check_mode, SortCheckMode::DiagnoseFirst)
+                            {
+                                fro::cio_eprintln!("sort: {err}");
+                                return Ok(2);
+                            }
+                        }
+                        'C' => {
+                            if let Err(err) =
+                                set_sort_check_mode(&mut check_mode, SortCheckMode::Silent)
+                            {
+                                fro::cio_eprintln!("sort: {err}");
+                                return Ok(2);
+                            }
+                        }
                         'g' => mode = SortMode::GeneralNumeric,
                         'h' => mode = SortMode::HumanNumeric,
                         'M' => mode = SortMode::Month,
                         'm' => merge = true,
                         'n' => mode = SortMode::Numeric,
+                        'k' => {
+                            let value_start = 2 + pos;
+                            let raw_spec = if value_start < other.len() {
+                                &other[value_start..]
+                            } else {
+                                let Some(spec) = args.get(idx + 1) else {
+                                    fro::cio_eprintln!("sort: option requires an argument -- 'k'");
+                                    fro::cio_eprintln!("Try 'sort --help' for more information.");
+                                    return Ok(2);
+                                };
+                                consumed_next = true;
+                                spec.as_str()
+                            };
+                            match parse_sort_key_spec(raw_spec) {
+                                Ok(parsed) => key_specs.push(parsed),
+                                Err(err) => {
+                                    fro::cio_eprintln!("sort: {err}");
+                                    return Ok(2);
+                                }
+                            }
+                            break;
+                        }
                         'r' => reverse = true,
                         'u' => unique = true,
                         'V' => mode = SortMode::Version,
@@ -443,12 +708,19 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
         idx += 1;
     }
 
-    if check && files.len() > 1 {
-        fro::cio_eprintln!("sort: extra operand '{}' not allowed with -c", files[1]);
+    if check_mode.is_enabled() && files.len() > 1 {
+        fro::cio_eprintln!(
+            "sort: extra operand '{}' not allowed with {}",
+            files[1],
+            check_mode.short_flag()
+        );
         return Ok(2);
     }
-    if check && output_path.is_some() {
-        fro::cio_eprintln!("sort: options '-co' are incompatible");
+    if check_mode.is_enabled() && output_path.is_some() {
+        fro::cio_eprintln!(
+            "sort: options '{}o' are incompatible",
+            check_mode.short_flag()
+        );
         return Ok(2);
     }
 
@@ -465,11 +737,21 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
     }
 
     let started_at = std::time::Instant::now();
-    let total_bytes = if check {
-        match external::check_input_sorted(&inputs[0], io_mode, mode, unique, reverse, terminator) {
+    let comparator = SortComparator::new(mode, key_specs);
+    let total_bytes = if check_mode.is_enabled() {
+        match external::check_input_sorted(
+            &inputs[0],
+            io_mode,
+            &comparator,
+            unique,
+            reverse,
+            terminator,
+        ) {
             Ok(result) => {
                 if let Some(disorder) = result.disorder {
-                    report_sort_disorder(sort_input_label(&inputs[0]), &disorder, terminator)?;
+                    if check_mode.emits_diagnostics() {
+                        report_sort_disorder(sort_input_label(&inputs[0]), &disorder, terminator)?;
+                    }
                     return Ok(1);
                 }
                 result.total_bytes
@@ -484,7 +766,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             external::merge_presorted_inputs(
                 &inputs,
                 io_mode,
-                mode,
+                &comparator,
                 unique,
                 reverse,
                 terminator,
@@ -495,7 +777,7 @@ pub(super) fn run_sort(args: &[String]) -> io::Result<i32> {
             external::sort_inputs(
                 &inputs,
                 io_mode,
-                mode,
+                &comparator,
                 unique,
                 reverse,
                 terminator,
@@ -544,6 +826,10 @@ mod tests {
         (storage, refs)
     }
 
+    fn comparator(mode: SortMode) -> SortComparator {
+        SortComparator::new(mode, Vec::new())
+    }
+
     #[test]
     fn radix_sort_matches_bytewise_order_for_prefixes_and_empty_lines() {
         let input = [
@@ -555,7 +841,7 @@ mod tests {
             b"z".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        sort_line_refs(&mut refs, &storage, SortMode::Bytewise, false).unwrap();
+        sort_line_refs(&mut refs, &storage, &comparator(SortMode::Bytewise), false).unwrap();
         let sorted = refs
             .iter()
             .map(|line| line.bytes(&storage).to_vec())
@@ -625,7 +911,14 @@ mod tests {
         let (storage, refs) = refs_for_lines(&input);
 
         let mut sorted = refs.clone();
-        finalize_sorted_lines(&mut sorted, &storage, SortMode::Bytewise, false, false).unwrap();
+        finalize_sorted_lines(
+            &mut sorted,
+            &storage,
+            &comparator(SortMode::Bytewise),
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             sorted
                 .iter()
@@ -641,7 +934,14 @@ mod tests {
         );
 
         let mut unique_only = refs.clone();
-        finalize_sorted_lines(&mut unique_only, &storage, SortMode::Bytewise, true, false).unwrap();
+        finalize_sorted_lines(
+            &mut unique_only,
+            &storage,
+            &comparator(SortMode::Bytewise),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             unique_only
                 .iter()
@@ -654,7 +954,7 @@ mod tests {
         finalize_sorted_lines(
             &mut unique_reverse,
             &storage,
-            SortMode::Bytewise,
+            &comparator(SortMode::Bytewise),
             true,
             true,
         )
@@ -682,7 +982,7 @@ mod tests {
             b"  10".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&lines);
-        sort_line_refs(&mut refs, &storage, SortMode::Numeric, false).unwrap();
+        sort_line_refs(&mut refs, &storage, &comparator(SortMode::Numeric), false).unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -710,7 +1010,14 @@ mod tests {
             b"2".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        finalize_sorted_lines(&mut refs, &storage, SortMode::Numeric, true, false).unwrap();
+        finalize_sorted_lines(
+            &mut refs,
+            &storage,
+            &comparator(SortMode::Numeric),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -732,7 +1039,13 @@ mod tests {
             b"+inf".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&lines);
-        sort_line_refs(&mut refs, &storage, SortMode::GeneralNumeric, false).unwrap();
+        sort_line_refs(
+            &mut refs,
+            &storage,
+            &comparator(SortMode::GeneralNumeric),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -761,7 +1074,14 @@ mod tests {
             b"1M".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        finalize_sorted_lines(&mut refs, &storage, SortMode::HumanNumeric, true, false).unwrap();
+        finalize_sorted_lines(
+            &mut refs,
+            &storage,
+            &comparator(SortMode::HumanNumeric),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -787,7 +1107,14 @@ mod tests {
             b"Dec".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        finalize_sorted_lines(&mut refs, &storage, SortMode::Month, true, false).unwrap();
+        finalize_sorted_lines(
+            &mut refs,
+            &storage,
+            &comparator(SortMode::Month),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -813,7 +1140,7 @@ mod tests {
             b"v1~".as_slice(),
         ];
         let (storage, mut refs) = refs_for_lines(&input);
-        sort_line_refs(&mut refs, &storage, SortMode::Version, false).unwrap();
+        sort_line_refs(&mut refs, &storage, &comparator(SortMode::Version), false).unwrap();
         assert_eq!(
             refs.iter()
                 .map(|line| line.bytes(&storage).to_vec())
@@ -833,28 +1160,63 @@ mod tests {
     #[test]
     fn compare_line_bytes_matches_numeric_last_resort_ordering() {
         assert_eq!(
-            compare_line_bytes(b"1", b"1.0", SortMode::Numeric, false),
+            compare_line_bytes(b"1", b"1.0", &comparator(SortMode::Numeric), false),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_line_bytes(b"x", b"NaN", SortMode::GeneralNumeric, false),
+            compare_line_bytes(b"x", b"NaN", &comparator(SortMode::GeneralNumeric), false,),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_line_bytes(b"1KiB", b"1024K", SortMode::HumanNumeric, false),
+            compare_line_bytes(
+                b"1KiB",
+                b"1024K",
+                &comparator(SortMode::HumanNumeric),
+                false,
+            ),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_line_bytes(b"JAN", b"Jan", SortMode::Month, false),
+            compare_line_bytes(b"JAN", b"Jan", &comparator(SortMode::Month), false),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_line_bytes(b"v01", b"v1", SortMode::Version, false),
+            compare_line_bytes(b"v01", b"v1", &comparator(SortMode::Version), false),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_line_bytes(b"beta", b"alpha", SortMode::Bytewise, true),
+            compare_line_bytes(b"beta", b"alpha", &comparator(SortMode::Bytewise), true),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn parse_sort_key_spec_supports_bounded_field_ranges() {
+        assert_eq!(
+            parse_sort_key_spec("2.3,4.5").unwrap(),
+            SortKeySpec {
+                start: SortKeyPosition {
+                    field: 2,
+                    char_offset: 2,
+                },
+                end: SortKeyEnd::Char {
+                    field: 4,
+                    char_end: 5,
+                },
+            }
+        );
+        assert_eq!(
+            parse_sort_key_spec("3,3.0").unwrap(),
+            SortKeySpec {
+                start: SortKeyPosition {
+                    field: 3,
+                    char_offset: 0,
+                },
+                end: SortKeyEnd::FieldEnd { field: 3 },
+            }
+        );
+        assert!(parse_sort_key_spec("0,1").is_err());
+        assert!(parse_sort_key_spec("1.0,1").is_err());
+        assert!(parse_sort_key_spec("1b,1").is_err());
     }
 }

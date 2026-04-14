@@ -30,7 +30,22 @@ fn assert_success(output: &Output, alias: &str, mode: &str) {
 #[test]
 fn multicall_argv0_help_uses_alias_names() {
     let aliases = [
-        "cat", "cksum", "cmp", "cp", "find", "head", "mv", "tail", "tar", "wc",
+        "base64",
+        "cat",
+        "cksum",
+        "cmp",
+        "cp",
+        "dd",
+        "du",
+        "find",
+        "head",
+        "md5sum",
+        "mv",
+        "shred",
+        "sha256sum",
+        "tail",
+        "tar",
+        "wc",
     ];
     for alias in aliases {
         let output = run_alias(alias, &["--help"]);
@@ -74,7 +89,22 @@ fn multicall_argv0_help_uses_alias_names() {
 #[test]
 fn multicall_argv0_version_uses_alias_names() {
     let aliases = [
-        "cat", "cksum", "cmp", "cp", "find", "head", "mv", "tail", "tar", "wc",
+        "base64",
+        "cat",
+        "cksum",
+        "cmp",
+        "cp",
+        "dd",
+        "du",
+        "find",
+        "head",
+        "md5sum",
+        "mv",
+        "shred",
+        "sha256sum",
+        "tail",
+        "tar",
+        "wc",
     ];
     for alias in aliases {
         let output = run_alias(alias, &["--version"]);
@@ -93,4 +123,23 @@ fn multicall_argv0_version_uses_alias_names() {
             "{alias} version should not use argv0 path:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn cmp_argv0_short_version_uses_alias_name() {
+    let output = run_alias("cmp", &["-v"]);
+    assert_success(&output, "cmp", "-v");
+    let stdout = String::from_utf8(output.stdout).expect("version output should be UTF-8");
+    assert!(
+        stdout.starts_with("cmp "),
+        "cmp -v should start with the alias name:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "cmp -v should include the package version:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("bin/cmp"),
+        "cmp -v should not use argv0 path:\n{stdout}"
+    );
 }

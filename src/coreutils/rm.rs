@@ -1,5 +1,6 @@
 use super::*;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptMode {
@@ -20,7 +21,7 @@ fn mark_removed(path: &Path, is_dir: bool, verbose: bool) {
 
 fn print_rm_help(program: &str) {
     fro::cio_println!(
-        "Usage: {program} [-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
+        "Usage: {program} [-f] [-i|-I|--interactive[=WHEN]] [--one-file-system] [--preserve-root|--no-preserve-root] [-d] [-r|-R|--recursive] [-v] <file> [file ...]"
     );
     fro::cio_println!("Remove files or directories.");
     fro::cio_println!();
@@ -33,9 +34,39 @@ fn print_rm_help(program: &str) {
     fro::cio_println!(
         "      --interactive[=WHEN] prompt according to WHEN: never, once, or always"
     );
+    fro::cio_println!(
+        "      --one-file-system skip recursive child directories on different file systems"
+    );
+    fro::cio_println!("      --preserve-root refuse recursive removal of / (default)");
+    fro::cio_println!("      --no-preserve-root allow recursive removal of /");
     fro::cio_println!("  -r, -R, --recursive remove directories and their contents recursively");
     fro::cio_println!("  -v, --verbose      print a line for each removed path");
     fro::cio_println!("  -h, --help         display this help and exit");
+    fro::cio_println!("      --version      output version information and exit");
+}
+
+fn operand_targets_root(operand: &str) -> bool {
+    !operand.is_empty() && operand.bytes().all(|byte| byte == b'/')
+}
+
+fn preserve_root_warning_lines() -> [&'static str; 2] {
+    [
+        "rm: it is dangerous to operate recursively on '/'",
+        "rm: use --no-preserve-root to override this failsafe",
+    ]
+}
+
+fn write_preserve_root_warning() {
+    for line in preserve_root_warning_lines() {
+        fro::cio_eprintln!("{line}");
+    }
+}
+
+fn write_one_file_system_warning(path: &Path) {
+    fro::cio_eprintln!(
+        "rm: skipping '{}', since it's on a different file system",
+        path.display()
+    );
 }
 
 fn parse_interactive_when(value: &str) -> io::Result<PromptMode> {
@@ -110,7 +141,11 @@ fn remove_empty_dir(path: &Path, verbose: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_path_recursively_with_prompts(path: &Path, verbose: bool) -> io::Result<bool> {
+fn remove_path_recursively_with_prompts(
+    path: &Path,
+    verbose: bool,
+    root_device: Option<u64>,
+) -> io::Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
@@ -127,7 +162,11 @@ fn remove_path_recursively_with_prompts(path: &Path, verbose: bool) -> io::Resul
         let child_path = entry.path();
         let child_metadata = fs::symlink_metadata(&child_path)?;
         if child_metadata.file_type().is_dir() {
-            let _ = remove_path_recursively_with_prompts(&child_path, verbose)?;
+            if root_device.is_some_and(|root_device| child_metadata.dev() != root_device) {
+                write_one_file_system_warning(&child_path);
+                continue;
+            }
+            let _ = remove_path_recursively_with_prompts(&child_path, verbose, root_device)?;
             continue;
         }
         if prompt_user(&remove_prompt(&child_path, &child_metadata, false))? {
@@ -146,6 +185,8 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
     let mut dir = false;
     let mut recursive = false;
     let mut force = false;
+    let mut one_file_system = false;
+    let mut preserve_root = true;
     let mut verbose = false;
     let mut prompt_mode = PromptMode::Never;
     let mut targets = Vec::new();
@@ -161,12 +202,19 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
                 print_rm_help(program);
                 return Ok(0);
             }
+            "--version" => {
+                print_coreutils_version("rm");
+                return Ok(0);
+            }
             "--dir" => dir = true,
             "--recursive" => recursive = true,
             "--force" => {
                 force = true;
                 prompt_mode = PromptMode::Never;
             }
+            "--one-file-system" => one_file_system = true,
+            "--preserve-root" => preserve_root = true,
+            "--no-preserve-root" => preserve_root = false,
             "--verbose" => verbose = true,
             "--interactive" => prompt_mode = PromptMode::Always,
             other if other.starts_with("--interactive=") => {
@@ -208,7 +256,7 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
             return Ok(0);
         }
         fro::cio_eprintln!(
-            "Usage: {} [-f] [-i|-I|--interactive[=WHEN]] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
+            "Usage: {} [-f] [-i|-I|--interactive[=WHEN]] [--one-file-system] [--preserve-root|--no-preserve-root] [-d] [-r|-R|--recursive] [-v] <file> [file ...]",
             program
         );
         return Err(io::Error::new(
@@ -228,6 +276,11 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
 
     let mut exit_code = 0;
     for target in targets {
+        if recursive && preserve_root && operand_targets_root(&target) {
+            write_preserve_root_warning();
+            exit_code = 1;
+            continue;
+        }
         let path = Path::new(&target);
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -240,14 +293,27 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
         };
         if metadata.file_type().is_dir() {
             if recursive {
+                let root_device = one_file_system.then_some(metadata.dev());
                 if prompt_mode == PromptMode::Always {
-                    if let Err(err) = remove_path_recursively_with_prompts(path, verbose) {
+                    if let Err(err) =
+                        remove_path_recursively_with_prompts(path, verbose, root_device)
+                    {
                         write_warning_line("rm", path, &err, "cannot remove");
                         exit_code = 1;
                     }
                     continue;
                 }
-                if let Err(err) = crate::main_app::remove_path_recursively(path, verbose) {
+                let result = if let Some(root_device) = root_device {
+                    crate::main_app::remove_path_recursively_one_file_system(
+                        path,
+                        verbose,
+                        root_device,
+                        write_one_file_system_warning,
+                    )
+                } else {
+                    crate::main_app::remove_path_recursively(path, verbose)
+                };
+                if let Err(err) = result {
                     write_warning_line("rm", path, &err, "cannot remove");
                     exit_code = 1;
                 } else {
@@ -292,4 +358,46 @@ pub(super) fn run_rm(args: &[String]) -> io::Result<i32> {
         }
     }
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_preservation_only_matches_explicit_root_operands() {
+        assert!(operand_targets_root("/"));
+        assert!(operand_targets_root("///"));
+        assert!(!operand_targets_root("/./"));
+        assert!(!operand_targets_root("/tmp"));
+        assert!(!operand_targets_root("."));
+    }
+
+    #[test]
+    fn rm_preserve_root_warning_matches_gnu_wording() {
+        let mut stderr = Vec::new();
+        for line in preserve_root_warning_lines() {
+            writeln!(&mut stderr, "{line}").unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "rm: it is dangerous to operate recursively on '/'\nrm: use --no-preserve-root to override this failsafe\n"
+        );
+    }
+
+    #[test]
+    fn rm_one_file_system_warning_matches_gnu_style_wording() {
+        let path = Path::new("/mnt/chroot/home");
+        let mut stderr = Vec::new();
+        writeln!(
+            &mut stderr,
+            "rm: skipping '{}', since it's on a different file system",
+            path.display()
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "rm: skipping '/mnt/chroot/home', since it's on a different file system\n"
+        );
+    }
 }

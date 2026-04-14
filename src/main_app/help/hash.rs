@@ -1,7 +1,10 @@
 use super::CommandHelp;
 
-const HASH_REPORT_GBPS_NOTES: &[&str] =
-    &["--report-gbps writes effective hashed-input throughput to stderr."];
+const HASH_SUM_COMMON_NOTES: &[&str] = &[
+    "--report-gbps writes effective hashed-input throughput to stderr.",
+    "-h/--help shows this message and exits.",
+    "--version prints the fro digest-tool version string and exits.",
+];
 
 fn digest_command_help(
     name: &'static str,
@@ -13,7 +16,7 @@ fn digest_command_help(
         name,
         usage,
         summary,
-        notes: HASH_REPORT_GBPS_NOTES,
+        notes: HASH_SUM_COMMON_NOTES,
         examples,
     }
 }
@@ -29,6 +32,8 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
                 "-c/--check verifies fro-style manifest lines in the emitted '<crc> <bytes> <path>' format.",
                 "--quiet, --status, --warn, --strict, and --ignore-missing share the same verification behavior as the digest-family check path.",
                 "--report-gbps writes effective hashed-input throughput to stderr.",
+                "--help shows this message and exits.",
+                "--version prints the fro cksum version string and exits.",
             ],
             examples: &[
                 ("Print POSIX CRC32 and size", "cksum archive.tar"),
@@ -41,12 +46,24 @@ pub(super) fn command_help(name: &str) -> Option<CommandHelp> {
             "Print BLAKE3 digests for one or more files.",
             &[("Hash one file with BLAKE3", "b3sum bigfile.dat")],
         )),
-        "b2sum" => Some(digest_command_help(
-            "b2sum",
-            "b2sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
-            "Print BLAKE2b-512 digests for one or more files.",
-            &[("Hash one file with BLAKE2b-512", "b2sum bigfile.dat")],
-        )),
+        "b2sum" => Some(CommandHelp {
+            name: "b2sum",
+            usage: "b2sum [--auto|--no-direct|--direct] [--report-gbps] [-l BITS|--length BITS] [--] <file> [file ...]",
+            summary: "Print BLAKE2b-512 digests for one or more files.",
+            notes: &[
+                "-l/--length truncates BLAKE2b output to the requested bit length; accepted values are 0 or multiples of 8 up to 512 bits.",
+                "--report-gbps writes effective hashed-input throughput to stderr.",
+                "-h/--help shows this message and exits.",
+                "--version prints the fro digest-tool version string and exits.",
+            ],
+            examples: &[
+                ("Hash one file with BLAKE2b-512", "b2sum bigfile.dat"),
+                (
+                    "Emit a truncated BLAKE2b digest",
+                    "b2sum --length 256 bigfile.dat",
+                ),
+            ],
+        }),
         "md5sum" => Some(digest_command_help(
             "md5sum",
             "md5sum [--auto|--no-direct|--direct] [--report-gbps] [--] <file> [file ...]",
