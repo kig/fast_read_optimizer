@@ -129,7 +129,7 @@ pub fn rewrite_subcommand_alias(args: Vec<String>) -> Vec<String> {
 
 fn multicall_help_command(name: &str) -> Option<&str> {
     match name {
-        "cp" => Some("copy"),
+        "cp" => Some("cp"),
         other if is_coreutils_command(other) => Some(other),
         _ => None,
     }

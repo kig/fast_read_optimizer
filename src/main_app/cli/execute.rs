@@ -10,44 +10,12 @@ use crate::main_app::recursive::split_manifest::run_split_manifest_recursive_cop
 use std::sync::Arc;
 
 mod config_command;
+mod copy_helpers;
+mod save_params;
 
 use config_command::handle_config_command;
-
-fn resolve_cp_file_target_path(
-    source_path: &Path,
-    target_path: &Path,
-    cp_compat: bool,
-    cp_no_target_directory: bool,
-) -> io::Result<PathBuf> {
-    if !cp_compat || cp_no_target_directory {
-        return Ok(target_path.to_path_buf());
-    }
-    if fs::symlink_metadata(target_path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-        return Ok(target_path.join(source_path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cp source has no final path component",
-            )
-        })?));
-    }
-    Ok(target_path.to_path_buf())
-}
-
-fn preserve_copied_file_metadata(
-    source_path: &Path,
-    target_path: &Path,
-    preserve_mode: bool,
-    preserve_timestamps: bool,
-) -> io::Result<()> {
-    if preserve_mode {
-        let source_mode = fs::metadata(source_path)?.permissions().mode();
-        fs::set_permissions(target_path, fs::Permissions::from_mode(source_mode))?;
-    }
-    if preserve_timestamps {
-        recursive::preserve_file_timestamps(source_path, target_path)?;
-    }
-    Ok(())
-}
+use copy_helpers::{preserve_copied_file_metadata, resolve_cp_file_target_path};
+use save_params::{save_best_params, save_single_run_params};
 
 pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     let ParsedArgs {
@@ -953,24 +921,13 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
         );
         drop(prepared);
         if save_config {
-            match io_mode {
-                common::IOMode::Auto => {}
-                _ => {
-                    let direct = io_mode == common::IOMode::Direct;
-                    let off = if direct { 3 } else { 0 };
-                    config.update_params_for_path(
-                        config_mode,
-                        direct,
-                        context_path,
-                        config::IOParams {
-                            num_threads: single_run_params[off],
-                            block_size: single_run_params[off + 1],
-                            qd: single_run_params[off + 2] as usize,
-                        },
-                    );
-                    config.save();
-                }
-            }
+            save_single_run_params(
+                &mut config,
+                io_mode,
+                config_mode,
+                context_path,
+                &single_run_params,
+            );
         }
         return Ok(0);
     }
@@ -1006,35 +963,15 @@ pub(super) fn run(parsed: ParsedArgs) -> io::Result<i32> {
     }
 
     if save_config {
-        match (mode.as_str(), copy_strategy, io_mode) {
-            ("copy", CopyStrategy::CopyFileRange, _) => {
-                config.update_copy_range_params_for_path(
-                    context_path,
-                    config::IOParams {
-                        num_threads: best_params[6],
-                        block_size: best_params[7],
-                        qd: best_params[8] as usize,
-                    },
-                );
-                config.save();
-            }
-            (_, _, common::IOMode::Auto) => {}
-            _ => {
-                let direct = io_mode == common::IOMode::Direct;
-                let off = if direct { 3 } else { 0 };
-                config.update_params_for_path(
-                    config_mode,
-                    direct,
-                    context_path,
-                    config::IOParams {
-                        num_threads: best_params[off],
-                        block_size: best_params[off + 1],
-                        qd: best_params[off + 2] as usize,
-                    },
-                );
-                config.save();
-            }
-        }
+        save_best_params(
+            &mut config,
+            mode.as_str(),
+            copy_strategy,
+            io_mode,
+            config_mode,
+            context_path,
+            &best_params,
+        );
     }
 
     if exit_code != 0 {

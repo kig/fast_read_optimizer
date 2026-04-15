@@ -488,10 +488,30 @@ fn find_help_and_version_surface_stay_wired() {
     let output = run_fro(&["find", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.contains("find - Walk one or more directory trees and print matching paths."));
+    assert!(stdout.contains(
+        "find - Walk one or more directory trees with a bounded GNU find-compatible predicate slice."
+    ));
     assert!(stdout.contains(
         "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
     ));
+    assert!(stdout.contains(
+        "This is a bounded GNU find-compatible path-walking/predicate slice, not the full GNU find expression language."
+    ));
+    assert!(stdout.contains(
+        "Supported in-process families are limited to roots, -maxdepth, -type, -name/-iname, -path/-ipath, and -print/-print0."
+    ));
+    assert!(stdout.contains("Supported selector families combine as a bounded implicit AND"));
+    assert!(stdout.contains(
+        "Tracked GNU find tokens implemented in this bounded in-process path-walking slice"
+    ));
+    assert!(
+        stdout.contains("GNU find tokens intentionally omitted from this bounded in-process slice")
+    );
+    assert!(stdout.contains("-D, -H, -L, -N, -Olevel, -P"));
+    assert!(stdout.contains("-delete"));
+    assert!(stdout.contains("-exec"));
+    assert!(stdout.contains("-regex"));
+    assert!(stdout.contains("-xtype"));
     assert!(stdout.contains("--help shows this message and exits."));
     assert!(stdout.contains("--version prints the fro find version string and exits."));
     assert!(stdout.contains("-maxdepth limits descent below each starting path"));

@@ -5,97 +5,18 @@ use crate::main_app::copy_plan::{resolve_copy_execution, CopyRewriteMode, Resolv
 pub(crate) mod archive;
 pub(super) mod bench;
 pub(crate) mod delete;
+mod metadata;
 pub(crate) mod move_dir;
 pub(super) mod openat;
 pub(super) mod paths;
+mod verbose;
 
-#[derive(Clone, Copy)]
-pub(super) struct PreservedTimestamps {
-    atime_sec: i64,
-    atime_nsec: i64,
-    mtime_sec: i64,
-    mtime_nsec: i64,
-}
-
-#[derive(Clone)]
-struct RecursiveDirectoryMetadataTask {
-    target_path: PathBuf,
-    timestamps: PreservedTimestamps,
-}
-
-pub(super) fn preserved_timestamps_from_metadata(metadata: &fs::Metadata) -> PreservedTimestamps {
-    PreservedTimestamps {
-        atime_sec: metadata.atime(),
-        atime_nsec: metadata.atime_nsec(),
-        mtime_sec: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
-    }
-}
-
-fn set_path_timestamps(
-    path: &Path,
-    timestamps: PreservedTimestamps,
-    nofollow_symlink: bool,
-) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path contains interior NUL: {}", path.display()),
-        )
-    })?;
-    let times = [
-        libc::timespec {
-            tv_sec: timestamps.atime_sec,
-            tv_nsec: timestamps.atime_nsec,
-        },
-        libc::timespec {
-            tv_sec: timestamps.mtime_sec,
-            tv_nsec: timestamps.mtime_nsec,
-        },
-    ];
-    let flags = if nofollow_symlink {
-        libc::AT_SYMLINK_NOFOLLOW
-    } else {
-        0
-    };
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) };
-    if rc == 0 {
-        return Ok(());
-    }
-    Err(io::Error::last_os_error())
-}
-
-pub(super) fn preserve_file_timestamps(source_path: &Path, target_path: &Path) -> io::Result<()> {
-    let metadata = fs::metadata(source_path)?;
-    set_path_timestamps(
-        target_path,
-        preserved_timestamps_from_metadata(&metadata),
-        false,
-    )
-}
-
-fn finalize_directory_timestamps(tasks: &[RecursiveDirectoryMetadataTask]) -> io::Result<()> {
-    let mut sorted = tasks.to_vec();
-    sorted.sort_by_key(|task| std::cmp::Reverse(task.target_path.components().count()));
-    for task in sorted {
-        set_path_timestamps(&task.target_path, task.timestamps, false)?;
-    }
-    Ok(())
-}
-
-fn maybe_print_verbose_copy(
-    verbose: bool,
-    cp_compat: bool,
-    source_path: &Path,
-    target_path: &Path,
-) {
-    if verbose && cp_compat {
-        fro::cio_println!("'{}' -> '{}'", source_path.display(), target_path.display());
-    }
-}
+use self::metadata::set_path_timestamps;
+pub(crate) use self::metadata::{
+    finalize_directory_timestamps, preserve_file_timestamps, preserved_timestamps_from_metadata,
+    PreservedTimestamps, RecursiveDirectoryMetadataTask,
+};
+use self::verbose::maybe_print_verbose_copy;
 
 fn collect_recursive_copy_manifest(
     ctx: &RecursiveCopyContext,

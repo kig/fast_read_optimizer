@@ -1,6 +1,9 @@
 use super::*;
 use crate::writer;
 
+mod helpers;
+use helpers::{rebuild_cp_fallback_args, wrapper_multicall_config_path};
+
 pub(super) struct ParsedArgs {
     pub(super) mode: String,
     pub(super) config_subcommand: Option<String>,
@@ -57,58 +60,9 @@ pub(super) enum ParseOutcome {
     Parsed(ParsedArgs),
 }
 
-fn rebuild_cp_fallback_args(raw_args: &[String]) -> Vec<String> {
-    if raw_args.get(1).is_some_and(|arg| arg == "cp") {
-        let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
-        rebuilt.push("cp".to_string());
-        rebuilt.extend(
-            raw_args
-                .iter()
-                .skip(2)
-                .filter(|arg| arg.as_str() != "--no-fallback")
-                .cloned(),
-        );
-        rebuilt
-    } else if raw_args.get(1).is_some_and(|arg| arg == "copy") {
-        let mut rebuilt = Vec::with_capacity(raw_args.len().saturating_sub(1));
-        rebuilt.push("cp".to_string());
-        rebuilt.extend(
-            raw_args
-                .iter()
-                .skip(2)
-                .filter(|arg| arg.as_str() != "--cp-compat" && arg.as_str() != "--no-fallback")
-                .cloned(),
-        );
-        rebuilt
-    } else {
-        raw_args.to_vec()
-    }
-}
-
 #[allow(dead_code)]
 pub(super) fn parse_cli() -> io::Result<ParseOutcome> {
     parse_cli_from(env::args().collect())
-}
-
-fn wrapper_multicall_config_path(raw_args: &[String]) -> Option<&str> {
-    let mut config_path: Option<&str> = None;
-    let mut idx = 1usize;
-    while idx < raw_args.len() {
-        match raw_args[idx].as_str() {
-            "--no-fallback" => {
-                idx += 1;
-            }
-            "-c" | "--config" => {
-                idx += 1;
-                config_path = raw_args.get(idx).map(String::as_str);
-                idx += 1;
-            }
-            "cp" => return config_path,
-            other if coreutils::is_coreutils_command(other) => return config_path,
-            _ => return None,
-        }
-    }
-    None
 }
 
 pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> {
@@ -124,6 +78,24 @@ pub(super) fn parse_cli_from(raw_args: Vec<String>) -> io::Result<ParseOutcome> 
     {
         print_version(raw_args[0].as_str());
         return Ok(ParseOutcome::Early(0));
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == "cp") {
+        if raw_args
+            .get(2)
+            .is_some_and(|arg| is_help_flag(arg.as_str()))
+        {
+            if let Some(help) = command_help("cp") {
+                print_command_help(raw_args[0].as_str(), help);
+            }
+            return Ok(ParseOutcome::Early(0));
+        }
+        if raw_args
+            .get(2)
+            .is_some_and(|arg| crate::main_app::is_version_flag(arg.as_str()))
+        {
+            crate::coreutils::print_coreutils_version("cp");
+            return Ok(ParseOutcome::Early(0));
+        }
     }
     let args = coreutils::rewrite_subcommand_alias(coreutils::rewrite_alias_args(raw_args.clone()));
     if args.len() < 2 || is_help_flag(args[1].as_str()) {

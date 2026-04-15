@@ -129,15 +129,21 @@ pub const ROWS: &[CoverageRow] = &[
         name: "cp",
         covered: &[
             "-a/--archive",
-            "-r/-R",
+            "-r/-R/--recursive",
             "-n/--no-clobber",
             "-u/--update",
             "-T/--no-target-directory",
             "-t/--target-directory",
             "-p/--preserve",
+            "--preserve=mode",
             "--preserve=timestamps",
+            "--preserve=mode,timestamps",
+            "--preserve=all",
+            "-L/--dereference",
             "-P/--no-dereference",
             "-v/--verbose",
+            "--help",
+            "--version",
         ],
         remaining: &[],
     },
@@ -174,6 +180,7 @@ pub const ROWS: &[CoverageRow] = &[
             "-c/--total",
             "-S/--separate-dirs",
             "-H/-D/--dereference-args",
+            "-L/--dereference",
             "-P/--no-dereference",
             "-b/--bytes",
             "-k",
@@ -200,8 +207,52 @@ pub const ROWS: &[CoverageRow] = &[
             "-v/--invert-match",
             "-e/--regexp",
             "-f/--file",
+            "--help",
+            "--version",
         ],
-        remaining: &[],
+        remaining: &[
+            "-A/--after-context=NUM",
+            "-B/--before-context=NUM",
+            "-C/--context=NUM",
+            "-NUM",
+            "-b/--byte-offset",
+            "--color",
+            "--colour",
+            "-D/--devices=ACTION",
+            "-d/--directories=ACTION",
+            "--directories=recurse",
+            "--binary-files=TYPE",
+            "--binary-files=text",
+            "-I/--binary-files=without-match",
+            "-U/--binary",
+            "-a/--text",
+            "-E/--extended-regexp",
+            "-G/--basic-regexp",
+            "-P/--perl-regexp",
+            "-H/--with-filename",
+            "-h/--no-filename",
+            "--label=LABEL",
+            "--line-buffered",
+            "-m/--max-count=NUM",
+            "--group-separator=SEP",
+            "--no-group-separator",
+            "-o/--only-matching",
+            "-q/--quiet/--silent",
+            "-r/--recursive",
+            "-R/--dereference-recursive",
+            "--include=GLOB",
+            "--exclude=GLOB",
+            "--exclude-dir=GLOB",
+            "--exclude-from=FILE",
+            "-L/--files-without-match",
+            "-l/--files-with-matches",
+            "-T/--initial-tab",
+            "-V",
+            "-Z/--null",
+            "-w/--word-regexp",
+            "-z/--null-data",
+            "-s/--no-messages",
+        ],
     },
     CoverageRow {
         name: "find",
@@ -218,7 +269,77 @@ pub const ROWS: &[CoverageRow] = &[
             "--help",
             "--version",
         ],
-        remaining: &[],
+        remaining: &[
+            "-D",
+            "-H",
+            "-L",
+            "-N",
+            "-Olevel",
+            "-P",
+            "-a",
+            "-amin",
+            "-and",
+            "-anewer",
+            "-atime",
+            "-cmin",
+            "-cnewer",
+            "-context",
+            "-ctime",
+            "-daystart",
+            "-delete",
+            "-depth",
+            "-empty",
+            "-exec",
+            "-execdir",
+            "-executable",
+            "-false",
+            "-fls",
+            "-follow",
+            "-fprint",
+            "-fprint0",
+            "-fprintf",
+            "-fstype",
+            "-gid",
+            "-group",
+            "-ignore_readdir_race",
+            "-ilname",
+            "-inum",
+            "-iregex",
+            "-iwholename",
+            "-links",
+            "-lname",
+            "-ls",
+            "-mindepth",
+            "-mmin",
+            "-mount",
+            "-mtime",
+            "-newer",
+            "-nogroup",
+            "-noignore_readdir_race",
+            "-noleaf",
+            "-not",
+            "-nouser",
+            "-o",
+            "-ok",
+            "-okdir",
+            "-or",
+            "-perm",
+            "-printf",
+            "-prune",
+            "-quit",
+            "-readable",
+            "-regex",
+            "-regextype",
+            "-size",
+            "-true",
+            "-uid",
+            "-used",
+            "-user",
+            "-wholename",
+            "-writable",
+            "-xdev",
+            "-xtype",
+        ],
     },
     CoverageRow {
         name: "head",
@@ -313,17 +434,32 @@ pub const ROWS: &[CoverageRow] = &[
         name: "sort",
         covered: &[
             "(default bytewise ascending)",
+            "-b/--ignore-leading-blanks",
+            "-d/--dictionary-order",
+            "-f/--ignore-case",
+            "-i/--ignore-nonprinting",
             "-m",
             "-c/--check/--check=diagnose-first",
             "-C/--check=quiet/--check=silent",
             "-g/-h",
             "-M/--month-sort",
             "-n/--numeric-sort",
+            "-R/--random-sort",
+            "--random-source",
+            "--files0-from",
+            "--batch-size",
+            "--parallel",
+            "--compress-program",
+            "--debug",
+            "--sort=WORD",
             "-r/--reverse",
+            "-s/--stable",
+            "-S/--buffer-size",
             "-u/--unique",
             "-V/--version-sort",
             "-z/--zero-terminated",
             "-k/--key",
+            "-t/--field-separator",
             "-o/--output",
             "-T/--temporary-directory",
             "--help",
@@ -352,6 +488,13 @@ pub const ROWS: &[CoverageRow] = &[
             "-z/--zero-terminated",
             "-q/--quiet/--silent",
             "-v/--verbose",
+            "-f/--follow",
+            "--follow=name",
+            "-F",
+            "--retry",
+            "-s/--sleep-interval",
+            "--pid",
+            "--max-unchanged-stats",
             "--help",
             "--version",
         ],
@@ -398,6 +541,30 @@ pub fn row_for(name: &str) -> Option<&'static CoverageRow> {
 
 pub fn help_section_lines(name: &str) -> Option<Vec<String>> {
     let row = row_for(name)?;
+    if row.name == "fgrep" {
+        return Some(vec![
+            format!(
+                "Tracked GNU/coreutils flags implemented in this bounded literal-search slice: {}",
+                row.covered.join(", ")
+            ),
+            format!(
+                "GNU grep tokens intentionally omitted from the in-process literal-search path (unsupported here; external fallback may still handle some invocations): {}",
+                row.remaining.join(", ")
+            ),
+        ]);
+    }
+    if row.name == "find" {
+        return Some(vec![
+            format!(
+                "Tracked GNU find tokens implemented in this bounded in-process path-walking slice: {}",
+                row.covered.join(", ")
+            ),
+            format!(
+                "GNU find tokens intentionally omitted from this bounded in-process slice (unsupported here; fro keeps the current no-follow/default-print behavior instead of exposing these families): {}",
+                row.remaining.join(", ")
+            ),
+        ]);
+    }
     let mut lines = vec![format!(
         "Tracked GNU/coreutils flags for this slice: {}",
         row.covered.join(", ")
@@ -501,10 +668,39 @@ pub fn system_help_text(command: &str) -> String {
 }
 
 pub fn parse_help_flag_surface_tokens(text: &str) -> BTreeSet<String> {
-    parse_help_flag_tokens(text)
-        .into_iter()
-        .filter(|token| token.starts_with('-'))
-        .collect()
+    let mut tokens = BTreeSet::new();
+    for line in text.lines() {
+        let chars = line.char_indices().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let (byte_index, ch) = chars[index];
+            if index > 0 && !is_token_boundary(chars[index - 1].1) {
+                index += 1;
+                continue;
+            }
+            if ch != '-' {
+                index += 1;
+                continue;
+            }
+            let mut end = byte_index + ch.len_utf8();
+            let mut next = index + 1;
+            while next < chars.len() && is_token_char(chars[next].1) {
+                end = chars[next].0 + chars[next].1.len_utf8();
+                next += 1;
+            }
+            if let Some(normalized) = normalize_help_token(&line[byte_index..end]) {
+                if !is_illustrative_operand_token(line, byte_index, end) {
+                    tokens.extend(
+                        normalized
+                            .into_iter()
+                            .filter(|token| token.starts_with('-')),
+                    );
+                }
+            }
+            index = next;
+        }
+    }
+    tokens
 }
 
 pub fn parse_help_flag_tokens(text: &str) -> BTreeSet<String> {
@@ -555,6 +751,25 @@ fn leading_bare_value_token(line: &str) -> Option<&str> {
         return None;
     }
     Some(token)
+}
+
+fn is_illustrative_operand_token(line: &str, start: usize, end: usize) -> bool {
+    if is_token_after_end_of_options_marker(line, start) || is_path_prefixed_token(line, start) {
+        return true;
+    }
+    let quoted = matches!(line[..start].chars().next_back(), Some('\'' | '"'))
+        && matches!(line[end..].chars().next(), Some('\'' | '"'));
+    quoted && line[..start].to_ascii_lowercase().contains("example")
+}
+
+fn is_token_after_end_of_options_marker(line: &str, start: usize) -> bool {
+    let prefix = line[..start].trim_end();
+    prefix.ends_with(" --")
+}
+
+fn is_path_prefixed_token(line: &str, start: usize) -> bool {
+    let prefix = line[..start].trim_end();
+    prefix.ends_with("./") || prefix.ends_with("../")
 }
 
 fn is_token_boundary(ch: char) -> bool {

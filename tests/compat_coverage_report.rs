@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 mod help_compat;
 
 use help_compat::{
-    fro_help_text, help_token_coverage, parse_help_flag_tokens, system_help_text,
-    tracked_help_tokens, CoverageRow, EXCLUDED_CUSTOM_MULTICALLS, ROWS,
+    fro_help_text, help_token_coverage, parse_help_flag_surface_tokens, parse_help_flag_tokens,
+    system_help_text, tracked_help_tokens, CoverageRow, EXCLUDED_CUSTOM_MULTICALLS, ROWS,
 };
 
 fn render_report() -> String {
@@ -112,11 +112,11 @@ b2sum     12/12 100%  remaining: none  help: ok
 cat       12/12 100%  remaining: none  help: ok
 cksum      9/9  100%  remaining: none  help: ok
 cmp        6/6  100%  remaining: none  help: ok
-cp        10/10 100%  remaining: none  help: ok
+cp        16/16 100%  remaining: none  help: ok
 dd        16/16 100%  remaining: none  help: ok
-du        19/19 100%  remaining: none  help: ok
-fgrep      9/9  100%  remaining: none  help: ok
-find      11/11 100%  remaining: none  help: ok
+du        20/20 100%  remaining: none  help: ok
+fgrep     11/52  21%  remaining: -A/--after-context=NUM, -B/--before-context=NUM, -C/--context=NUM, -NUM, -b/--byte-offset, --color, --colour, -D/--devices=ACTION, -d/--directories=ACTION, --directories=recurse, --binary-files=TYPE, --binary-files=text, -I/--binary-files=without-match, -U/--binary, -a/--text, -E/--extended-regexp, -G/--basic-regexp, -P/--perl-regexp, -H/--with-filename, -h/--no-filename, --label=LABEL, --line-buffered, -m/--max-count=NUM, --group-separator=SEP, --no-group-separator, -o/--only-matching, -q/--quiet/--silent, -r/--recursive, -R/--dereference-recursive, --include=GLOB, --exclude=GLOB, --exclude-dir=GLOB, --exclude-from=FILE, -L/--files-without-match, -l/--files-with-matches, -T/--initial-tab, -V, -Z/--null, -w/--word-regexp, -z/--null-data, -s/--no-messages  help: ok
+find      11/80  14%  remaining: -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype  help: ok
 head       7/7  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
 mv        12/12 100%  remaining: none  help: ok
@@ -126,9 +126,9 @@ sha256sum 11/11 100%  remaining: none  help: ok
 sha384sum 11/11 100%  remaining: none  help: ok
 sha512sum 11/11 100%  remaining: none  help: ok
 shred      9/9  100%  remaining: none  help: ok
-sort      16/16 100%  remaining: none  help: ok
+sort      31/31 100%  remaining: none  help: ok
 tac        7/7  100%  remaining: none  help: ok
-tail       7/7  100%  remaining: none  help: ok
+tail      14/14 100%  remaining: none  help: ok
 tar        5/5  100%  remaining: none  help: ok
 wc         8/8  100%  remaining: none  help: ok
 ";
@@ -148,24 +148,24 @@ b2sum      19/19  100%  remaining: none
 cat        19/19  100%  remaining: none
 cksum       2/2   100%  remaining: none
 cmp        14/14  100%  remaining: none
-cp         25/57   44%  remaining: --attributes-only, --backup, --context, --copy-contents, --force, --help, --interactive, --link, --no-preserve, --one-file-system, --parents, --preserve=links, --reflink=auto, --reflink=never, --remove-destination, --sparse, --sparse=always, --sparse=auto, --sparse=never, --strip-trailing-slashes, --suffix, --symbolic-link, --version, -H, -S, -Z, -b, -d, -f, -i, -l, -x
+cp         57/57  100%  remaining: none
 dd          2/2   100%  remaining: none
-du         31/44   70%  remaining: --count-links, --dereference, --exclude, --exclude-from, --files0-from, --inodes, --one-file-system, --time, --time-style, -L, -X, -l, -x
-fgrep      17/87   20%  remaining: --after-context, --basic-regexp, --before-context, --binary, --binary-files, --binary-files=text, --binary-files=without-match, --byte-offset, --color, --colour, --context, --dereference-recursive, --devices, --directories, --directories=recurse, --exclude, --exclude-dir, --exclude-from, --extended-regexp, --files-with-matches, --files-without-match, --group-separator, --help, --include, --initial-tab, --label, --line-buffered, --max-count, --no-filename, --no-group-separator, --no-messages, --null, --null-data, --only-matching, --perl-regexp, --quiet, --recursive, --silent, --text, --version, --with-filename, --word-regexp, -A, -B, -C, -D, -E, -G, -H, -I, -L, -N, -P, -R, -T, -U, -V, -Z, -a, -b, -d, -h, -l, -m, -o, -q, -r, -s, -w, -z
-find        9/78   12%  remaining: -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype
+du         44/44  100%  remaining: none
+fgrep      87/87  100%  remaining: none
+find       78/78  100%  remaining: none
 head       15/15  100%  remaining: none
 md5sum      6/6   100%  remaining: none
-mv         21/23   91%  remaining: --context, -Z
-rm         17/18   94%  remaining: -foo
+mv         23/23  100%  remaining: none
+rm         17/17  100%  remaining: none
 sha224sum  17/17  100%  remaining: none
 sha256sum   6/6   100%  remaining: none
 sha384sum  17/17  100%  remaining: none
 sha512sum  17/17  100%  remaining: none
 shred      17/17  100%  remaining: none
-sort       32/55   58%  remaining: --batch-size, --buffer-size, --compress-program, --debug, --dictionary-order, --field-separator, --files0-from, --ignore-case, --ignore-leading-blanks, --ignore-nonprinting, --parallel, --random-sort, --random-source, --sort, --stable, -R, -S, -b, -d, -f, -i, -s, -t
+sort       55/55  100%  remaining: none
 tac         8/8   100%  remaining: none
-tail       15/24   63%  remaining: --follow, --follow=name, --max-unchanged-stats, --pid, --retry, --sleep-interval, -F, -f, -s
-tar        20/230   9%  remaining: --absolute-names, --acls, --add-file, --after-date, --after-date=DATE-OR-FILE, --anchored, --append, --atime-preserve, --auto-compress, --backup, --block-number, --blocking-factor, --bzip2, --catenate, --check-device, --check-links, --checkpoint, --checkpoint-action, --clamp-mtime, --compare, --compress, --concatenate, --confirmation, --delay-directory-restore, --delete, --dereference, --diff, --exclude, --exclude-backups, --exclude-caches, --exclude-caches-all, --exclude-caches-under, --exclude-from, --exclude-ignore, --exclude-ignore-recursive, --exclude-tag, --exclude-tag-all, --exclude-tag-under, --exclude-vcs, --exclude-vcs-ignores, --files-from, --force-local, --format, --format=gnu, --format=posix, --format=v7, --full-time, --get, --group, --group-map, --hard-dereference, --help, --hole-detection, --ignore-case, --ignore-command-error, --ignore-failed-read, --ignore-zeros, --incremental, --index-file, --info-script, --interactive, --keep-directory-symlink, --keep-newer-files, --keep-old-files, --label, --level, --listed-incremental, --lzip, --lzma, --lzop, --mode, --mtime, --mtime=DATE-OR-FILE, --multi-volume, --new-volume-script, --newer, --newer-mtime, --newer=DATE-OR-FILE, --no-acls, --no-anchored, --no-auto-compress, --no-check-device, --no-delay-directory-restore, --no-ignore-case, --no-ignore-command-error, --no-null, --no-overwrite-dir, --no-quote-chars, --no-recursion, --no-same-owner, --no-same-permissions, --no-seek, --no-selinux, --no-unquote, --no-verbatim-files-from, --no-wildcards, --no-wildcards-match-slash, --no-xattrs, --null, --numeric-owner, --occurrence, --old-archive, --one-file-system, --one-top-level, --overwrite, --overwrite-dir, --owner, --owner-map, --pax-option, --pax-option=keyword, --portability, --posix, --preserve-order, --preserve-permissions, --quote-chars, --quoting-style, --quoting-style=escape, --read-full-records, --record-size, --recursion, --recursive-unlink, --remove-files, --restrict, --rmt-command, --rmt-command=, --rsh-command, --rsh-command=, --same-order, --same-owner, --same-permissions, --seek, --selinux, --show-defaults, --show-omitted-dirs, --show-snapshot-field-ranges, --show-stored-names, --show-transformed-names, --skip-old-files, --sort, --sparse, --sparse-version, --starting-file, --starting-file=MEMBER-NAME, --strip-components, --suffix, --tape-length, --test-label, --to-command, --to-stdout, --totals, --touch, --transform, --uncompress, --unlink-first, --unquote, --update, --usage, --use-compress-program, --utc, --verbatim-files-from, --verify, --version, --volno-file, --warning, --wildcards, --wildcards-match-slash, --xattrs, --xattrs-exclude, --xattrs-include, --xform, --xz, -A, -B, -F, -G, -H, -I, -K, -L, -M, -N, -O, -P, -R, -S, -T, -U, -V, -W, -X, -Z, -a, -b, -d, -f-, -g, -h, -i, -j, -k, -l, -m, -n, -o, -p, -r, -s, -u, -w, -xf
+tail       24/24  100%  remaining: none
+tar       230/230 100%  remaining: none
 wc         13/13  100%  remaining: none
 ";
 
@@ -201,6 +201,21 @@ fn compat_help_token_parser_handles_alias_lists_and_dd_operands() {
         "status=none".to_string(),
     ]);
     assert_eq!(parsed, expected);
+}
+
+#[test]
+fn compat_help_surface_parser_skips_dash_prefixed_example_operands() {
+    let parsed = parse_help_flag_surface_tokens(
+        "  -f, --force\nTo remove a file whose name starts with a '-', for example '-foo',\nuse one of these commands:\n  rm -- -foo\n  rm ./-foo\nFIXME: bounded note still tracks unsupported flags like -Z and --context.\n",
+    );
+    let expected = BTreeSet::from([
+        "--context".to_string(),
+        "--force".to_string(),
+        "-Z".to_string(),
+        "-f".to_string(),
+    ]);
+    assert_eq!(parsed, expected);
+    assert!(!parsed.contains("-foo"));
 }
 
 #[test]
@@ -241,7 +256,7 @@ fn cmp_actual_help_surface_covers_help_and_version() {
 
 #[test]
 fn bounded_actual_help_surface_covers_help_and_version() {
-    for command in ["base64", "cat", "cksum", "dd"] {
+    for command in ["base64", "cat", "cksum", "cp", "dd"] {
         let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), command);
         assert!(
             coverage.system_tokens.contains("--help"),
@@ -324,6 +339,10 @@ fn rm_actual_help_surface_covers_help_version_and_root_policy_flags() {
         "rm tracked help/root-policy tokens should not be missing from actual help coverage: {}",
         missing.join(", ")
     );
+    assert!(
+        !coverage.system_tokens.contains("-foo"),
+        "rm help coverage should ignore dash-prefixed example operands"
+    );
 }
 
 #[test]
@@ -358,7 +377,17 @@ fn wc_actual_help_surface_covers_help_and_version() {
 #[test]
 fn find_actual_help_surface_covers_help_and_version() {
     let coverage = help_token_coverage(env!("CARGO_BIN_EXE_fro"), "find");
-    for token in ["--help", "--version"] {
+    for token in [
+        "--help",
+        "--version",
+        "-maxdepth",
+        "-print0",
+        "-D",
+        "-delete",
+        "-exec",
+        "-regex",
+        "-xtype",
+    ] {
         assert!(
             coverage.system_tokens.contains(token),
             "system find --help should expose {token}"
@@ -370,10 +399,8 @@ fn find_actual_help_surface_covers_help_and_version() {
     }
     let missing = coverage.missing_tokens();
     assert!(
-        !missing
-            .iter()
-            .any(|token| token == "--help" || token == "--version"),
-        "find help/version should not be missing from actual help coverage: {}",
+        missing.is_empty(),
+        "find actual help coverage should be fully closed: {}",
         missing.join(", ")
     );
 }
@@ -543,6 +570,15 @@ fn tail_actual_help_surface_covers_bounded_count_and_help_tokens() {
         "--silent",
         "-v",
         "--verbose",
+        "-f",
+        "--follow",
+        "--follow=name",
+        "-F",
+        "--retry",
+        "-s",
+        "--sleep-interval",
+        "--pid",
+        "--max-unchanged-stats",
         "--help",
         "--version",
     ] {
@@ -572,6 +608,15 @@ fn tail_actual_help_surface_covers_bounded_count_and_help_tokens() {
                     | "--silent"
                     | "-v"
                     | "--verbose"
+                    | "-f"
+                    | "--follow"
+                    | "--follow=name"
+                    | "-F"
+                    | "--retry"
+                    | "-s"
+                    | "--sleep-interval"
+                    | "--pid"
+                    | "--max-unchanged-stats"
                     | "--help"
                     | "--version"
             )
@@ -587,6 +632,8 @@ fn mv_actual_help_surface_covers_supported_overwrite_and_meta_flags() {
     for token in [
         "-b",
         "--backup",
+        "-Z",
+        "--context",
         "-f",
         "--force",
         "-i",
@@ -619,12 +666,14 @@ fn mv_actual_help_surface_covers_supported_overwrite_and_meta_flags() {
     let missing = coverage.missing_tokens();
     for token in [
         "--backup",
+        "--context",
         "--suffix",
         "--strip-trailing-slashes",
         "--force",
         "--interactive",
         "--help",
         "--version",
+        "-Z",
         "-i",
     ] {
         assert!(
@@ -693,15 +742,24 @@ fn compat_help_fixmes_cover_remaining_or_incompatible_flags() {
 fn compat_coverage_explicit_gap_rows_match_source_help() {
     let help_source = concat!(
         include_str!("../src/main_app/help.rs"),
-        include_str!("../src/main_app/help/commands.rs")
+        include_str!("../src/main_app/help/commands.rs"),
+        include_str!("../src/help_compat.rs")
     );
     assert!(help_source.contains("FIXME: Unsupported GNU sort features currently return an error"));
     assert!(help_source.contains("locale collation and per-key modifiers"));
     assert!(help_source.contains("--version prints the fro sort version string and exits."));
     assert!(help_source.contains("FIXME: Extract currently targets regular-file archives"));
+    assert!(help_source.contains("unsupported/omitted notes, not runtime promises"));
+    assert!(help_source.contains("--same-order"));
     assert!(help_source.contains("FIXME: When invoked via the cp multicall alias"));
-
-    let find_source = include_str!("../src/coreutils/find.rs");
-    assert!(find_source
-        .contains("-print             print each matching path followed by a newline (default)"));
+    assert!(help_source.contains("-Z/--context remain unsupported in this bounded slice"));
+    assert!(help_source.contains("bounded GNU find-compatible path-walking/predicate slice"));
+    assert!(help_source.contains(
+        "Tracked GNU find tokens implemented in this bounded in-process path-walking slice"
+    ));
+    assert!(help_source
+        .contains("GNU find tokens intentionally omitted from this bounded in-process slice"));
+    assert!(help_source.contains("\"-D\""));
+    assert!(help_source.contains("\"-Olevel\""));
+    assert!(help_source.contains("\"-xtype\""));
 }

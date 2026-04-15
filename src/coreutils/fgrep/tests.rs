@@ -1,7 +1,9 @@
+use super::line_matching::{
+    fgrep_line_matches, fgrep_line_matches_any, fgrep_short_flag_effect,
+};
 use super::{
-    compile_patterns, count_literal_matching_lines, fgrep_line_matches, fgrep_line_matches_any,
-    fgrep_regular_file_path, fgrep_short_flag_effect, parse_fgrep_args, parse_pattern_file_bytes,
-    FgrepOptions, FgrepPattern, FgrepRegularFilePath,
+    compile_patterns, count_literal_matching_lines, fgrep_regular_file_path, parse_fgrep_args,
+    parse_pattern_file_bytes, FgrepOptions, FgrepPattern, FgrepRegularFilePath,
 };
 
 fn fgrep_test_temp_file(name: &str) -> std::path::PathBuf {

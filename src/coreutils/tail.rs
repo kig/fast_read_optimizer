@@ -5,10 +5,15 @@ use fro::{
 };
 use memchr::memrchr_iter;
 use std::collections::VecDeque;
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
+use std::time::Duration;
 
+mod windowed;
+use windowed::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TailCount {
     FromEnd(u64),
@@ -35,6 +40,62 @@ enum RecordTerminator {
     Nul,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FollowMode {
+    Descriptor,
+    Name,
+}
+
+#[derive(Clone, Debug)]
+struct TailFollowOptions {
+    mode: Option<FollowMode>,
+    retry: bool,
+    sleep_interval: Duration,
+    pid: Option<libc::pid_t>,
+    max_unchanged_stats: u64,
+}
+
+impl Default for TailFollowOptions {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            retry: false,
+            sleep_interval: Duration::from_secs(1),
+            pid: None,
+            max_unchanged_stats: 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TailFollowState {
+    path: String,
+    header_label: String,
+    input_index: usize,
+    mode: FollowMode,
+    offset: u64,
+    file: Option<File>,
+    identity: Option<FileIdentity>,
+    ever_opened: bool,
+    missing_reported: bool,
+    unchanged_iterations: u64,
+}
+
 impl RecordTerminator {
     fn byte(self) -> u8 {
         match self {
@@ -48,6 +109,58 @@ const TAIL_SCAN_BLOCK_SIZE: usize = 1 << 20;
 const TAIL_PIPE_WINDOW_SIZE: usize = 1 << 20;
 const TAIL_PIPE_WINDOW_MIN_CAPACITY: usize = 64 << 10;
 const TAIL_STDIN_PREBUFFER_LIMIT: usize = 64 << 10;
+
+fn parse_follow_mode(value: &str, flag: &str) -> io::Result<FollowMode> {
+    match value {
+        "descriptor" => Ok(FollowMode::Descriptor),
+        "name" => Ok(FollowMode::Name),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        )),
+    }
+}
+
+fn parse_sleep_interval(value: &str, flag: &str) -> io::Result<Duration> {
+    let seconds = value.parse::<f64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        )
+    })?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        ));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_pid(value: &str, flag: &str) -> io::Result<libc::pid_t> {
+    let pid = value.parse::<i32>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        )
+    })?;
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        ));
+    }
+    Ok(pid)
+}
+
+fn parse_follow_u64(value: &str, flag: &str) -> io::Result<u64> {
+    value.parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid argument for {flag}: {value}"),
+        )
+    })
+}
 
 fn regular_stdin_path() -> io::Result<Option<&'static str>> {
     if fd_is_regular(fro::command_io::stdin_fd())? {
@@ -120,6 +233,7 @@ fn parse_tail_options(
     TailMode,
     RecordTerminator,
     HeaderMode,
+    TailFollowOptions,
     bool,
     Vec<String>,
 )> {
@@ -127,6 +241,7 @@ fn parse_tail_options(
     let mut mode = TailMode::Lines(TailCount::FromEnd(10));
     let mut terminator = RecordTerminator::Newline;
     let mut header_mode = HeaderMode::Auto;
+    let mut follow = TailFollowOptions::default();
     let mut report_gbps = false;
     let mut files = Vec::new();
     let mut i = 1usize;
@@ -153,6 +268,47 @@ fn parse_tail_options(
             "--quiet" | "--silent" | "-q" => header_mode = HeaderMode::Never,
             "--verbose" | "-v" => header_mode = HeaderMode::Always,
             "-z" | "--zero-terminated" => terminator = RecordTerminator::Nul,
+            "-f" | "--follow" => follow.mode = Some(FollowMode::Descriptor),
+            "-F" => {
+                follow.mode = Some(FollowMode::Name);
+                follow.retry = true;
+            }
+            "--retry" => follow.retry = true,
+            "--sleep-interval" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument for --sleep-interval",
+                    )
+                })?;
+                follow.sleep_interval = parse_sleep_interval(value, "--sleep-interval")?;
+            }
+            "-s" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for -s")
+                })?;
+                follow.sleep_interval = parse_sleep_interval(value, "-s")?;
+            }
+            "--pid" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument for --pid")
+                })?;
+                follow.pid = Some(parse_pid(value, "--pid")?);
+            }
+            "--max-unchanged-stats" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing argument for --max-unchanged-stats",
+                    )
+                })?;
+                follow.max_unchanged_stats =
+                    parse_follow_u64(value, "--max-unchanged-stats")?.max(1);
+            }
             "-n" => {
                 i += 1;
                 let value = args.get(i).ok_or_else(|| {
@@ -179,12 +335,34 @@ fn parse_tail_options(
             other if other.starts_with("--bytes=") => {
                 mode = TailMode::Bytes(parse_tail_count(&other["--bytes=".len()..], "--bytes")?);
             }
+            other if other.starts_with("--follow=") => {
+                follow.mode = Some(parse_follow_mode(&other["--follow=".len()..], "--follow")?);
+            }
+            other if other.starts_with("--sleep-interval=") => {
+                follow.sleep_interval =
+                    parse_sleep_interval(&other["--sleep-interval=".len()..], "--sleep-interval")?;
+            }
+            other if other.starts_with("--pid=") => {
+                follow.pid = Some(parse_pid(&other["--pid=".len()..], "--pid")?);
+            }
+            other if other.starts_with("--max-unchanged-stats=") => {
+                follow.max_unchanged_stats = parse_follow_u64(
+                    &other["--max-unchanged-stats=".len()..],
+                    "--max-unchanged-stats",
+                )?
+                .max(1);
+            }
             other if other.starts_with('-') && other != "-" => {
                 for flag in other[1..].chars() {
                     match flag {
                         'q' => header_mode = HeaderMode::Never,
                         'v' => header_mode = HeaderMode::Always,
                         'z' => terminator = RecordTerminator::Nul,
+                        'f' => follow.mode = Some(FollowMode::Descriptor),
+                        'F' => {
+                            follow.mode = Some(FollowMode::Name);
+                            follow.retry = true;
+                        }
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -198,7 +376,15 @@ fn parse_tail_options(
         }
         i += 1;
     }
-    Ok((io_mode, mode, terminator, header_mode, report_gbps, files))
+    Ok((
+        io_mode,
+        mode,
+        terminator,
+        header_mode,
+        follow,
+        report_gbps,
+        files,
+    ))
 }
 
 fn write_regular_range<W: Write>(out: &mut W, path: &str, range: ByteRange) -> io::Result<()> {
@@ -298,439 +484,411 @@ fn try_write_tail_regular_path_fast(path: &str, start_offset: u64) -> io::Result
     Ok(copied.map(|written| written.min(emitted_len)))
 }
 
-#[derive(Debug)]
-struct TailSegment {
-    start_offset: u64,
-    data: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct ByteTailPipeWindow {
-    slots: Vec<AlignedBuffer>,
-    slot_len: usize,
-    capacity: usize,
-    write_pos: usize,
-    total_seen: u64,
-}
-
-impl ByteTailPipeWindow {
-    fn new(count: u64) -> io::Result<Self> {
-        let requested = usize::try_from(count).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("tail byte count {count} does not fit in usize"),
-            )
-        })?;
-        let capacity = requested
-            .max(TAIL_PIPE_WINDOW_MIN_CAPACITY)
-            .next_multiple_of(4096);
-        let slot_len = capacity.min(TAIL_PIPE_WINDOW_SIZE);
-        let slot_count = capacity.div_ceil(slot_len);
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            slots.push(AlignedBuffer::new_uninit(slot_len)?);
-        }
-        Ok(Self {
-            slots,
-            slot_len,
-            capacity,
-            write_pos: 0,
-            total_seen: 0,
-        })
-    }
-
-    #[cfg(test)]
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    #[cfg(test)]
-    fn push_bytes(&mut self, mut data: &[u8]) {
-        while !data.is_empty() {
-            let slot_index = self.write_pos / self.slot_len;
-            let slot_offset = self.write_pos % self.slot_len;
-            let copy_len = (self.slot_len - slot_offset).min(data.len());
-            self.slots[slot_index][slot_offset..slot_offset + copy_len]
-                .copy_from_slice(&data[..copy_len]);
-            self.advance(copy_len);
-            data = &data[copy_len..];
-        }
-    }
-
-    fn advance(&mut self, len: usize) {
-        self.write_pos = (self.write_pos + len) % self.capacity;
-        self.total_seen = self.total_seen.saturating_add(len as u64);
-    }
-
-    fn read_from<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
-        loop {
-            let slot_index = self.write_pos / self.slot_len;
-            let slot_offset = self.write_pos % self.slot_len;
-            let read = reader.read(&mut self.slots[slot_index][slot_offset..self.slot_len])?;
-            if read == 0 {
-                return Ok(());
-            }
-            self.advance(read);
-        }
-    }
-
-    fn read_from_raw_fd_until(&mut self, fd: libc::c_int, limit: usize) -> io::Result<bool> {
-        let mut remaining = limit;
-        while remaining != 0 {
-            let slot_index = self.write_pos / self.slot_len;
-            let slot_offset = self.write_pos % self.slot_len;
-            let read_len = (self.slot_len - slot_offset).min(remaining);
-            let read = read_raw_fd(
-                fd,
-                &mut self.slots[slot_index][slot_offset..slot_offset + read_len],
-            )?;
-            if read == 0 {
-                return Ok(true);
-            }
-            self.advance(read);
-            remaining -= read;
-        }
-        Ok(false)
-    }
-
-    fn for_each_tail_chunk<F>(&self, count: u64, mut visit: F) -> io::Result<usize>
-    where
-        F: FnMut(&[u8]) -> io::Result<()>,
-    {
-        let keep = usize::try_from(count.min(self.total_seen)).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("tail byte count {count} does not fit in usize"),
-            )
-        })?;
-        if keep == 0 {
-            return Ok(0);
-        }
-        let start = if keep == self.capacity {
-            self.write_pos
-        } else {
-            (self.write_pos + self.capacity - keep) % self.capacity
-        };
-        let mut remaining = keep;
-        let mut pos = start;
-        while remaining > 0 {
-            let slot_index = pos / self.slot_len;
-            let slot_offset = pos % self.slot_len;
-            let chunk_len = remaining.min(self.slot_len - slot_offset);
-            visit(&self.slots[slot_index][slot_offset..slot_offset + chunk_len])?;
-            remaining -= chunk_len;
-            pos = (pos + chunk_len) % self.capacity;
-        }
-        Ok(keep)
-    }
-
-    fn write_last<W: Write>(&self, out: &mut W, count: u64) -> io::Result<()> {
-        self.for_each_tail_chunk(count, |chunk| out.write_all(chunk))?;
-        Ok(())
-    }
-
-    fn write_last_to_raw_fd(&self, fd: libc::c_int, count: u64) -> io::Result<u64> {
-        let keep = self.for_each_tail_chunk(count, |chunk| write_raw_fd_all(fd, chunk))?;
-        Ok(keep as u64)
-    }
-}
-
-fn read_raw_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
-    loop {
-        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if read >= 0 {
-            return Ok(read as usize);
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR | libc::EAGAIN) => continue,
-            _ => return Err(err),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct TailWindow {
-    segments: VecDeque<TailSegment>,
-    total_len: u64,
-}
-
-impl TailWindow {
-    fn push_block(&mut self, block: &[u8]) {
-        if block.is_empty() {
-            return;
-        }
-        let start_offset = self.total_len;
-        self.total_len = self.total_len.saturating_add(block.len() as u64);
-        self.segments.push_back(TailSegment {
-            start_offset,
-            data: block.to_vec(),
-        });
-    }
-
-    fn trim_before(&mut self, keep_from: u64) {
-        while let Some(front) = self.segments.front() {
-            let front_end = front.start_offset.saturating_add(front.data.len() as u64);
-            if front_end <= keep_from {
-                self.segments.pop_front();
-            } else {
-                break;
-            }
-        }
-        if let Some(front) = self.segments.front_mut() {
-            if keep_from > front.start_offset {
-                let trim = (keep_from - front.start_offset) as usize;
-                front.data.drain(..trim);
-                front.start_offset = keep_from;
-            }
-        }
-    }
-
-    fn write_all<W: Write>(&self, out: &mut W) -> io::Result<()> {
-        for segment in &self.segments {
-            out.write_all(&segment.data)?;
-        }
-        Ok(())
-    }
-}
-
-fn write_tail_bytes_windowed_from_reader<W: Write, R: Read>(
-    out: &mut W,
-    reader: &mut R,
-    count: u64,
+fn write_follow_stderr(
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    message: impl AsRef<str>,
 ) -> io::Result<()> {
-    if count == 0 {
+    let stderr = stderr.get_or_insert(fro::command_io::stderr_buf_writer(4096)?);
+    stderr.write_all(message.as_ref().as_bytes())?;
+    stderr.flush()
+}
+
+fn follow_error_text(err: &io::Error) -> String {
+    err.raw_os_error()
+        .map(|code| {
+            unsafe { CStr::from_ptr(libc::strerror(code)) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| err.to_string())
+}
+
+fn write_follow_open_error(
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    path: &str,
+    err: &io::Error,
+) -> io::Result<()> {
+    write_follow_stderr(
+        stderr,
+        format!(
+            "tail: cannot open '{path}' for reading: {}\n",
+            follow_error_text(err)
+        ),
+    )
+}
+
+fn write_follow_missing_notice(
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    path: &str,
+    err: &io::Error,
+) -> io::Result<()> {
+    write_follow_stderr(
+        stderr,
+        format!("tail: {path}: {}\n", follow_error_text(err)),
+    )
+}
+
+fn write_follow_appeared_notice(
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    path: &str,
+) -> io::Result<()> {
+    write_follow_stderr(
+        stderr,
+        format!("tail: '{path}' has appeared;  following new file\n"),
+    )
+}
+
+fn write_follow_retry_warning(stderr: &mut Option<std::io::BufWriter<File>>) -> io::Result<()> {
+    write_follow_stderr(
+        stderr,
+        "tail: warning: --retry only effective for the initial open\n",
+    )
+}
+
+fn write_follow_truncated_notice(
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    path: &str,
+) -> io::Result<()> {
+    write_follow_stderr(stderr, format!("tail: {path}: file truncated\n"))
+}
+
+fn is_pid_alive(pid: libc::pid_t) -> bool {
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn write_file_from_offset<W: Write>(
+    out: &mut W,
+    file: &mut File,
+    start_offset: u64,
+) -> io::Result<u64> {
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut buffer = vec![0_u8; TAIL_SCAN_BLOCK_SIZE];
+    let mut written = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(written);
+        }
+        out.write_all(&buffer[..read])?;
+        written = written
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("tail follow byte count overflow"))?;
+    }
+}
+
+fn emit_follow_header(
+    out: &mut Option<BufWriter>,
+    show_headers: bool,
+    last_output_index: &mut Option<usize>,
+    state: &TailFollowState,
+) -> io::Result<()> {
+    if !show_headers || *last_output_index == Some(state.input_index) {
         return Ok(());
     }
-    let mut window = ByteTailPipeWindow::new(count)?;
-    window.read_from(reader)?;
-    window.write_last(out, count)
+    let out = out.get_or_insert(stdout_buf_writer()?);
+    if last_output_index.is_some() {
+        out.write_all(b"\n")?;
+    }
+    writeln!(out, "==> {} <==", state.header_label)?;
+    *last_output_index = Some(state.input_index);
+    Ok(())
 }
 
-fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
-    let mut window = ByteTailPipeWindow::new(count)?;
-    let prebuffer_limit = TAIL_STDIN_PREBUFFER_LIMIT
-        .max(count as usize)
-        .min(TAIL_PIPE_WINDOW_SIZE);
-    if window.read_from_raw_fd_until(fro::command_io::stdin_fd(), prebuffer_limit)? {
-        window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-        return Ok(true);
+fn write_follow_state_output(
+    state: &mut TailFollowState,
+    out: &mut Option<BufWriter>,
+    show_headers: bool,
+    last_output_index: &mut Option<usize>,
+) -> io::Result<u64> {
+    emit_follow_header(out, show_headers, last_output_index, state)?;
+    let Some(file) = state.file.as_mut() else {
+        return Ok(0);
+    };
+    let out = out.get_or_insert(stdout_buf_writer()?);
+    let written = write_file_from_offset(out, file, state.offset)?;
+    state.offset = state
+        .offset
+        .checked_add(written)
+        .ok_or_else(|| io::Error::other("tail follow offset overflow"))?;
+    Ok(written)
+}
+
+fn make_follow_state(
+    path: &str,
+    input_index: usize,
+    mode: FollowMode,
+    offset: u64,
+    ever_opened: bool,
+    file: Option<File>,
+    identity: Option<FileIdentity>,
+) -> TailFollowState {
+    TailFollowState {
+        path: path.to_string(),
+        header_label: path.to_string(),
+        input_index,
+        mode,
+        offset,
+        file,
+        identity,
+        ever_opened,
+        missing_reported: !ever_opened,
+        unchanged_iterations: 0,
+    }
+}
+
+fn poll_descriptor_follow(
+    state: &mut TailFollowState,
+    out: &mut Option<BufWriter>,
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    show_headers: bool,
+    last_output_index: &mut Option<usize>,
+) -> io::Result<u64> {
+    if state.file.is_none() {
+        match File::open(&state.path) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() {
+                    return Ok(0);
+                }
+                if state.missing_reported {
+                    write_follow_appeared_notice(stderr, &state.path)?;
+                }
+                state.offset = 0;
+                state.identity = Some(FileIdentity::from_metadata(&metadata));
+                state.file = Some(file);
+                state.ever_opened = true;
+                state.missing_reported = false;
+            }
+            Err(err) => {
+                if !state.missing_reported {
+                    write_follow_open_error(stderr, &state.path, &err)?;
+                    state.missing_reported = true;
+                }
+                return Ok(0);
+            }
+        }
     }
 
-    let mut pipe_fds = [0; 2];
-    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
-        window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-        return Ok(true);
+    let metadata = state
+        .file
+        .as_ref()
+        .ok_or_else(|| io::Error::other("descriptor follow handle missing"))?
+        .metadata()?;
+    if metadata.len() < state.offset {
+        write_follow_truncated_notice(stderr, &state.path)?;
+        state.offset = 0;
     }
-    let pipe_read = pipe_fds[0];
-    let pipe_write = pipe_fds[1];
-    let result = (|| -> io::Result<bool> {
-        let desired = STREAM_WINDOW_BLOCK_SIZE
-            .max(count as usize)
-            .saturating_add(4096);
-        let actual_size = pipe_size_best_effort(pipe_write, desired)?;
-        if actual_size as u64 <= count {
-            window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
-            window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-            return Ok(true);
-        }
-        grow_pipe_best_effort(fro::command_io::stdin_fd())?;
-        grow_pipe_best_effort(fro::command_io::stdout_fd())?;
-        let mut buffered = window.write_last_to_raw_fd(pipe_write, count)?;
-        let dev_null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
-        let dev_null_fd = dev_null.as_raw_fd();
-        loop {
-            let free_space = (actual_size as u64).saturating_sub(buffered);
-            if free_space == 0 {
-                let drop_len = buffered.saturating_sub(count);
-                if drop_len == 0 {
-                    window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
-                    window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-                    return Ok(true);
-                }
-                let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
-                if dropped != drop_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "pipe tail short drop while trimming prefetched prefix",
-                    ));
-                }
-                buffered -= dropped;
-                continue;
+    if metadata.len() == state.offset {
+        return Ok(0);
+    }
+    write_follow_state_output(state, out, show_headers, last_output_index)
+}
+
+fn poll_name_follow(
+    state: &mut TailFollowState,
+    out: &mut Option<BufWriter>,
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    show_headers: bool,
+    last_output_index: &mut Option<usize>,
+    max_unchanged_stats: u64,
+) -> io::Result<u64> {
+    let metadata = match std::fs::metadata(&state.path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            if state.ever_opened && !state.missing_reported {
+                write_follow_missing_notice(stderr, &state.path, &err)?;
+                state.missing_reported = true;
             }
-            let read_len = free_space.min(TAIL_PIPE_WINDOW_SIZE as u64) as usize;
-            let moved = unsafe {
-                libc::splice(
-                    fro::command_io::stdin_fd(),
-                    std::ptr::null_mut(),
-                    pipe_write,
-                    std::ptr::null_mut(),
-                    read_len,
-                    0,
-                )
+            state.file = None;
+            state.identity = None;
+            state.unchanged_iterations = 0;
+            return Ok(0);
+        }
+    };
+    if !metadata.file_type().is_file() {
+        state.file = None;
+        state.identity = None;
+        state.unchanged_iterations = 0;
+        return Ok(0);
+    }
+
+    let identity = FileIdentity::from_metadata(&metadata);
+    let same_length = metadata.len() == state.offset;
+    if same_length {
+        state.unchanged_iterations = state.unchanged_iterations.saturating_add(1);
+    } else {
+        state.unchanged_iterations = 0;
+    }
+
+    let changed_identity = state.identity != Some(identity);
+    let should_reopen = state.file.is_none()
+        || (changed_identity
+            && (!same_length || state.unchanged_iterations >= max_unchanged_stats));
+
+    if should_reopen {
+        let file = File::open(&state.path)?;
+        if state.ever_opened || state.missing_reported {
+            write_follow_appeared_notice(stderr, &state.path)?;
+        }
+        state.offset = 0;
+        state.file = Some(file);
+        state.identity = Some(identity);
+        state.ever_opened = true;
+        state.missing_reported = false;
+        state.unchanged_iterations = 0;
+    } else if metadata.len() < state.offset {
+        write_follow_truncated_notice(stderr, &state.path)?;
+        state.offset = 0;
+    }
+
+    if metadata.len() == state.offset {
+        return Ok(0);
+    }
+    write_follow_state_output(state, out, show_headers, last_output_index)
+}
+
+fn follow_tail_inputs(
+    out: &mut Option<BufWriter>,
+    stderr: &mut Option<std::io::BufWriter<File>>,
+    states: &mut [TailFollowState],
+    show_headers: bool,
+    last_output_index: &mut Option<usize>,
+    follow: &TailFollowOptions,
+) -> io::Result<u64> {
+    let mut total_output_bytes = 0_u64;
+    loop {
+        for state in states.iter_mut() {
+            let emitted = match state.mode {
+                FollowMode::Descriptor => {
+                    poll_descriptor_follow(state, out, stderr, show_headers, last_output_index)?
+                }
+                FollowMode::Name => poll_name_follow(
+                    state,
+                    out,
+                    stderr,
+                    show_headers,
+                    last_output_index,
+                    follow.max_unchanged_stats,
+                )?,
             };
-            if moved > 0 {
-                buffered = buffered
-                    .checked_add(moved as u64)
-                    .ok_or_else(|| io::Error::other("pipe tail byte count overflow"))?;
-                if buffered > count {
-                    let drop_len = buffered - count;
-                    let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
-                    if dropped != drop_len {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "pipe tail short drop while trimming prefetched prefix",
-                        ));
-                    }
-                    buffered -= dropped;
-                }
-                continue;
-            }
-            if moved == 0 {
-                let emitted = splice_all(pipe_read, fro::command_io::stdout_fd(), buffered)?;
-                return Ok(emitted == buffered);
-            }
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR | libc::EAGAIN) => continue,
-                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
-                    window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
-                    window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-                    return Ok(true);
-                }
-                _ => return Err(err),
+            total_output_bytes = total_output_bytes
+                .checked_add(emitted)
+                .ok_or_else(|| io::Error::other("tail follow output byte count overflow"))?;
+        }
+        if let Some(out) = out.as_mut() {
+            out.flush()?;
+        }
+        if let Some(pid) = follow.pid {
+            if !is_pid_alive(pid) {
+                return Ok(total_output_bytes);
             }
         }
-    })();
-    unsafe {
-        libc::close(pipe_read);
-        libc::close(pipe_write);
+        std::thread::sleep(follow.sleep_interval);
     }
-    result
 }
 
-fn try_write_tail_pipe_bytes_fast(input: &StreamInput, count: u64) -> io::Result<bool> {
-    if count == 0 {
-        return Ok(true);
-    }
+fn write_tail_input(
+    out: &mut Option<BufWriter>,
+    input: &StreamInput,
+    io_mode: IOMode,
+    mode: TailMode,
+    terminator: RecordTerminator,
+    report_throughput: bool,
+) -> io::Result<u64> {
     match input {
-        StreamInput::Stdin { .. } => {
-            let copied = if count <= TAIL_PIPE_WINDOW_SIZE as u64 {
-                return try_write_tail_stdin_small_prefetched(count);
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            let start_offset = regular_tail_start_offset(path, mode, terminator)?;
+            if let Some(out) = out.as_mut() {
+                out.flush()?;
+            }
+            if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
+                Ok(written)
             } else {
-                copy_pipe_tail_to_stdout_large(fro::command_io::stdin_fd(), count)?
-            };
-            Ok(copied.is_some())
+                let out = out.get_or_insert(stdout_buf_writer()?);
+                let mut counted = CountingWrite::new(out);
+                write_regular_range(&mut counted, path, ByteRange::starting_at(start_offset))?;
+                Ok(counted.bytes_written())
+            }
+        }
+        StreamInput::Stdin { .. } => {
+            if let Some(path) = regular_stdin_path()? {
+                let start_offset = regular_tail_start_offset(path, mode, terminator)?;
+                if let Some(out) = out.as_mut() {
+                    out.flush()?;
+                }
+                if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
+                    Ok(written)
+                } else {
+                    let out = out.get_or_insert(stdout_buf_writer()?);
+                    let mut counted = CountingWrite::new(out);
+                    write_regular_range(&mut counted, path, ByteRange::starting_at(start_offset))?;
+                    Ok(counted.bytes_written())
+                }
+            } else if let TailMode::Bytes(TailCount::FromEnd(count)) = mode {
+                if !report_throughput {
+                    if let Some(out) = out.as_mut() {
+                        out.flush()?;
+                    }
+                }
+                if !report_throughput && try_write_tail_pipe_bytes_fast(input, count)? {
+                    Ok(count)
+                } else {
+                    let out = out.get_or_insert(stdout_buf_writer()?);
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
+                    Ok(counted.bytes_written())
+                }
+            } else if matches!(mode, TailMode::Lines(TailCount::FromEnd(_))) {
+                let out = out.get_or_insert(stdout_buf_writer()?);
+                let mut counted = CountingWrite::new(out);
+                write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
+                Ok(counted.bytes_written())
+            } else {
+                let out = out.get_or_insert(stdout_buf_writer()?);
+                let mut counted = CountingWrite::new(out);
+                write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
+                Ok(counted.bytes_written())
+            }
         }
         StreamInput::File(path) => {
-            let file = File::open(path)?;
-            let copied = if count <= TAIL_PIPE_WINDOW_SIZE as u64 {
-                copy_pipe_tail_to_stdout_small(file.as_raw_fd(), count)?
-            } else {
-                copy_pipe_tail_to_stdout_large(file.as_raw_fd(), count)?
-            };
-            Ok(copied.is_some())
-        }
-    }
-}
-
-fn write_tail_from_start<W: Write>(
-    out: &mut W,
-    input: &StreamInput,
-    io_mode: IOMode,
-    mode: TailMode,
-    terminator: RecordTerminator,
-) -> io::Result<()> {
-    match mode {
-        TailMode::Bytes(TailCount::FromStart(count)) => {
-            let mut skip = count.saturating_sub(1);
-            visit_ordered_input(input, io_mode, |block| {
-                if skip >= block.len() as u64 {
-                    skip -= block.len() as u64;
-                    return Ok(());
-                }
-                let start = skip as usize;
-                skip = 0;
-                out.write_all(&block[start..])
-            })
-        }
-        TailMode::Lines(TailCount::FromStart(start_line)) => {
-            let mut remaining = start_line.saturating_sub(1);
-            visit_ordered_input(input, io_mode, |block| {
-                if remaining == 0 {
-                    return out.write_all(block);
-                }
-                for newline_offset in memchr_iter(terminator.byte(), block) {
-                    remaining -= 1;
-                    if remaining == 0 {
-                        return out.write_all(&block[newline_offset + 1..]);
+            let file_type = std::fs::metadata(path)?.file_type();
+            match mode {
+                TailMode::Bytes(TailCount::FromEnd(count))
+                    if file_type.is_fifo() && !report_throughput =>
+                {
+                    if let Some(out) = out.as_mut() {
+                        out.flush()?;
                     }
-                }
-                Ok(())
-            })
-        }
-        _ => unreachable!("from-start helper only accepts +N tail modes"),
-    }
-}
-
-fn write_tail_windowed<W: Write>(
-    out: &mut W,
-    input: &StreamInput,
-    io_mode: IOMode,
-    mode: TailMode,
-    terminator: RecordTerminator,
-) -> io::Result<()> {
-    let mut window = TailWindow::default();
-    match mode {
-        TailMode::Bytes(TailCount::FromEnd(count)) => match input {
-            StreamInput::Stdin { .. } => {
-                grow_pipe_best_effort(fro::command_io::stdin_fd())?;
-                let mut reader = stdin_buf_reader()?;
-                return write_tail_bytes_windowed_from_reader(out, &mut reader, count);
-            }
-            StreamInput::File(path) => {
-                let file = File::open(path)?;
-                grow_pipe_best_effort(file.as_raw_fd())?;
-                let mut reader = BufReader::new(file);
-                return write_tail_bytes_windowed_from_reader(out, &mut reader, count);
-            }
-        },
-        TailMode::Lines(TailCount::FromEnd(lines)) => {
-            if lines == 0 {
-                return Ok(());
-            }
-            let keep_starts = lines.saturating_add(1) as usize;
-            let mut line_starts = VecDeque::from([0_u64]);
-            visit_ordered_input(input, io_mode, |block| {
-                let block_start = window.total_len;
-                window.push_block(block);
-                for newline_offset in memchr_iter(terminator.byte(), block) {
-                    line_starts.push_back(block_start + newline_offset as u64 + 1);
-                    if line_starts.len() > keep_starts {
-                        line_starts.pop_front();
+                    if !try_write_tail_pipe_bytes_fast(input, count)? {
+                        let out = out.get_or_insert(stdout_buf_writer()?);
+                        write_tail_windowed(out, input, io_mode, mode, terminator)?;
                     }
+                    Ok(count)
                 }
-                if let Some(&keep_from) = line_starts.front() {
-                    window.trim_before(keep_from);
+                TailMode::Bytes(TailCount::FromEnd(_)) | TailMode::Lines(TailCount::FromEnd(_)) => {
+                    let out = out.get_or_insert(stdout_buf_writer()?);
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
+                    Ok(counted.bytes_written())
                 }
-                Ok(())
-            })?;
-            while matches!(line_starts.back(), Some(&offset) if offset >= window.total_len) {
-                line_starts.pop_back();
+                TailMode::Bytes(TailCount::FromStart(_))
+                | TailMode::Lines(TailCount::FromStart(_)) => {
+                    let out = out.get_or_insert(stdout_buf_writer()?);
+                    let mut counted = CountingWrite::new(out);
+                    write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
+                    Ok(counted.bytes_written())
+                }
             }
-            while line_starts.len() > lines as usize {
-                line_starts.pop_front();
-            }
-            window.trim_before(line_starts.front().copied().unwrap_or(window.total_len));
         }
-        _ => unreachable!("windowed helper only accepts trailing tail modes"),
     }
-    window.write_all(out)
 }
 
 pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
-    let (io_mode, mode, terminator, header_mode, report_throughput, files) =
+    let (io_mode, mode, terminator, header_mode, follow, report_throughput, files) =
         parse_tail_options(args)?;
     let inputs = parse_stream_inputs(files);
     let show_headers = match header_mode {
@@ -741,6 +899,12 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
     let started_at = report_throughput.then(std::time::Instant::now);
     let mut total_output_bytes = 0_u64;
     let mut out = None;
+    let mut stderr = None;
+    let mut follow_states = Vec::new();
+    let mut last_output_index = None;
+    if follow.mode == Some(FollowMode::Descriptor) && follow.retry {
+        write_follow_retry_warning(&mut stderr)?;
+    }
     for (index, input) in inputs.iter().enumerate() {
         if show_headers {
             let out = out.get_or_insert(stdout_buf_writer()?);
@@ -752,100 +916,74 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
                 StreamInput::Stdin { .. } => "standard input",
             };
             writeln!(out, "==> {label} <==")?;
+            last_output_index = Some(index);
         }
         let emitted_bytes = match input {
-            StreamInput::File(path) if is_regular_input_path(path)? => {
-                let start_offset = regular_tail_start_offset(path, mode, terminator)?;
-                if let Some(out) = out.as_mut() {
-                    out.flush()?;
-                }
-                if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
-                    written
-                } else {
-                    let out = out.get_or_insert(stdout_buf_writer()?);
-                    let mut counted = CountingWrite::new(out);
-                    write_regular_range(&mut counted, path, ByteRange::starting_at(start_offset))?;
-                    counted.bytes_written()
-                }
-            }
-            StreamInput::Stdin { .. } => {
-                if let Some(path) = regular_stdin_path()? {
-                    let start_offset = regular_tail_start_offset(path, mode, terminator)?;
-                    if let Some(out) = out.as_mut() {
-                        out.flush()?;
-                    }
-                    if let Some(written) = try_write_tail_regular_path_fast(path, start_offset)? {
-                        written
-                    } else {
-                        let out = out.get_or_insert(stdout_buf_writer()?);
-                        let mut counted = CountingWrite::new(out);
-                        write_regular_range(
-                            &mut counted,
+            StreamInput::File(path) if follow.mode.is_some() && follow.retry => {
+                match write_tail_input(
+                    &mut out,
+                    input,
+                    io_mode,
+                    mode,
+                    terminator,
+                    report_throughput,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        write_follow_open_error(&mut stderr, path, &err)?;
+                        follow_states.push(make_follow_state(
                             path,
-                            ByteRange::starting_at(start_offset),
-                        )?;
-                        counted.bytes_written()
-                    }
-                } else if let TailMode::Bytes(TailCount::FromEnd(count)) = mode {
-                    if !report_throughput {
-                        if let Some(out) = out.as_mut() {
-                            out.flush()?;
-                        }
-                    }
-                    if !report_throughput && try_write_tail_pipe_bytes_fast(input, count)? {
-                        count
-                    } else {
-                        let out = out.get_or_insert(stdout_buf_writer()?);
-                        let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
-                        counted.bytes_written()
-                    }
-                } else if matches!(mode, TailMode::Lines(TailCount::FromEnd(_))) {
-                    let out = out.get_or_insert(stdout_buf_writer()?);
-                    let mut counted = CountingWrite::new(out);
-                    write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
-                    counted.bytes_written()
-                } else {
-                    let out = out.get_or_insert(stdout_buf_writer()?);
-                    let mut counted = CountingWrite::new(out);
-                    write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
-                    counted.bytes_written()
-                }
-            }
-            StreamInput::File(path) => {
-                let file_type = std::fs::metadata(path)?.file_type();
-                match mode {
-                    TailMode::Bytes(TailCount::FromEnd(count))
-                        if file_type.is_fifo() && !report_throughput =>
-                    {
-                        if let Some(out) = out.as_mut() {
-                            out.flush()?;
-                        }
-                        if !try_write_tail_pipe_bytes_fast(input, count)? {
-                            let out = out.get_or_insert(stdout_buf_writer()?);
-                            write_tail_windowed(out, input, io_mode, mode, terminator)?;
-                        }
-                        count
-                    }
-                    TailMode::Bytes(TailCount::FromEnd(_))
-                    | TailMode::Lines(TailCount::FromEnd(_)) => {
-                        let out = out.get_or_insert(stdout_buf_writer()?);
-                        let mut counted = CountingWrite::new(out);
-                        write_tail_windowed(&mut counted, input, io_mode, mode, terminator)?;
-                        counted.bytes_written()
-                    }
-                    TailMode::Bytes(TailCount::FromStart(_))
-                    | TailMode::Lines(TailCount::FromStart(_)) => {
-                        let out = out.get_or_insert(stdout_buf_writer()?);
-                        let mut counted = CountingWrite::new(out);
-                        write_tail_from_start(&mut counted, input, io_mode, mode, terminator)?;
-                        counted.bytes_written()
+                            index,
+                            follow.mode.expect("follow mode"),
+                            0,
+                            false,
+                            None,
+                            None,
+                        ));
+                        0
                     }
                 }
             }
+            _ => write_tail_input(
+                &mut out,
+                input,
+                io_mode,
+                mode,
+                terminator,
+                report_throughput,
+            )?,
         };
+        if let (Some(follow_mode), StreamInput::File(path)) = (follow.mode, input) {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if metadata.file_type().is_file() {
+                    let file = File::open(path)?;
+                    let file_metadata = file.metadata()?;
+                    follow_states.push(make_follow_state(
+                        path,
+                        index,
+                        follow_mode,
+                        file_metadata.len(),
+                        true,
+                        Some(file),
+                        Some(FileIdentity::from_metadata(&file_metadata)),
+                    ));
+                }
+            }
+        }
         total_output_bytes = total_output_bytes
             .checked_add(emitted_bytes)
+            .ok_or_else(|| io::Error::other("tail output byte count overflow"))?;
+    }
+    if follow.mode.is_some() && !follow_states.is_empty() {
+        total_output_bytes = total_output_bytes
+            .checked_add(follow_tail_inputs(
+                &mut out,
+                &mut stderr,
+                &mut follow_states,
+                show_headers,
+                &mut last_output_index,
+                &follow,
+            )?)
             .ok_or_else(|| io::Error::other("tail output byte count overflow"))?;
     }
     match out {
@@ -859,102 +997,4 @@ pub(super) fn run_tail(args: &[String]) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reverse_tail_line_scan_handles_trailing_newline() {
-        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join(format!("fro-tail-unit-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("tail-lines.txt");
-        std::fs::write(&path, b"alpha\nbeta\ngamma\n").unwrap();
-
-        assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 1, RecordTerminator::Newline).unwrap(),
-            11
-        );
-        assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 2, RecordTerminator::Newline).unwrap(),
-            6
-        );
-    }
-
-    #[test]
-    fn reverse_tail_line_scan_handles_missing_trailing_newline() {
-        let tmp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join(format!("fro-tail-unit-no-nl-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("tail-lines.txt");
-        std::fs::write(&path, b"alpha\nbeta\ngamma").unwrap();
-
-        assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 1, RecordTerminator::Newline).unwrap(),
-            11
-        );
-        assert_eq!(
-            regular_tail_line_start(path.to_str().unwrap(), 2, RecordTerminator::Newline).unwrap(),
-            6
-        );
-    }
-
-    #[test]
-    fn byte_tail_pipe_window_uses_64k_floor_for_small_counts() {
-        let window = ByteTailPipeWindow::new(65_536).unwrap();
-        assert_eq!(window.capacity(), TAIL_PIPE_WINDOW_MIN_CAPACITY);
-    }
-
-    #[test]
-    fn byte_tail_pipe_window_rounds_large_counts_to_4k_multiple() {
-        let window = ByteTailPipeWindow::new(65_537).unwrap();
-        assert_eq!(window.capacity(), 69_632);
-    }
-
-    #[test]
-    fn byte_tail_pipe_window_wraps_and_keeps_requested_suffix() {
-        let mut window = ByteTailPipeWindow::new(65_536).unwrap();
-        let input = (0..(TAIL_PIPE_WINDOW_SIZE + 32_768))
-            .map(|idx| (idx % 251) as u8)
-            .collect::<Vec<_>>();
-        window.push_bytes(&input);
-
-        let mut out = Vec::new();
-        window.write_last(&mut out, 65_536).unwrap();
-        assert_eq!(out, input[input.len() - 65_536..]);
-    }
-
-    #[test]
-    fn tail_windowed_lines_drop_older_complete_lines() {
-        let input = StreamInput::File(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("test-tmp")
-                .join(format!("fro-tail-window-lines-{}", std::process::id()))
-                .join("lines.txt")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        let path = match &input {
-            StreamInput::File(path) => path,
-            _ => unreachable!(),
-        };
-        let path_buf = std::path::PathBuf::from(path);
-        std::fs::create_dir_all(path_buf.parent().unwrap()).unwrap();
-        std::fs::write(path, b"alpha\nbeta\ngamma").unwrap();
-
-        let mut out = Vec::new();
-        write_tail_windowed(
-            &mut out,
-            &input,
-            IOMode::PageCache,
-            TailMode::Lines(TailCount::FromEnd(2)),
-            RecordTerminator::Newline,
-        )
-        .unwrap();
-        assert_eq!(out, b"beta\ngamma");
-    }
-}
+mod tests;

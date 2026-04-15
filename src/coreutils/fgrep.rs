@@ -1,5 +1,4 @@
 use super::*;
-use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FgrepOptions {
@@ -38,79 +37,15 @@ struct ParsedFgrepArgs {
     files: Vec<String>,
 }
 
-pub(super) fn fgrep_short_flag_effect(flag: u8) -> Option<bool> {
-    match flag {
-        b'F' => Some(true),
-        _ => None,
-    }
-}
+mod line_matching;
+
+use self::line_matching::normalize_case;
+use self::line_matching::{
+    fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line, fgrep_short_flag_effect,
+};
 
 pub(super) fn fgrep_line_number_prefix(print_line_numbers: bool, line_no: u64) -> Option<u64> {
     print_line_numbers.then_some(line_no)
-}
-
-fn trim_trailing_newline(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\n").unwrap_or(line)
-}
-
-fn normalize_case<'a>(bytes: &'a [u8], ignore_case: bool) -> Cow<'a, [u8]> {
-    if ignore_case {
-        Cow::Owned(bytes.iter().map(u8::to_ascii_lowercase).collect())
-    } else {
-        Cow::Borrowed(bytes)
-    }
-}
-
-fn fgrep_line_matches(
-    line: &[u8],
-    pattern: &[u8],
-    normalized_pattern: &[u8],
-    options: FgrepOptions,
-) -> bool {
-    let candidate = if options.line_regexp {
-        trim_trailing_newline(line)
-    } else {
-        line
-    };
-    let normalized_line = normalize_case(candidate, options.ignore_case);
-    if options.line_regexp {
-        normalized_line.as_ref() == normalized_pattern
-    } else if pattern.is_empty() {
-        true
-    } else {
-        Finder::new(normalized_pattern)
-            .find(normalized_line.as_ref())
-            .is_some()
-    }
-}
-
-fn fgrep_line_matches_any(line: &[u8], patterns: &[FgrepPattern], options: FgrepOptions) -> bool {
-    let candidate = if options.line_regexp {
-        trim_trailing_newline(line)
-    } else {
-        line
-    };
-    let normalized_line = normalize_case(candidate, options.ignore_case);
-    let normalized_line = normalized_line.as_ref();
-    patterns.iter().any(|pattern| {
-        if options.line_regexp {
-            normalized_line == pattern.normalized.as_slice()
-        } else if pattern.raw.is_empty() {
-            true
-        } else {
-            Finder::new(pattern.normalized.as_slice())
-                .find(normalized_line)
-                .is_some()
-        }
-    })
-}
-
-fn fgrep_select_line(is_match: bool, options: FgrepOptions) -> bool {
-    if options.invert_match {
-        !is_match
-    } else {
-        is_match
-    }
 }
 
 fn parse_pattern_file_bytes(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -998,51 +933,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
 }
 
 #[cfg(kani)]
-mod kani_proofs {
-    use super::{
-        fgrep_line_matches, fgrep_line_number_prefix, fgrep_select_line, fgrep_short_flag_effect,
-        FgrepOptions,
-    };
-
-    #[kani::proof]
-    fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
-        let flag: u8 = kani::any();
-        let expected = match flag {
-            b'F' => Some(true),
-            _ => None,
-        };
-        assert_eq!(fgrep_short_flag_effect(flag), expected);
-    }
-
-    #[kani::proof]
-    fn fgrep_line_number_prefix_matches_boolean_gate() {
-        let print_line_numbers: bool = kani::any();
-        let line_no: u64 = kani::any();
-        assert_eq!(
-            fgrep_line_number_prefix(print_line_numbers, line_no),
-            if print_line_numbers {
-                Some(line_no)
-            } else {
-                None
-            }
-        );
-    }
-
-    #[kani::proof]
-    fn fgrep_line_matches_line_regexp_trims_one_newline() {
-        let payload = [b'a', b'\n'];
-        let options = FgrepOptions {
-            count_only: false,
-            print_line_numbers: false,
-            line_regexp: true,
-            ignore_case: false,
-            invert_match: false,
-            report_gbps: false,
-        };
-        assert!(fgrep_line_matches(&payload, b"a", b"a", options));
-        assert!(!fgrep_line_matches(&payload, b"a\n", b"a\n", options));
-    }
-}
+#[path = "fgrep/kani_proofs.rs"]
+mod kani_proofs;
 
 #[cfg(test)]
 mod tests;

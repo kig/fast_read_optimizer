@@ -1,6 +1,6 @@
 mod packed;
 
-use super::compare::compare_output_lines;
+use super::compare::{compare_line_bytes, compare_output_lines};
 use super::*;
 use memchr::memchr_iter;
 pub(crate) use packed::{sort_inputs, SortCheckFailure, SortCheckResult};
@@ -9,6 +9,7 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{self, BufReader as StdBufReader, BufWriter as StdBufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SORT_MEM_LIMIT_ENV: &str = "FRO_SORT_MAX_IN_MEMORY_BYTES";
@@ -22,6 +23,48 @@ const SORT_PARALLEL_OUTPUT_THRESHOLD_BYTES: u64 = 64 << 20;
 const SORT_PARALLEL_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 const SORT_PARALLEL_MAX_THREADS: usize = 8;
 const SORT_STREAM_BLOCK_SIZE: usize = 2 << 20;
+
+pub(super) fn parse_sort_buffer_size(value: &str, option_name: &str) -> io::Result<u64> {
+    let trimmed = value.trim();
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {option_name} argument '{value}'"),
+        )
+    };
+    if trimmed.is_empty() {
+        return Err(invalid());
+    }
+
+    if let Some(percent) = trimmed.strip_suffix('%') {
+        let amount = percent.parse::<u64>().map_err(|_| invalid())?;
+        let base = mem_available_bytes().unwrap_or(SORT_DEFAULT_MAX_STREAMING_MEMORY_BYTES);
+        return base
+            .checked_mul(amount)
+            .and_then(|scaled| scaled.checked_div(100))
+            .ok_or_else(invalid);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let split = lower
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(lower.len());
+    if split == 0 {
+        return Err(invalid());
+    }
+    let amount = lower[..split].parse::<u64>().map_err(|_| invalid())?;
+    let multiplier = match lower[split..].trim() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        "p" | "pb" | "pib" => 1024_u64.pow(5),
+        "e" | "eb" | "eib" => 1024_u64.pow(6),
+        _ => return Err(invalid()),
+    };
+    amount.checked_mul(multiplier).ok_or_else(invalid)
+}
 
 fn tiny_regular_sort_fast_path_enabled(
     total_bytes: u64,
@@ -38,6 +81,7 @@ fn sort_inputs_tiny_regular_fast(
     comparator: &SortComparator,
     unique: bool,
     reverse: bool,
+    debug: bool,
     terminator: RecordTerminator,
 ) -> io::Result<u64> {
     let mut total_bytes = 0u64;
@@ -68,10 +112,24 @@ fn sort_inputs_tiny_regular_fast(
         )?;
     }
     finalize_sorted_lines(&mut lines, &storage, comparator, unique, reverse)?;
+    if debug {
+        emit_sort_debug_preamble(comparator)?;
+    }
     let mut out =
         StdBufWriter::with_capacity(SORT_STREAM_BLOCK_SIZE, fro::command_io::stdout_file()?);
-    write_sorted_lines(&mut out, &lines, &storage, terminator)
-        .map_err(|err| io::Error::new(err.kind(), format!("write failed: {err}")))?;
+    if debug {
+        write_sorted_lines_with_debug(
+            &mut out,
+            &lines,
+            &storage,
+            comparator,
+            unique,
+            RecordTerminator::Newline,
+        )
+    } else {
+        write_sorted_lines(&mut out, &lines, &storage, terminator)
+    }
+    .map_err(|err| io::Error::new(err.kind(), format!("write failed: {err}")))?;
     Ok(total_bytes)
 }
 
@@ -81,6 +139,7 @@ fn sort_inputs_in_memory(
     comparator: &SortComparator,
     unique: bool,
     reverse: bool,
+    debug: bool,
     terminator: RecordTerminator,
     output_path: Option<&str>,
 ) -> io::Result<u64> {
@@ -107,86 +166,22 @@ fn sort_inputs_in_memory(
         )?;
     }
     finalize_sorted_lines(&mut lines, &storage, comparator, unique, reverse)?;
-    with_output_writer(output_path, io_mode, |out| {
-        write_sorted_lines(out, &lines, &storage, terminator)
-    })?;
-    Ok(total_bytes)
-}
-
-fn sort_inputs_streamed(
-    inputs: &[StreamInput],
-    io_mode: IOMode,
-    comparator: &SortComparator,
-    unique: bool,
-    reverse: bool,
-    terminator: RecordTerminator,
-    output_path: Option<&str>,
-    memory_budget: u64,
-    temporary_directory: Option<&Path>,
-) -> io::Result<u64> {
-    let chunk_target = spill_chunk_target_bytes(memory_budget);
-    let mut spill = SpillSorter::new(
-        comparator,
-        unique,
-        reverse,
-        terminator,
-        chunk_target,
-        temporary_directory,
-    );
-    let mut total_bytes = 0u64;
-    for input in inputs {
-        let bytes = visit_ordered_input_counted(input, io_mode, |block| spill.push_block(block))
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("cannot read '{}': {err}", sort_input_label(input)),
-                )
-            })?;
-        total_bytes = total_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| io::Error::other("sort input byte count overflow"))?;
+    if debug {
+        emit_sort_debug_preamble(comparator)?;
     }
-    spill.finish(output_path, io_mode)?;
-    Ok(total_bytes)
-}
-
-pub(super) fn merge_presorted_inputs(
-    inputs: &[StreamInput],
-    io_mode: IOMode,
-    comparator: &SortComparator,
-    unique: bool,
-    reverse: bool,
-    terminator: RecordTerminator,
-    output_path: Option<&str>,
-    temporary_directory: Option<&Path>,
-) -> io::Result<u64> {
-    let mut temp_files = SpillTempFiles::new(temporary_directory)?;
-    let mut next_sequence = 0u64;
-    let mut total_bytes = 0u64;
-    for input in inputs {
-        let path = temp_files.next_chunk_path();
-        total_bytes = total_bytes
-            .checked_add(
-                write_presorted_input_chunk(&path, input, io_mode, &mut next_sequence, terminator)
-                    .map_err(|err| {
-                        io::Error::new(
-                            err.kind(),
-                            format!("cannot read '{}': {err}", sort_input_label(input)),
-                        )
-                    })?,
+    with_output_writer(output_path, io_mode, |out| {
+        if debug {
+            write_sorted_lines_with_debug(
+                out,
+                &lines,
+                &storage,
+                comparator,
+                unique,
+                RecordTerminator::Newline,
             )
-            .ok_or_else(|| io::Error::other("sort merge input byte count overflow"))?;
-        temp_files.paths.push(path);
-    }
-    with_output_writer(output_path, io_mode, |out| {
-        merge_sorted_chunks(
-            out,
-            &temp_files.paths,
-            comparator,
-            unique,
-            reverse,
-            terminator,
-        )
+        } else {
+            write_sorted_lines(out, &lines, &storage, terminator)
+        }
     })?;
     Ok(total_bytes)
 }
@@ -231,7 +226,10 @@ pub(super) fn check_input_sorted(
     }
 }
 
-fn sort_memory_budget_bytes() -> io::Result<u64> {
+pub(super) fn sort_memory_budget_bytes(buffer_size_override: Option<u64>) -> io::Result<u64> {
+    if let Some(value) = buffer_size_override {
+        return Ok(value);
+    }
     if let Ok(value) = std::env::var(SORT_MEM_LIMIT_ENV) {
         return value.parse::<u64>().map_err(|err| {
             io::Error::new(
@@ -249,7 +247,7 @@ fn sort_in_memory_limit_bytes(memory_budget: u64) -> u64 {
     memory_budget.min(SORT_DEFAULT_MAX_IN_MEMORY_BYTES)
 }
 
-fn mem_available_bytes() -> Option<u64> {
+pub(super) fn mem_available_bytes() -> Option<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         let value = line.strip_prefix("MemAvailable:")?;
@@ -268,6 +266,17 @@ fn spill_chunk_target_bytes(memory_budget: u64) -> usize {
     chunk_target
         .max(SORT_MIN_SPILL_CHUNK_BYTES)
         .min(usize::MAX as u64) as usize
+}
+
+fn sort_parallel_threads(parallel_override: Option<usize>) -> usize {
+    parallel_override
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+        })
+        .max(1)
+        .min(SORT_PARALLEL_MAX_THREADS)
 }
 
 struct SortCheckState {
@@ -323,7 +332,13 @@ impl SortCheckState {
             .ok_or_else(|| io::Error::other("sort check line count overflow"))?;
         let current = std::mem::take(&mut self.carry);
         if let Some(previous) = self.previous.as_deref() {
-            let compare = compare_line_bytes(previous, &current, &self.comparator, self.reverse);
+            let compare = compare_line_bytes(
+                previous,
+                &current,
+                &self.comparator,
+                self.unique,
+                self.reverse,
+            );
             let strict_duplicate =
                 self.unique && same_sort_key(previous, &current, &self.comparator);
             if compare == Ordering::Greater || strict_duplicate {
@@ -388,374 +403,4 @@ where
     }
 }
 
-struct SpillSorter {
-    comparator: SortComparator,
-    unique: bool,
-    reverse: bool,
-    terminator: RecordTerminator,
-    chunk_target: usize,
-    storage: Vec<u8>,
-    lines: Vec<SortLineRef>,
-    carry: Vec<u8>,
-    next_sequence: u64,
-    temporary_directory: Option<PathBuf>,
-    temp_files: Option<SpillTempFiles>,
-}
-
-impl SpillSorter {
-    fn new(
-        comparator: &SortComparator,
-        unique: bool,
-        reverse: bool,
-        terminator: RecordTerminator,
-        chunk_target: usize,
-        temporary_directory: Option<&Path>,
-    ) -> Self {
-        Self {
-            comparator: comparator.clone(),
-            unique,
-            reverse,
-            terminator,
-            chunk_target,
-            storage: Vec::new(),
-            lines: Vec::new(),
-            carry: Vec::new(),
-            next_sequence: 0,
-            temporary_directory: temporary_directory.map(Path::to_path_buf),
-            temp_files: None,
-        }
-    }
-
-    fn push_block(&mut self, block: &[u8]) -> io::Result<()> {
-        let mut consumed = 0usize;
-        for separator in memchr_iter(self.terminator.byte(), block) {
-            self.carry.extend_from_slice(&block[consumed..separator]);
-            self.push_complete_line()?;
-            consumed = separator + 1;
-        }
-        self.carry.extend_from_slice(&block[consumed..]);
-        Ok(())
-    }
-
-    fn push_complete_line(&mut self) -> io::Result<()> {
-        let start = self.storage.len();
-        self.storage.extend_from_slice(&self.carry);
-        self.lines.push(SortLineRef {
-            start,
-            len: self.carry.len(),
-            sequence: self.next_sequence,
-        });
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
-        self.carry.clear();
-        if self.storage.len() >= self.chunk_target {
-            self.flush_chunk()?;
-        }
-        Ok(())
-    }
-
-    fn flush_chunk(&mut self) -> io::Result<()> {
-        if self.lines.is_empty() {
-            return Ok(());
-        }
-        finalize_sorted_lines(
-            &mut self.lines,
-            &self.storage,
-            &self.comparator,
-            self.unique,
-            self.reverse,
-        )?;
-        if self.temp_files.is_none() {
-            self.temp_files = Some(SpillTempFiles::new(self.temporary_directory.as_deref())?);
-        }
-        let temp_files = self
-            .temp_files
-            .as_mut()
-            .ok_or_else(|| io::Error::other("missing sort spill temp files"))?;
-        let path = temp_files.next_chunk_path();
-        write_chunk_file(&path, &self.lines, &self.storage)?;
-        temp_files.paths.push(path);
-        self.storage.clear();
-        self.lines.clear();
-        Ok(())
-    }
-
-    fn finish(mut self, output_path: Option<&str>, io_mode: IOMode) -> io::Result<()> {
-        if !self.carry.is_empty() {
-            self.push_complete_line()?;
-        }
-        if self.temp_files.is_none() {
-            finalize_sorted_lines(
-                &mut self.lines,
-                &self.storage,
-                &self.comparator,
-                self.unique,
-                self.reverse,
-            )?;
-            return with_output_writer(output_path, io_mode, |out| {
-                write_sorted_lines(out, &self.lines, &self.storage, self.terminator)
-            });
-        }
-        self.flush_chunk()?;
-        let temp_files = self
-            .temp_files
-            .take()
-            .ok_or_else(|| io::Error::other("missing sort spill temp files"))?;
-        with_output_writer(output_path, io_mode, |out| {
-            merge_sorted_chunks(
-                out,
-                &temp_files.paths,
-                &self.comparator,
-                self.unique,
-                self.reverse,
-                self.terminator,
-            )
-        })
-    }
-}
-
-struct SpillTempFiles {
-    dir: PathBuf,
-    paths: Vec<PathBuf>,
-    next_index: usize,
-}
-
-impl SpillTempFiles {
-    fn new(temporary_directory: Option<&Path>) -> io::Result<Self> {
-        let base_dir = if let Some(path) = temporary_directory {
-            match fs::metadata(path) {
-                Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
-                Ok(_) => {
-                    return Err(io::Error::other(format!(
-                        "cannot create temporary file in '{}': Not a directory",
-                        path.display()
-                    )))
-                }
-                Err(err) => {
-                    return Err(io::Error::new(
-                        err.kind(),
-                        format!(
-                            "cannot create temporary file in '{}': {err}",
-                            path.display()
-                        ),
-                    ))
-                }
-            }
-        } else {
-            std::env::temp_dir()
-        };
-        let mut dir = base_dir;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        dir.push(format!("fro-sort-{}-{timestamp}", std::process::id()));
-        fs::create_dir(&dir).map_err(|err| {
-            let parent =
-                temporary_directory.unwrap_or_else(|| dir.parent().unwrap_or(Path::new(".")));
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "cannot create temporary file in '{}': {err}",
-                    parent.display()
-                ),
-            )
-        })?;
-        Ok(Self {
-            dir,
-            paths: Vec::new(),
-            next_index: 0,
-        })
-    }
-
-    fn next_chunk_path(&mut self) -> PathBuf {
-        let path = self.dir.join(format!("chunk-{:06}.bin", self.next_index));
-        self.next_index += 1;
-        path
-    }
-}
-
-impl Drop for SpillTempFiles {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = fs::remove_file(path);
-        }
-        let _ = fs::remove_dir(&self.dir);
-    }
-}
-
-fn write_chunk_record<W: Write>(writer: &mut W, sequence: u64, line: &[u8]) -> io::Result<()> {
-    writer.write_all(&sequence.to_le_bytes())?;
-    writer.write_all(&(line.len() as u64).to_le_bytes())?;
-    writer.write_all(line)
-}
-
-fn write_presorted_input_chunk(
-    path: &Path,
-    input: &StreamInput,
-    io_mode: IOMode,
-    next_sequence: &mut u64,
-    terminator: RecordTerminator,
-) -> io::Result<u64> {
-    let file = File::create(path)?;
-    let mut writer = StdBufWriter::new(file);
-    let mut carry = Vec::new();
-    let total_bytes = visit_ordered_input_counted(input, io_mode, |block| {
-        let mut consumed = 0usize;
-        for separator in memchr_iter(terminator.byte(), block) {
-            carry.extend_from_slice(&block[consumed..separator]);
-            write_chunk_record(&mut writer, *next_sequence, &carry)?;
-            *next_sequence = next_sequence
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
-            carry.clear();
-            consumed = separator + 1;
-        }
-        carry.extend_from_slice(&block[consumed..]);
-        Ok(())
-    })?;
-    if !carry.is_empty() {
-        write_chunk_record(&mut writer, *next_sequence, &carry)?;
-        *next_sequence = next_sequence
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("sort line sequence overflow"))?;
-    }
-    writer.flush()?;
-    Ok(total_bytes)
-}
-
-fn write_chunk_file(path: &Path, lines: &[SortLineRef], storage: &[u8]) -> io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = StdBufWriter::new(file);
-    for line in lines {
-        write_chunk_record(&mut writer, line.sequence, line.bytes(storage))?;
-    }
-    writer.flush()
-}
-
-struct ChunkReader {
-    reader: StdBufReader<File>,
-}
-
-impl ChunkReader {
-    fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            reader: StdBufReader::with_capacity(SORT_STREAM_BLOCK_SIZE, File::open(path)?),
-        })
-    }
-
-    fn next_record(&mut self) -> io::Result<Option<ChunkRecord>> {
-        let mut header = [0u8; 16];
-        let mut filled = 0usize;
-        while filled < header.len() {
-            let read = self.reader.read(&mut header[filled..])?;
-            if read == 0 {
-                if filled == 0 {
-                    return Ok(None);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated sort spill header",
-                ));
-            }
-            filled += read;
-        }
-        let sequence = u64::from_le_bytes(header[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(header[8..].try_into().unwrap());
-        let len = usize::try_from(len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sort spill line too large"))?;
-        let mut line = vec![0u8; len];
-        self.reader.read_exact(&mut line)?;
-        Ok(Some(ChunkRecord { line, sequence }))
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ChunkRecord {
-    line: Vec<u8>,
-    sequence: u64,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct HeapItem {
-    record: ChunkRecord,
-    chunk_index: usize,
-    comparator: SortComparator,
-    unique: bool,
-    reverse: bool,
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_output_lines(
-            &self.record.line,
-            self.record.sequence,
-            &other.record.line,
-            other.record.sequence,
-            &self.comparator,
-            self.unique,
-            self.reverse,
-        )
-        .reverse()
-    }
-}
-
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-fn merge_sorted_chunks(
-    out: &mut dyn Write,
-    paths: &[PathBuf],
-    comparator: &SortComparator,
-    unique: bool,
-    reverse: bool,
-    terminator: RecordTerminator,
-) -> io::Result<()> {
-    let mut readers = paths
-        .iter()
-        .map(|path| ChunkReader::open(path))
-        .collect::<io::Result<Vec<_>>>()?;
-    let mut heap = BinaryHeap::new();
-    for (chunk_index, reader) in readers.iter_mut().enumerate() {
-        if let Some(record) = reader.next_record()? {
-            heap.push(HeapItem {
-                record,
-                chunk_index,
-                comparator: comparator.clone(),
-                unique,
-                reverse,
-            });
-        }
-    }
-
-    let mut output_buffer = Vec::with_capacity(SORT_WRITE_BUFFER_SIZE);
-    let mut last_written: Option<Vec<u8>> = None;
-    while let Some(item) = heap.pop() {
-        let should_write = match &last_written {
-            Some(previous) if unique => !same_sort_key(previous, &item.record.line, comparator),
-            _ => true,
-        };
-        if should_write {
-            buffered_write_sort_line(out, &mut output_buffer, &item.record.line, terminator)?;
-            if unique {
-                last_written = Some(item.record.line.clone());
-            }
-        }
-        if let Some(record) = readers[item.chunk_index].next_record()? {
-            heap.push(HeapItem {
-                record,
-                chunk_index: item.chunk_index,
-                comparator: comparator.clone(),
-                unique,
-                reverse,
-            });
-        }
-    }
-    flush_sort_output_buffer(out, &mut output_buffer)?;
-    out.flush()
-}
+include!("external/spill.rs");

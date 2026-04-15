@@ -42,16 +42,35 @@ src/
       process.rs
       process_layout.rs
       tests.rs
+    cmp/
+      tests.rs
+    du/
+      kani_proofs.rs
+      options.rs
+      tests.rs
     fgrep/
+      kani_proofs.rs
+      line_matching.rs
       tests.rs
     hash/
       check.rs
       cksum.rs
     sort/
+      compare/
+        key.rs
+        numeric.rs
+        version.rs
       external/
         packed.rs
+        spill.rs
+      cli.rs
+      common.rs
       compare.rs
       external.rs
+      tests.rs
+    tail/
+      tests.rs
+      windowed.rs
     wc/
       count.rs
       tests.rs
@@ -80,9 +99,12 @@ src/
   main_app/
     cli/
       args/
+        helpers.rs
         tests.rs
       execute/
         config_command.rs
+        copy_helpers.rs
+        save_params.rs
       args.rs
       execute.rs
       mod.rs
@@ -104,12 +126,14 @@ src/
       archive.rs
       bench.rs
       delete.rs
+      metadata.rs
       move_dir.rs
       openat.rs
       paths.rs
       scheduling.rs
       split_manifest.rs
       tests.rs
+      verbose.rs
     copy_plan.rs
     file_list.rs
     help.rs

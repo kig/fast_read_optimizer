@@ -32,17 +32,30 @@ pub(crate) fn sort_inputs(
     comparator: &SortComparator,
     unique: bool,
     reverse: bool,
+    debug: bool,
     terminator: RecordTerminator,
     output_path: Option<&str>,
     temporary_directory: Option<&Path>,
+    compress_program: Option<&str>,
+    buffer_size_override: Option<u64>,
+    batch_size: Option<usize>,
+    parallel_override: Option<usize>,
 ) -> io::Result<u64> {
-    let configured_budget = sort_memory_budget_bytes()?;
+    let configured_budget = sort_memory_budget_bytes(buffer_size_override)?;
     let in_memory_limit = sort_in_memory_limit_bytes(configured_budget);
     if let Some(total_bytes) = total_regular_input_bytes(inputs)? {
         if tiny_regular_sort_fast_path_enabled(total_bytes, io_mode, output_path) {
-            return sort_inputs_tiny_regular_fast(inputs, comparator, unique, reverse, terminator);
+            return sort_inputs_tiny_regular_fast(
+                inputs, comparator, unique, reverse, debug, terminator,
+            );
         }
-        if bytewise_packed_fast_path_enabled(inputs, total_bytes, comparator, temporary_directory)?
+        if !debug
+            && bytewise_packed_fast_path_enabled(
+                inputs,
+                total_bytes,
+                comparator,
+                temporary_directory,
+            )?
         {
             return sort_inputs_bytewise_packed_fast(
                 inputs,
@@ -51,6 +64,7 @@ pub(crate) fn sort_inputs(
                 reverse,
                 terminator,
                 output_path,
+                parallel_override,
             );
         }
         if total_bytes <= in_memory_limit {
@@ -60,6 +74,7 @@ pub(crate) fn sort_inputs(
                 comparator,
                 unique,
                 reverse,
+                debug,
                 terminator,
                 output_path,
             );
@@ -70,10 +85,13 @@ pub(crate) fn sort_inputs(
             comparator,
             unique,
             reverse,
+            debug,
             terminator,
             output_path,
             configured_budget,
             temporary_directory,
+            compress_program,
+            batch_size,
         );
     }
     sort_inputs_streamed(
@@ -82,10 +100,13 @@ pub(crate) fn sort_inputs(
         comparator,
         unique,
         reverse,
+        debug,
         terminator,
         output_path,
         configured_budget,
         temporary_directory,
+        compress_program,
+        batch_size,
     )
 }
 
@@ -97,6 +118,10 @@ pub(super) fn bytewise_packed_fast_path_enabled(
 ) -> io::Result<bool> {
     if comparator.mode != SortMode::Bytewise
         || comparator.has_key_selection()
+        || comparator.dictionary_order
+        || comparator.ignore_case
+        || comparator.ignore_leading_blanks
+        || comparator.ignore_nonprinting
         || total_bytes > SORT_BYTEWISE_PACKED_FAST_MAX_BYTES
         || inputs.len() != 1
         || temporary_directory.is_some()
@@ -116,6 +141,7 @@ pub(super) fn sort_inputs_bytewise_packed_fast(
     reverse: bool,
     terminator: RecordTerminator,
     output_path: Option<&str>,
+    parallel_override: Option<usize>,
 ) -> io::Result<u64> {
     let input = inputs
         .first()
@@ -127,10 +153,10 @@ pub(super) fn sort_inputs_bytewise_packed_fast(
         )
     })?;
     let total_bytes = storage.len() as u64;
-    let mut lines = build_packed_line_refs(&storage, terminator)?;
+    let mut lines = build_packed_line_refs(&storage, terminator, parallel_override)?;
     finalize_packed_sorted_lines(&mut lines, &storage, unique, reverse)?;
     with_output_writer(output_path, io_mode, |out| {
-        write_sorted_packed_lines(out, &lines, &storage, terminator)
+        write_sorted_packed_lines(out, &lines, &storage, terminator, parallel_override)
     })?;
     Ok(total_bytes)
 }
@@ -138,13 +164,14 @@ pub(super) fn sort_inputs_bytewise_packed_fast(
 fn build_packed_line_refs(
     storage: &[u8],
     terminator: RecordTerminator,
+    parallel_override: Option<usize>,
 ) -> io::Result<Vec<PackedSortLineRef>> {
     if storage.len() > SORT_BYTEWISE_PACKED_FAST_MAX_BYTES as usize {
         return Err(io::Error::other(
             "sort packed fast path input exceeds 4 GiB",
         ));
     }
-    let threads = sort_parallel_threads();
+    let threads = super::sort_parallel_threads(parallel_override);
     let terminator = terminator.byte();
     if threads <= 1 || storage.len() < SORT_PARALLEL_LINE_BUILD_THRESHOLD_BYTES as usize {
         return build_packed_line_refs_range(storage, 0, storage, terminator);
@@ -247,12 +274,13 @@ fn write_sorted_packed_lines(
     lines: &[PackedSortLineRef],
     storage: &[u8],
     terminator: RecordTerminator,
+    parallel_override: Option<usize>,
 ) -> io::Result<()> {
     if lines.is_empty() {
         return out.flush();
     }
-    if storage.len() < SORT_PARALLEL_OUTPUT_THRESHOLD_BYTES as usize || sort_parallel_threads() <= 1
-    {
+    let threads = super::sort_parallel_threads(parallel_override);
+    if storage.len() < SORT_PARALLEL_OUTPUT_THRESHOLD_BYTES as usize || threads <= 1 {
         let mut buffer = Vec::with_capacity(SORT_WRITE_BUFFER_SIZE);
         for line in lines {
             buffered_write_sort_line(out, &mut buffer, line.bytes(storage), terminator)?;
@@ -262,7 +290,7 @@ fn write_sorted_packed_lines(
     }
 
     let chunk_ranges = build_output_chunk_ranges(lines);
-    let threads = sort_parallel_threads().min(chunk_ranges.len().max(1));
+    let threads = threads.min(chunk_ranges.len().max(1));
     let term = terminator.byte();
     let mut next_chunk = 0usize;
     while next_chunk < chunk_ranges.len() {
@@ -321,10 +349,4 @@ fn build_sorted_output_chunk(
         buffer.push(terminator);
     }
     buffer
-}
-
-fn sort_parallel_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|count| count.get().min(SORT_PARALLEL_MAX_THREADS))
-        .unwrap_or(1)
 }

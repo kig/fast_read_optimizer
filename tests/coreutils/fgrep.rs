@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn fgrep_help_and_version_surface_stay_wired() {
+    let output = run_fro("fgrep", &["--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains(
+        "fgrep - Bounded literal line-oriented grep slice on top of fro's fast substring scanner."
+    ));
+    assert!(stdout.contains(
+        "fgrep [-n] [-i] [-x] [-v] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]"
+    ));
+    assert!(
+        stdout.contains("This is a bounded literal-search compatibility slice, not full GNU grep.")
+    );
+    assert!(stdout.contains("--help shows this message and exits."));
+    assert!(stdout.contains("--version prints the fro fgrep version string and exits."));
+    assert!(stdout
+        .contains("Tracked GNU/coreutils flags implemented in this bounded literal-search slice:"));
+    assert!(stdout
+        .contains("GNU grep tokens intentionally omitted from the in-process literal-search path"));
+    assert!(stdout.contains("-A/--after-context=NUM"));
+    assert!(stdout.contains("-E/--extended-regexp"));
+    assert!(stdout.contains("-r/--recursive"));
+    assert!(stdout.contains("-V"));
+    assert!(output.stderr.is_empty());
+
+    let version = run_fro("fgrep", &["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert!(
+        version.stderr.is_empty(),
+        "fgrep --version unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let version_stdout = String::from_utf8_lossy(&version.stdout);
+    assert!(version_stdout.starts_with("fgrep (fro coreutils) "));
+    assert!(version_stdout.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn fgrep_fixed_strings_flags_match_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-fgrep-fixed-strings");
     let a = tmp.join("a.txt");

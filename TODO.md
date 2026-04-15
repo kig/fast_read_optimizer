@@ -13,6 +13,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 - evaluate and use fast libs: StringZilla, simdutf, mgzip/pgzip, rapidgzip, pzstd, fd, rg
 - match system coreutils on small data, go faster on large files and dir trees
 
+- [ ] Make a test matrix that tests all system --help coreutils flags against fro coreutils --help flags
 
 ### P0: shared fast-I/O work with the broadest payoff
 

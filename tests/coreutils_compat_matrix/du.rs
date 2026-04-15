@@ -201,6 +201,47 @@ fn du_dereference_args_matches_system_output() {
 }
 
 #[test]
+fn du_dereference_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-dereference");
+    let tree = tmp.join("tree");
+    let linked_dir = tmp.join("linked-dir");
+    let nested = linked_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(linked_dir.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x22; 8192]).unwrap();
+    let linked_file = tmp.join("linked-file.bin");
+    fs::write(&linked_file, vec![0x33; 6144]).unwrap();
+
+    let dir_link = tree.join("dir-link");
+    let file_link = tree.join("file-link");
+    symlink(&linked_dir, &dir_link).unwrap();
+    symlink(&linked_file, &file_link).unwrap();
+
+    for du_args in [
+        vec!["-aL", tree.to_str().unwrap()],
+        vec!["--dereference", "-a", tree.to_str().unwrap()],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du dereference {:?}", du_args),
+        );
+    }
+
+    for du_args in [
+        vec!["-L", dir_link.to_str().unwrap()],
+        vec!["--dereference", file_link.to_str().unwrap()],
+    ] {
+        assert_same_result(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du dereference {:?}", du_args),
+        );
+    }
+}
+
+#[test]
 fn du_explicit_no_dereference_matches_system_output() {
     let tmp = unique_temp_dir("fro-coreutils-du-no-dereference");
     let real = tmp.join("real");
@@ -220,6 +261,44 @@ fn du_explicit_no_dereference_matches_system_output() {
             run_fro("du", &du_args),
             run_system("du", &du_args),
             &format!("du no-dereference {:?}", du_args),
+        );
+    }
+}
+
+#[test]
+fn du_dereference_last_flag_wins_matches_system_output() {
+    let tmp = unique_temp_dir("fro-coreutils-du-dereference-precedence");
+    let tree = tmp.join("tree");
+    let linked_dir = tmp.join("linked-dir");
+    let nested = linked_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(linked_dir.join("root.txt"), vec![0x11; 4096]).unwrap();
+    fs::write(nested.join("leaf.bin"), vec![0x22; 8192]).unwrap();
+    symlink(&linked_dir, tree.join("dir-link")).unwrap();
+
+    for du_args in [
+        vec!["-L", "-P", "-a", tree.to_str().unwrap()],
+        vec!["-P", "-L", "-a", tree.to_str().unwrap()],
+        vec!["-H", "-L", "-a", tree.to_str().unwrap()],
+        vec!["-L", "-H", "-a", tree.to_str().unwrap()],
+        vec![
+            "--dereference",
+            "--no-dereference",
+            "-a",
+            tree.to_str().unwrap(),
+        ],
+        vec![
+            "--no-dereference",
+            "--dereference",
+            "-a",
+            tree.to_str().unwrap(),
+        ],
+    ] {
+        assert_same_sorted_lines(
+            run_fro("du", &du_args),
+            run_system("du", &du_args),
+            &format!("du dereference precedence {:?}", du_args),
         );
     }
 }
@@ -407,19 +486,36 @@ fn du_help_and_version_surface_stay_wired() {
     );
     let help_stdout = String::from_utf8(help.stdout).expect("du help should be UTF-8");
     for token in [
+        "bounded GNU du-compatible accounting/traversal slice",
+        "-c/--total",
         "--null",
+        "--count-links",
+        "--exclude",
+        "--exclude-from",
+        "--files0-from",
+        "--inodes",
+        "--one-file-system",
         "--threshold",
         "--bytes",
         "--apparent-size",
         "--block-size",
         "--no-dereference",
+        "--dereference",
         "--si",
+        "--time",
+        "--time-style",
         "--help",
         "--version",
         "-0",
+        "-D",
+        "-L",
+        "-X",
+        "-c",
+        "-l",
         "-t",
         "-k",
         "-m",
+        "-x",
         "--max-depth",
     ] {
         assert!(
