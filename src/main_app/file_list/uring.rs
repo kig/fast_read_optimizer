@@ -163,7 +163,7 @@ pub(super) fn wait_for_ready_slots(io_uring: &mut IoUring) -> io::Result<Vec<(us
     let mut ready = vec![(
         usize::try_from(first.user_data())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slot id overflowed"))?,
-        first.result()?,
+        first.result()? as u32,
     )];
     while io_uring.cq_ready() > 0 {
         let cq = io_uring.peek_for_cqe().ok_or_else(|| {
@@ -172,7 +172,7 @@ pub(super) fn wait_for_ready_slots(io_uring: &mut IoUring) -> io::Result<Vec<(us
         ready.push((
             usize::try_from(cq.user_data())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "slot id overflowed"))?,
-            cq.result()?,
+            cq.result()? as u32,
         ));
     }
     Ok(ready)

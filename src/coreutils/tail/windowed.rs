@@ -219,14 +219,14 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
         return Ok(true);
     }
 
-    let mut pipe_fds = [0; 2];
-    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
-        window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
-        return Ok(true);
-    }
-    let pipe_read = pipe_fds[0];
-    let pipe_write = pipe_fds[1];
+    let (pipe_read, pipe_write) = match fro::os::pipe2(libc::O_CLOEXEC) {
+        Ok((r, w)) => (r, w),
+        Err(_) => {
+            window.read_from_raw_fd_until(fro::command_io::stdin_fd(), usize::MAX)?;
+            window.write_last_to_raw_fd(fro::command_io::stdout_fd(), count)?;
+            return Ok(true);
+        }
+    };
     let result = (|| -> io::Result<bool> {
         let desired = STREAM_WINDOW_BLOCK_SIZE
             .max(count as usize)
@@ -262,15 +262,32 @@ fn try_write_tail_stdin_small_prefetched(count: u64) -> io::Result<bool> {
                 continue;
             }
             let read_len = free_space.min(TAIL_PIPE_WINDOW_SIZE as u64) as usize;
-            let moved = unsafe {
-                libc::splice(
-                    fro::command_io::stdin_fd(),
-                    std::ptr::null_mut(),
-                    pipe_write,
-                    std::ptr::null_mut(),
-                    read_len,
-                    0,
-                )
+            let moved = {
+                #[cfg(target_os = "linux")]
+                {
+                    unsafe {
+                        libc::splice(
+                            fro::command_io::stdin_fd(),
+                            std::ptr::null_mut(),
+                            pipe_write,
+                            std::ptr::null_mut(),
+                            read_len,
+                            0,
+                        )
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Fallback: read from stdin and write to pipe_write
+                    let mut buf = vec![0u8; read_len];
+                    let n = read_raw_fd(fro::command_io::stdin_fd(), &mut buf)?;
+                    if n == 0 {
+                        0
+                    } else {
+                        write_raw_fd_all(pipe_write, &buf[..n])?;
+                        n as isize
+                    }
+                }
             };
             if moved > 0 {
                 buffered = buffered

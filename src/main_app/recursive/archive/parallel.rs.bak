@@ -41,11 +41,11 @@ fn sendfile_to_sink(
     source_len: u64,
 ) -> io::Result<Option<u64>> {
     let mut copied_total = 0_u64;
-    let mut source_pos: fro::os::loff_t = 0;
+    let mut source_pos: crate::os::loff_t = 0;
     while copied_total < source_len {
         let remaining = source_len - copied_total;
         let chunk = remaining.min(TAR_FAST_COPY_SENDFILE_CHUNK_SIZE as u64) as usize;
-        let copied = match fro::os::sendfile(
+        let copied = match crate::os::sendfile(
             target.as_raw_fd(),
             source.as_raw_fd(),
             &mut source_pos,
@@ -224,7 +224,7 @@ impl ReusableTarSlab {
         madvise_best_effort(
             buffer.as_slice().as_ptr() as *mut libc::c_void,
             buffer.len(),
-            fro::os::MADV_HUGEPAGE,
+            crate::os::MADV_HUGEPAGE,
         )?;
         Ok(Self { buffer })
     }

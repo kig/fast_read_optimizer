@@ -147,7 +147,7 @@ pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result
     open_direct_with_fallback(fallback, "direct reader open", || {
         OpenOptions::new()
             .read(true)
-            .custom_flags(fro::os::O_DIRECT)
+            .custom_flags(crate::os::O_DIRECT)
             .open(path)
     })
 }
@@ -156,7 +156,7 @@ pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result
     open_direct_with_fallback(fallback, "direct writer open", || {
         OpenOptions::new()
             .write(true)
-            .custom_flags(fro::os::O_DIRECT)
+            .custom_flags(crate::os::O_DIRECT)
             .open(path)
     })
 }
@@ -165,7 +165,7 @@ pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result
 pub fn direct_writer_supported(path: &str) -> io::Result<bool> {
     match OpenOptions::new()
         .write(true)
-        .custom_flags(fro::os::O_DIRECT)
+        .custom_flags(crate::os::O_DIRECT)
         .open(path)
     {
         Ok(_) => Ok(true),
@@ -203,7 +203,7 @@ pub fn checked_posix_fallocate(
             format!("{context}: length does not fit in off_t"),
         )
     })?;
-    let rc = fro::os::posix_fallocate(file.as_raw_fd(), offset, len);
+    let rc = crate::os::posix_fallocate(file.as_raw_fd(), offset, len);
     if rc == 0 {
         Ok(())
     } else {

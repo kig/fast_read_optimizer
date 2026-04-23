@@ -83,11 +83,11 @@ pub(super) fn prepare_copy_destination(
                 let fadvise_offset = to_off_t(dest_offset, "destination offset")?;
                 let fadvise_len = to_off_t(copy_size, "copy size")?;
                 unsafe {
-                    let _ = fro::os::posix_fadvise(
+                    let _ = crate::os::posix_fadvise(
                         f.as_raw_fd(),
                         fadvise_offset,
                         fadvise_len,
-                        fro::os::POSIX_FADV_NOREUSE,
+                        crate::os::POSIX_FADV_NOREUSE,
                     );
                 }
                 checked_posix_fallocate(
@@ -176,13 +176,13 @@ pub(crate) fn copy_file_range_syscall_with_progress(
     }
 
     let mut copied_total = 0_u64;
-    let mut source_position: fro::os::loff_t = source_offset.try_into().map_err(|_| {
+    let mut source_position: crate::os::loff_t = source_offset.try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "source offset does not fit in loff_t",
         )
     })?;
-    let mut target_position: fro::os::loff_t = dest_offset.try_into().map_err(|_| {
+    let mut target_position: crate::os::loff_t = dest_offset.try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "destination offset does not fit in loff_t",
@@ -192,7 +192,7 @@ pub(crate) fn copy_file_range_syscall_with_progress(
     while copied_total < copy_size {
         let remaining = copy_size - copied_total;
         let chunk = remaining.min(usize::MAX as u64) as usize;
-        let copied = match fro::os::copy_file_range(
+        let copied = match crate::os::copy_file_range(
             source_file.as_raw_fd(),
             &mut source_position,
             target_file.as_raw_fd(),
@@ -353,7 +353,7 @@ pub(crate) fn copy_file_range_chunked_with_progress(
                 }
                 let remaining = copy_size - local_offset;
                 let extent_len = remaining.min(chunk_size);
-                let mut src_pos: fro::os::loff_t = source_offset
+                let mut src_pos: crate::os::loff_t = source_offset
                     .checked_add(local_offset)
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidInput, "source offset overflowed")
@@ -365,7 +365,7 @@ pub(crate) fn copy_file_range_chunked_with_progress(
                             "source offset does not fit in loff_t",
                         )
                     })?;
-                let mut dst_pos: fro::os::loff_t = dest_offset
+                let mut dst_pos: crate::os::loff_t = dest_offset
                     .checked_add(local_offset)
                     .ok_or_else(|| {
                         io::Error::new(
@@ -383,7 +383,7 @@ pub(crate) fn copy_file_range_chunked_with_progress(
                 let mut copied_extent = 0_u64;
                 while copied_extent < extent_len {
                     let step = (extent_len - copied_extent).min(usize::MAX as u64) as usize;
-                    let copied = match fro::os::copy_file_range(
+                    let copied = match crate::os::copy_file_range(
                         source_file.as_raw_fd(),
                         &mut src_pos,
                         target_file.as_raw_fd(),
@@ -493,7 +493,7 @@ pub fn copy_file_reflink(
     let rc = unsafe {
         libc::ioctl(
             target_file.as_raw_fd(),
-            fro::os::FICLONE as libc::c_ulong,
+            crate::os::FICLONE as libc::c_ulong,
             source_file.as_raw_fd(),
         )
     };

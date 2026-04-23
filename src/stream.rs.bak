@@ -76,7 +76,7 @@ pub fn allocate_pipe_output_buffer(min_capacity: usize) -> Vec<u8> {
         handle_alloc_error(layout);
     }
     unsafe {
-        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, fro::os::MADV_HUGEPAGE);
+        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, crate::os::MADV_HUGEPAGE);
     }
     unsafe { Vec::from_raw_parts(ptr, capacity, capacity) }
 }
@@ -747,7 +747,7 @@ impl ParallelWriter {
             //let mut writes = 0;
 
             //let mut vmsplice_all = unsafe { |pipe_write: RawFd, buf: &[u8]| -> std::io::Result<usize> {
-            // Use fro::os::vmsplice_all for portability (Linux fast-path, write fallback)
+            // Use crate::os::vmsplice_all for portability (Linux fast-path, write fallback)
             // vmsplice_all defined in src/os.rs
             // The function signature is: pub fn vmsplice_all(pipe_fd: RawFd, buf: &[u8]) -> std::io::Result<usize>
 
@@ -787,8 +787,8 @@ impl ParallelWriter {
                     let mut offset = 0usize;
                     while remaining > 0 {
                         let chunk = &data[offset..offset + remaining.min(1 << 20)];
-                        // Portability: use fro::os::vmsplice_all to avoid direct libc::vmsplice on non-Linux.
-let pushed = fro::os::vmsplice_all(dest_fd, chunk).expect("Boom");
+                        // Portability: use crate::os::vmsplice_all to avoid direct libc::vmsplice on non-Linux.
+let pushed = crate::os::vmsplice_all(dest_fd, chunk).expect("Boom");
                         offset += pushed;
                         remaining -= pushed;
                         bytes_written =

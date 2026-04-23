@@ -17,8 +17,6 @@ bytemuck = { version = "1.21", features = ["derive", "extern_crate_alloc", "min_
 crc-fast = "1.10.0"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 gzp = { version = "2.0.2", default-features = false, features = ["deflate_rust"] }
-io-uring = "0.7.11"
-iou = "0.3.3"
 libc = "0.2.137"
 memchr = "2.5"
 openssl = "0.10"
@@ -32,6 +30,11 @@ stringzilla = "4.6.0"
 unicode-width = "0.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.11"
+iou = "0.3.3"
+
 
 [dev-dependencies]
 proptest = "1"

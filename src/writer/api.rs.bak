@@ -594,7 +594,7 @@ pub fn write_buffer_range(
             f.set_len(total_size)?;
             // SAFETY: `f` is a valid writable fd and `posix_fadvise` only consumes the fd/range
             // arguments to adjust kernel cache heuristics.
-            let _ = fro::os::posix_fadvise(f.as_raw_fd(), 0, 0, fro::os::POSIX_FADV_NOREUSE);
+            let _ = crate::os::posix_fadvise(f.as_raw_fd(), 0, 0, crate::os::POSIX_FADV_NOREUSE);
         }
     }
 
@@ -727,7 +727,7 @@ fn _write_file_internal(
             f.set_len(total_size)?;
             // SAFETY: `f` is a valid writable fd and `posix_fadvise` only consumes the fd/range
             // arguments to adjust kernel cache heuristics.
-            let _ = fro::os::posix_fadvise(f.as_raw_fd(), 0, 0, fro::os::POSIX_FADV_NOREUSE);
+            let _ = crate::os::posix_fadvise(f.as_raw_fd(), 0, 0, crate::os::POSIX_FADV_NOREUSE);
         }
     }
 

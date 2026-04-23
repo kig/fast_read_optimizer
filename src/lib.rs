@@ -10,6 +10,7 @@ mod file_hash;
 mod io_util;
 mod mincore;
 pub mod test_sizing;
+pub mod uring;
 mod uring_util;
 mod verified_copy;
 
@@ -18,6 +19,7 @@ pub mod config;
 pub mod reader;
 pub mod stream;
 pub mod writer;
+pub mod os;
 
 pub use api::{
     benchmark_page_cache_lift, copy_fd_range_to_fd_with_progress, copy_file,

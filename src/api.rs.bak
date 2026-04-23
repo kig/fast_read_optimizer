@@ -96,7 +96,7 @@ fn grow_pipe_best_effort(fd: RawFd) -> io::Result<()> {
     if !fd_is_fifo(fd)? {
         return Ok(());
     }
-    fro::os::grow_pipe_best_effort(fd)
+    crate::os::grow_pipe_best_effort(fd)
 }
 
 pub fn copy_path_range_to_fd_with_progress<P, F>(
@@ -143,7 +143,7 @@ where
             None => FAST_COPY_SENDFILE_CHUNK_SIZE,
         };
         let mut off_tmp: libc::off_t = offset as libc::off_t;
-        let copied = match fro::os::sendfile(dst_fd, src_fd, &mut off_tmp, count) {
+        let copied = match crate::os::sendfile(dst_fd, src_fd, &mut off_tmp, count) {
             Ok(v) => v,
             Err(err) => {
                 if err.raw_os_error() == Some(libc::EINTR) {

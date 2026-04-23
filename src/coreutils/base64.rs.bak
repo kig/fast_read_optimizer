@@ -414,7 +414,7 @@ pub fn encode_base64_block_aligned(bytes: &[u8]) -> Vec<u8> {
     }
 
     unsafe {
-        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, fro::os::MADV_HUGEPAGE);
+        let _ret = libc::madvise(ptr as *mut libc::c_void, capacity, crate::os::MADV_HUGEPAGE);
     }
 
     let mut out_vec = unsafe { Vec::from_raw_parts(ptr, capacity, capacity) };

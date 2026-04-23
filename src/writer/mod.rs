@@ -5,7 +5,7 @@ use crate::io_util::{
     open_direct_writer_or_fallback,
 };
 use crate::mincore::is_edge_pages_resident;
-use iou::IoUring;
+use fro::uring::IoUring;
 use rand::RngExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

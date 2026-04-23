@@ -7,8 +7,8 @@ use crate::reader::{
 };
 use crate::writer::{write_generated_file, BufWriter, GeneratedWritePattern};
 use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};
-use iou::sqe::SpliceFlags;
-use iou::IoUring;
+use fro::uring::SpliceFlags;
+use fro::uring::IoUring;
 use memchr::{memchr_iter, memmem::Finder};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;

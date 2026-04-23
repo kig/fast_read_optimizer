@@ -23,7 +23,7 @@ use crate::writer::{
     overwrite_changed_chunks_direct, write_buffer, write_file,
 };
 use crate::{common, config, coreutils};
-use iou::IoUring;
+use fro::uring::IoUring;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};

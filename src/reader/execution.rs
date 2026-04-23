@@ -82,13 +82,13 @@ pub(super) fn submit_read_with_probe(
 
 pub(super) fn wait_for_ready(io_uring: &mut IoUring) -> std::io::Result<Vec<(u64, u32)>> {
     let cq = io_uring.wait_for_cqe().map_err(std::io::Error::other)?;
-    let mut ready = vec![(cq.user_data(), cq.result()?)];
+    let mut ready = vec![(cq.user_data(), cq.result()? as u32)];
 
     while io_uring.cq_ready() > 0 {
         let cq = io_uring.peek_for_cqe().ok_or_else(|| {
             std::io::Error::other("completion queue reported ready but no CQE was available")
         })?;
-        ready.push((cq.user_data(), cq.result()?));
+        ready.push((cq.user_data(), cq.result()? as u32));
     }
 
     Ok(ready)

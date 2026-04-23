@@ -53,7 +53,7 @@ fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
         ));
     }
 
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | fro::os::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -118,7 +118,7 @@ fn recv_request(stream: &UnixStream) -> io::Result<Option<Request>> {
     header.msg_iov = &mut iov;
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
-    header.msg_controllen = control.len();
+    header.msg_controllen = control.len() as _;
 
     let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut header, 0) };
     if read < 0 {

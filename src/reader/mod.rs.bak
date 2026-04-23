@@ -54,7 +54,7 @@ pub(crate) fn evict_file_cache(filename: &str) -> io::Result<()> {
     let file = File::open(filename)?;
     // SAFETY: `file` is a valid open fd for the duration of the call, and `posix_fadvise`
     // only observes the fd plus plain integer arguments.
-    let result = fro::os::posix_fadvise(file.as_raw_fd(), 0, 0, fro::os::POSIX_FADV_DONTNEED);
+    let result = crate::os::posix_fadvise(file.as_raw_fd(), 0, 0, crate::os::POSIX_FADV_DONTNEED);
     if result == 0 {
         Ok(())
     } else {
@@ -520,7 +520,7 @@ fn advise_mapped_read_region(
 ) -> io::Result<()> {
     madvise_best_effort(ptr, len, libc::MADV_RANDOM)?;
     if options.use_hugepages_for_len(len) {
-        madvise_best_effort(ptr, len, fro::os::MADV_HUGEPAGE)?;
+        madvise_best_effort(ptr, len, crate::os::MADV_HUGEPAGE)?;
     }
     Ok(())
 }

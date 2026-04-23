@@ -1,7 +1,7 @@
 use crate::common::{AlignedBuffer, IOMode};
 use crate::io_util::{note_direct_unaligned_fallback, open_direct_reader_or_fallback};
 use crate::mincore::is_edge_pages_resident;
-use iou::IoUring;
+use fro::uring::IoUring;
 use rand::RngExt;
 use std::fs::File;
 use std::io;

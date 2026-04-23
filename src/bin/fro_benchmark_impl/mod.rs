@@ -160,9 +160,7 @@ fn evict_cache(path: &str) {
     }
     if let Ok(file) = std::fs::File::open(path) {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
+        let _ = fro::os::posix_fadvise(file.as_raw_fd(), 0, 0, fro::os::POSIX_FADV_DONTNEED);
     }
 }
 
@@ -181,9 +179,7 @@ fn pre_cache(path: &str) {
     }
     if let Ok(mut file) = std::fs::File::open(path) {
         use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
-        }
+        let _ = fro::os::posix_fadvise(file.as_raw_fd(), 0, 0, fro::os::POSIX_FADV_WILLNEED);
         use std::io::Read;
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         while let Ok(n) = file.read(&mut buf) {

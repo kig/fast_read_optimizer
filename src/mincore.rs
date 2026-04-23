@@ -46,7 +46,7 @@ fn is_page_resident(fd: RawFd, page_size: usize, offset: u64) -> Result<bool, St
             return Err("mmap failed".to_string());
         }
         let mut vec: u8 = 0;
-        let result = mincore(addr, page_size, &mut vec as *mut u8);
+        let result = mincore(addr, page_size, &mut vec as *mut u8 as *mut libc::c_char);
         munmap(addr, page_size);
         if result == 0 {
             Ok((vec & 1) != 0)
@@ -79,7 +79,7 @@ pub fn is_range_in_page_cache(file: &File, offset: u64, len: usize) -> bool {
 
         let num_pages = len_aligned / page_size;
         let mut vec = vec![0u8; num_pages];
-        let res = libc::mincore(ptr, len_aligned, vec.as_mut_ptr());
+        let res = libc::mincore(ptr, len_aligned, vec.as_mut_ptr() as *mut libc::c_char);
         libc::munmap(ptr, len_aligned);
 
         if res != 0 {

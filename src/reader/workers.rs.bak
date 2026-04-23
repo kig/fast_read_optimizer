@@ -54,7 +54,7 @@ fn load_file_to_shared_buffer_blocking(
         madvise_best_effort(
             data.as_mut_slice().as_mut_ptr().cast(),
             file_len.max(1),
-            fro::os::MADV_HUGEPAGE,
+            crate::os::MADV_HUGEPAGE,
         )?;
     }
     let (file, file_direct) = open_reader_files(filename, params.use_direct)?;
@@ -483,7 +483,7 @@ pub(super) fn load_file_to_shared_buffer(
         madvise_best_effort(
             data.as_mut_slice().as_mut_ptr().cast(),
             file_len.max(1),
-            fro::os::MADV_HUGEPAGE,
+            crate::os::MADV_HUGEPAGE,
         )?;
     }
     let output = Arc::new(SharedOutput {

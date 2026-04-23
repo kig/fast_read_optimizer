@@ -240,7 +240,7 @@ pub(crate) fn bench_tar_archive_variant(
             madvise_best_effort(
                 archive.as_mut_slice().as_mut_ptr().cast(),
                 archive.len().max(1),
-                fro::os::MADV_HUGEPAGE,
+                crate::os::MADV_HUGEPAGE,
             )?;
             let output = Arc::new(TarBenchOutput {
                 ptr: archive.as_mut_slice().as_mut_ptr(),
@@ -268,7 +268,7 @@ pub(crate) fn bench_tar_archive_variant(
             madvise_best_effort(
                 archive.as_mut_slice().as_mut_ptr().cast(),
                 archive.len().max(1),
-                fro::os::MADV_HUGEPAGE,
+                crate::os::MADV_HUGEPAGE,
             )?;
             let output = Arc::new(TarBenchOutput {
                 ptr: archive.as_mut_slice().as_mut_ptr(),
@@ -340,7 +340,7 @@ pub(crate) fn bench_tar_archive_variant(
             if ptr == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error());
             }
-            madvise_best_effort(ptr, total_len.max(1), fro::os::MADV_HUGEPAGE)?;
+            madvise_best_effort(ptr, total_len.max(1), crate::os::MADV_HUGEPAGE)?;
             let output = Arc::new(TarBenchOutput {
                 ptr: ptr.cast(),
                 len: total_len,

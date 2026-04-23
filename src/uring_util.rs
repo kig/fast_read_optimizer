@@ -1,4 +1,3 @@
-use iou::IoUring;
 use std::io;
 
 pub(crate) const FORCE_NO_IO_URING_ENV: &str = "FRO_FORCE_NO_IO_URING";
@@ -10,7 +9,9 @@ pub(crate) fn io_uring_setup_should_fallback(err: &io::Error) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn io_uring_available(entries: u32) -> io::Result<bool> {
+    use fro::uring::IoUring;
     if std::env::var_os(FORCE_NO_IO_URING_ENV).is_some() {
         return Ok(false);
     }
@@ -19,6 +20,14 @@ pub(crate) fn io_uring_available(entries: u32) -> io::Result<bool> {
         Err(err) if io_uring_setup_should_fallback(&err) => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn io_uring_available(_entries: u32) -> io::Result<bool> {
+    // io_uring is Linux-specific. Allow the codebase to run on other OSes by
+    // reporting "unavailable" and letting higher-level logic choose alternate
+    // read/write paths.
+    Ok(false)
 }
 
 #[cfg(test)]

@@ -331,7 +331,7 @@ pub(crate) fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
         return Ok(());
     }
     let target_size = COREUTILS_PIPE_TARGET_SIZE as libc::c_int;
-    match fro::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size) {
+    match crate::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size) {
         Ok(_rc) => Ok(()),
         Err(err) => match err.raw_os_error() {
             Some(libc::EPERM) | Some(libc::EINVAL) | Some(libc::EBUSY) => Ok(()),
@@ -352,7 +352,7 @@ pub(crate) fn pipe_size_best_effort(fd: libc::c_int, target_size: usize) -> io::
     if !fd_is_fifo(fd)? {
         return Ok(0);
     }
-    match fro::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size as libc::c_int) {
+    match crate::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size as libc::c_int) {
         Ok(actual) if actual >= 0 => Ok(actual as usize),
         Ok(actual) => Ok(actual as usize),
         Err(err) => match err.raw_os_error() {
@@ -481,7 +481,12 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
         return Ok(None);
     }
 
-    let (pipe_read, pipe_write) = fro::os::pipe2(libc::O_CLOEXEC)?;
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pipe_read = pipe_fds[0];
+    let pipe_write = pipe_fds[1];
     let result = (|| -> io::Result<Option<u64>> {
         let desired = STREAM_WINDOW_BLOCK_SIZE
             .max(count as usize)
@@ -501,24 +506,15 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
                 return Ok(None);
             }
             let read_len = free_space.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize;
-            let moved = match fro::os::splice(
-                src_fd,
-                std::ptr::null_mut(),
-                pipe_write,
-                std::ptr::null_mut(),
-                read_len,
-                0,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    match e.raw_os_error() {
-                        Some(libc::EINTR | libc::EAGAIN) => continue,
-                        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
-                            return Ok(None)
-                        }
-                        _ => return Err(e),
-                    }
-                }
+            let moved = unsafe {
+                libc::splice(
+                    src_fd,
+                    std::ptr::null_mut(),
+                    pipe_write,
+                    std::ptr::null_mut(),
+                    read_len,
+                    0,
+                )
             };
             if moved > 0 {
                 buffered = buffered
@@ -540,6 +536,14 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
             if moved == 0 {
                 let emitted = splice_all(pipe_read, fro::command_io::stdout_fd(), buffered)?;
                 return Ok(Some(emitted));
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR | libc::EAGAIN) => continue,
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                    return Ok(None)
+                }
+                _ => return Err(err),
             }
         }
     })();
@@ -639,7 +643,7 @@ where
     let mut total = 0u64;
     loop {
         let mut off_tmp: libc::off_t = 0;
-        let copied = match fro::os::sendfile(
+        let copied = match crate::os::sendfile(
             dst_fd,
             src_fd,
             &mut off_tmp,
