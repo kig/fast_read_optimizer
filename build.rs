@@ -68,13 +68,13 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::process::exit;
 
-extern \"C\" {{
+extern "C" {{
     fn execv(path: *const c_char, argv: *const *const c_char) -> i32;
 }}
 
 fn main() {{
-    let fro = r#\"{}\"#;
-    let prog = r#\"{}\"#;
+    let fro = r#"{}"#;
+    let prog = r#"{}"#;
     let c_fro = CString::new(fro).expect("invalid fro path");
     let mut c_args: Vec<CString> = Vec::new();
     c_args.push(CString::new(prog).unwrap());
