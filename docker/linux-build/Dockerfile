@@ -16,7 +16,7 @@ WORKDIR /repo
 COPY . /repo
 
 # Use size-optimized Rust flags for minimized binaries
-ENV RUSTFLAGS="-C opt-level=s -C lto -C codegen-units=1 -C panic=abort -C link-arg=-s"
+ENV RUSTFLAGS="-C opt-level=s -C codegen-units=1 -C panic=abort -C link-arg=-s"
 
 # Build release
 RUN cargo build --release

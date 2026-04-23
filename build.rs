@@ -98,7 +98,6 @@ fn main() {{
     let status = Command::new("rustc")
         .arg(src_path)
         .arg("-C").arg("opt-level=s")
-        .arg("-C").arg("lto")
         .arg("-C").arg("codegen-units=1")
         .arg("-C").arg("panic=abort")
         .arg("-C").arg("link-arg=-s")
