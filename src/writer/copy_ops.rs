@@ -161,6 +161,20 @@ pub(crate) fn copy_file_range_syscall_with_progress(
         ));
     }
     let copy_size = copy_size.min(source_meta.len().saturating_sub(source_offset));
+
+    // Fast path for whole-file copy on macOS: prefer std::fs::copy to leverage platform optimizations.
+    if source_offset == 0 && dest_offset == 0 && truncate_target && copy_size == source_meta.len() {
+        #[cfg(target_os = "macos")]
+        {
+            fro::os::copy_path(source, filename)
+                .map_err(|e| io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e)))?;
+            if let Some(progress) = progress_count.as_ref() {
+                progress.fetch_add(source_meta.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+            return Ok(source_meta.len());
+        }
+    }
+
     prepare_copy_destination(filename, dest_offset, copy_size, truncate_target)?;
     let target_file = OpenOptions::new()
         .read(true)
@@ -307,6 +321,20 @@ pub(crate) fn copy_file_range_chunked_with_progress(
         ));
     }
     let copy_size = copy_size.min(source_meta.len().saturating_sub(source_offset));
+
+    // Fast path for whole-file copy on macOS: prefer std::fs::copy to leverage platform optimizations.
+    if source_offset == 0 && dest_offset == 0 && truncate_target && copy_size == source_meta.len() {
+        #[cfg(target_os = "macos")]
+        {
+            fro::os::copy_path(source, filename)
+                .map_err(|e| io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e)))?;
+            if let Some(progress) = progress_count.as_ref() {
+                progress.fetch_add(source_meta.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+            return Ok(source_meta.len());
+        }
+    }
+
     prepare_copy_destination(filename, dest_offset, copy_size, truncate_target)?;
     let target_file = OpenOptions::new()
         .read(true)
@@ -490,20 +518,7 @@ pub fn copy_file_reflink(
         ));
     }
 
-    let rc = unsafe {
-        libc::ioctl(
-            target_file.as_raw_fd(),
-            fro::os::FICLONE as libc::c_ulong,
-            source_file.as_raw_fd(),
-        )
-    };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        return Err(io::Error::new(
-            err.kind(),
-            format!("reflink clone failed: {}", err),
-        ));
-    }
+    fro::os::reflink_paths(source, filename).map_err(|err| io::Error::new(err.kind(), format!("reflink clone failed: {}", err)))?;
 
     Ok(source_meta.len())
 }

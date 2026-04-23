@@ -174,10 +174,51 @@ pub fn reflink_paths(src: &str, dst: &str) -> io::Result<()> {
 // Provide a loff_t alias for code that expects it.
 pub type loff_t = libc::off_t;
 
+/// Copy file path using platform-optimized primitives on macOS (copyfile),
+/// falling back to std::fs::copy on other platforms. Returns Ok(()) on success.
+pub fn copy_path(src: &str, dst: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let csrc = CString::new(src)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let cdst = CString::new(dst)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
+        // Use copyfile(3) for potentially optimized kernel/userpath copy on macOS.
+        let rc = unsafe { libc::copyfile(csrc.as_ptr(), cdst.as_ptr(), std::ptr::null_mut(), 0) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::copy(src, dst).map(|_| ()).map_err(|e| e)
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub const MADV_HUGEPAGE: libc::c_int = libc::MADV_HUGEPAGE;
 #[cfg(not(target_os = "linux"))]
 pub const MADV_HUGEPAGE: libc::c_int = 0;
+
+/// Set or clear the non-caching (F_NOCACHE) flag on a file descriptor.
+/// On macOS this uses fcntl(F_NOCACHE, 1) to avoid page-cache; other platforms treat it as a no-op.
+pub fn set_fd_nocache(fd: RawFd, enable: bool) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let val: libc::c_int = if enable { 1 } else { 0 };
+        let rc = unsafe { libc::fcntl(fd, libc::F_NOCACHE, val) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (fd, enable);
+        Ok(())
+    }
+}
 
 
 // Grow pipe best-effort: attempt to set pipe size when supported (Linux), otherwise no-op.
