@@ -2,7 +2,9 @@
 //! so the crate can compile and run on macOS with reasonable fallbacks.
 
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{RawFd, AsRawFd};
+use std::fs::OpenOptions;
+use std::ffi::CString;
 
 #[cfg(target_os = "linux")]
 pub const O_DIRECT: i32 = libc::O_DIRECT;
@@ -57,7 +59,7 @@ pub fn posix_fallocate(fd: RawFd, offset: i64, len: i64) -> i32 {
     }
 }
 
-// copy_file_range wrapper: on Linux call syscall; on macOS return Err(Unsupported).
+// copy_file_range wrapper: on Linux call syscall; on other platforms perform a chunked pread/pwrite fallback.
 pub fn copy_file_range(
     src_fd: RawFd,
     src_off: &mut libc::off_t,
@@ -85,19 +87,89 @@ pub fn copy_file_range(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (src_fd, src_off, dst_fd, dst_off, len, flags);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "copy_file_range not supported on this platform",
-        ))
+        use std::cmp;
+        let mut remaining = len;
+        let mut total_copied: isize = 0;
+        let mut buf = vec![0u8; 128 * 1024];
+        while remaining > 0 {
+            let to_read = cmp::min(remaining, buf.len());
+            let nread = unsafe {
+                libc::pread(
+                    src_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    to_read,
+                    *src_off,
+                )
+            };
+            if nread < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if nread == 0 {
+                break;
+            }
+            let mut written = 0usize;
+            while written < nread as usize {
+                let nw = unsafe {
+                    libc::pwrite(
+                        dst_fd,
+                        buf[written..nread as usize].as_ptr() as *const libc::c_void,
+                        (nread as usize - written) as libc::size_t,
+                        *dst_off,
+                    )
+                };
+                if nw < 0 {
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        _ => return Err(err),
+                    }
+                }
+                written += nw as usize;
+                *dst_off = (*dst_off).saturating_add(nw as libc::off_t);
+            }
+            *src_off = (*src_off).saturating_add(nread as libc::off_t);
+            remaining = remaining.saturating_sub(nread as usize);
+            total_copied += nread as isize;
+        }
+        Ok(total_copied)
     }
 }
 
-// Reflink constant (FICLONE) - on macOS use clonefile, but for now expose a stub value.
+// Reflink constant (FICLONE) - on macOS use clonefile, but keep a Linux constant when available.
 #[cfg(target_os = "linux")]
-pub const FICLONE: i32 = libc::FICLONE;
+pub const FICLONE: libc::c_ulong = libc::FICLONE as libc::c_ulong;
 #[cfg(not(target_os = "linux"))]
-pub const FICLONE: i32 = 0;
+pub const FICLONE: libc::c_ulong = 0;
+
+/// Attempt a platform-appropriate reflink/clone from `src` to `dst`.
+/// On Linux this performs an ioctl(FICLONE) on the destination fd.
+/// On macOS this calls clonefile(src, dst). On other platforms it falls back to a buffered copy.
+pub fn reflink_paths(src: &str, dst: &str) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let src_f = OpenOptions::new().read(true).open(src)?;
+        let dst_f = OpenOptions::new().read(true).write(true).open(dst)?;
+        let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE as libc::c_ulong, src_f.as_raw_fd()) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let csrc = CString::new(src).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let cdst = CString::new(dst).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
+        let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::fs::copy(src, dst).map(|_| ()).map_err(|e| e)
+    }
+}
 
 // Provide a loff_t alias for code that expects it.
 pub type loff_t = libc::off_t;
