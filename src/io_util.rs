@@ -145,19 +145,55 @@ where
 
 pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
     open_direct_with_fallback(fallback, "direct reader open", || {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(fro::os::O_DIRECT)
-            .open(path)
+        #[cfg(target_os = "linux")]
+        {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let f = OpenOptions::new().read(true).open(path)?;
+            match fro::os::set_fd_nocache(f.as_raw_fd(), true) {
+                Ok(_) => Ok(f),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
     })
 }
 
 pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
     open_direct_with_fallback(fallback, "direct writer open", || {
-        OpenOptions::new()
-            .write(true)
-            .custom_flags(fro::os::O_DIRECT)
-            .open(path)
+        #[cfg(target_os = "linux")]
+        {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let f = OpenOptions::new().write(true).open(path)?;
+            match fro::os::set_fd_nocache(f.as_raw_fd(), true) {
+                Ok(_) => Ok(f),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
     })
 }
 

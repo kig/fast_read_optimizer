@@ -23,11 +23,19 @@ pub(crate) fn io_uring_available(entries: u32) -> io::Result<bool> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn io_uring_available(_entries: u32) -> io::Result<bool> {
-    // io_uring is Linux-specific. Allow the codebase to run on other OSes by
-    // reporting "unavailable" and letting higher-level logic choose alternate
-    // read/write paths.
-    Ok(false)
+pub(crate) fn io_uring_available(entries: u32) -> io::Result<bool> {
+    // Respect explicit opt-out.
+    if std::env::var_os(FORCE_NO_IO_URING_ENV).is_some() {
+        return Ok(false);
+    }
+
+    // The non-Linux IoUring implementation is a synchronous stub that executes
+    // prepared SQEs in the calling thread. Returning `true` allows the reader
+    // code to use the threaded execution model (one IoUring per worker thread),
+    // which enables concurrent pread/pwrite across OS threads and restores
+    // multi-threaded throughput on platforms like macOS.
+    let _ = entries;
+    Ok(true)
 }
 
 #[cfg(test)]

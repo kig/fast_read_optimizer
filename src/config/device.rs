@@ -139,12 +139,17 @@ pub fn mount_info_for_path(path: &str) -> Option<MountInfo> {
                 data
             }
             Err(err) => {
-                MOUNTINFO_WARNING.call_once(|| {
-                    eprintln!(
-                        "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
-                        err
-                    );
-                });
+                // Only warn about missing /proc/self/mountinfo on Linux. On other
+                // platforms (macOS, *BSD) /proc may not exist and this is expected.
+                #[cfg(target_os = "linux")]
+                {
+                    MOUNTINFO_WARNING.call_once(|| {
+                        eprintln!(
+                            "Warning: could not read /proc/self/mountinfo ({}); mount-specific config overrides are disabled",
+                            err
+                        );
+                    });
+                }
                 return None;
             }
         },
