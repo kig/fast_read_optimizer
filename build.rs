@@ -68,9 +68,9 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::process::exit;
 
-extern "C" {
+extern \"C\" {{
     fn execv(path: *const c_char, argv: *const *const c_char) -> i32;
-}
+}}
 
 fn main() {{
     let fro = r#\"{}\"#;
@@ -86,7 +86,7 @@ fn main() {{
     unsafe {{
         execv(c_fro.as_ptr(), argv.as_ptr());
         let err = std::io::Error::last_os_error();
-        eprintln!("execv failed: {}", err);
+        eprintln!("execv failed: {{}}", err);
         exit(1);
     }}
 }}
