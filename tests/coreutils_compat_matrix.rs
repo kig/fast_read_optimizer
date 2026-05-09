@@ -367,3 +367,5 @@ mod stream_coreutils;
 mod tar;
 #[path = "coreutils_compat_matrix/wc.rs"]
 mod wc;
+#[path = "coreutils_compat_matrix/flag_parity.rs"]
+mod flag_parity;
