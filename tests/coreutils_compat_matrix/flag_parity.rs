@@ -10,6 +10,113 @@
 //! 4. `#[ignore = "TODO"]` stubs for every remaining find system-only flag  (69 items)
 
 use super::*;
+use std::ffi::CStr;
+use std::os::unix::fs::MetadataExt;
+
+fn assert_find_same_sorted(root: &Path, extra_args: &[&str], label: &str) {
+    let root_arg = root.to_str().unwrap();
+    let mut fro_args = vec![root_arg];
+    fro_args.extend_from_slice(extra_args);
+    let mut sys_args = vec![root_arg];
+    sys_args.extend_from_slice(extra_args);
+    assert_same_sorted_lines(
+        run_fro("find", &fro_args),
+        run_system("find", &sys_args),
+        label,
+    );
+}
+
+fn set_file_times(path: &Path, atime_sec: i64, mtime_sec: i64) {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: atime_sec,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: mtime_sec,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(
+        rc,
+        0,
+        "utimensat failed for {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+fn current_user_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    let mut buf_len = 1024usize;
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0u8; buf_len];
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        assert_eq!(
+            rc,
+            0,
+            "getpwuid_r failed: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
+        let result = result.cast_const();
+        assert!(!result.is_null(), "current uid {uid} has no passwd entry");
+        return unsafe { CStr::from_ptr((*result).pw_name) }
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
+}
+
+fn current_group_name() -> String {
+    let gid = unsafe { libc::getgid() };
+    let mut buf_len = 1024usize;
+    loop {
+        let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0u8; buf_len];
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                grp.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        assert_eq!(
+            rc,
+            0,
+            "getgrgid_r failed: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
+        let result = result.cast_const();
+        assert!(!result.is_null(), "current gid {gid} has no group entry");
+        return unsafe { CStr::from_ptr((*result).gr_name) }
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════
 // §1  fgrep: covered flags not exercised by earlier test files
@@ -310,14 +417,8 @@ fn find_print_flag_explicit_matches_system() {
     assert_same_sorted_lines(fro, system, "find -print explicit");
 
     // -type f -print combined
-    let fro2 = run_fro(
-        "find",
-        &[root.to_str().unwrap(), "-type", "f", "-print"],
-    );
-    let system2 = run_system(
-        "find",
-        &[root.to_str().unwrap(), "-type", "f", "-print"],
-    );
+    let fro2 = run_fro("find", &[root.to_str().unwrap(), "-type", "f", "-print"]);
+    let system2 = run_system("find", &[root.to_str().unwrap(), "-type", "f", "-print"]);
     assert_same_sorted_lines(fro2, system2, "find -type f -print");
 }
 
@@ -530,40 +631,106 @@ fn find_not_todo() {}
 // ── Time-based predicates ───────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -atime not yet implemented in fro bounded find slice"]
-fn find_atime_todo() {}
+fn find_atime_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-atime");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-atime", "0"], "find -atime 0");
+}
 
 #[test]
-#[ignore = "TODO: find -amin not yet implemented in fro bounded find slice"]
-fn find_amin_todo() {}
+fn find_amin_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-amin");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-amin", "-1"], "find -amin -1");
+}
 
 #[test]
-#[ignore = "TODO: find -anewer not yet implemented in fro bounded find slice"]
-fn find_anewer_todo() {}
+fn find_anewer_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-anewer");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let reference = root.join("reference.txt");
+    fs::write(&reference, b"reference").unwrap();
+    set_file_times(&reference, 1, 1);
+    fs::write(root.join("candidate.txt"), b"candidate").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-type", "f", "-anewer", reference.to_str().unwrap()],
+        "find -anewer ref",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -ctime not yet implemented in fro bounded find slice"]
-fn find_ctime_todo() {}
+fn find_ctime_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-ctime");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-ctime", "0"], "find -ctime 0");
+}
 
 #[test]
-#[ignore = "TODO: find -cmin not yet implemented in fro bounded find slice"]
-fn find_cmin_todo() {}
+fn find_cmin_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-cmin");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-cmin", "-1"], "find -cmin -1");
+}
 
 #[test]
-#[ignore = "TODO: find -cnewer not yet implemented in fro bounded find slice"]
-fn find_cnewer_todo() {}
+fn find_cnewer_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-cnewer");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let reference = root.join("reference.txt");
+    fs::write(&reference, b"reference").unwrap();
+    set_file_times(&reference, 1, 1);
+    fs::write(root.join("candidate.txt"), b"candidate").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-type", "f", "-cnewer", reference.to_str().unwrap()],
+        "find -cnewer ref",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -mtime not yet implemented in fro bounded find slice"]
-fn find_mtime_todo() {}
+fn find_mtime_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-mtime");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-mtime", "0"], "find -mtime 0");
+}
 
 #[test]
-#[ignore = "TODO: find -mmin not yet implemented in fro bounded find slice"]
-fn find_mmin_todo() {}
+fn find_mmin_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-mmin");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recent.txt"), b"recent").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-mmin", "-1"], "find -mmin -1");
+}
 
 #[test]
-#[ignore = "TODO: find -newer not yet implemented in fro bounded find slice"]
-fn find_newer_todo() {}
+fn find_newer_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-newer");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let reference = root.join("reference.txt");
+    fs::write(&reference, b"reference").unwrap();
+    set_file_times(&reference, 1, 1);
+    fs::write(root.join("candidate.txt"), b"candidate").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-type", "f", "-newer", reference.to_str().unwrap()],
+        "find -newer ref",
+    );
+}
 
 #[test]
 #[ignore = "TODO: find -daystart not yet implemented in fro bounded find slice"]
@@ -576,62 +743,157 @@ fn find_used_todo() {}
 // ── Size / count predicates ─────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -size not yet implemented in fro bounded find slice"]
-fn find_size_todo() {}
+fn find_size_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-size");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("empty.txt"), b"").unwrap();
+    fs::write(root.join("five.txt"), b"12345").unwrap();
+    fs::write(root.join("six.txt"), b"123456").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-size", "+0c"], "find -size +0c");
+    assert_find_same_sorted(&root, &["-type", "f", "-size", "5c"], "find -size 5c");
+}
 
 #[test]
-#[ignore = "TODO: find -links not yet implemented in fro bounded find slice"]
-fn find_links_todo() {}
+fn find_links_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-links");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("single.txt"), b"single").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-links", "1"], "find -links 1");
+}
 
 #[test]
-#[ignore = "TODO: find -inum not yet implemented in fro bounded find slice"]
-fn find_inum_todo() {}
+fn find_inum_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-inum");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let target = root.join("target.txt");
+    fs::write(&target, b"target").unwrap();
+    let inum = fs::metadata(&target).unwrap().ino().to_string();
+    assert_find_same_sorted(&root, &["-inum", &inum], "find -inum");
+}
 
 // ── Ownership / permission predicates ───────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -perm not yet implemented in fro bounded find slice"]
-fn find_perm_todo() {}
+fn find_perm_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-perm");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let exact = root.join("exact.txt");
+    let other = root.join("other.txt");
+    fs::write(&exact, b"exact").unwrap();
+    fs::write(&other, b"other").unwrap();
+    fs::set_permissions(&exact, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-perm", "0644"], "find -perm 0644");
+}
 
 #[test]
-#[ignore = "TODO: find -uid not yet implemented in fro bounded find slice"]
-fn find_uid_todo() {}
+fn find_uid_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-uid");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    let uid = unsafe { libc::getuid() }.to_string();
+    assert_find_same_sorted(&root, &["-type", "f", "-uid", &uid], "find -uid");
+}
 
 #[test]
-#[ignore = "TODO: find -gid not yet implemented in fro bounded find slice"]
-fn find_gid_todo() {}
+fn find_gid_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-gid");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    let gid = unsafe { libc::getgid() }.to_string();
+    assert_find_same_sorted(&root, &["-type", "f", "-gid", &gid], "find -gid");
+}
 
 #[test]
-#[ignore = "TODO: find -user not yet implemented in fro bounded find slice"]
-fn find_user_todo() {}
+fn find_user_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-user");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    let user = current_user_name();
+    assert_find_same_sorted(&root, &["-type", "f", "-user", &user], "find -user");
+}
 
 #[test]
-#[ignore = "TODO: find -group not yet implemented in fro bounded find slice"]
-fn find_group_todo() {}
+fn find_group_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-group");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    let group = current_group_name();
+    assert_find_same_sorted(&root, &["-type", "f", "-group", &group], "find -group");
+}
 
 #[test]
-#[ignore = "TODO: find -nouser not yet implemented in fro bounded find slice"]
-fn find_nouser_todo() {}
+fn find_nouser_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-nouser");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    assert_find_same_sorted(&root, &["-nouser"], "find -nouser");
+}
 
 #[test]
-#[ignore = "TODO: find -nogroup not yet implemented in fro bounded find slice"]
-fn find_nogroup_todo() {}
+fn find_nogroup_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-nogroup");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    assert_find_same_sorted(&root, &["-nogroup"], "find -nogroup");
+}
 
 #[test]
-#[ignore = "TODO: find -readable not yet implemented in fro bounded find slice"]
-fn find_readable_todo() {}
+fn find_readable_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-readable");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("readable.txt"), b"readable").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-readable"], "find -readable");
+}
 
 #[test]
-#[ignore = "TODO: find -writable not yet implemented in fro bounded find slice"]
-fn find_writable_todo() {}
+fn find_writable_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-writable");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("writable.txt"), b"writable").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-writable"], "find -writable");
+}
 
 #[test]
-#[ignore = "TODO: find -executable not yet implemented in fro bounded find slice"]
-fn find_executable_todo() {}
+fn find_executable_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-executable");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let exec = root.join("exec.sh");
+    let plain = root.join("plain.txt");
+    fs::write(&exec, b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&plain, b"plain").unwrap();
+    fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-executable"], "find -executable");
+}
 
 #[test]
-#[ignore = "TODO: find -empty not yet implemented in fro bounded find slice"]
-fn find_empty_todo() {}
+fn find_empty_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-empty");
+    let root = tmp.join("root");
+    let empty_dir = root.join("empty-dir");
+    let full_dir = root.join("full-dir");
+    fs::create_dir_all(&empty_dir).unwrap();
+    fs::create_dir_all(&full_dir).unwrap();
+    fs::write(root.join("empty.txt"), b"").unwrap();
+    fs::write(root.join("full.txt"), b"full").unwrap();
+    fs::write(full_dir.join("nested.txt"), b"nested").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-empty"], "find -empty -type f");
+    assert_find_same_sorted(&root, &["-type", "d", "-empty"], "find -empty -type d");
+}
 
 // ── Regex predicates ────────────────────────────────────────────────
 
@@ -666,8 +928,15 @@ fn find_iwholename_todo() {}
 // ── Filesystem / traversal control ──────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -mindepth not yet implemented in fro bounded find slice"]
-fn find_mindepth_todo() {}
+fn find_mindepth_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-mindepth");
+    let root = tmp.join("root");
+    let level1 = root.join("a");
+    let level2 = level1.join("b");
+    fs::create_dir_all(&level2).unwrap();
+    fs::write(level2.join("file.txt"), b"leaf").unwrap();
+    assert_find_same_sorted(&root, &["-mindepth", "2"], "find -mindepth 2");
+}
 
 #[test]
 #[ignore = "TODO: find -depth not yet implemented in fro bounded find slice"]

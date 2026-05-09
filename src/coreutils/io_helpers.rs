@@ -637,8 +637,8 @@ where
     }
     grow_pipe_best_effort(dst_fd)?;
     let mut total = 0u64;
+    let mut off_tmp: libc::off_t = 0;
     loop {
-        let mut off_tmp: libc::off_t = 0;
         let copied = match fro::os::sendfile(
             dst_fd,
             src_fd,

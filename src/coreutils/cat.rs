@@ -648,6 +648,7 @@ mod tests {
         cat_squeeze_blank_step, cat_uses_transform_path, cat_visible_byte_rendered_len,
         parse_cat_args, parse_short_cat_flags, CatArgs, CatExecutionBackend, StreamInput,
     };
+    use crate::coreutils::fd_is_fifo;
     use std::io;
 
     fn cat_test_temp_file(name: &str) -> std::path::PathBuf {
@@ -843,10 +844,20 @@ mod tests {
         let input = StreamInput::File(file.clone());
         let args = vec!["cat".to_string(), "--direct".to_string(), file];
         let parsed = parse_cat_args(&args).unwrap();
+        let backend = cat_execution_backend(&input, &parsed).unwrap();
 
-        assert_eq!(
-            cat_execution_backend(&input, &parsed).unwrap(),
+        // --direct with a regular file stays on a fast-copy path (never ordered transform).
+        // When stdout happens to be a FIFO (e.g. cargo test captures output via a pipe),
+        // the implementation uses FastCopyToStdout; on a terminal/file it uses BufferedCopy.
+        let stdout_is_fifo = fd_is_fifo(fro::command_io::stdout_fd()).unwrap_or(false);
+        let expected = if stdout_is_fifo {
+            CatExecutionBackend::FastCopyToStdout
+        } else {
             CatExecutionBackend::BufferedCopy
+        };
+        assert_eq!(
+            backend, expected,
+            "direct mode should select appropriate fast-copy backend for current stdout type"
         );
 
         let _ = std::fs::remove_file(tmp);
