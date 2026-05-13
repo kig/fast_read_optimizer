@@ -359,6 +359,8 @@ mod du;
 mod fgrep_flags;
 #[path = "coreutils_compat_matrix/fgrep_null_data.rs"]
 mod fgrep_null_data;
+#[path = "coreutils_compat_matrix/fgrep_recurse.rs"]
+mod fgrep_recurse;
 #[path = "coreutils_compat_matrix/fgrep_context.rs"]
 mod fgrep_context;
 #[path = "coreutils_compat_matrix/fgrep_color.rs"]

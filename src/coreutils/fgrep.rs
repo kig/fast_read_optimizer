@@ -105,8 +105,8 @@ mod runtime;
 
 use self::context::{fgrep_context_enabled, fgrep_reset_context_output_state};
 use self::file_kinds::{
-    fgrep_input_path_kind, parse_devices_value, parse_directories_value, FgrepDevicePolicy,
-    FgrepDirectoryPolicy, FgrepInputPathKind,
+    collect_dir_files_sorted, fgrep_input_path_kind, parse_devices_value, parse_directories_value,
+    FgrepDevicePolicy, FgrepDirectoryPolicy, FgrepInputPathKind,
 };
 use self::runtime::{
     fgrep_display_label, fgrep_exit_code, fgrep_report_input_error,
@@ -392,6 +392,9 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
             }
             "--report-gbps" => options.report_gbps = true,
             "-F" | "--fixed-strings" => {}
+            "-r" | "--recursive" | "--directories=recurse" => {
+                options.directory_policy = FgrepDirectoryPolicy::Recurse;
+            }
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
@@ -595,15 +598,47 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     }
     let pattern = &patterns[0];
     let regular_file_path = fgrep_regular_file_path(options, patterns.len());
-    let inputs = parse_stream_inputs(files);
+    let raw_inputs = parse_stream_inputs(files);
+
+    let mut saw_error = false;
+    let recurse = matches!(options.directory_policy, FgrepDirectoryPolicy::Recurse);
+    // Expand directory arguments when --directories=recurse is active so that
+    // multi_file and the main processing loop see a flat file list.
+    let (inputs, any_dir_expanded) = if recurse {
+        let mut expanded: Vec<StreamInput> = Vec::new();
+        let mut any_dir = false;
+        for input in raw_inputs {
+            match &input {
+                StreamInput::File(file) => {
+                    match fgrep_input_path_kind(file) {
+                        Ok(FgrepInputPathKind::Directory) => {
+                            any_dir = true;
+                            let dir_files = collect_dir_files_sorted(file, &mut |path, e| {
+                                fgrep_report_input_error(path, &e, options);
+                                saw_error = true;
+                            });
+                            for f in dir_files {
+                                expanded.push(StreamInput::File(f));
+                            }
+                        }
+                        _ => expanded.push(input),
+                    }
+                }
+                _ => expanded.push(input),
+            }
+        }
+        (expanded, any_dir)
+    } else {
+        (raw_inputs, false)
+    };
+
     let multi_file = match options.filename_mode {
         FgrepFilenameMode::Always => true,
         FgrepFilenameMode::Never => false,
-        FgrepFilenameMode::Auto => inputs.len() > 1,
+        FgrepFilenameMode::Auto => inputs.len() > 1 || any_dir_expanded,
     };
     let mut out = stdout_buf_writer()?;
     let mut matched_any = false;
-    let mut saw_error = false;
     let started_at = std::time::Instant::now();
     let mut total_bytes = 0_u64;
     let mut config = None;
@@ -621,7 +656,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 };
                 match kind {
                     FgrepInputPathKind::Directory => match options.directory_policy {
-                        FgrepDirectoryPolicy::Skip => continue,
+                        FgrepDirectoryPolicy::Skip | FgrepDirectoryPolicy::Recurse => continue,
                         FgrepDirectoryPolicy::Read => {
                             let e = io::Error::new(io::ErrorKind::Other, "Is a directory");
                             fgrep_report_input_error(file, &e, options);

@@ -9,7 +9,7 @@ fn fgrep_help_and_version_surface_stay_wired() {
         "fgrep - Bounded literal line-oriented grep slice on top of fro's fast substring scanner."
     ));
     assert!(stdout.contains(
-        "fgrep [-n] [-b] [-i] [-x] [-w] [-v] [-z] [-A NUM] [-B NUM] [-C NUM] [-NUM] [-c|-q|-l|-L] [-H|-h] [-Z] [-s] [-T] [-D ACTION] [-d ACTION] [--label LABEL] [--line-buffered] [-a|-I|-U|--binary-files=TYPE] [-m NUM] [--color[=WHEN]|--colour[=WHEN]] [-e PATTERN | -f FILE]... [-V|--version] [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]"
+        "fgrep [-n] [-b] [-i] [-x] [-w] [-v] [-z] [-r] [-A NUM] [-B NUM] [-C NUM] [-NUM] [-c|-q|-l|-L] [-H|-h] [-Z] [-s] [-T] [-D ACTION] [-d ACTION] [--label LABEL] [--line-buffered] [-a|-I|-U|--binary-files=TYPE] [-m NUM] [--color[=WHEN]|--colour[=WHEN]] [-e PATTERN | -f FILE]... [-V|--version] [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]"
     ));
     assert!(
         stdout.contains("This is a bounded literal-search compatibility slice, not full GNU grep.")
