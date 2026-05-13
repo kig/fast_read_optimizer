@@ -488,7 +488,7 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
             .saturating_add(4096);
         let actual_size = pipe_size_best_effort(pipe_write, desired)?;
         if actual_size as u64 <= count {
-            return Ok(None);
+            return copy_pipe_tail_to_stdout_large(src_fd, count);
         }
         grow_pipe_best_effort(src_fd)?;
         grow_pipe_best_effort(fro::command_io::stdout_fd())?;
@@ -498,7 +498,7 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
         loop {
             let free_space = (actual_size as u64).saturating_sub(buffered);
             if free_space == 0 {
-                return Ok(None);
+                return copy_pipe_tail_to_stdout_large(src_fd, count);
             }
             let read_len = free_space.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize;
             let moved = match fro::os::splice(
@@ -510,15 +510,13 @@ pub(crate) fn copy_pipe_tail_to_stdout_small(
                 0,
             ) {
                 Ok(n) => n,
-                Err(e) => {
-                    match e.raw_os_error() {
-                        Some(libc::EINTR | libc::EAGAIN) => continue,
-                        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
-                            return Ok(None)
-                        }
-                        _ => return Err(e),
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR | libc::EAGAIN) => continue,
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Err(e)
                     }
-                }
+                    _ => return Err(e),
+                },
             };
             if moved > 0 {
                 buffered = buffered
@@ -639,20 +637,16 @@ where
     let mut total = 0u64;
     let mut off_tmp: libc::off_t = 0;
     loop {
-        let copied = match fro::os::sendfile(
-            dst_fd,
-            src_fd,
-            &mut off_tmp,
-            FAST_COPY_SENDFILE_CHUNK_SIZE,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                match err.raw_os_error() {
-                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
+        let copied =
+            match fro::os::sendfile(dst_fd, src_fd, &mut off_tmp, FAST_COPY_SENDFILE_CHUNK_SIZE) {
+                Ok(v) => v,
+                Err(err) => match err.raw_os_error() {
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Ok(None)
+                    }
                     _ => return Err(err),
-                }
-            }
-        };
+                },
+            };
         if copied > 0 {
             total = total
                 .checked_add(copied as u64)
@@ -760,7 +754,9 @@ where
             {
                 // Fallback: read/write loop
                 let mut buf = vec![0u8; chunk_size];
-                let n = unsafe { libc::read(src_fd, buf.as_mut_ptr() as *mut libc::c_void, chunk_size) };
+                let n = unsafe {
+                    libc::read(src_fd, buf.as_mut_ptr() as *mut libc::c_void, chunk_size)
+                };
                 if n < 0 {
                     return Err(io::Error::last_os_error());
                 }

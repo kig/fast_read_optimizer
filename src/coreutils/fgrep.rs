@@ -3,11 +3,38 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FgrepOptions {
     count_only: bool,
+    quiet: bool,
+    files_with_matches: bool,
+    files_without_match: bool,
+    color: bool,
+    only_matching: bool,
+    suppress_messages: bool,
+    initial_tab: bool,
+    line_buffered: bool,
+    before_context: u64,
+    after_context: u64,
+    offset_width: usize,
     print_line_numbers: bool,
+    print_byte_offsets: bool,
     line_regexp: bool,
+    word_regexp: bool,
     ignore_case: bool,
     invert_match: bool,
+    max_count: Option<u64>,
+    null_terminate_filenames: bool,
+    null_data: bool,
     report_gbps: bool,
+    group_separator: FgrepGroupSeparatorPolicy,
+    binary_mode: FgrepBinaryMode,
+    filename_mode: FgrepFilenameMode,
+    device_policy: FgrepDevicePolicy,
+    directory_policy: FgrepDirectoryPolicy,
+}
+
+impl FgrepOptions {
+    fn record_sep(self) -> u8 {
+        if self.null_data { b'\0' } else { b'\n' }
+    }
 }
 
 #[derive(Clone)]
@@ -19,6 +46,35 @@ struct FgrepPattern {
 enum PatternSource {
     Inline(String),
     File(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FgrepFilenameMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FgrepBinaryMode {
+    Default,
+    Text,
+    WithoutMatch,
+    Binary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FgrepColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FgrepGroupSeparatorPolicy {
+    Default,
+    Disabled,
+    Custom(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,14 +91,32 @@ struct ParsedFgrepArgs {
     options: FgrepOptions,
     pattern_sources: Vec<PatternSource>,
     files: Vec<String>,
+    stdin_label: Option<String>,
 }
 
-mod line_matching;
+const FGREP_MAX_COUNT_REACHED: &str = "fgrep max count reached";
 
-use self::line_matching::normalize_case;
-use self::line_matching::{
-    fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line, fgrep_short_flag_effect,
+mod context;
+mod color;
+mod file_kinds;
+mod only_matching;
+mod line_matching;
+mod runtime;
+
+use self::context::{fgrep_context_enabled, fgrep_reset_context_output_state};
+use self::file_kinds::{
+    fgrep_input_path_kind, parse_devices_value, parse_directories_value, FgrepDevicePolicy,
+    FgrepDirectoryPolicy, FgrepInputPathKind,
 };
+use self::runtime::{
+    fgrep_display_label, fgrep_exit_code, fgrep_report_input_error,
+    fgrep_suppresses_matching_line_output, handle_loaded_match_result, write_count_line,
+    write_filename_result, write_matching_stream_lines, write_matching_stream_lines_multi,
+};
+#[cfg(test)]
+use self::runtime::count_literal_matching_lines;
+use self::line_matching::normalize_case;
+use self::line_matching::fgrep_short_flag_effect;
 
 pub(super) fn fgrep_line_number_prefix(print_line_numbers: bool, line_no: u64) -> Option<u64> {
     print_line_numbers.then_some(line_no)
@@ -109,8 +183,104 @@ fn parse_option_value(
     })
 }
 
+fn parse_max_count_value(value: &str) -> io::Result<u64> {
+    value.parse::<u64>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("fgrep: invalid max count '{value}': {err}"),
+        )
+    })
+}
+
+fn parse_context_count_value(value: &str) -> io::Result<u64> {
+    value.parse::<u64>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("fgrep: invalid context count '{value}': {err}"),
+        )
+    })
+}
+
+fn parse_binary_files_value(value: &str) -> io::Result<FgrepBinaryMode> {
+    match value {
+        "binary" => Ok(FgrepBinaryMode::Binary),
+        "text" => Ok(FgrepBinaryMode::Text),
+        "without-match" => Ok(FgrepBinaryMode::WithoutMatch),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unknown binary-files type",
+        )),
+    }
+}
+
+fn parse_color_mode_value(value: Option<&str>, option_name: &str) -> io::Result<FgrepColorMode> {
+    match value {
+        None => Ok(FgrepColorMode::Auto),
+        Some("always") => Ok(FgrepColorMode::Always),
+        Some("auto") => Ok(FgrepColorMode::Auto),
+        Some("never") => Ok(FgrepColorMode::Never),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("fgrep: invalid color mode for '{option_name}'"),
+        )),
+    }
+}
+
+fn fgrep_stdout_is_tty() -> bool {
+    unsafe { libc::isatty(fro::command_io::stdout_fd()) == 1 }
+}
+
+fn fgrep_probe_options(options: FgrepOptions) -> FgrepOptions {
+    FgrepOptions {
+        count_only: false,
+        quiet: true,
+        files_with_matches: false,
+        files_without_match: false,
+        color: options.color,
+        only_matching: options.only_matching,
+        suppress_messages: false,
+        initial_tab: false,
+        line_buffered: false,
+        before_context: options.before_context,
+        after_context: options.after_context,
+        offset_width: options.offset_width,
+        print_line_numbers: false,
+        print_byte_offsets: false,
+        line_regexp: false,
+        word_regexp: false,
+        ignore_case: options.ignore_case,
+        invert_match: false,
+        max_count: None,
+        null_terminate_filenames: false,
+        null_data: options.null_data,
+        report_gbps: false,
+        group_separator: options.group_separator,
+        binary_mode: options.binary_mode,
+        filename_mode: options.filename_mode,
+        device_policy: options.device_policy,
+        directory_policy: options.directory_policy,
+    }
+}
+
+fn fgrep_data_is_binary(data: &[u8], options: FgrepOptions) -> bool {
+    !options.null_data
+        && !matches!(options.binary_mode, FgrepBinaryMode::Text)
+        && memchr::memchr(b'\0', data).is_some()
+}
+
+fn fgrep_binary_without_match(options: FgrepOptions) -> bool {
+    matches!(options.binary_mode, FgrepBinaryMode::WithoutMatch)
+}
+
+fn fgrep_binary_reports_match(options: FgrepOptions) -> bool {
+    matches!(
+        options.binary_mode,
+        FgrepBinaryMode::Default | FgrepBinaryMode::Binary
+    ) && !fgrep_suppresses_matching_line_output(options)
+}
+
 fn fgrep_regular_file_path(options: FgrepOptions, pattern_count: usize) -> FgrepRegularFilePath {
-    if options.line_regexp || options.ignore_case {
+    if options.line_regexp || options.word_regexp || options.ignore_case || fgrep_context_enabled(options) {
         if pattern_count == 1 {
             FgrepRegularFilePath::LineFilterSinglePattern
         } else {
@@ -133,507 +303,42 @@ fn try_load_small_regular_file_bytes(path: &str, io_mode: IOMode) -> io::Result<
     fs::read(path).map(Some)
 }
 
-fn write_matching_line<W: Write>(
-    out: &mut W,
-    label: Option<&str>,
-    line: &[u8],
-    line_no: u64,
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<()> {
-    if multi_file {
-        if let Some(label) = label {
-            write!(out, "{label}:")?;
-        }
-    }
-    if let Some(number) = fgrep_line_number_prefix(options.print_line_numbers, line_no) {
-        write!(out, "{number}:")?;
-    }
-    out.write_all(line)?;
-    if !line.ends_with(b"\n") {
-        out.write_all(b"\n")?;
-    }
-    Ok(())
-}
-
-fn write_count_line<W: Write>(
-    out: &mut W,
-    label: Option<&str>,
-    count: u64,
-    multi_file: bool,
-) -> io::Result<()> {
-    if multi_file {
-        if let Some(label) = label {
-            write!(out, "{label}:")?;
-        }
-    }
-    writeln!(out, "{count}")?;
-    Ok(())
-}
-
-fn count_literal_matching_lines(data: &[u8], pattern: &[u8], options: FgrepOptions) -> (bool, u64) {
-    let finder = (!pattern.is_empty()).then(|| Finder::new(pattern));
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut line_start = 0usize;
-
-    for rel_end in memchr_iter(b'\n', data) {
-        let line_end = rel_end + 1;
-        let is_match = pattern.is_empty()
-            || finder
-                .as_ref()
-                .is_some_and(|finder| finder.find(&data[line_start..line_end]).is_some());
-        if fgrep_select_line(is_match, options) {
-            matched_any = true;
-            match_count += 1;
-        }
-        line_start = line_end;
-    }
-
-    if line_start < data.len() {
-        let is_match = pattern.is_empty()
-            || finder
-                .as_ref()
-                .is_some_and(|finder| finder.find(&data[line_start..]).is_some());
-        if fgrep_select_line(is_match, options) {
-            matched_any = true;
-            match_count += 1;
-        }
-    }
-
-    (matched_any, match_count)
-}
-
-fn write_count_literal_matching_lines<W: Write>(
-    out: &mut W,
-    file: &str,
-    data: &[u8],
-    pattern: &[u8],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<bool> {
-    let (matched_any, match_count) = count_literal_matching_lines(data, pattern, options);
-    write_count_line(out, Some(file), match_count, multi_file)?;
-    Ok(matched_any)
-}
-
-fn finish_pending_line<W: Write>(
-    out: &mut W,
-    label: Option<&str>,
-    pending_line: &mut Vec<u8>,
-    pattern: &[u8],
-    normalized_pattern: &[u8],
-    line_no: u64,
-    multi_file: bool,
-    options: FgrepOptions,
-    matched_any: &mut bool,
-    match_count: &mut u64,
-) -> io::Result<()> {
-    if fgrep_select_line(
-        fgrep_line_matches(pending_line, pattern, normalized_pattern, options),
-        options,
-    ) {
-        *matched_any = true;
-        *match_count += 1;
-        if !options.count_only {
-            write_matching_line(out, label, pending_line, line_no, multi_file, options)?;
-        }
-    }
-    pending_line.clear();
-    Ok(())
-}
-
-fn write_matching_stream_lines<W: Write>(
-    out: &mut W,
-    label: Option<&str>,
-    input: &StreamInput,
-    io_mode: IOMode,
-    pattern: &[u8],
-    normalized_pattern: &[u8],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<(bool, u64)> {
-    if options.line_regexp {
-        let mut matched_any = false;
-        let mut match_count = 0_u64;
-        let mut pending_line = Vec::new();
-        let mut line_no = 1_u64;
-        let bytes = visit_ordered_input_counted(input, io_mode, |block| {
-            let mut line_start = 0usize;
-            for rel_end in memchr_iter(b'\n', block) {
-                let line_end = rel_end + 1;
-                pending_line.extend_from_slice(&block[line_start..line_end]);
-                finish_pending_line(
-                    out,
-                    label,
-                    &mut pending_line,
-                    pattern,
-                    normalized_pattern,
-                    line_no,
-                    multi_file,
-                    options,
-                    &mut matched_any,
-                    &mut match_count,
-                )?;
-                line_no += 1;
-                line_start = line_end;
-            }
-            if line_start < block.len() {
-                pending_line.extend_from_slice(&block[line_start..]);
-            }
-            Ok::<_, io::Error>(())
-        })?;
-        if !pending_line.is_empty() {
-            finish_pending_line(
-                out,
-                label,
-                &mut pending_line,
-                pattern,
-                normalized_pattern,
-                line_no,
-                multi_file,
-                options,
-                &mut matched_any,
-                &mut match_count,
-            )?;
-        }
-        if options.count_only {
-            write_count_line(out, label, match_count, multi_file)?;
-        }
-        return Ok((matched_any, bytes));
-    }
-
-    let finder = Finder::new(normalized_pattern);
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut pending_line = Vec::new();
-    let mut pending_line_has_match = pattern.is_empty();
-    let mut boundary_tail = Vec::new();
-    let mut line_no = 1_u64;
-    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
-        let normalized_block = normalize_case(block, options.ignore_case);
-        let search_block = normalized_block.as_ref();
-        let block_matches = if pattern.is_empty() {
-            Vec::new()
-        } else {
-            finder.find_iter(search_block).collect::<Vec<_>>()
-        };
-        let mut next_match = 0usize;
-        if !pattern.is_empty() && !boundary_tail.is_empty() {
-            let prefix_len = search_block.len().min(pattern.len().saturating_sub(1));
-            if prefix_len > 0 {
-                let mut boundary = Vec::with_capacity(boundary_tail.len() + prefix_len);
-                boundary.extend_from_slice(&boundary_tail);
-                boundary.extend_from_slice(&search_block[..prefix_len]);
-                pending_line_has_match |= finder.find_iter(&boundary).any(|offset| {
-                    offset < boundary_tail.len() && offset + pattern.len() > boundary_tail.len()
-                });
-            }
-        }
-        let mut line_start = 0usize;
-        for rel_end in memchr_iter(b'\n', block) {
-            let line_end = rel_end + 1;
-            while next_match < block_matches.len() && block_matches[next_match] < line_end {
-                if block_matches[next_match] >= line_start {
-                    pending_line_has_match = true;
-                }
-                next_match += 1;
-            }
-            if pending_line.is_empty() {
-                let line = &block[line_start..line_end];
-                if fgrep_select_line(pending_line_has_match, options) {
-                    matched_any = true;
-                    match_count += 1;
-                    if !options.count_only {
-                        write_matching_line(out, label, line, line_no, multi_file, options)?;
-                    }
-                }
-            } else {
-                pending_line.extend_from_slice(&block[line_start..line_end]);
-                if fgrep_select_line(pending_line_has_match, options) {
-                    matched_any = true;
-                    match_count += 1;
-                    if !options.count_only {
-                        write_matching_line(
-                            out,
-                            label,
-                            &pending_line,
-                            line_no,
-                            multi_file,
-                            options,
-                        )?;
-                    }
-                }
-                pending_line.clear();
-            }
-            pending_line_has_match = pattern.is_empty();
-            line_no += 1;
-            line_start = line_end;
-        }
-        if line_start < block.len() {
-            pending_line.extend_from_slice(&block[line_start..]);
-            while next_match < block_matches.len() {
-                pending_line_has_match = true;
-                next_match += 1;
-            }
-        }
-        if pattern.is_empty() {
-            boundary_tail.clear();
-        } else {
-            let tail_len = pattern.len().saturating_sub(1).min(search_block.len());
-            boundary_tail.clear();
-            boundary_tail.extend_from_slice(&search_block[search_block.len() - tail_len..]);
-        }
-        Ok::<_, io::Error>(())
-    })?;
-    if !pending_line.is_empty() && fgrep_select_line(pending_line_has_match, options) {
-        matched_any = true;
-        match_count += 1;
-        if !options.count_only {
-            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
-        }
-    }
-    if options.count_only {
-        write_count_line(out, label, match_count, multi_file)?;
-    }
-    Ok((matched_any, bytes))
-}
-
-fn write_matching_stream_lines_multi<W: Write>(
-    out: &mut W,
-    label: Option<&str>,
-    input: &StreamInput,
-    io_mode: IOMode,
-    patterns: &[FgrepPattern],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<(bool, u64)> {
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut pending_line = Vec::new();
-    let mut line_no = 1_u64;
-    let bytes = visit_ordered_input_counted(input, io_mode, |block| {
-        let mut line_start = 0usize;
-        for rel_end in memchr_iter(b'\n', block) {
-            let line_end = rel_end + 1;
-            pending_line.extend_from_slice(&block[line_start..line_end]);
-            if fgrep_select_line(
-                fgrep_line_matches_any(&pending_line, patterns, options),
-                options,
-            ) {
-                matched_any = true;
-                match_count += 1;
-                if !options.count_only {
-                    write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
-                }
-            }
-            pending_line.clear();
-            line_no += 1;
-            line_start = line_end;
-        }
-        if line_start < block.len() {
-            pending_line.extend_from_slice(&block[line_start..]);
-        }
-        Ok::<_, io::Error>(())
-    })?;
-    if !pending_line.is_empty()
-        && fgrep_select_line(
-            fgrep_line_matches_any(&pending_line, patterns, options),
-            options,
-        )
-    {
-        matched_any = true;
-        match_count += 1;
-        if !options.count_only {
-            write_matching_line(out, label, &pending_line, line_no, multi_file, options)?;
-        }
-    }
-    if options.count_only {
-        write_count_line(out, label, match_count, multi_file)?;
-    }
-    Ok((matched_any, bytes))
-}
-
-fn write_matching_lines<W: Write>(
-    out: &mut W,
-    file: &str,
-    data: &[u8],
-    matches: &[u64],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<bool> {
-    let bytes = data;
-    let mut next_match = 0usize;
-    let mut line_start = 0usize;
-    let mut line_no = 1_u64;
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    while line_start < bytes.len() {
-        let rel_end = bytes[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|pos| pos + 1)
-            .unwrap_or(bytes.len() - line_start);
-        let line_end = line_start + rel_end;
-        let mut matched = false;
-        while next_match < matches.len() && matches[next_match] < line_end as u64 {
-            if matches[next_match] >= line_start as u64 {
-                matched = true;
-            }
-            next_match += 1;
-        }
-        if fgrep_select_line(matched, options) {
-            matched_any = true;
-            match_count += 1;
-            if !options.count_only {
-                write_matching_line(
-                    out,
-                    Some(file),
-                    &bytes[line_start..line_end],
-                    line_no,
-                    multi_file,
-                    options,
-                )?;
-            }
-        }
-        line_start = line_end;
-        line_no += 1;
-    }
-    if options.count_only {
-        write_count_line(out, Some(file), match_count, multi_file)?;
-    }
-    Ok(matched_any)
-}
-
-fn write_line_regexp_matches<W: Write>(
-    out: &mut W,
-    file: &str,
-    data: &[u8],
-    pattern: &[u8],
-    normalized_pattern: &[u8],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<bool> {
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut line_start = 0usize;
-    let mut line_no = 1_u64;
-    while line_start < data.len() {
-        let rel_end = data[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|pos| pos + 1)
-            .unwrap_or(data.len() - line_start);
-        let line_end = line_start + rel_end;
-        let line = &data[line_start..line_end];
-        if fgrep_select_line(
-            fgrep_line_matches(line, pattern, normalized_pattern, options),
-            options,
-        ) {
-            matched_any = true;
-            match_count += 1;
-            if !options.count_only {
-                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
-            }
-        }
-        line_start = line_end;
-        line_no += 1;
-    }
-    if options.count_only {
-        write_count_line(out, Some(file), match_count, multi_file)?;
-    }
-    Ok(matched_any)
-}
-
-fn write_filtered_lines<W: Write>(
-    out: &mut W,
-    file: &str,
-    data: &[u8],
-    pattern: &[u8],
-    normalized_pattern: &[u8],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<bool> {
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut line_start = 0usize;
-    let mut line_no = 1_u64;
-    while line_start < data.len() {
-        let rel_end = data[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|pos| pos + 1)
-            .unwrap_or(data.len() - line_start);
-        let line_end = line_start + rel_end;
-        let line = &data[line_start..line_end];
-        if fgrep_select_line(
-            fgrep_line_matches(line, pattern, normalized_pattern, options),
-            options,
-        ) {
-            matched_any = true;
-            match_count += 1;
-            if !options.count_only {
-                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
-            }
-        }
-        line_start = line_end;
-        line_no += 1;
-    }
-    if options.count_only {
-        write_count_line(out, Some(file), match_count, multi_file)?;
-    }
-    Ok(matched_any)
-}
-
-fn write_filtered_lines_multi<W: Write>(
-    out: &mut W,
-    file: &str,
-    data: &[u8],
-    patterns: &[FgrepPattern],
-    multi_file: bool,
-    options: FgrepOptions,
-) -> io::Result<bool> {
-    let mut matched_any = false;
-    let mut match_count = 0_u64;
-    let mut line_start = 0usize;
-    let mut line_no = 1_u64;
-    while line_start < data.len() {
-        let rel_end = data[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map(|pos| pos + 1)
-            .unwrap_or(data.len() - line_start);
-        let line_end = line_start + rel_end;
-        let line = &data[line_start..line_end];
-        if fgrep_select_line(fgrep_line_matches_any(line, patterns, options), options) {
-            matched_any = true;
-            match_count += 1;
-            if !options.count_only {
-                write_matching_line(out, Some(file), line, line_no, multi_file, options)?;
-            }
-        }
-        line_start = line_end;
-        line_no += 1;
-    }
-    if options.count_only {
-        write_count_line(out, Some(file), match_count, multi_file)?;
-    }
-    Ok(matched_any)
-}
-
 fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
     let mut io_mode = IOMode::Auto;
     let mut options = FgrepOptions {
         count_only: false,
+        quiet: false,
+        files_with_matches: false,
+        files_without_match: false,
+        color: false,
+        only_matching: false,
+        suppress_messages: false,
+        initial_tab: false,
+        line_buffered: false,
+        before_context: 0,
+        after_context: 0,
+        offset_width: 0,
         print_line_numbers: false,
+        print_byte_offsets: false,
         line_regexp: false,
+        word_regexp: false,
         ignore_case: false,
         invert_match: false,
+        max_count: None,
+        null_terminate_filenames: false,
+        null_data: false,
         report_gbps: false,
+        group_separator: FgrepGroupSeparatorPolicy::Default,
+        binary_mode: FgrepBinaryMode::Default,
+        filename_mode: FgrepFilenameMode::Auto,
+        device_policy: FgrepDevicePolicy::Read,
+        directory_policy: FgrepDirectoryPolicy::Read,
     };
+    let mut color_mode = FgrepColorMode::Auto;
     let mut pattern_sources = Vec::new();
     let mut positional_pattern = None::<String>;
     let mut files = Vec::new();
+    let mut stdin_label = None::<String>;
     let mut end_flags = false;
     let mut index = 1usize;
     while index < args.len() {
@@ -648,67 +353,203 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
             continue;
         }
         match arg.as_str() {
-            "-c" => options.count_only = true,
-            "--count" => options.count_only = true,
-            "-n" => options.print_line_numbers = true,
-            "--line-number" => options.print_line_numbers = true,
-            "-x" => options.line_regexp = true,
-            "--line-regexp" => options.line_regexp = true,
-            "-i" => options.ignore_case = true,
-            "--ignore-case" => options.ignore_case = true,
+            "-c" | "--count" => options.count_only = true,
+            "-n" | "--line-number" => options.print_line_numbers = true,
+            "-x" | "--line-regexp" => options.line_regexp = true,
+            "-w" | "--word-regexp" => options.word_regexp = true,
+            "-i" | "--ignore-case" => options.ignore_case = true,
             "--no-ignore-case" => options.ignore_case = false,
-            "-v" => options.invert_match = true,
-            "--invert-match" => options.invert_match = true,
+            "-v" | "--invert-match" => options.invert_match = true,
+            "-q" | "--quiet" | "--silent" => options.quiet = true,
+            "--color" | "--colour" => color_mode = FgrepColorMode::Auto,
+            "-o" | "--only-matching" => options.only_matching = true,
+            "-l" | "--files-with-matches" => options.files_with_matches = true,
+            "-L" | "--files-without-match" => options.files_without_match = true,
+            "-H" | "--with-filename" => options.filename_mode = FgrepFilenameMode::Always,
+            "-h" | "--no-filename" => options.filename_mode = FgrepFilenameMode::Never,
+            "-b" | "--byte-offset" => options.print_byte_offsets = true,
+            "-Z" | "--null" => options.null_terminate_filenames = true,
+            "-z" | "--null-data" => options.null_data = true,
+            "-T" | "--initial-tab" => options.initial_tab = true,
+            "--line-buffered" => options.line_buffered = true,
+            "-s" | "--no-messages" => options.suppress_messages = true,
+            "--group-separator" => {
+                let separator: &'static str = Box::leak(
+                    parse_option_value(args, &mut index, None, "--group-separator")?
+                        .into_boxed_str(),
+                );
+                options.group_separator = FgrepGroupSeparatorPolicy::Custom(separator);
+            }
+            "--no-group-separator" => options.group_separator = FgrepGroupSeparatorPolicy::Disabled,
+            "-a" | "--text" | "--binary-files=text" => {
+                options.binary_mode = FgrepBinaryMode::Text;
+            }
+            "-I" | "--binary-files=without-match" => {
+                options.binary_mode = FgrepBinaryMode::WithoutMatch;
+            }
+            "-U" | "--binary" | "--binary-files=binary" => {
+                options.binary_mode = FgrepBinaryMode::Binary;
+            }
             "--report-gbps" => options.report_gbps = true,
-            "-e" => pattern_sources.push(PatternSource::Inline(parse_option_value(
-                args, &mut index, None, "-e",
-            )?)),
-            "--regexp" => pattern_sources.push(PatternSource::Inline(parse_option_value(
-                args, &mut index, None, "--regexp",
-            )?)),
-            "-f" => pattern_sources.push(PatternSource::File(parse_option_value(
-                args, &mut index, None, "-f",
-            )?)),
-            "--file" => pattern_sources.push(PatternSource::File(parse_option_value(
-                args, &mut index, None, "--file",
-            )?)),
-            "--fixed-strings" => {}
+            "-F" | "--fixed-strings" => {}
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "--" => end_flags = true,
+            "-e" => pattern_sources
+                .push(PatternSource::Inline(parse_option_value(args, &mut index, None, "-e")?)),
+            "--regexp" => pattern_sources.push(PatternSource::Inline(parse_option_value(
+                args, &mut index, None, "--regexp",
+            )?)),
+            "-f" => pattern_sources
+                .push(PatternSource::File(parse_option_value(args, &mut index, None, "-f")?)),
+            "--file" => pattern_sources.push(PatternSource::File(parse_option_value(
+                args, &mut index, None, "--file",
+            )?)),
+            "-m" => {
+                options.max_count =
+                    Some(parse_max_count_value(&parse_option_value(args, &mut index, None, "-m")?)?)
+            }
+            "--max-count" => {
+                options.max_count = Some(parse_max_count_value(&parse_option_value(
+                    args, &mut index, None, "--max-count",
+                )?)?)
+            }
+            "-A" => {
+                options.after_context = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "-A",
+                )?)?
+            }
+            "--after-context" => {
+                options.after_context = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "--after-context",
+                )?)?
+            }
+            "-B" => {
+                options.before_context = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "-B",
+                )?)?
+            }
+            "--before-context" => {
+                options.before_context = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "--before-context",
+                )?)?
+            }
+            "-C" => {
+                let n = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "-C",
+                )?)?;
+                options.before_context = n;
+                options.after_context = n;
+            }
+            "--context" => {
+                let n = parse_context_count_value(&parse_option_value(
+                    args, &mut index, None, "--context",
+                )?)?;
+                options.before_context = n;
+                options.after_context = n;
+            }
+            "-D" => {
+                options.device_policy = parse_devices_value(&parse_option_value(
+                    args, &mut index, None, "-D",
+                )?)?
+            }
+            "--devices" => {
+                options.device_policy = parse_devices_value(&parse_option_value(
+                    args, &mut index, None, "--devices",
+                )?)?
+            }
+            "-d" => {
+                options.directory_policy = parse_directories_value(&parse_option_value(
+                    args, &mut index, None, "-d",
+                )?)?
+            }
+            "--directories" => {
+                options.directory_policy = parse_directories_value(&parse_option_value(
+                    args, &mut index, None, "--directories",
+                )?)?
+            }
+            "--label" => {
+                stdin_label = Some(parse_option_value(args, &mut index, None, "--label")?)
+            }
             other => {
-                if let Some(value) = other.strip_prefix("--regexp=") {
-                    pattern_sources.push(PatternSource::Inline(value.to_string()));
-                    index += 1;
-                    continue;
-                }
-                if let Some(value) = other.strip_prefix("--file=") {
-                    pattern_sources.push(PatternSource::File(value.to_string()));
-                    index += 1;
-                    continue;
-                }
-                if let Some(value) = other.strip_prefix("-e") {
-                    if !value.is_empty() {
-                        pattern_sources.push(PatternSource::Inline(value.to_string()));
-                        index += 1;
-                        continue;
+                if let Some(v) = other.strip_prefix("--regexp=") {
+                    pattern_sources.push(PatternSource::Inline(v.to_string()));
+                } else if let Some(v) = other.strip_prefix("--file=") {
+                    pattern_sources.push(PatternSource::File(v.to_string()));
+                } else if let Some(v) = other.strip_prefix("--max-count=") {
+                    options.max_count = Some(parse_max_count_value(v)?);
+                } else if let Some(v) = other.strip_prefix("--after-context=") {
+                    options.after_context = parse_context_count_value(v)?;
+                } else if let Some(v) = other.strip_prefix("--before-context=") {
+                    options.before_context = parse_context_count_value(v)?;
+                } else if let Some(v) = other.strip_prefix("--context=") {
+                    let n = parse_context_count_value(v)?;
+                    options.before_context = n;
+                    options.after_context = n;
+                } else if let Some(v) = other.strip_prefix("--devices=") {
+                    options.device_policy = parse_devices_value(v)?;
+                } else if let Some(v) = other.strip_prefix("--directories=") {
+                    options.directory_policy = parse_directories_value(v)?;
+                } else if let Some(v) = other.strip_prefix("--label=") {
+                    stdin_label = Some(v.to_string());
+                } else if let Some(v) = other.strip_prefix("--binary-files=") {
+                    options.binary_mode = parse_binary_files_value(v)?;
+                } else if let Some(v) = other.strip_prefix("--color=") {
+                    color_mode = parse_color_mode_value(Some(v), "--color")?;
+                } else if let Some(v) = other.strip_prefix("--colour=") {
+                    color_mode = parse_color_mode_value(Some(v), "--colour")?;
+                } else if let Some(v) = other.strip_prefix("--group-separator=") {
+                    let separator: &'static str = Box::leak(v.to_string().into_boxed_str());
+                    options.group_separator = FgrepGroupSeparatorPolicy::Custom(separator);
+                } else if let Some(v) = other.strip_prefix("-e") {
+                    if !v.is_empty() {
+                        pattern_sources.push(PatternSource::Inline(v.to_string()));
                     }
-                }
-                if let Some(value) = other.strip_prefix("-f") {
-                    if !value.is_empty() {
-                        pattern_sources.push(PatternSource::File(value.to_string()));
-                        index += 1;
-                        continue;
+                } else if let Some(v) = other.strip_prefix("-f") {
+                    if !v.is_empty() {
+                        pattern_sources.push(PatternSource::File(v.to_string()));
                     }
-                }
-                if let [b'-', flag] = other.as_bytes() {
-                    if fgrep_short_flag_effect(*flag).is_some() {
-                        index += 1;
-                        continue;
+                } else if let Some(v) = other.strip_prefix("-m") {
+                    if !v.is_empty() {
+                        options.max_count = Some(parse_max_count_value(v)?);
                     }
-                }
-                if positional_pattern.is_none() && pattern_sources.is_empty() {
+                } else if let Some(v) = other.strip_prefix("-A") {
+                    if !v.is_empty() {
+                        options.after_context = parse_context_count_value(v)?;
+                    }
+                } else if let Some(v) = other.strip_prefix("-B") {
+                    if !v.is_empty() {
+                        options.before_context = parse_context_count_value(v)?;
+                    }
+                } else if let Some(v) = other.strip_prefix("-C") {
+                    if !v.is_empty() {
+                        let n = parse_context_count_value(v)?;
+                        options.before_context = n;
+                        options.after_context = n;
+                    }
+                } else if let Some(v) = other.strip_prefix("-D") {
+                    if !v.is_empty() {
+                        options.device_policy = parse_devices_value(v)?;
+                    }
+                } else if let Some(v) = other.strip_prefix("-d") {
+                    if !v.is_empty() {
+                        options.directory_policy = parse_directories_value(v)?;
+                    }
+                } else if other.len() > 1
+                    && other.starts_with('-')
+                    && other[1..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    let n = parse_context_count_value(&other[1..])?;
+                    options.before_context = n;
+                    options.after_context = n;
+                } else if let [b'-', flag] = other.as_bytes() {
+                    if fgrep_short_flag_effect(*flag).is_none()
+                        && (positional_pattern.is_none() && pattern_sources.is_empty())
+                    {
+                        positional_pattern = Some(other.to_string());
+                    }
+                } else if positional_pattern.is_none() && pattern_sources.is_empty() {
                     positional_pattern = Some(other.to_string());
                 } else {
                     files.push(other.to_string());
@@ -726,11 +567,17 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
             "fgrep requires a search pattern",
         ));
     }
+    options.color = match color_mode {
+        FgrepColorMode::Always => true,
+        FgrepColorMode::Never => false,
+        FgrepColorMode::Auto => fgrep_stdout_is_tty(),
+    };
     Ok(ParsedFgrepArgs {
         io_mode,
         options,
         pattern_sources,
         files,
+        stdin_label,
     })
 }
 
@@ -740,188 +587,305 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
         options,
         pattern_sources,
         files,
+        stdin_label,
     } = parse_fgrep_args(args)?;
     let patterns = compile_patterns(pattern_sources, options.ignore_case)?;
-    let regular_file_path = fgrep_regular_file_path(options, patterns.len());
-    let inputs = parse_stream_inputs(files);
     if patterns.is_empty() {
-        for input in &inputs {
-            if let StreamInput::File(file) = input {
-                let _ = is_regular_input_path(file)?;
-            }
-        }
         return Ok(1);
     }
     let pattern = &patterns[0];
+    let regular_file_path = fgrep_regular_file_path(options, patterns.len());
+    let inputs = parse_stream_inputs(files);
+    let multi_file = match options.filename_mode {
+        FgrepFilenameMode::Always => true,
+        FgrepFilenameMode::Never => false,
+        FgrepFilenameMode::Auto => inputs.len() > 1,
+    };
     let mut out = stdout_buf_writer()?;
     let mut matched_any = false;
+    let mut saw_error = false;
     let started_at = std::time::Instant::now();
     let mut total_bytes = 0_u64;
-    let multi_file = inputs.len() > 1;
     let mut config = None;
-    for input in inputs {
-        match &input {
-            StreamInput::File(file) if is_regular_input_path(file)? => match regular_file_path {
-                FgrepRegularFilePath::LiteralSearchOffsets => {
-                    if options.count_only {
-                        if let Some(data) = try_load_small_regular_file_bytes(file, io_mode)? {
-                            total_bytes += data.len() as u64;
-                            matched_any |= write_count_literal_matching_lines(
+    fgrep_reset_context_output_state();
+    for input in &inputs {
+        match input {
+            StreamInput::File(file) => {
+                let kind = match fgrep_input_path_kind(file) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        fgrep_report_input_error(file, &e, options);
+                        saw_error = true;
+                        continue;
+                    }
+                };
+                match kind {
+                    FgrepInputPathKind::Directory => match options.directory_policy {
+                        FgrepDirectoryPolicy::Skip => continue,
+                        FgrepDirectoryPolicy::Read => {
+                            let e = io::Error::new(io::ErrorKind::Other, "Is a directory");
+                            fgrep_report_input_error(file, &e, options);
+                            saw_error = true;
+                            if options.max_count == Some(0) {
+                                continue;
+                            }
+                            let matched = handle_loaded_match_result(
                                 &mut out,
-                                file,
-                                data.as_slice(),
-                                pattern.raw.as_slice(),
+                                Some(file.as_str()),
+                                &[],
+                                pattern,
+                                &patterns,
+                                regular_file_path,
+                                None,
                                 multi_file,
                                 options,
                             )?;
-                            continue;
-                        }
-                        let data = load_file_bytes(file, io_mode, "read_to_memory")?;
-                        total_bytes += data.data.len() as u64;
-                        matched_any |= write_count_literal_matching_lines(
-                            &mut out,
-                            file,
-                            data.data.as_slice(),
-                            pattern.raw.as_slice(),
-                            multi_file,
-                            options,
-                        )?;
-                        continue;
-                    }
-                    if let Some(data) = try_load_small_regular_file_bytes(file, io_mode)? {
-                        total_bytes += data.len() as u64;
-                        matched_any |= write_filtered_lines(
-                            &mut out,
-                            file,
-                            data.as_slice(),
-                            pattern.raw.as_slice(),
-                            pattern.normalized.as_slice(),
-                            multi_file,
-                            options,
-                        )?;
-                        continue;
-                    }
-                    let config = config.get_or_insert_with(|| load_config(None));
-                    total_bytes += fs::metadata(file)?.len();
-                    let (matches, _) = grep_match_offsets_for_mode(
-                        config,
-                        "grep",
-                        file,
-                        internal_io_mode(io_mode),
-                        pattern.raw.as_slice(),
-                    )?;
-                    if matches.is_empty() {
-                        if !options.invert_match {
-                            if options.count_only {
-                                write_count_line(&mut out, Some(file), 0, multi_file)?;
+                            if matched {
+                                matched_any = true;
+                            }
+                            if options.files_with_matches && matched {
+                                write_filename_result(&mut out, Some(file.as_str()), options)?;
+                            } else if options.files_without_match && !matched {
+                                write_filename_result(&mut out, Some(file.as_str()), options)?;
                             }
                             continue;
                         }
+                    },
+                    FgrepInputPathKind::Device | FgrepInputPathKind::Other => {
+                        match options.device_policy {
+                            FgrepDevicePolicy::Skip => continue,
+                            FgrepDevicePolicy::Read => {
+                                if options.max_count == Some(0) {
+                                    continue;
+                                }
+                                let result = if patterns.len() == 1 {
+                                    write_matching_stream_lines(
+                                        &mut out,
+                                        Some(file.as_str()),
+                                        input,
+                                        io_mode,
+                                        pattern.raw.as_slice(),
+                                        pattern.normalized.as_slice(),
+                                        multi_file,
+                                        options,
+                                    )
+                                } else {
+                                    write_matching_stream_lines_multi(
+                                        &mut out,
+                                        Some(file.as_str()),
+                                        input,
+                                        io_mode,
+                                        &patterns,
+                                        multi_file,
+                                        options,
+                                    )
+                                };
+                                match result {
+                                    Ok((matched, bytes)) => {
+                                        total_bytes += bytes;
+                                        if matched {
+                                            matched_any = true;
+                                        }
+                                        if options.files_with_matches && matched {
+                                            write_filename_result(
+                                                &mut out,
+                                                Some(file.as_str()),
+                                                options,
+                                            )?;
+                                        } else if options.files_without_match && !matched {
+                                            write_filename_result(
+                                                &mut out,
+                                                Some(file.as_str()),
+                                                options,
+                                            )?;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        fgrep_report_input_error(file, &e, options);
+                                        saw_error = true;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                     }
-                    let data = load_file_to_memory_for_mode(
-                        config,
-                        "read_to_memory",
-                        file,
-                        internal_io_mode(io_mode),
-                    )?;
-                    matched_any |= write_matching_lines(
-                        &mut out,
-                        file,
-                        data.data.as_slice(),
-                        &matches,
-                        multi_file,
-                        options,
-                    )?;
+                    FgrepInputPathKind::Regular => {
+                        if options.max_count == Some(0) {
+                            continue;
+                        }
+                        let matched = 'regular: {
+                            let small_data = match try_load_small_regular_file_bytes(file, io_mode)
+                            {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    fgrep_report_input_error(file, &e, options);
+                                    saw_error = true;
+                                    break 'regular false;
+                                }
+                            };
+                            if let Some(data) = small_data {
+                                total_bytes += data.len() as u64;
+                                handle_loaded_match_result(
+                                    &mut out,
+                                    Some(file.as_str()),
+                                    data.as_slice(),
+                                    pattern,
+                                    &patterns,
+                                    regular_file_path,
+                                    None,
+                                    multi_file,
+                                    options,
+                                )?
+                            } else if matches!(
+                                regular_file_path,
+                                FgrepRegularFilePath::LiteralSearchOffsets
+                            ) && !fgrep_context_enabled(options)
+                            {
+                                let cfg = config.get_or_insert_with(|| load_config(None));
+                                let file_len = match fs::metadata(file) {
+                                    Ok(metadata) => metadata.len(),
+                                    Err(e) => {
+                                        fgrep_report_input_error(file, &e, options);
+                                        saw_error = true;
+                                        break 'regular false;
+                                    }
+                                };
+                                total_bytes += file_len;
+                                let (matches, _) = match grep_match_offsets_for_mode(
+                                    cfg,
+                                    "grep",
+                                    file,
+                                    internal_io_mode(io_mode),
+                                    pattern.raw.as_slice(),
+                                ) {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        fgrep_report_input_error(file, &e, options);
+                                        saw_error = true;
+                                        break 'regular false;
+                                    }
+                                };
+                                if matches.is_empty() && !options.invert_match {
+                                    if options.count_only {
+                                        write_count_line(
+                                            &mut out,
+                                            Some(file.as_str()),
+                                            0,
+                                            options,
+                                            multi_file,
+                                        )?;
+                                    }
+                                    break 'regular false;
+                                }
+                                let data = match load_file_to_memory_for_mode(
+                                    cfg,
+                                    "read_to_memory",
+                                    file,
+                                    internal_io_mode(io_mode),
+                                ) {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        fgrep_report_input_error(file, &e, options);
+                                        saw_error = true;
+                                        break 'regular false;
+                                    }
+                                };
+                                handle_loaded_match_result(
+                                    &mut out,
+                                    Some(file.as_str()),
+                                    data.data.as_slice(),
+                                    pattern,
+                                    &patterns,
+                                    regular_file_path,
+                                    Some(&matches),
+                                    multi_file,
+                                    options,
+                                )?
+                            } else {
+                                let data = match load_file_bytes(file, io_mode, "read_to_memory") {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        fgrep_report_input_error(file, &e, options);
+                                        saw_error = true;
+                                        break 'regular false;
+                                    }
+                                };
+                                total_bytes += data.data.len() as u64;
+                                handle_loaded_match_result(
+                                    &mut out,
+                                    Some(file.as_str()),
+                                    data.data.as_slice(),
+                                    pattern,
+                                    &patterns,
+                                    regular_file_path,
+                                    None,
+                                    multi_file,
+                                    options,
+                                )?
+                            }
+                        };
+                        if matched {
+                            matched_any = true;
+                        }
+                        if options.files_with_matches && matched {
+                            write_filename_result(&mut out, Some(file.as_str()), options)?;
+                        } else if options.files_without_match && !matched {
+                            write_filename_result(&mut out, Some(file.as_str()), options)?;
+                        }
+                        continue;
+                    }
                 }
-                FgrepRegularFilePath::LineFilterSinglePattern => {
-                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
-                    total_bytes += data.data.len() as u64;
-                    matched_any |= if options.line_regexp {
-                        write_line_regexp_matches(
-                            &mut out,
-                            file,
-                            data.data.as_slice(),
-                            pattern.raw.as_slice(),
-                            pattern.normalized.as_slice(),
-                            multi_file,
-                            options,
-                        )?
-                    } else {
-                        write_filtered_lines(
-                            &mut out,
-                            file,
-                            data.data.as_slice(),
-                            pattern.raw.as_slice(),
-                            pattern.normalized.as_slice(),
-                            multi_file,
-                            options,
-                        )?
-                    };
-                }
-                FgrepRegularFilePath::LineFilterMultiPattern => {
-                    let data = load_file_bytes(file, io_mode, "read_to_memory")?;
-                    total_bytes += data.data.len() as u64;
-                    matched_any |= write_filtered_lines_multi(
-                        &mut out,
-                        file,
-                        data.data.as_slice(),
-                        &patterns,
-                        multi_file,
-                        options,
-                    )?;
-                }
-            },
-            StreamInput::File(file) => {
-                let (matched, bytes) = if patterns.len() == 1 {
-                    write_matching_stream_lines(
-                        &mut out,
-                        Some(file),
-                        &input,
-                        io_mode,
-                        pattern.raw.as_slice(),
-                        pattern.normalized.as_slice(),
-                        multi_file,
-                        options,
-                    )?
-                } else {
-                    write_matching_stream_lines_multi(
-                        &mut out,
-                        Some(file),
-                        &input,
-                        io_mode,
-                        &patterns,
-                        multi_file,
-                        options,
-                    )?
-                };
-                total_bytes += bytes;
-                matched_any |= matched;
             }
             StreamInput::Stdin { label } => {
-                let (matched, bytes) = if patterns.len() == 1 {
+                let effective = stdin_label.as_deref().or(label.as_deref());
+                if options.max_count == Some(0) {
+                    continue;
+                }
+                let mut stream_options = options;
+                if stream_options.initial_tab
+                    && (multi_file || matches!(stream_options.filename_mode, FgrepFilenameMode::Always))
+                {
+                    stream_options.offset_width = 20;
+                }
+                let result = if patterns.len() == 1 {
                     write_matching_stream_lines(
                         &mut out,
-                        label.as_deref(),
-                        &input,
+                        effective,
+                        input,
                         io_mode,
                         pattern.raw.as_slice(),
                         pattern.normalized.as_slice(),
                         multi_file,
-                        options,
-                    )?
+                        stream_options,
+                    )
                 } else {
                     write_matching_stream_lines_multi(
                         &mut out,
-                        label.as_deref(),
-                        &input,
+                        effective,
+                        input,
                         io_mode,
                         &patterns,
                         multi_file,
-                        options,
-                    )?
+                        stream_options,
+                    )
                 };
-                total_bytes += bytes;
-                matched_any |= matched;
+                match result {
+                    Ok((matched, bytes)) => {
+                        total_bytes += bytes;
+                        if matched {
+                            matched_any = true;
+                        }
+                        if options.files_with_matches && matched {
+                            write_filename_result(&mut out, effective, stream_options)?;
+                        } else if options.files_without_match && !matched {
+                            write_filename_result(&mut out, effective, stream_options)?;
+                        }
+                    }
+                    Err(e) => {
+                        fgrep_report_input_error(fgrep_display_label(effective), &e, options);
+                        saw_error = true;
+                    }
+                }
             }
         }
     }
@@ -929,7 +893,7 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     if options.report_gbps {
         report_gbps("fgrep", total_bytes, started_at);
     }
-    Ok(if matched_any { 0 } else { 1 })
+    Ok(fgrep_exit_code(matched_any, saw_error, options))
 }
 
 #[cfg(kani)]
@@ -938,3 +902,7 @@ mod kani_proofs;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "fgrep/tests_null_data.rs"]
+mod tests_null_data;

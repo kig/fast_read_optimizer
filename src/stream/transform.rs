@@ -1,7 +1,6 @@
 use super::allocate_pipe_output_buffer;
 use super::ParallelStream;
 use crate::config::load_config;
-use libc::fcntl;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -315,9 +314,7 @@ fn is_stdout_dev_null() -> io::Result<bool> {
 }
 
 pub fn grow_pipe_capacity_best_effort(pipe_fd: i32, new_size: usize) {
-    unsafe {
-        let _ = fro::os::try_set_pipe_size(pipe_fd, new_size.try_into().unwrap_or_default());
-    }
+    let _ = fro::os::try_set_pipe_size(pipe_fd, new_size.try_into().unwrap_or_default());
 }
 
 pub fn run_reader_transform_to_file<R, F>(
@@ -427,12 +424,8 @@ pub fn run_reader_transform_to_pipe<R: Read>(
     output_policy: PipeOutputPolicy,
     processor: fn(&[u8], &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
-    use std::os::unix::io::RawFd;
-
     // Use portable fro::os::vmsplice_all for portability.
     // This avoids direct libc::vmsplice calls on non-Linux platforms.
-    
-
 
     let _ = output_policy;
     grow_pipe_capacity_best_effort(dest.as_raw_fd(), geometry.write_block_size);
@@ -461,7 +454,7 @@ pub fn run_reader_transform_to_pipe<R: Read>(
                 let mut written = 0usize;
                 while written < len {
                     // Portability: use fro::os::vmsplice_all to avoid direct libc::vmsplice on non-Linux.
-written += fro::os::vmsplice_all(pipe_fd, &buf[written..len])?;
+                    written += fro::os::vmsplice_all(pipe_fd, &buf[written..len])?;
                 }
                 writer_pool_tx
                     .send(allocate_pipe_output_buffer(geometry.write_block_size))

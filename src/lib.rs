@@ -16,10 +16,10 @@ mod verified_copy;
 
 pub mod block_hash;
 pub mod config;
+pub mod os;
 pub mod reader;
 pub mod stream;
 pub mod writer;
-pub mod os;
 
 pub use api::{
     benchmark_page_cache_lift, copy_fd_range_to_fd_with_progress, copy_file,

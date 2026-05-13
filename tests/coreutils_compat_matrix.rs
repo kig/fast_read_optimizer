@@ -355,8 +355,24 @@ mod cmp_fgrep;
 mod cp_shred;
 #[path = "coreutils_compat_matrix/du.rs"]
 mod du;
+#[path = "coreutils_compat_matrix/fgrep_flags.rs"]
+mod fgrep_flags;
+#[path = "coreutils_compat_matrix/fgrep_null_data.rs"]
+mod fgrep_null_data;
+#[path = "coreutils_compat_matrix/fgrep_context.rs"]
+mod fgrep_context;
+#[path = "coreutils_compat_matrix/fgrep_color.rs"]
+mod fgrep_color;
+#[path = "coreutils_compat_matrix/fgrep_only_matching.rs"]
+mod fgrep_only_matching;
+#[path = "coreutils_compat_matrix/fgrep_word_regexp.rs"]
+mod fgrep_word_regexp;
 #[path = "coreutils_compat_matrix/fifo.rs"]
 mod fifo;
+#[path = "coreutils_compat_matrix/find_flags.rs"]
+mod find_flags;
+#[path = "coreutils_compat_matrix/flag_parity.rs"]
+mod flag_parity;
 #[path = "coreutils_compat_matrix/hash.rs"]
 mod hash;
 #[path = "coreutils_compat_matrix/rm_mv.rs"]
@@ -367,5 +383,3 @@ mod stream_coreutils;
 mod tar;
 #[path = "coreutils_compat_matrix/wc.rs"]
 mod wc;
-#[path = "coreutils_compat_matrix/flag_parity.rs"]
-mod flag_parity;

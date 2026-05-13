@@ -274,3 +274,22 @@ fn cmp_argv0_short_version_uses_alias_name() {
         "cmp -v should not use argv0 path:\n{stdout}"
     );
 }
+
+#[test]
+fn fgrep_argv0_short_version_uses_alias_name() {
+    let output = run_alias("fgrep", &["-V"]);
+    assert_success(&output, "fgrep", "-V");
+    let stdout = String::from_utf8(output.stdout).expect("version output should be UTF-8");
+    assert!(
+        stdout.starts_with("fgrep "),
+        "fgrep -V should start with the alias name:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "fgrep -V should include the package version:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("bin/fgrep"),
+        "fgrep -V should not use argv0 path:\n{stdout}"
+    );
+}

@@ -66,7 +66,14 @@ pub(super) fn open_relative_target_for_copy(
         )
     })?;
     let create_flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c_rel.as_ptr(), create_flags, mode as libc::c_uint) };
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_rel.as_ptr(),
+            create_flags,
+            mode as libc::c_uint,
+        )
+    };
     if fd >= 0 {
         return Ok((unsafe { fs::File::from_raw_fd(fd) }, true));
     }

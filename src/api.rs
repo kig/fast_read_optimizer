@@ -152,7 +152,9 @@ where
                     continue;
                 }
                 match err.raw_os_error() {
-                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Ok(None)
+                    }
                     _ => return Err(err),
                 }
             }

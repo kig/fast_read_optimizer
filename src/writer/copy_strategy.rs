@@ -72,12 +72,15 @@ pub fn copy_file_range_with_strategy_and_progress(
     {
         if source_offset == 0 && dest_offset == 0 && truncate_target {
             if let Ok(src_meta) = std::fs::metadata(source) {
-                let effective_copy_size = copy_size.min(src_meta.len().saturating_sub(source_offset));
+                let effective_copy_size =
+                    copy_size.min(src_meta.len().saturating_sub(source_offset));
                 if effective_copy_size == src_meta.len() {
-                    fro::os::copy_path(source, filename)
-                        .map_err(|e| std::io::Error::new(e.kind(), format!("macOS fast copy failed: {}", e)))?;
+                    fro::os::copy_path(source, filename).map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("macOS fast copy failed: {}", e))
+                    })?;
                     if let Some(progress) = progress_count.as_ref() {
-                        progress.fetch_add(effective_copy_size, std::sync::atomic::Ordering::SeqCst);
+                        progress
+                            .fetch_add(effective_copy_size, std::sync::atomic::Ordering::SeqCst);
                     }
                     return Ok(effective_copy_size);
                 }

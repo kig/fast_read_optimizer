@@ -62,7 +62,8 @@ fn main() {
 fn build_runner_rust(fro_path: &Path, output_name: &str, out_dir: &Path, coreutils_dir: &Path) {
     use std::process::Command;
     // Create a tiny Rust wrapper that execs the fro multicall path with argv[0] set to output_name
-    let src = format!(r###"
+    let src = format!(
+        r###"
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
@@ -90,21 +91,33 @@ fn main() {{
         exit(1);
     }}
 }}
-"###, fro_path.display(), output_name);
+"###,
+        fro_path.display(),
+        output_name
+    );
 
     let src_path = out_dir.join(format!("runner_{}.rs", output_name));
     std::fs::write(&src_path, src).expect("write runner source");
     let out_path = coreutils_dir.join(output_name);
     let status = Command::new("rustc")
         .arg(src_path)
-        .arg("-C").arg("opt-level=s")
-        .arg("-C").arg("codegen-units=1")
-        .arg("-C").arg("panic=abort")
-        .arg("-C").arg("link-arg=-s")
-        .arg("-o").arg(out_path)
+        .arg("-C")
+        .arg("opt-level=s")
+        .arg("-C")
+        .arg("codegen-units=1")
+        .arg("-C")
+        .arg("panic=abort")
+        .arg("-C")
+        .arg("link-arg=-s")
+        .arg("-o")
+        .arg(out_path)
         .status()
         .expect("failed to spawn rustc to build runner");
-    assert!(status.success(), "failed to build rust runner {}", output_name);
+    assert!(
+        status.success(),
+        "failed to build rust runner {}",
+        output_name
+    );
 }
 
 fn profile_dir_from_out_dir(out_dir: &Path) -> PathBuf {

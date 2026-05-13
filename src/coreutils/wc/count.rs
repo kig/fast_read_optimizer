@@ -47,8 +47,8 @@ fn get_regular_file_path<R: AsRawFd>(reader: &mut R) -> Option<String> {
 }
 
 const WC_STREAM_BLOCK_SIZE: usize = 2 << 20;
-use libc::madvise;
 use fro::os::MADV_HUGEPAGE;
+use libc::madvise;
 
 fn get_aligned_wc_block() -> Vec<u8> {
     let huge_page_size = 2 * 1024 * 1024;

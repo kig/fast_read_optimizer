@@ -1,10 +1,11 @@
 //! OS compatibility helpers: provide fallbacks or mappings for Linux-only syscalls and constants
 //! so the crate can compile and run on macOS with reasonable fallbacks.
 
-use std::io;
-use std::os::unix::io::{RawFd, AsRawFd};
-use std::fs::OpenOptions;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
+use std::fs::OpenOptions;
+use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 #[cfg(target_os = "linux")]
 pub const O_DIRECT: i32 = libc::O_DIRECT;
@@ -149,7 +150,13 @@ pub fn reflink_paths(src: &str, dst: &str) -> io::Result<()> {
     {
         let src_f = OpenOptions::new().read(true).open(src)?;
         let dst_f = OpenOptions::new().read(true).write(true).open(dst)?;
-        let rc = unsafe { libc::ioctl(dst_f.as_raw_fd(), FICLONE as libc::c_ulong, src_f.as_raw_fd()) };
+        let rc = unsafe {
+            libc::ioctl(
+                dst_f.as_raw_fd(),
+                FICLONE as libc::c_ulong,
+                src_f.as_raw_fd(),
+            )
+        };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -157,8 +164,11 @@ pub fn reflink_paths(src: &str, dst: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let csrc = CString::new(src).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
-        let cdst = CString::new(dst).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
+        let csrc = CString::new(src)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let cdst = CString::new(dst).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
         let rc = unsafe { libc::clonefile(csrc.as_ptr(), cdst.as_ptr(), 0) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -172,6 +182,7 @@ pub fn reflink_paths(src: &str, dst: &str) -> io::Result<()> {
 }
 
 // Provide a loff_t alias for code that expects it.
+#[allow(non_camel_case_types)]
 pub type loff_t = libc::off_t;
 
 /// Copy file path using platform-optimized primitives on macOS (copyfile),
@@ -181,8 +192,9 @@ pub fn copy_path(src: &str, dst: &str) -> io::Result<()> {
     {
         let csrc = CString::new(src)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
-        let cdst = CString::new(dst)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL"))?;
+        let cdst = CString::new(dst).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
         // Use copyfile(3) for potentially optimized kernel/userpath copy on macOS.
         let rc = unsafe { libc::copyfile(csrc.as_ptr(), cdst.as_ptr(), std::ptr::null_mut(), 0) };
         if rc != 0 {
@@ -219,7 +231,6 @@ pub fn set_fd_nocache(fd: RawFd, enable: bool) -> io::Result<()> {
         Ok(())
     }
 }
-
 
 // Grow pipe best-effort: attempt to set pipe size when supported (Linux), otherwise no-op.
 pub fn grow_pipe_best_effort(fd: RawFd) -> io::Result<()> {
@@ -322,12 +333,17 @@ pub fn vmsplice_all(pipe_fd: RawFd, buf: &[u8]) -> io::Result<usize> {
         Ok(written_total)
     }
 }
-pub fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: &mut libc::off_t, count: usize) -> io::Result<isize> {
-// --- vmsplice_all portable implementation appended below ---
+pub fn sendfile(
+    out_fd: RawFd,
+    in_fd: RawFd,
+    offset: &mut libc::off_t,
+    count: usize,
+) -> io::Result<isize> {
+    // --- vmsplice_all portable implementation appended below ---
 
-/// Portable vmsplice_all: on Linux uses vmsplice, on other platforms falls back to write.
+    // Portable sendfile wrapper used by higher-level copy helpers.
 
-// --- end vmsplice_all portable implementation ---
+    // --- end vmsplice_all portable implementation ---
 
     #[cfg(target_os = "linux")]
     unsafe {
@@ -379,7 +395,7 @@ pub fn sendfile(out_fd: RawFd, in_fd: RawFd, offset: &mut libc::off_t, count: us
             remaining = remaining.saturating_sub(nread as usize);
             total_copied += nread as isize;
         }
-            Ok(total_copied)
+        Ok(total_copied)
     }
 }
 
@@ -422,7 +438,14 @@ pub fn splice(
 ) -> io::Result<isize> {
     #[cfg(target_os = "linux")]
     unsafe {
-        let ret = libc::splice(fd_in, off_in as *mut libc::off_t, fd_out, off_out as *mut libc::off_t, len as libc::size_t, flags as libc::c_uint);
+        let ret = libc::splice(
+            fd_in,
+            off_in as *mut libc::off_t,
+            fd_out,
+            off_out as *mut libc::off_t,
+            len as libc::size_t,
+            flags as libc::c_uint,
+        );
         if ret < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -435,4 +458,3 @@ pub fn splice(
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 }
-

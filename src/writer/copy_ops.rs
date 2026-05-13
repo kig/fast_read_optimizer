@@ -82,14 +82,12 @@ pub(super) fn prepare_copy_destination(
             if current_len < required_size {
                 let fadvise_offset = to_off_t(dest_offset, "destination offset")?;
                 let fadvise_len = to_off_t(copy_size, "copy size")?;
-                unsafe {
-                    let _ = fro::os::posix_fadvise(
-                        f.as_raw_fd(),
-                        fadvise_offset,
-                        fadvise_len,
-                        fro::os::POSIX_FADV_NOREUSE,
-                    );
-                }
+                let _ = fro::os::posix_fadvise(
+                    f.as_raw_fd(),
+                    fadvise_offset,
+                    fadvise_len,
+                    fro::os::POSIX_FADV_NOREUSE,
+                );
                 checked_posix_fallocate(
                     &f,
                     0,
@@ -166,8 +164,9 @@ pub(crate) fn copy_file_range_syscall_with_progress(
     if source_offset == 0 && dest_offset == 0 && truncate_target && copy_size == source_meta.len() {
         #[cfg(target_os = "macos")]
         {
-            fro::os::copy_path(source, filename)
-                .map_err(|e| io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e)))?;
+            fro::os::copy_path(source, filename).map_err(|e| {
+                io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e))
+            })?;
             if let Some(progress) = progress_count.as_ref() {
                 progress.fetch_add(source_meta.len(), std::sync::atomic::Ordering::SeqCst);
             }
@@ -326,8 +325,9 @@ pub(crate) fn copy_file_range_chunked_with_progress(
     if source_offset == 0 && dest_offset == 0 && truncate_target && copy_size == source_meta.len() {
         #[cfg(target_os = "macos")]
         {
-            fro::os::copy_path(source, filename)
-                .map_err(|e| io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e)))?;
+            fro::os::copy_path(source, filename).map_err(|e| {
+                io::Error::new(e.kind(), format!("fast full-file copy failed: {}", e))
+            })?;
             if let Some(progress) = progress_count.as_ref() {
                 progress.fetch_add(source_meta.len(), std::sync::atomic::Ordering::SeqCst);
             }
@@ -518,7 +518,8 @@ pub fn copy_file_reflink(
         ));
     }
 
-    fro::os::reflink_paths(source, filename).map_err(|err| io::Error::new(err.kind(), format!("reflink clone failed: {}", err)))?;
+    fro::os::reflink_paths(source, filename)
+        .map_err(|err| io::Error::new(err.kind(), format!("reflink clone failed: {}", err)))?;
 
     Ok(source_meta.len())
 }

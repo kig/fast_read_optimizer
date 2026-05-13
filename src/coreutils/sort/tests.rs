@@ -1,6 +1,4 @@
-use super::compare::{
-    compare_line_bytes, compare_output_lines, compare_sort_keys, same_sort_key,
-};
+use super::compare::{compare_line_bytes, compare_output_lines, compare_sort_keys, same_sort_key};
 use super::*;
 
 fn refs_for_lines(lines: &[&[u8]]) -> (Vec<u8>, Vec<SortLineRef>) {

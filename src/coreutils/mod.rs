@@ -6,10 +6,10 @@ use crate::reader::{
     LoadedFile,
 };
 use crate::writer::{write_generated_file, BufWriter, GeneratedWritePattern};
-use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};
-use fro::uring::SpliceFlags;
 use fro::uring::IoUring;
-use memchr::{memchr_iter, memmem::Finder};
+use fro::uring::SpliceFlags;
+use fro::{hash_file, read_file_with_mode, visit_blocks_with_mode, HashAlgorithm, IOMode};
+use memchr::memchr_iter;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::{CStr, CString};
@@ -139,13 +139,20 @@ fn is_multicall_help_flag(arg: Option<&String>) -> bool {
     matches!(arg.map(String::as_str), Some("-h" | "--help"))
 }
 
-fn is_multicall_version_flag(invoked: &str, arg: Option<&String>) -> bool {
-    matches!(arg.map(String::as_str), Some("--version"))
-        || (invoked == "cmp" && matches!(arg.map(String::as_str), Some("-v")))
+fn is_multicall_version_flag(invoked: &str, args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| match arg.as_str() {
+            "--version" => true,
+            "-v" => invoked == "cmp",
+            "-V" => invoked == "fgrep",
+            _ => false,
+        })
 }
 
 fn multicall_short_help_is_real_flag(invoked: &str, arg: Option<&String>) -> bool {
-    invoked == "sort" && matches!(arg.map(String::as_str), Some("-h"))
+    matches!(arg.map(String::as_str), Some("-h")) && matches!(invoked, "du" | "fgrep" | "sort")
 }
 
 pub(crate) fn args_request_no_fallback(args: &[String]) -> bool {
@@ -471,7 +478,7 @@ pub fn try_run_multicall(args: &[String]) -> io::Result<Option<i32>> {
             crate::main_app::print_direct_command_help(&invoked, help_name);
             return Ok(Some(0));
         }
-        if is_multicall_version_flag(&invoked, sanitized_args.get(1)) {
+        if is_multicall_version_flag(&invoked, &sanitized_args) {
             print_coreutils_version(&invoked);
             return Ok(Some(0));
         }
@@ -657,7 +664,7 @@ fn run_named_command(
         crate::main_app::print_direct_command_help(invoked, invoked);
         return Ok(Some(0));
     }
-    if is_multicall_version_flag(invoked, args.get(1)) {
+    if is_multicall_version_flag(invoked, args) {
         print_coreutils_version(invoked);
         return Ok(Some(0));
     }

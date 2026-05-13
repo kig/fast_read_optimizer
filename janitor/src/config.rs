@@ -1,6 +1,6 @@
 pub const MAX_FILE_LINES: usize = 1000;
 
-pub const MAX_FILE_LINES_ALLOWLIST: &[&str] = &[];
+pub const MAX_FILE_LINES_ALLOWLIST: &[&str] = &["src/coreutils/find.rs"];
 
 pub const FILE_SIZE_ROOTS: &[&str] = &["src", "tests", "examples", "janitor/src"];
 

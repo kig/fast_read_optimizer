@@ -53,7 +53,13 @@ fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
         ));
     }
 
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | fro::os::SOCK_CLOEXEC, 0) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | fro::os::SOCK_CLOEXEC,
+            0,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

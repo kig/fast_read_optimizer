@@ -740,7 +740,6 @@ impl ParallelWriter {
         pool_sender: Option<mpsc::Sender<Vec<u8>>>,
         write_block_size: u64,
     ) -> std::io::Result<Self> {
-        use std::os::unix::io::RawFd;
         let (tx, rx) = mpsc::channel::<WriteRequest>();
         let join_handle = std::thread::spawn(move || -> std::io::Result<ParallelWriteReport> {
             //let mut vmsplices = 0;
@@ -788,7 +787,7 @@ impl ParallelWriter {
                     while remaining > 0 {
                         let chunk = &data[offset..offset + remaining.min(1 << 20)];
                         // Portability: use fro::os::vmsplice_all to avoid direct libc::vmsplice on non-Linux.
-let pushed = fro::os::vmsplice_all(dest_fd, chunk).expect("Boom");
+                        let pushed = fro::os::vmsplice_all(dest_fd, chunk).expect("Boom");
                         offset += pushed;
                         remaining -= pushed;
                         bytes_written =

@@ -9,7 +9,7 @@ fn fgrep_help_and_version_surface_stay_wired() {
         "fgrep - Bounded literal line-oriented grep slice on top of fro's fast substring scanner."
     ));
     assert!(stdout.contains(
-        "fgrep [-n] [-i] [-x] [-v] [-e PATTERN | -f FILE]... [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]"
+        "fgrep [-n] [-b] [-i] [-x] [-w] [-v] [-z] [-A NUM] [-B NUM] [-C NUM] [-NUM] [-c|-q|-l|-L] [-H|-h] [-Z] [-s] [-T] [-D ACTION] [-d ACTION] [--label LABEL] [--line-buffered] [-a|-I|-U|--binary-files=TYPE] [-m NUM] [--color[=WHEN]|--colour[=WHEN]] [-e PATTERN | -f FILE]... [-V|--version] [--no-ignore-case] [--auto|--no-direct|--direct] [--report-gbps] [pattern] <file> [file ...]"
     ));
     assert!(
         stdout.contains("This is a bounded literal-search compatibility slice, not full GNU grep.")
@@ -21,8 +21,25 @@ fn fgrep_help_and_version_surface_stay_wired() {
     assert!(stdout
         .contains("GNU grep tokens intentionally omitted from the in-process literal-search path"));
     assert!(stdout.contains("-A/--after-context=NUM"));
+    assert!(stdout.contains("-B/--before-context=NUM"));
+    assert!(stdout.contains("-C/--context=NUM"));
+    assert!(stdout.contains("-NUM"));
+    assert!(stdout.contains("-b/--byte-offset"));
+    assert!(stdout.contains("-w/--word-regexp"));
+    assert!(stdout.contains("-m/--max-count"));
+    assert!(stdout.contains("-D/--devices"));
+    assert!(stdout.contains("-d/--directories"));
+    assert!(stdout.contains("--label"));
+    assert!(stdout.contains("-T/--initial-tab"));
+    assert!(stdout.contains("--line-buffered"));
+    assert!(stdout.contains("--binary-files=TYPE"));
+    assert!(stdout.contains("-I/--binary-files=without-match"));
+    assert!(stdout.contains("-a/--text"));
+    assert!(stdout.contains("-U/--binary"));
     assert!(stdout.contains("-E/--extended-regexp"));
     assert!(stdout.contains("-r/--recursive"));
+    assert!(stdout.contains("-s/--no-messages"));
+    assert!(stdout.contains("-Z/--null"));
     assert!(stdout.contains("-V"));
     assert!(output.stderr.is_empty());
 
@@ -36,6 +53,17 @@ fn fgrep_help_and_version_surface_stay_wired() {
     let version_stdout = String::from_utf8_lossy(&version.stdout);
     assert!(version_stdout.starts_with("fgrep (fro coreutils) "));
     assert!(version_stdout.contains(env!("CARGO_PKG_VERSION")));
+
+    let short_version = run_fro("fgrep", &["-V"]);
+    assert_eq!(short_version.status.code(), Some(0));
+    assert!(
+        short_version.stderr.is_empty(),
+        "fgrep -V unexpectedly wrote stderr:\n{}",
+        String::from_utf8_lossy(&short_version.stderr)
+    );
+    let short_version_stdout = String::from_utf8_lossy(&short_version.stdout);
+    assert!(short_version_stdout.starts_with("fgrep (fro coreutils) "));
+    assert!(short_version_stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
