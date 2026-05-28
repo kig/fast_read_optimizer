@@ -116,7 +116,7 @@ cp        16/16 100%  remaining: none  help: ok
 dd        16/16 100%  remaining: none  help: ok
 du        20/20 100%  remaining: none  help: ok
 fgrep     52/52 100%  remaining: none  help: ok
-find      69/79  87%  remaining: -D, -context, -delete, -execdir, -follow, -fprint, -fprint0, -fstype, -ignore_readdir_race, -noignore_readdir_race  help: ok
+find      78/78 100%  remaining: none  help: ok
 head       7/7  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
 mv        12/12 100%  remaining: none  help: ok
@@ -757,9 +757,8 @@ fn compat_coverage_explicit_gap_rows_match_source_help() {
     assert!(help_source.contains(
         "Tracked GNU find tokens implemented in this bounded in-process path-walking slice"
     ));
-    assert!(help_source
-        .contains("GNU find tokens intentionally omitted from this bounded in-process slice"));
-    assert!(help_source.contains("\"-D\""));
+    assert!(help_source.contains("GNU debug output (-D) remain intentionally omitted"));
+    assert!(help_source.contains("fro does not expose GNU find's internal debug-output family"));
     assert!(help_source.contains("\"-Olevel\""));
     assert!(help_source.contains("\"-xtype\""));
 }

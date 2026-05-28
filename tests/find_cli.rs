@@ -491,33 +491,30 @@ fn find_help_and_version_surface_stay_wired() {
     assert!(stdout.contains(
         "find - Walk one or more directory trees with a bounded GNU find-compatible predicate slice."
     ));
-    assert!(stdout.contains(
-        "[-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N]"
-    ));
+    assert!(stdout.contains("[-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N]"));
     assert!(stdout.contains(
         "This is a bounded GNU find-compatible path-walking/predicate slice, not the full GNU find expression language."
     ));
     assert!(stdout.contains(
-        "Supported in-process families now cover bounded path walking, GNU symlink policy flags (-P/-H/-L)"
+        "Supported in-process families now cover bounded path walking, GNU symlink policy flags (-P/-H/-L/-follow)"
     ));
     assert!(stdout.contains(
-        "Parentheses, batched -exec ... +, alternate execdir actions"
+        "Parentheses, batched -exec ... +, and GNU debug output (-D) remain intentionally omitted"
     ));
     assert!(stdout.contains(
         "Tracked GNU find tokens implemented in this bounded in-process path-walking slice"
     ));
-    assert!(
-        stdout.contains("GNU find tokens intentionally omitted from this bounded in-process slice")
-    );
-    assert!(stdout.contains("-D, -context"));
+    assert!(!stdout
+        .contains("GNU find tokens intentionally omitted from this bounded in-process slice"));
+    assert!(stdout.contains("-D"));
     assert!(stdout.contains("-delete"));
     assert!(stdout.contains("-regex"));
+    assert!(stdout.contains("regex path matching (-regex/-iregex with bounded -regextype values)"));
     assert!(stdout.contains(
-        "regex path matching (-regex/-iregex with bounded -regextype values)"
+        "bounded formatter/listing/file-output actions (-printf/-fprintf/-fprint/-fprint0/-ls/-fls)"
     ));
-    assert!(stdout.contains("bounded formatter/listing actions (-printf/-fprintf/-ls/-fls)"));
     assert!(stdout.contains(
-        "-P keeps GNU find's default no-follow mode, -H follows command-line symlink roots only, and -L follows symlinked roots and discovered child symlinks during traversal."
+        "-P keeps GNU find's default no-follow mode, -H follows command-line symlink roots only, and -L/-follow follow symlinked roots and discovered child symlinks during traversal."
     ));
     assert!(stdout.contains(
         "-mindepth/-maxdepth bound which levels are emitted and descended, and -mount/-xdev keep traversal on the same device as each starting path."
@@ -532,16 +529,19 @@ fn find_help_and_version_surface_stay_wired() {
         "-regex/-iregex match the whole emitted path via the Rust regex crate; bounded -regextype support currently accepts emacs/findutils-default and posix-extended/egrep syntax families."
     ));
     assert!(stdout.contains(
-        "-newer/-anewer/-cnewer and the -mtime/-mmin/-atime/-amin/-ctime/-cmin family are supported in-process; -used compares access time versus status-change time in whole days; and -daystart shifts subsequent day-granularity predicates to the start of the current local day."
+        "-newer/-anewer/-cnewer and the -mtime/-mmin/-atime/-amin/-ctime/-cmin family are supported in-process; -used compares access time versus status-change time in whole days; -fstype compares the containing filesystem type; -context matches SELinux contexts when SELinux is enabled; and -daystart shifts subsequent day-granularity predicates to the start of the current local day."
     ));
     assert!(stdout.contains(
         "-true, -false, -noleaf, !/-not, and -a/-and/-o/-or are accepted in the current bounded evaluator."
     ));
     assert!(stdout.contains(
-        "-depth emits directories after their descendants; -prune suppresses descent into the current matched directory; and -quit stops the walk immediately after the current match."
+        "-depth emits directories after their descendants; -delete also forces depth-first deletion of the current directory entry itself; -prune suppresses descent into the current matched directory; and -quit stops the walk immediately after the current match."
     ));
     assert!(stdout.contains(
-        "-print is the default action; -print0 emits NUL-delimited paths; bounded -printf/-fprintf currently support %%p, %%f, %%h, %%s, %%y, %%%% plus \\n/\\t/\\\\ escapes; -ls/-fls emit a GNU-like inode/block/owner/group listing; -exec CMD ... ';' runs one command per match; and -ok/-okdir add GNU-style confirmation prompts before each per-match command."
+        "-ignore_readdir_race suppresses ENOENT races discovered during traversal, while -noignore_readdir_race restores the default warning behavior."
+    ));
+    assert!(stdout.contains(
+        "-print is the default action; -print0 emits NUL-delimited paths; -fprint/-fprint0 write newline- or NUL-delimited matches to a file; bounded -printf/-fprintf currently support %%p, %%f, %%h, %%s, %%y, %%%% plus \\n/\\t/\\\\ escapes; -ls/-fls emit a GNU-like inode/block/owner/group listing; -exec/-execdir run one command per match; and -ok/-okdir add GNU-style confirmation prompts before each per-match command."
     ));
     assert!(stdout.contains("--help shows this message and exits."));
     assert!(stdout.contains("--version prints the fro find version string and exits."));

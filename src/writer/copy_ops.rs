@@ -100,7 +100,7 @@ pub(super) fn prepare_copy_destination(
     Ok(())
 }
 
-fn to_off_t(value: u64, field_name: &'static str) -> io::Result<i64> {
+pub(super) fn to_off_t(value: u64, field_name: &'static str) -> io::Result<i64> {
     i64::try_from(value).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -43,7 +43,7 @@ pub(super) fn escaped_hash_check_display(label: &str) -> String {
     }
 }
 
-pub(super) fn hash_check_should_print_result(
+pub(crate) fn hash_check_should_print_result(
     success: bool,
     quiet: bool,
     status_only: bool,

@@ -278,6 +278,8 @@ enum FindPredicate {
     Inum(NumericComparison),
     Newer(SystemTime, TimeField),
     Used(NumericComparison),
+    FsType(String),
+    Context(FindGlobPattern),
     TimePeriods {
         cmp: NumericComparison,
         secs_per_period: u64,
@@ -344,6 +346,11 @@ impl FindPredicate {
                 let days = delta.as_secs() / 86_400;
                 Ok(cmp.matches(days))
             }
+            Self::FsType(expected) => {
+                Ok(find_fstype_name(path, entry)?.is_some_and(|actual| actual == *expected))
+            }
+            Self::Context(pattern) => Ok(read_selinux_context(path, entry.followed)?
+                .is_some_and(|context| pattern.matches(&context))),
             Self::TimePeriods {
                 cmp,
                 secs_per_period,
@@ -502,10 +509,14 @@ impl FindFormatTemplate {
                     match directive {
                         b'%' => literal.push(b'%'),
                         b'p' => parts.push(FindFormatPart::Directive(FindFormatDirective::Path)),
-                        b'f' => parts.push(FindFormatPart::Directive(FindFormatDirective::Basename)),
+                        b'f' => {
+                            parts.push(FindFormatPart::Directive(FindFormatDirective::Basename))
+                        }
                         b'h' => parts.push(FindFormatPart::Directive(FindFormatDirective::Parent)),
                         b's' => parts.push(FindFormatPart::Directive(FindFormatDirective::Size)),
-                        b'y' => parts.push(FindFormatPart::Directive(FindFormatDirective::FileType)),
+                        b'y' => {
+                            parts.push(FindFormatPart::Directive(FindFormatDirective::FileType))
+                        }
                         other => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -539,11 +550,8 @@ impl FindFormatTemplate {
                     rendered.extend_from_slice(path.as_os_str().as_bytes());
                 }
                 FindFormatPart::Directive(FindFormatDirective::Basename) => {
-                    rendered.extend_from_slice(
-                        path.file_name()
-                            .unwrap_or(path.as_os_str())
-                            .as_bytes(),
-                    );
+                    rendered
+                        .extend_from_slice(path.file_name().unwrap_or(path.as_os_str()).as_bytes());
                 }
                 FindFormatPart::Directive(FindFormatDirective::Parent) => {
                     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -592,6 +600,37 @@ impl FindFileFormatAction {
 }
 
 #[derive(Clone)]
+struct FindFilePrintAction {
+    delimiter: u8,
+    output: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl FindFilePrintAction {
+    fn open(path: &str, delimiter: u8) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self {
+            delimiter,
+            output: Arc::new(Mutex::new(std::io::BufWriter::new(file))),
+        })
+    }
+
+    fn write(&self, path: &Path) -> io::Result<bool> {
+        let mut chunk = Vec::with_capacity(path.as_os_str().as_bytes().len() + 1);
+        append_find_path(&mut chunk, path, self.delimiter);
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| io::Error::other("find fprint writer lock poisoned"))?;
+        output.write_all(&chunk)?;
+        Ok(true)
+    }
+}
+
+#[derive(Clone)]
 struct FindFileLsAction {
     output: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
 }
@@ -625,6 +664,8 @@ enum FindAction {
     Exec(FindExecAction),
     PrintFormat(FindFormatTemplate),
     FileFormat(FindFileFormatAction),
+    FilePrint(FindFilePrintAction),
+    Delete,
     Ls,
     Fls(FindFileLsAction),
     Prune,
@@ -648,14 +689,18 @@ impl FindAction {
                 output.write_all(&format.render(path, metadata))?;
                 Ok(FindEvalOutcome::matched(true))
             }
-            Self::FileFormat(file_action) => Ok(FindEvalOutcome::matched(file_action.write(
-                path, metadata,
-            )?)),
+            Self::FileFormat(file_action) => {
+                Ok(FindEvalOutcome::matched(file_action.write(path, metadata)?))
+            }
+            Self::FilePrint(file_action) => Ok(FindEvalOutcome::matched(file_action.write(path)?)),
+            Self::Delete => Ok(FindEvalOutcome::matched(delete_find_path(path)?)),
             Self::Ls => {
                 output.write_all(&render_find_ls_line(path, metadata)?)?;
                 Ok(FindEvalOutcome::matched(true))
             }
-            Self::Fls(file_action) => Ok(FindEvalOutcome::matched(file_action.write(path, metadata)?)),
+            Self::Fls(file_action) => {
+                Ok(FindEvalOutcome::matched(file_action.write(path, metadata)?))
+            }
             Self::Prune => Ok(FindEvalOutcome {
                 matched: true,
                 prune: true,
@@ -735,6 +780,7 @@ struct FindPlan {
     min_depth: Option<usize>,
     max_depth: Option<usize>,
     follow_mode: FindFollowMode,
+    ignore_readdir_race: bool,
     same_file_system: bool,
     depth_first: bool,
     has_action: bool,
@@ -791,11 +837,20 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         print_coreutils_version("find");
         return Ok(0);
     }
+    if args.iter().skip(1).any(|arg| arg == "-context") && !selinux_enabled() {
+        eprintln!("find: invalid predicate -context: SELinux is not enabled.");
+        return Ok(1);
+    }
     let (roots, plan) = parse_find_args(args)?;
     let output = Arc::new(FindOutput::stdout());
     let had_warnings = Arc::new(AtomicBool::new(false));
-    let force_serial = plan.depth_first || plan.has_action || plan.follow_mode != FindFollowMode::Never;
-    let worker_count = if force_serial { 0 } else { parallel_find_worker_count() };
+    let force_serial =
+        plan.depth_first || plan.has_action || plan.follow_mode != FindFollowMode::Never;
+    let worker_count = if force_serial {
+        0
+    } else {
+        parallel_find_worker_count()
+    };
     let queue = (!force_serial).then(|| Arc::new(WorkQueue::default()));
     let stop = (!force_serial).then(|| Arc::new(AtomicBool::new(false)));
     let serial_candidate = roots.len() == 1;
@@ -805,6 +860,7 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         let path = PathBuf::from(root);
         let entry = match load_find_entry_metadata(&path, plan.follow_mode.follow_root()) {
             Ok(entry) => entry,
+            Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &path, &err, "cannot access");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -814,7 +870,11 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         };
         let root_type = entry.effective.file_type();
         let root_outcome = if !root_type.is_dir() || !plan.depth_first {
-            Some(plan.evaluate_path(&path, &entry, 0, &output)?)
+            match plan.evaluate_path(&path, &entry, 0, &output) {
+                Ok(outcome) => Some(outcome),
+                Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => None,
+                Err(err) => return Err(err),
+            }
         } else {
             None
         };
@@ -851,26 +911,33 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
     if force_serial {
         for task in serial_tasks {
             if task.depth == usize::MAX {
-                let entry = load_find_entry_metadata(&task.dir, plan.follow_mode.follow_root())?;
-                if plan.evaluate_path(&task.dir, &entry, 0, &output)?.quit {
+                let entry =
+                    match load_find_entry_metadata(&task.dir, plan.follow_mode.follow_root()) {
+                        Ok(entry) => entry,
+                        Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                let outcome = match plan.evaluate_path(&task.dir, &entry, 0, &output) {
+                    Ok(outcome) => outcome,
+                    Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                if outcome.quit {
                     break;
                 }
             } else {
-                if walk_find_subtree_serial(
-                    task,
-                    output.as_ref(),
-                    &had_warnings,
-                    &plan,
-                    &[],
-                )? {
+                if walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan, &[])? {
                     break;
                 }
             }
         }
     } else if !serial_tasks.is_empty() {
         for task in serial_tasks {
-            if walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan, &[])?
-            {
+            if walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan, &[])? {
                 break;
             }
         }
@@ -880,19 +947,12 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
             stop.expect("parallel stop missing"),
             worker_count,
             {
-            let output = output.clone();
-            let had_warnings = had_warnings.clone();
-            move |start_dir, queue, stop| {
-                walk_find_subtree(
-                    start_dir,
-                    queue,
-                    &output,
-                    stop,
-                    &had_warnings,
-                    &plan,
-                )
-            }
-        },
+                let output = output.clone();
+                let had_warnings = had_warnings.clone();
+                move |start_dir, queue, stop| {
+                    walk_find_subtree(start_dir, queue, &output, stop, &had_warnings, &plan)
+                }
+            },
         )?;
     }
     let output = Arc::into_inner(output)
@@ -930,6 +990,7 @@ fn walk_find_subtree(
         let mut child_dirs = Vec::new();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
+            Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &dir, &err, "cannot read directory");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -940,6 +1001,7 @@ fn walk_find_subtree(
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
+                Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
                 Err(err) if is_permission_denied(&err) => {
                     write_warning_line("find", &dir, &err, "cannot read directory");
                     had_warnings.store(true, Ordering::SeqCst);
@@ -949,17 +1011,24 @@ fn walk_find_subtree(
             };
             let file_name = entry.file_name();
             let child_path = child_find_path(&dir, &file_name);
-            let entry = match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children())
-            {
-                Ok(entry) => entry,
-                Err(err) if is_permission_denied(&err) => {
-                    write_warning_line("find", &child_path, &err, "cannot access");
-                    had_warnings.store(true, Ordering::SeqCst);
-                    continue;
-                }
+            let entry =
+                match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children()) {
+                    Ok(entry) => entry,
+                    Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => {
+                        continue
+                    }
+                    Err(err) if is_permission_denied(&err) => {
+                        write_warning_line("find", &child_path, &err, "cannot access");
+                        had_warnings.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+            let outcome = match plan.evaluate_path(&child_path, &entry, child_depth, output) {
+                Ok(outcome) => outcome,
+                Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
                 Err(err) => return Err(err),
             };
-            let outcome = plan.evaluate_path(&child_path, &entry, child_depth, output)?;
             if outcome.quit {
                 stop.store(true, Ordering::SeqCst);
                 break;
@@ -998,6 +1067,7 @@ fn walk_find_subtree_serial(
     next_ancestors.push(current_dir_key);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
+        Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => return Ok(false),
         Err(err) if is_permission_denied(&err) => {
             write_warning_line("find", &dir, &err, "cannot read directory");
             had_warnings.store(true, Ordering::SeqCst);
@@ -1008,6 +1078,7 @@ fn walk_find_subtree_serial(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
+            Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &dir, &err, "cannot read directory");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -1017,8 +1088,10 @@ fn walk_find_subtree_serial(
         };
         let file_name = entry.file_name();
         let child_path = child_find_path(&dir, &file_name);
-        let entry = match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children()) {
+        let entry = match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children())
+        {
             Ok(entry) => entry,
+            Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &child_path, &err, "cannot access");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -1028,7 +1101,13 @@ fn walk_find_subtree_serial(
         };
         if entry.effective.file_type().is_dir() {
             if !plan.depth_first {
-                let outcome = plan.evaluate_path(&child_path, &entry, child_depth, output)?;
+                let outcome = match plan.evaluate_path(&child_path, &entry, child_depth, output) {
+                    Ok(outcome) => outcome,
+                    Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if outcome.quit {
                     return Ok(true);
                 }
@@ -1050,8 +1129,7 @@ fn walk_find_subtree_serial(
                         had_warnings,
                         plan,
                         &next_ancestors,
-                    )?
-                    {
+                    )? {
                         return Ok(true);
                     }
                 }
@@ -1074,17 +1152,28 @@ fn walk_find_subtree_serial(
                         had_warnings,
                         plan,
                         &next_ancestors,
-                    )?
-                    {
+                    )? {
                         return Ok(true);
                     }
                 }
-                if plan.evaluate_path(&child_path, &entry, child_depth, output)?.quit {
+                let outcome = match plan.evaluate_path(&child_path, &entry, child_depth, output) {
+                    Ok(outcome) => outcome,
+                    Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                if outcome.quit {
                     return Ok(true);
                 }
             }
         } else {
-            if plan.evaluate_path(&child_path, &entry, child_depth, output)?.quit {
+            let outcome = match plan.evaluate_path(&child_path, &entry, child_depth, output) {
+                Ok(outcome) => outcome,
+                Err(err) if should_ignore_find_error(plan.ignore_readdir_race, &err) => continue,
+                Err(err) => return Err(err),
+            };
+            if outcome.quit {
                 return Ok(true);
             }
         }
@@ -1209,6 +1298,98 @@ fn load_find_entry_metadata(path: &Path, follow: bool) -> io::Result<FindEntryMe
     })
 }
 
+fn should_ignore_find_error(ignore_readdir_race: bool, err: &io::Error) -> bool {
+    ignore_readdir_race && err.kind() == io::ErrorKind::NotFound
+}
+
+fn find_fstype_name(path: &Path, entry: &FindEntryMetadata) -> io::Result<Option<String>> {
+    let query_path = if entry.followed {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(query_str) = query_path.to_str() {
+        if let Some(info) = crate::config::mount_info_for_path(query_str) {
+            return Ok(Some(info.fstype));
+        }
+    }
+
+    let path_c = CString::new(query_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let rc = unsafe { libc::statfs(path_c.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(find_fstype_name_from_magic(stat.f_type as libc::c_long))
+}
+
+fn find_fstype_name_from_magic(magic: libc::c_long) -> Option<String> {
+    let name = match magic as u64 {
+        0x0102_1994 => "tmpfs",
+        0x2fc1_2fc1 => "zfs",
+        0x5846_5342 => "xfs",
+        0x794c_7630 => "overlay",
+        0x6969 => "nfs",
+        0xef53 => "ext2/ext3",
+        0x9123_683e => "btrfs",
+        0x7371_7368 => "squashfs",
+        0x6573_5546 => "fuseblk",
+        0x9fa0 => "proc",
+        0x6265_6572 => "sysfs",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn selinux_enabled() -> bool {
+    Path::new("/sys/fs/selinux/enforce").exists()
+}
+
+fn read_selinux_context(path: &Path, follow: bool) -> io::Result<Option<Vec<u8>>> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
+    let name = CString::new("security.selinux").expect("valid selinux xattr name");
+    let mut size = unsafe {
+        if follow {
+            libc::getxattr(path_c.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+        } else {
+            libc::lgetxattr(path_c.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+        }
+    };
+    if size < 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOTSUP) => Ok(None),
+            _ => Err(err),
+        };
+    }
+    let mut buf = vec![0u8; size as usize];
+    size = unsafe {
+        if follow {
+            libc::getxattr(
+                path_c.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        } else {
+            libc::lgetxattr(
+                path_c.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        }
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(size as usize);
+    Ok(Some(buf))
+}
+
 struct FindParseState {
     time_reference: SystemTime,
     daystart_active: bool,
@@ -1216,6 +1397,7 @@ struct FindParseState {
     max_depth: Option<usize>,
     regex_type: FindRegexType,
     follow_mode: FindFollowMode,
+    ignore_readdir_race: bool,
     same_file_system: bool,
     depth_first: bool,
     has_action: bool,
@@ -1303,7 +1485,10 @@ fn parse_find_primary(
         )),
         "-mindepth" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -mindepth")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -mindepth",
+                )
             })?;
             state.min_depth = Some(parse_find_depth("-mindepth", value)?);
             *index += 2;
@@ -1311,7 +1496,10 @@ fn parse_find_primary(
         }
         "-maxdepth" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -maxdepth")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -maxdepth",
+                )
             })?;
             state.max_depth = Some(parse_find_depth("-maxdepth", value)?);
             *index += 2;
@@ -1333,6 +1521,16 @@ fn parse_find_primary(
             *index += 1;
             Ok(FindExpression::Predicate(FindPredicate::True))
         }
+        "-ignore_readdir_race" => {
+            state.ignore_readdir_race = true;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-noignore_readdir_race" => {
+            state.ignore_readdir_race = false;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
         "-mount" | "-xdev" => {
             state.same_file_system = true;
             *index += 1;
@@ -1340,7 +1538,10 @@ fn parse_find_primary(
         }
         "-regextype" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -regextype")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -regextype",
+                )
             })?;
             state.regex_type = FindRegexType::parse(value)?;
             *index += 2;
@@ -1348,7 +1549,10 @@ fn parse_find_primary(
         }
         "-type" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -type")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -type",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Type(
@@ -1357,7 +1561,10 @@ fn parse_find_primary(
         }
         "-xtype" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -xtype")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -xtype",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::XType(
@@ -1366,7 +1573,10 @@ fn parse_find_primary(
         }
         "-name" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -name")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -name",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Name(
@@ -1375,7 +1585,10 @@ fn parse_find_primary(
         }
         "-iname" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -iname")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -iname",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Name(
@@ -1384,7 +1597,10 @@ fn parse_find_primary(
         }
         "-path" | "-wholename" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing argument to find {arg}"),
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Path(
@@ -1393,7 +1609,10 @@ fn parse_find_primary(
         }
         "-ipath" | "-iwholename" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing argument to find {arg}"),
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Path(
@@ -1402,7 +1621,10 @@ fn parse_find_primary(
         }
         "-lname" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -lname")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -lname",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::LinkName(
@@ -1411,7 +1633,10 @@ fn parse_find_primary(
         }
         "-ilname" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -ilname")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -ilname",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::LinkName(
@@ -1420,7 +1645,10 @@ fn parse_find_primary(
         }
         "-regex" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -regex")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -regex",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Regex(
@@ -1429,7 +1657,10 @@ fn parse_find_primary(
         }
         "-iregex" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -iregex")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -iregex",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Regex(
@@ -1454,14 +1685,22 @@ fn parse_find_primary(
         }
         "-size" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -size")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -size",
+                )
             })?;
             *index += 2;
-            Ok(FindExpression::Predicate(parse_size_predicate("-size", value)?))
+            Ok(FindExpression::Predicate(parse_size_predicate(
+                "-size", value,
+            )?))
         }
         "-links" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -links")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -links",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Links(
@@ -1470,7 +1709,10 @@ fn parse_find_primary(
         }
         "-inum" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -inum")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -inum",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Inum(
@@ -1479,7 +1721,10 @@ fn parse_find_primary(
         }
         "-newer" | "-anewer" | "-cnewer" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing argument to find {arg}"),
+                )
             })?;
             let metadata = fs::symlink_metadata(value)?;
             *index += 2;
@@ -1495,16 +1740,52 @@ fn parse_find_primary(
         }
         "-used" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -used")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -used",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Used(
                 parse_numeric_comparison("-used", value)?,
             )))
         }
+        "-fstype" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -fstype",
+                )
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::FsType(
+                value.to_string(),
+            )))
+        }
+        "-context" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -context",
+                )
+            })?;
+            if !selinux_enabled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid predicate `-context': SELinux is not enabled.",
+                ));
+            }
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Context(
+                FindGlobPattern::parse("-context", value, 0)?,
+            )))
+        }
         "-mtime" | "-mmin" | "-atime" | "-amin" | "-ctime" | "-cmin" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing argument to find {arg}"),
+                )
             })?;
             let (secs_per_period, field) = match arg {
                 "-mtime" => (86_400, TimeField::Modified),
@@ -1526,7 +1807,10 @@ fn parse_find_primary(
         }
         "-perm" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -perm")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -perm",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(parse_perm_predicate(value)?))
@@ -1542,7 +1826,10 @@ fn parse_find_primary(
         }
         "-user" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -user")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -user",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Uid(
@@ -1560,7 +1847,10 @@ fn parse_find_primary(
         }
         "-group" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -group")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -group",
+                )
             })?;
             *index += 2;
             Ok(FindExpression::Predicate(FindPredicate::Gid(
@@ -1601,7 +1891,10 @@ fn parse_find_primary(
         }
         "-printf" => {
             let value = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -printf")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing argument to find -printf",
+                )
             })?;
             let format = FindFormatTemplate::parse("-printf", value)?;
             state.has_action = true;
@@ -1611,10 +1904,16 @@ fn parse_find_primary(
         }
         "-fprintf" => {
             let path = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing file argument to find -fprintf")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing file argument to find -fprintf",
+                )
             })?;
             let value = args.get(*index + 2).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing format argument to find -fprintf")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing format argument to find -fprintf",
+                )
             })?;
             let format = FindFormatTemplate::parse("-fprintf", value)?;
             let action = FindFileFormatAction::open(path, format)?;
@@ -1623,8 +1922,47 @@ fn parse_find_primary(
             *index += 3;
             Ok(FindExpression::Action(FindAction::FileFormat(action)))
         }
+        "-fprint" => {
+            let path = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing file argument to find -fprint",
+                )
+            })?;
+            let action = FindFilePrintAction::open(path, b'\n')?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 2;
+            Ok(FindExpression::Action(FindAction::FilePrint(action)))
+        }
+        "-fprint0" => {
+            let path = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing file argument to find -fprint0",
+                )
+            })?;
+            let action = FindFilePrintAction::open(path, b'\0')?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 2;
+            Ok(FindExpression::Action(FindAction::FilePrint(action)))
+        }
+        "-delete" => {
+            state.has_action = true;
+            state.suppress_default_print = true;
+            state.depth_first = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Delete))
+        }
         "-exec" => {
             let action = parse_find_exec_action(args, index, false, false)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            Ok(FindExpression::Action(FindAction::Exec(action)))
+        }
+        "-execdir" => {
+            let action = parse_find_exec_action(args, index, false, true)?;
             state.has_action = true;
             state.suppress_default_print = true;
             Ok(FindExpression::Action(FindAction::Exec(action)))
@@ -1649,7 +1987,10 @@ fn parse_find_primary(
         }
         "-fls" => {
             let path = args.get(*index + 1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing file argument to find -fls")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing file argument to find -fls",
+                )
             })?;
             let action = FindFileLsAction::open(path)?;
             state.has_action = true;
@@ -1757,6 +2098,7 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
         max_depth: None,
         regex_type: FindRegexType::Emacs,
         follow_mode,
+        ignore_readdir_race: false,
         same_file_system: false,
         depth_first: false,
         has_action: false,
@@ -1779,6 +2121,7 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
             min_depth: state.min_depth,
             max_depth: state.max_depth,
             follow_mode: state.follow_mode,
+            ignore_readdir_race: state.ignore_readdir_race,
             same_file_system: state.same_file_system,
             depth_first: state.depth_first,
             has_action: state.has_action,
@@ -1794,17 +2137,20 @@ fn is_find_expression_token(arg: &str) -> bool {
 
 fn print_find_help(program: &str) {
     fro::cio_println!(
-        "Usage: {program} [-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N] [-mount|-xdev] [-type TYPE] [-xtype TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN|-wholename PATTERN|-iwholename PATTERN] [-lname PATTERN|-ilname PATTERN] [-regex PATTERN|-iregex PATTERN] [-regextype TYPE] [-empty] [-size N[cwbkMG]] [-links N] [-inum N] [-newer FILE|-anewer FILE|-cnewer FILE] [-used N] [-daystart] [-mtime N|-mmin N|-atime N|-amin N|-ctime N|-cmin N] [-perm [/+-]MODE] [-user NAME|-uid N] [-group NAME|-gid N] [-nouser] [-nogroup] [-readable] [-writable] [-executable] [-true|-false] [-depth] [!|-not] [-a|-and] [-o|-or] [-noleaf] [-print|-print0|-printf FMT|-fprintf FILE FMT|-exec CMD ... ';'|-ok CMD ... ';'|-okdir CMD ... ';'|-ls|-fls FILE|-prune|-quit] [--help] [--version]"
+        "Usage: {program} [-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N] [-mount|-xdev] [-follow] [-ignore_readdir_race|-noignore_readdir_race] [-type TYPE] [-xtype TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN|-wholename PATTERN|-iwholename PATTERN] [-lname PATTERN|-ilname PATTERN] [-regex PATTERN|-iregex PATTERN] [-regextype TYPE] [-empty] [-size N[cwbkMG]] [-links N] [-inum N] [-newer FILE|-anewer FILE|-cnewer FILE] [-used N] [-fstype TYPE] [-context PATTERN] [-daystart] [-mtime N|-mmin N|-atime N|-amin N|-ctime N|-cmin N] [-perm [/+-]MODE] [-user NAME|-uid N] [-group NAME|-gid N] [-nouser] [-nogroup] [-readable] [-writable] [-executable] [-true|-false] [-depth] [!|-not] [-a|-and] [-o|-or] [-noleaf] [-print|-print0|-fprint FILE|-fprint0 FILE|-printf FMT|-fprintf FILE FMT|-exec CMD ... ';'|-execdir CMD ... ';'|-ok CMD ... ';'|-okdir CMD ... ';'|-delete|-ls|-fls FILE|-prune|-quit] [--help] [--version]"
     );
     fro::cio_println!("Walk directory trees and print matching paths.");
     fro::cio_println!();
     fro::cio_println!("  -P                 never follow symlinks (default)");
     fro::cio_println!("  -H                 follow command-line symlink roots only");
     fro::cio_println!("  -L                 follow command-line and discovered symlinks");
+    fro::cio_println!("  -follow            alias for -L in this bounded slice");
     fro::cio_println!("  -Olevel            GNU optimisation hint accepted before paths");
     fro::cio_println!("  -mindepth N        emit only entries at depth N or deeper");
     fro::cio_println!("  -maxdepth N        descend at most N levels below each starting path");
     fro::cio_println!("  -mount, -xdev      stay on the same device as each starting path");
+    fro::cio_println!("  -ignore_readdir_race suppress ENOENT races discovered during traversal");
+    fro::cio_println!("  -noignore_readdir_race restore default ENOENT race reporting");
     fro::cio_println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
     fro::cio_println!(
         "  -xtype TYPE        use symlink target type matching under -P/no-follow mode"
@@ -1821,7 +2167,9 @@ fn print_find_help(program: &str) {
     fro::cio_println!("  -ilname PATTERN    like -lname, but match ASCII case-insensitively");
     fro::cio_println!("  -regex PATTERN     full-path regex match using the current regex syntax");
     fro::cio_println!("  -iregex PATTERN    like -regex, but match ASCII case-insensitively");
-    fro::cio_println!("  -regextype TYPE    regex syntax: emacs/findutils-default or posix-extended/egrep");
+    fro::cio_println!(
+        "  -regextype TYPE    regex syntax: emacs/findutils-default or posix-extended/egrep"
+    );
     fro::cio_println!("  -empty             match empty regular files and empty directories");
     fro::cio_println!("  -size N[cwbkMG]    compare size using find-style numeric prefixes");
     fro::cio_println!("  -links N           compare hard-link count");
@@ -1830,6 +2178,8 @@ fn print_find_help(program: &str) {
     fro::cio_println!("  -anewer FILE       match if atime is newer than FILE's mtime");
     fro::cio_println!("  -cnewer FILE       match if ctime is newer than FILE's mtime");
     fro::cio_println!("  -used N            compare whole days between atime and ctime");
+    fro::cio_println!("  -fstype TYPE       match the containing filesystem type");
+    fro::cio_println!("  -context PATTERN   match SELinux contexts when SELinux is enabled");
     fro::cio_println!("  -daystart          compare later time predicates from the start of today");
     fro::cio_println!("  -mtime/-mmin N     compare modification age in days or minutes");
     fro::cio_println!("  -atime/-amin N     compare access age in days or minutes");
@@ -1853,13 +2203,21 @@ fn print_find_help(program: &str) {
         "  -print             print each matching path followed by a newline (default)"
     );
     fro::cio_println!("  -print0            print each matching path followed by NUL");
+    fro::cio_println!("  -fprint FILE       write newline-delimited matches to FILE");
+    fro::cio_println!("  -fprint0 FILE      write NUL-delimited matches to FILE");
     fro::cio_println!("  -printf FMT        write bounded formatted output to stdout");
     fro::cio_println!("  -fprintf FILE FMT  write bounded formatted output to FILE");
     fro::cio_println!("  -ls                emit a GNU-like long listing for each match");
     fro::cio_println!("  -fls FILE          write GNU-like long listings to FILE");
-    fro::cio_println!("  -exec CMD ... ';'  run CMD once per matching path; '{{}}' expands to the path");
+    fro::cio_println!(
+        "  -exec CMD ... ';'  run CMD once per matching path; '{{}}' expands to the path"
+    );
+    fro::cio_println!("  -execdir CMD ... ';' like -exec, but run in the match parent directory");
     fro::cio_println!("  -ok CMD ... ';'    like -exec, but prompt before each command");
     fro::cio_println!("  -okdir CMD ... ';' like -ok, but run in the match parent directory");
+    fro::cio_println!(
+        "  -delete            delete each match in depth-first order (implies -depth)"
+    );
     fro::cio_println!("  -prune             skip descending into the current matched directory");
     fro::cio_println!("  -quit              stop the walk immediately");
     fro::cio_println!("  -h, --help         display this help and exit");
@@ -1926,6 +2284,32 @@ fn prompt_find_exec(argv: &[std::ffi::OsString], path: &Path) -> io::Result<bool
     ))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FindDeleteKind {
+    RemoveDir,
+    RemoveFile,
+}
+
+fn classify_find_delete_kind(is_dir: bool, is_symlink: bool) -> FindDeleteKind {
+    if is_dir && !is_symlink {
+        FindDeleteKind::RemoveDir
+    } else {
+        FindDeleteKind::RemoveFile
+    }
+}
+
+fn delete_find_path(path: &Path) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    match classify_find_delete_kind(
+        metadata.file_type().is_dir(),
+        metadata.file_type().is_symlink(),
+    ) {
+        FindDeleteKind::RemoveDir => fs::remove_dir(path)?,
+        FindDeleteKind::RemoveFile => fs::remove_file(path)?,
+    }
+    Ok(true)
+}
+
 fn render_find_ls_line(path: &Path, metadata: &fs::Metadata) -> io::Result<Vec<u8>> {
     let inode = metadata.ino();
     let blocks = metadata.blocks() / 2;
@@ -1982,7 +2366,12 @@ fn format_find_ls_time(time: SystemTime) -> io::Result<String> {
         .as_secs() as libc::time_t;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "system clock before unix epoch"))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "system clock before unix epoch",
+            )
+        })?
         .as_secs() as libc::time_t;
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
     let mut now_tm = std::mem::MaybeUninit::<libc::tm>::uninit();
@@ -2001,14 +2390,8 @@ fn format_find_ls_time(time: SystemTime) -> io::Result<String> {
     };
     let fmt_c = CString::new(fmt).expect("valid ls time format");
     let mut buf = [0u8; 64];
-    let written = unsafe {
-        libc::strftime(
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            fmt_c.as_ptr(),
-            &tm,
-        )
-    };
+    let written =
+        unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), fmt_c.as_ptr(), &tm) };
     if written == 0 {
         return Err(io::Error::other("strftime failed for find -ls timestamp"));
     }
@@ -2332,6 +2715,19 @@ fn path_access(path: &Path, mode: libc::c_int) -> io::Result<bool> {
     Ok(unsafe { libc::access(path.as_ptr(), mode) == 0 })
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{classify_find_delete_kind, FindDeleteKind};
+
+    #[kani::proof]
+    fn find_delete_classification_only_uses_rmdir_for_real_directories() {
+        let is_dir: bool = kani::any();
+        let is_symlink: bool = kani::any();
+        let kind = classify_find_delete_kind(is_dir, is_symlink);
+        assert_eq!(kind == FindDeleteKind::RemoveDir, is_dir && !is_symlink);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2358,6 +2754,7 @@ mod tests {
             min_depth: None,
             max_depth: Some(1),
             follow_mode: FindFollowMode::Never,
+            ignore_readdir_race: false,
             same_file_system: false,
             depth_first: false,
             has_action: false,
@@ -2420,10 +2817,7 @@ mod tests {
 
         let (roots, plan) = parse_find_args(&args).unwrap();
         assert_eq!(roots, vec!["root".to_string()]);
-        assert!(matches!(
-            plan.expression,
-            FindExpression::And(_, _)
-        ));
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
     }
 
     #[test]
@@ -2455,10 +2849,7 @@ mod tests {
 
         let (roots, plan) = parse_find_args(&args).unwrap();
         assert_eq!(roots, vec!["root".to_string()]);
-        assert!(matches!(
-            plan.expression,
-            FindExpression::And(_, _)
-        ));
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
     }
 
     #[test]
@@ -2508,6 +2899,7 @@ mod tests {
         let (roots, plan) = parse_find_args(&args).unwrap();
         assert_eq!(roots, vec!["root".to_string()]);
         assert!(matches!(plan.follow_mode, FindFollowMode::RootsOnly));
+        assert!(!plan.ignore_readdir_race);
         assert!(matches!(
             plan.expression,
             FindExpression::Predicate(FindPredicate::Used(_))
@@ -2562,6 +2954,73 @@ mod tests {
         assert!(plan.has_action);
         assert!(plan.suppress_default_print);
         assert!(matches!(plan.expression, FindExpression::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_follow_fstype_fprint_and_execdir_tokens() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-follow".to_string(),
+            "-ignore_readdir_race".to_string(),
+            "-fstype".to_string(),
+            "tmpfs".to_string(),
+            "-fprint".to_string(),
+            "out.txt".to_string(),
+            "-execdir".to_string(),
+            "printf".to_string(),
+            "%s\\n".to_string(),
+            "{}".to_string(),
+            ";".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(plan.follow_mode, FindFollowMode::Always));
+        assert!(plan.ignore_readdir_race);
+        assert!(plan.has_action);
+        assert!(plan.suppress_default_print);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_rejects_context_when_selinux_disabled() {
+        if selinux_enabled() {
+            return;
+        }
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-context".to_string(),
+            "*".to_string(),
+        ];
+
+        let err = match parse_find_args(&args) {
+            Ok(_) => panic!("expected -context to fail without SELinux"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid predicate `-context': SELinux is not enabled."
+        );
+    }
+
+    #[test]
+    fn parse_find_args_delete_implies_depth_and_action_mode() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-name".to_string(),
+            "*.tmp".to_string(),
+            "-delete".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(plan.depth_first);
+        assert!(plan.has_action);
+        assert!(plan.suppress_default_print);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
     }
 
     #[test]

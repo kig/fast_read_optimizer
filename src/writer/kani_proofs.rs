@@ -1,4 +1,4 @@
-use super::to_off_t;
+use super::copy_ops::to_off_t;
 use std::io;
 
 #[kani::proof]

@@ -1,6 +1,5 @@
-use super::super::hash::{
-    hash_check_should_print_result, hash_check_untagged_kind, HashCheckLineKind,
-};
+use super::super::hash::check::hash_check_should_print_result;
+use super::super::hash::{hash_check_untagged_kind, HashCheckLineKind};
 use super::options::{DuDereferenceMode, DuDisplayFormat, DuLineTerminator, DuUsageMode};
 use super::{
     du_apply_short_flag, du_display_total_blocks, du_node_ready, permission_denied_components,

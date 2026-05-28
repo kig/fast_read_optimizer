@@ -5,7 +5,7 @@ use crc_fast::{CrcAlgorithm as FastCrcAlgorithm, Digest as CrcDigest};
 use fro::finalize_cksum_crc;
 use openssl::hash::Hasher;
 
-mod check;
+pub(super) mod check;
 pub(crate) mod cksum;
 
 use self::check::{is_check_behavior_flag, parse_check_options, CheckOptions, ManifestEntry};

@@ -270,9 +270,15 @@ pub const ROWS: &[CoverageRow] = &[
             "-cnewer",
             "-ctime",
             "-daystart",
+            "-delete",
             "-depth",
             "-empty",
             "-exec",
+            "-execdir",
+            "-follow",
+            "-fprint",
+            "-fprint0",
+            "-fstype",
             "-fls",
             "-executable",
             "-false",
@@ -314,10 +320,13 @@ pub const ROWS: &[CoverageRow] = &[
             "-quit",
             "-readable",
             "-size",
+            "-context",
             "-true",
             "-used",
             "-uid",
             "-user",
+            "-ignore_readdir_race",
+            "-noignore_readdir_race",
             "-lname",
             "-wholename",
             "-writable",
@@ -326,18 +335,7 @@ pub const ROWS: &[CoverageRow] = &[
             "--help",
             "--version",
         ],
-        remaining: &[
-            "-D",
-            "-context",
-            "-delete",
-            "-execdir",
-            "-follow",
-            "-fprint",
-            "-fprint0",
-            "-fstype",
-            "-ignore_readdir_race",
-            "-noignore_readdir_race",
-        ],
+        remaining: &[],
     },
     CoverageRow {
         name: "head",
@@ -552,16 +550,17 @@ pub fn help_section_lines(name: &str) -> Option<Vec<String>> {
         ]);
     }
     if row.name == "find" {
-        return Some(vec![
-            format!(
-                "Tracked GNU find tokens implemented in this bounded in-process path-walking slice: {}",
-                row.covered.join(", ")
-            ),
-            format!(
+        let mut lines = vec![format!(
+            "Tracked GNU find tokens implemented in this bounded in-process path-walking slice: {}",
+            row.covered.join(", ")
+        )];
+        if !row.remaining.is_empty() {
+            lines.push(format!(
                 "GNU find tokens intentionally omitted from this bounded in-process slice (unsupported here; fro keeps the current no-follow/default-print behavior instead of exposing these families): {}",
                 row.remaining.join(", ")
-            ),
-        ]);
+            ));
+        }
+        return Some(lines);
     }
     let mut lines = vec![format!(
         "Tracked GNU/coreutils flags for this slice: {}",

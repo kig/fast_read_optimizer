@@ -377,6 +377,10 @@ mod fgrep_recurse;
 mod fgrep_word_regexp;
 #[path = "coreutils_compat_matrix/fifo.rs"]
 mod fifo;
+#[path = "coreutils_compat_matrix/find_actions.rs"]
+mod find_actions;
+#[path = "coreutils_compat_matrix/find_delete.rs"]
+mod find_delete;
 #[path = "coreutils_compat_matrix/find_flags.rs"]
 mod find_flags;
 #[path = "coreutils_compat_matrix/flag_parity.rs"]
