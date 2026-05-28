@@ -27,12 +27,7 @@ fn spawn_system_grep(args: &[&str]) -> std::process::Child {
 
 fn run_fro_fgrep_null_data(args: &[&str], stdin_bytes: &[u8]) -> Vec<u8> {
     let mut child = spawn_fro_fgrep(args);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin_bytes)
-        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -44,12 +39,7 @@ fn run_fro_fgrep_null_data(args: &[&str], stdin_bytes: &[u8]) -> Vec<u8> {
 
 fn run_sys_grep_null_data(args: &[&str], stdin_bytes: &[u8]) -> Vec<u8> {
     let mut child = spawn_system_grep(args);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin_bytes)
-        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
     let out = child.wait_with_output().unwrap();
     // exit 1 = no match, exit 0 = match, both are fine
     assert!(
@@ -91,7 +81,11 @@ fn fgrep_null_data_no_match() {
         child.stdin.take().unwrap().write_all(&input).unwrap();
         child.wait_with_output().unwrap()
     };
-    assert_eq!(fro_out.status.code(), sys_out.status.code(), "-z no-match exit code");
+    assert_eq!(
+        fro_out.status.code(),
+        sys_out.status.code(),
+        "-z no-match exit code"
+    );
     assert_eq!(fro_out.stdout, sys_out.stdout, "-z no-match stdout");
 }
 

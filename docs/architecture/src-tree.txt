@@ -57,6 +57,7 @@ src/
       line_matching.rs
       matching_output.rs
       only_matching.rs
+      parsing.rs
       runtime.rs
       tests.rs
       tests_null_data.rs

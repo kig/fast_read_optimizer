@@ -57,7 +57,10 @@ fn fgrep_word_regexp_only_matching_flags_match_system() {
             assert_same_result(
                 run_fro("fgrep", &fro_args),
                 run_system("grep", &sys_args),
-                &format!("fgrep word-regexp only-matching {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep word-regexp only-matching {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
 

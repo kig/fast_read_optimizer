@@ -355,18 +355,24 @@ mod cmp_fgrep;
 mod cp_shred;
 #[path = "coreutils_compat_matrix/du.rs"]
 mod du;
-#[path = "coreutils_compat_matrix/fgrep_flags.rs"]
-mod fgrep_flags;
-#[path = "coreutils_compat_matrix/fgrep_null_data.rs"]
-mod fgrep_null_data;
-#[path = "coreutils_compat_matrix/fgrep_recurse.rs"]
-mod fgrep_recurse;
-#[path = "coreutils_compat_matrix/fgrep_context.rs"]
-mod fgrep_context;
 #[path = "coreutils_compat_matrix/fgrep_color.rs"]
 mod fgrep_color;
+#[path = "coreutils_compat_matrix/fgrep_context.rs"]
+mod fgrep_context;
+#[path = "coreutils_compat_matrix/fgrep_deref_recurse.rs"]
+mod fgrep_deref_recurse;
+#[path = "coreutils_compat_matrix/fgrep_flags.rs"]
+mod fgrep_flags;
+#[path = "coreutils_compat_matrix/fgrep_include_exclude.rs"]
+mod fgrep_include_exclude;
+#[path = "coreutils_compat_matrix/fgrep_matcher_conflicts.rs"]
+mod fgrep_matcher_conflicts;
+#[path = "coreutils_compat_matrix/fgrep_null_data.rs"]
+mod fgrep_null_data;
 #[path = "coreutils_compat_matrix/fgrep_only_matching.rs"]
 mod fgrep_only_matching;
+#[path = "coreutils_compat_matrix/fgrep_recurse.rs"]
+mod fgrep_recurse;
 #[path = "coreutils_compat_matrix/fgrep_word_regexp.rs"]
 mod fgrep_word_regexp;
 #[path = "coreutils_compat_matrix/fifo.rs"]

@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct FgrepOptions {
     count_only: bool,
     quiet: bool,
@@ -33,7 +33,11 @@ struct FgrepOptions {
 
 impl FgrepOptions {
     fn record_sep(self) -> u8 {
-        if self.null_data { b'\0' } else { b'\n' }
+        if self.null_data {
+            b'\0'
+        } else {
+            b'\n'
+        }
     }
 }
 
@@ -48,30 +52,34 @@ enum PatternSource {
     File(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FgrepFilenameMode {
+    #[default]
     Auto,
     Always,
     Never,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FgrepBinaryMode {
+    #[default]
     Default,
     Text,
     WithoutMatch,
     Binary,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FgrepColorMode {
+    #[default]
     Auto,
     Always,
     Never,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FgrepGroupSeparatorPolicy {
+    #[default]
     Default,
     Disabled,
     Custom(&'static str),
@@ -85,6 +93,7 @@ enum FgrepRegularFilePath {
 }
 
 const FGREP_SMALL_FILE_PROBE_LIMIT: u64 = 64 * 1024;
+const FGREP_CONFLICTING_MATCHERS: &str = "grep: conflicting matchers specified";
 
 struct ParsedFgrepArgs {
     io_mode: IOMode,
@@ -92,138 +101,41 @@ struct ParsedFgrepArgs {
     pattern_sources: Vec<PatternSource>,
     files: Vec<String>,
     stdin_label: Option<String>,
+    glob_filter: FgrepGlobFilter,
 }
 
 const FGREP_MAX_COUNT_REACHED: &str = "fgrep max count reached";
 
-mod context;
 mod color;
+mod context;
 mod file_kinds;
-mod only_matching;
 mod line_matching;
+mod only_matching;
+mod parsing;
 mod runtime;
 
 use self::context::{fgrep_context_enabled, fgrep_reset_context_output_state};
 use self::file_kinds::{
-    collect_dir_files_sorted, fgrep_input_path_kind, parse_devices_value, parse_directories_value,
-    FgrepDevicePolicy, FgrepDirectoryPolicy, FgrepInputPathKind,
+    collect_dir_files_sorted, collect_dir_files_sorted_dereference, fgrep_input_path_kind,
+    parse_devices_value, parse_directories_value, FgrepDevicePolicy, FgrepDirectoryPolicy,
+    FgrepGlobFilter, FgrepInputPathKind,
 };
+use self::line_matching::fgrep_short_flag_effect;
+use self::parsing::{
+    compile_patterns, fgrep_conflicting_matchers_error, fgrep_is_conflicting_matchers_error,
+    load_exclude_from, parse_binary_files_value, parse_color_mode_value, parse_context_count_value,
+    parse_max_count_value, parse_option_value, parse_pattern_file_bytes,
+};
+#[cfg(test)]
+use self::runtime::count_literal_matching_lines;
 use self::runtime::{
     fgrep_display_label, fgrep_exit_code, fgrep_report_input_error,
     fgrep_suppresses_matching_line_output, handle_loaded_match_result, write_count_line,
     write_filename_result, write_matching_stream_lines, write_matching_stream_lines_multi,
 };
-#[cfg(test)]
-use self::runtime::count_literal_matching_lines;
-use self::line_matching::normalize_case;
-use self::line_matching::fgrep_short_flag_effect;
 
 pub(super) fn fgrep_line_number_prefix(print_line_numbers: bool, line_no: u64) -> Option<u64> {
     print_line_numbers.then_some(line_no)
-}
-
-fn parse_pattern_file_bytes(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut patterns = Vec::new();
-    let mut start = 0usize;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            patterns.push(bytes[start..index].to_vec());
-            start = index + 1;
-        }
-    }
-    if start < bytes.len() {
-        patterns.push(bytes[start..].to_vec());
-    }
-    patterns
-}
-
-fn compile_patterns(
-    sources: Vec<PatternSource>,
-    ignore_case: bool,
-) -> io::Result<Vec<FgrepPattern>> {
-    let mut patterns = Vec::new();
-    for source in sources {
-        match source {
-            PatternSource::Inline(pattern) => {
-                patterns.push(FgrepPattern {
-                    normalized: normalize_case(pattern.as_bytes(), ignore_case).into_owned(),
-                    raw: pattern.into_bytes(),
-                });
-            }
-            PatternSource::File(path) => {
-                let bytes = fs::read(&path)?;
-                patterns.extend(parse_pattern_file_bytes(&bytes).into_iter().map(|pattern| {
-                    let normalized = normalize_case(&pattern, ignore_case).into_owned();
-                    FgrepPattern {
-                        raw: pattern,
-                        normalized,
-                    }
-                }));
-            }
-        }
-    }
-    Ok(patterns)
-}
-
-fn parse_option_value(
-    args: &[String],
-    index: &mut usize,
-    value: Option<&str>,
-    option_name: &str,
-) -> io::Result<String> {
-    if let Some(value) = value {
-        return Ok(value.to_string());
-    }
-    *index += 1;
-    args.get(*index).cloned().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("fgrep: option '{option_name}' requires an argument"),
-        )
-    })
-}
-
-fn parse_max_count_value(value: &str) -> io::Result<u64> {
-    value.parse::<u64>().map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("fgrep: invalid max count '{value}': {err}"),
-        )
-    })
-}
-
-fn parse_context_count_value(value: &str) -> io::Result<u64> {
-    value.parse::<u64>().map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("fgrep: invalid context count '{value}': {err}"),
-        )
-    })
-}
-
-fn parse_binary_files_value(value: &str) -> io::Result<FgrepBinaryMode> {
-    match value {
-        "binary" => Ok(FgrepBinaryMode::Binary),
-        "text" => Ok(FgrepBinaryMode::Text),
-        "without-match" => Ok(FgrepBinaryMode::WithoutMatch),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unknown binary-files type",
-        )),
-    }
-}
-
-fn parse_color_mode_value(value: Option<&str>, option_name: &str) -> io::Result<FgrepColorMode> {
-    match value {
-        None => Ok(FgrepColorMode::Auto),
-        Some("always") => Ok(FgrepColorMode::Always),
-        Some("auto") => Ok(FgrepColorMode::Auto),
-        Some("never") => Ok(FgrepColorMode::Never),
-        Some(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("fgrep: invalid color mode for '{option_name}'"),
-        )),
-    }
 }
 
 fn fgrep_stdout_is_tty() -> bool {
@@ -280,7 +192,11 @@ fn fgrep_binary_reports_match(options: FgrepOptions) -> bool {
 }
 
 fn fgrep_regular_file_path(options: FgrepOptions, pattern_count: usize) -> FgrepRegularFilePath {
-    if options.line_regexp || options.word_regexp || options.ignore_case || fgrep_context_enabled(options) {
+    if options.line_regexp
+        || options.word_regexp
+        || options.ignore_case
+        || fgrep_context_enabled(options)
+    {
         if pattern_count == 1 {
             FgrepRegularFilePath::LineFilterSinglePattern
         } else {
@@ -305,40 +221,13 @@ fn try_load_small_regular_file_bytes(path: &str, io_mode: IOMode) -> io::Result<
 
 fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
     let mut io_mode = IOMode::Auto;
-    let mut options = FgrepOptions {
-        count_only: false,
-        quiet: false,
-        files_with_matches: false,
-        files_without_match: false,
-        color: false,
-        only_matching: false,
-        suppress_messages: false,
-        initial_tab: false,
-        line_buffered: false,
-        before_context: 0,
-        after_context: 0,
-        offset_width: 0,
-        print_line_numbers: false,
-        print_byte_offsets: false,
-        line_regexp: false,
-        word_regexp: false,
-        ignore_case: false,
-        invert_match: false,
-        max_count: None,
-        null_terminate_filenames: false,
-        null_data: false,
-        report_gbps: false,
-        group_separator: FgrepGroupSeparatorPolicy::Default,
-        binary_mode: FgrepBinaryMode::Default,
-        filename_mode: FgrepFilenameMode::Auto,
-        device_policy: FgrepDevicePolicy::Read,
-        directory_policy: FgrepDirectoryPolicy::Read,
-    };
+    let mut options = FgrepOptions::default();
     let mut color_mode = FgrepColorMode::Auto;
     let mut pattern_sources = Vec::new();
     let mut positional_pattern = None::<String>;
     let mut files = Vec::new();
     let mut stdin_label = None::<String>;
+    let mut glob_filter = FgrepGlobFilter::default();
     let mut end_flags = false;
     let mut index = 1usize;
     while index < args.len() {
@@ -384,6 +273,9 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
             "-a" | "--text" | "--binary-files=text" => {
                 options.binary_mode = FgrepBinaryMode::Text;
             }
+            "-E" | "--extended-regexp" | "-G" | "--basic-regexp" | "-P" | "--perl-regexp" => {
+                return Err(fgrep_conflicting_matchers_error());
+            }
             "-I" | "--binary-files=without-match" => {
                 options.binary_mode = FgrepBinaryMode::WithoutMatch;
             }
@@ -395,88 +287,137 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
             "-r" | "--recursive" | "--directories=recurse" => {
                 options.directory_policy = FgrepDirectoryPolicy::Recurse;
             }
+            "-R" | "--dereference-recursive" => {
+                options.directory_policy = FgrepDirectoryPolicy::RecurseDereference;
+            }
             "--auto" => io_mode = IOMode::Auto,
             "--direct" => io_mode = IOMode::Direct,
             "--no-direct" => io_mode = IOMode::PageCache,
             "--" => end_flags = true,
-            "-e" => pattern_sources
-                .push(PatternSource::Inline(parse_option_value(args, &mut index, None, "-e")?)),
+            "-e" => pattern_sources.push(PatternSource::Inline(parse_option_value(
+                args, &mut index, None, "-e",
+            )?)),
             "--regexp" => pattern_sources.push(PatternSource::Inline(parse_option_value(
                 args, &mut index, None, "--regexp",
             )?)),
-            "-f" => pattern_sources
-                .push(PatternSource::File(parse_option_value(args, &mut index, None, "-f")?)),
+            "-f" => pattern_sources.push(PatternSource::File(parse_option_value(
+                args, &mut index, None, "-f",
+            )?)),
             "--file" => pattern_sources.push(PatternSource::File(parse_option_value(
                 args, &mut index, None, "--file",
             )?)),
             "-m" => {
-                options.max_count =
-                    Some(parse_max_count_value(&parse_option_value(args, &mut index, None, "-m")?)?)
+                options.max_count = Some(parse_max_count_value(&parse_option_value(
+                    args, &mut index, None, "-m",
+                )?)?)
             }
             "--max-count" => {
                 options.max_count = Some(parse_max_count_value(&parse_option_value(
-                    args, &mut index, None, "--max-count",
+                    args,
+                    &mut index,
+                    None,
+                    "--max-count",
                 )?)?)
             }
             "-A" => {
-                options.after_context = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "-A",
-                )?)?
+                options.after_context =
+                    parse_context_count_value(&parse_option_value(args, &mut index, None, "-A")?)?
             }
             "--after-context" => {
                 options.after_context = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "--after-context",
+                    args,
+                    &mut index,
+                    None,
+                    "--after-context",
                 )?)?
             }
             "-B" => {
-                options.before_context = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "-B",
-                )?)?
+                options.before_context =
+                    parse_context_count_value(&parse_option_value(args, &mut index, None, "-B")?)?
             }
             "--before-context" => {
                 options.before_context = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "--before-context",
+                    args,
+                    &mut index,
+                    None,
+                    "--before-context",
                 )?)?
             }
             "-C" => {
-                let n = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "-C",
-                )?)?;
+                let n =
+                    parse_context_count_value(&parse_option_value(args, &mut index, None, "-C")?)?;
                 options.before_context = n;
                 options.after_context = n;
             }
             "--context" => {
                 let n = parse_context_count_value(&parse_option_value(
-                    args, &mut index, None, "--context",
+                    args,
+                    &mut index,
+                    None,
+                    "--context",
                 )?)?;
                 options.before_context = n;
                 options.after_context = n;
             }
             "-D" => {
-                options.device_policy = parse_devices_value(&parse_option_value(
-                    args, &mut index, None, "-D",
-                )?)?
+                options.device_policy =
+                    parse_devices_value(&parse_option_value(args, &mut index, None, "-D")?)?
             }
             "--devices" => {
-                options.device_policy = parse_devices_value(&parse_option_value(
-                    args, &mut index, None, "--devices",
-                )?)?
+                options.device_policy =
+                    parse_devices_value(&parse_option_value(args, &mut index, None, "--devices")?)?
             }
             "-d" => {
-                options.directory_policy = parse_directories_value(&parse_option_value(
-                    args, &mut index, None, "-d",
-                )?)?
+                options.directory_policy =
+                    parse_directories_value(&parse_option_value(args, &mut index, None, "-d")?)?
             }
             "--directories" => {
                 options.directory_policy = parse_directories_value(&parse_option_value(
-                    args, &mut index, None, "--directories",
+                    args,
+                    &mut index,
+                    None,
+                    "--directories",
                 )?)?
             }
-            "--label" => {
-                stdin_label = Some(parse_option_value(args, &mut index, None, "--label")?)
+            "--label" => stdin_label = Some(parse_option_value(args, &mut index, None, "--label")?),
+            "--include" => {
+                let v = parse_option_value(args, &mut index, None, "--include")?;
+                glob_filter
+                    .include
+                    .push(FgrepGlobFilter::parse_glob("--include", &v)?);
+            }
+            "--exclude" => {
+                let v = parse_option_value(args, &mut index, None, "--exclude")?;
+                glob_filter
+                    .exclude
+                    .push(FgrepGlobFilter::parse_glob("--exclude", &v)?);
+            }
+            "--exclude-dir" => {
+                let v = parse_option_value(args, &mut index, None, "--exclude-dir")?;
+                glob_filter
+                    .exclude_dir
+                    .push(FgrepGlobFilter::parse_glob("--exclude-dir", &v)?);
+            }
+            "--exclude-from" => {
+                let path = parse_option_value(args, &mut index, None, "--exclude-from")?;
+                load_exclude_from(&mut glob_filter, &path)?;
             }
             other => {
-                if let Some(v) = other.strip_prefix("--regexp=") {
+                if let Some(v) = other.strip_prefix("--include=") {
+                    glob_filter
+                        .include
+                        .push(FgrepGlobFilter::parse_glob("--include", v)?);
+                } else if let Some(v) = other.strip_prefix("--exclude=") {
+                    glob_filter
+                        .exclude
+                        .push(FgrepGlobFilter::parse_glob("--exclude", v)?);
+                } else if let Some(v) = other.strip_prefix("--exclude-dir=") {
+                    glob_filter
+                        .exclude_dir
+                        .push(FgrepGlobFilter::parse_glob("--exclude-dir", v)?);
+                } else if let Some(v) = other.strip_prefix("--exclude-from=") {
+                    load_exclude_from(&mut glob_filter, v)?;
+                } else if let Some(v) = other.strip_prefix("--regexp=") {
                     pattern_sources.push(PatternSource::Inline(v.to_string()));
                 } else if let Some(v) = other.strip_prefix("--file=") {
                     pattern_sources.push(PatternSource::File(v.to_string()));
@@ -581,6 +522,7 @@ fn parse_fgrep_args(args: &[String]) -> io::Result<ParsedFgrepArgs> {
         pattern_sources,
         files,
         stdin_label,
+        glob_filter,
     })
 }
 
@@ -591,7 +533,15 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
         pattern_sources,
         files,
         stdin_label,
-    } = parse_fgrep_args(args)?;
+        glob_filter,
+    } = match parse_fgrep_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) if fgrep_is_conflicting_matchers_error(&err) => {
+            fro::cio_eprintln!("{err}");
+            return Ok(2);
+        }
+        Err(err) => return Err(err),
+    };
     let patterns = compile_patterns(pattern_sources, options.ignore_case)?;
     if patterns.is_empty() {
         return Ok(1);
@@ -601,33 +551,82 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
     let raw_inputs = parse_stream_inputs(files);
 
     let mut saw_error = false;
-    let recurse = matches!(options.directory_policy, FgrepDirectoryPolicy::Recurse);
-    // Expand directory arguments when --directories=recurse is active so that
-    // multi_file and the main processing loop see a flat file list.
+    let recurse = matches!(
+        options.directory_policy,
+        FgrepDirectoryPolicy::Recurse | FgrepDirectoryPolicy::RecurseDereference
+    );
+    // Expand directory arguments when --directories=recurse/-r/-R is active so
+    // that multi_file and the main processing loop see a flat file list.
     let (inputs, any_dir_expanded) = if recurse {
         let mut expanded: Vec<StreamInput> = Vec::new();
         let mut any_dir = false;
+        let dereference = matches!(
+            options.directory_policy,
+            FgrepDirectoryPolicy::RecurseDereference
+        );
         for input in raw_inputs {
             match &input {
                 StreamInput::File(file) => {
                     match fgrep_input_path_kind(file) {
                         Ok(FgrepInputPathKind::Directory) => {
                             any_dir = true;
-                            let dir_files = collect_dir_files_sorted(file, &mut |path, e| {
-                                fgrep_report_input_error(path, &e, options);
-                                saw_error = true;
-                            });
+                            let dir_files = if dereference {
+                                collect_dir_files_sorted_dereference(
+                                    file,
+                                    &glob_filter,
+                                    &mut |path, e| {
+                                        fgrep_report_input_error(path, &e, options);
+                                        saw_error = true;
+                                    },
+                                )
+                            } else {
+                                collect_dir_files_sorted(file, &glob_filter, &mut |path, e| {
+                                    fgrep_report_input_error(path, &e, options);
+                                    saw_error = true;
+                                })
+                            };
                             for f in dir_files {
                                 expanded.push(StreamInput::File(f));
                             }
                         }
-                        _ => expanded.push(input),
+                        // For non-directory explicit arguments, apply --include/--exclude
+                        // to the file's basename (GNU grep behaviour).
+                        _ => {
+                            if !glob_filter.is_empty() {
+                                let basename = std::path::Path::new(file.as_str())
+                                    .file_name()
+                                    .map(|n| n.as_encoded_bytes())
+                                    .unwrap_or(file.as_bytes());
+                                if glob_filter.file_allowed(basename) {
+                                    expanded.push(input);
+                                }
+                            } else {
+                                expanded.push(input);
+                            }
+                        }
                     }
                 }
                 _ => expanded.push(input),
             }
         }
         (expanded, any_dir)
+    } else if !glob_filter.is_empty() {
+        // No recursion but glob filters are active: apply --include/--exclude
+        // to explicit file arguments (GNU grep does the same).
+        let filtered = raw_inputs
+            .into_iter()
+            .filter(|input| match input {
+                StreamInput::File(file) => {
+                    let basename = std::path::Path::new(file.as_str())
+                        .file_name()
+                        .map(|n| n.as_encoded_bytes())
+                        .unwrap_or(file.as_bytes());
+                    glob_filter.file_allowed(basename)
+                }
+                _ => true,
+            })
+            .collect();
+        (filtered, false)
     } else {
         (raw_inputs, false)
     };
@@ -656,7 +655,9 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 };
                 match kind {
                     FgrepInputPathKind::Directory => match options.directory_policy {
-                        FgrepDirectoryPolicy::Skip | FgrepDirectoryPolicy::Recurse => continue,
+                        FgrepDirectoryPolicy::Skip
+                        | FgrepDirectoryPolicy::Recurse
+                        | FgrepDirectoryPolicy::RecurseDereference => continue,
                         FgrepDirectoryPolicy::Read => {
                             let e = io::Error::new(io::ErrorKind::Other, "Is a directory");
                             fgrep_report_input_error(file, &e, options);
@@ -878,7 +879,8 @@ pub(super) fn run_fgrep(args: &[String]) -> io::Result<i32> {
                 }
                 let mut stream_options = options;
                 if stream_options.initial_tab
-                    && (multi_file || matches!(stream_options.filename_mode, FgrepFilenameMode::Always))
+                    && (multi_file
+                        || matches!(stream_options.filename_mode, FgrepFilenameMode::Always))
                 {
                     stream_options.offset_width = 20;
                 }

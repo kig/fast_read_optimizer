@@ -33,7 +33,13 @@ fn fgrep_only_matching_prefix_and_listing_flags_match_system() {
             vec!["-o", "-Z", "needle", primary.as_str(), secondary.as_str()],
             vec!["-o", "-c", "needle", primary.as_str()],
             vec!["-o", "-l", "needle", primary.as_str(), secondary.as_str()],
-            vec!["-o", "-L", "missing-xyz", primary.as_str(), secondary.as_str()],
+            vec![
+                "-o",
+                "-L",
+                "missing-xyz",
+                primary.as_str(),
+                secondary.as_str(),
+            ],
             vec!["-o", "-q", "needle", primary.as_str()],
             vec!["-o", "-m", "1", "needle", primary.as_str()],
             vec!["-o", "-m", "1", "-n", "needle", primary.as_str()],
@@ -45,7 +51,10 @@ fn fgrep_only_matching_prefix_and_listing_flags_match_system() {
             assert_same_result(
                 run_fro("fgrep", &fro_args),
                 run_system("grep", &sys_args),
-                &format!("fgrep only-matching prefix {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep only-matching prefix {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
     }
@@ -62,7 +71,14 @@ fn fgrep_only_matching_context_and_invert_flags_match_system() {
             vec!["-o", "-B1", "needle", primary.as_str()],
             vec!["-o", "-C1", "needle", primary.as_str()],
             vec!["-o", "-A1", "-n", "needle", primary.as_str()],
-            vec!["-o", "-C1", "-H", "needle", primary.as_str(), secondary.as_str()],
+            vec![
+                "-o",
+                "-C1",
+                "-H",
+                "needle",
+                primary.as_str(),
+                secondary.as_str(),
+            ],
             vec!["-o", "-v", "needle", primary.as_str()],
             vec!["-o", "-v", "-A1", "needle", primary.as_str()],
         ] {
@@ -73,7 +89,10 @@ fn fgrep_only_matching_context_and_invert_flags_match_system() {
             assert_same_result(
                 run_fro("fgrep", &fro_args),
                 run_system("grep", &sys_args),
-                &format!("fgrep only-matching context {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep only-matching context {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
     }
@@ -91,7 +110,12 @@ fn fgrep_only_matching_case_and_binary_flags_match_system() {
             vec!["-o", "-a", "needle", binary.as_str()],
             vec!["-o", "--binary-files=text", "needle", binary.as_str()],
             vec!["-o", "-I", "needle", binary.as_str()],
-            vec!["-o", "--binary-files=without-match", "needle", binary.as_str()],
+            vec![
+                "-o",
+                "--binary-files=without-match",
+                "needle",
+                binary.as_str(),
+            ],
             vec!["-o", "-U", "needle", binary.as_str()],
         ] {
             let mut fro_args = io_flags.clone();
@@ -101,7 +125,10 @@ fn fgrep_only_matching_case_and_binary_flags_match_system() {
             assert_same_result(
                 run_fro("fgrep", &fro_args),
                 run_system("grep", &sys_args),
-                &format!("fgrep only-matching binary {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep only-matching binary {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
     }
@@ -128,7 +155,10 @@ fn fgrep_only_matching_stream_and_stdin_match_system() {
             assert_same_result(
                 run_fro_with_stdin("fgrep", &fro_args, stdin_payload),
                 run_system_with_stdin("grep", &sys_args, stdin_payload),
-                &format!("fgrep only-matching stdin {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep only-matching stdin {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
     }

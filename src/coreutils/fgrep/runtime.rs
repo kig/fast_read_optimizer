@@ -5,20 +5,20 @@ use super::color::{
 use super::*;
 use std::io::{self, Write};
 
-#[path = "matching_output.rs"]
-mod matching_output;
 #[path = "dispatcher.rs"]
 mod dispatcher;
+#[path = "matching_output.rs"]
+mod matching_output;
 
-#[allow(unused_imports)]
-pub(crate) use self::matching_output::{
-    count_literal_matching_lines, write_count_literal_matching_lines, write_filtered_lines,
-    write_filtered_lines_multi, write_line_regexp_matches, write_matching_lines,
-};
 #[allow(unused_imports)]
 pub(crate) use self::dispatcher::{
     finish_pending_line, handle_loaded_match_result, write_loaded_match_result,
     write_matching_stream_lines, write_matching_stream_lines_multi,
+};
+#[allow(unused_imports)]
+pub(crate) use self::matching_output::{
+    count_literal_matching_lines, write_count_literal_matching_lines, write_filtered_lines,
+    write_filtered_lines_multi, write_line_regexp_matches, write_matching_lines,
 };
 
 const FGREP_STDIN_LABEL: &str = "(standard input)";
@@ -166,7 +166,15 @@ pub(super) fn write_context_line<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<()> {
     write_line_with_separator(
-        out, label, line, line_no, byte_offset, multi_file, options, None, b'-',
+        out,
+        label,
+        line,
+        line_no,
+        byte_offset,
+        multi_file,
+        options,
+        None,
+        b'-',
     )
 }
 
@@ -196,7 +204,14 @@ pub(super) fn fgrep_record_selected_line(
 
 pub(super) fn fgrep_report_input_error(file: &str, err: &io::Error, options: FgrepOptions) {
     if !options.suppress_messages {
-        fro::cio_eprintln!("grep: {file}: {err}");
+        // GNU grep omits " (os error N)" from error messages; strip it to match.
+        let msg = err.to_string();
+        let msg = if let Some(pos) = msg.rfind(" (os error ") {
+            &msg[..pos]
+        } else {
+            msg.as_str()
+        };
+        fro::cio_eprintln!("grep: {file}: {msg}");
     }
 }
 

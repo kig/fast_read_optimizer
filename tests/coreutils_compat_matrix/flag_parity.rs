@@ -3,7 +3,7 @@
 //! Layout
 //! ──────
 //! 1. local helper routines reused by find TODO coverage probes
-//! 2. `#[ignore = "TODO"]` stubs for remaining find system-only flags (69 items)
+//! 2. `#[ignore = "TODO"]` stubs for remaining find system-only flags
 
 use super::*;
 use std::ffi::CStr;
@@ -19,6 +19,53 @@ fn assert_find_same_sorted(root: &Path, extra_args: &[&str], label: &str) {
         run_fro("find", &fro_args),
         run_system("find", &sys_args),
         label,
+    );
+}
+
+fn assert_find_same_exact(root: &Path, extra_args: &[&str], label: &str) {
+    let root_arg = root.to_str().unwrap();
+    let mut fro_args = vec![root_arg];
+    fro_args.extend_from_slice(extra_args);
+    let mut sys_args = vec![root_arg];
+    sys_args.extend_from_slice(extra_args);
+    assert_same_result(run_fro("find", &fro_args), run_system("find", &sys_args), label);
+}
+
+fn assert_find_fprintf_same(root: &Path, format: &str, label: &str) {
+    let out_dir = root.parent().unwrap_or(root);
+    let fro_out = out_dir.join("fro-output.txt");
+    let sys_out = out_dir.join("sys-output.txt");
+    let root_arg = root.to_str().unwrap();
+    let fro_out_arg = fro_out.to_str().unwrap();
+    let sys_out_arg = sys_out.to_str().unwrap();
+    let fro = run_fro("find", &[root_arg, "-type", "f", "-fprintf", fro_out_arg, format]);
+    let system = run_system("find", &[root_arg, "-type", "f", "-fprintf", sys_out_arg, format]);
+    assert_eq!(fro.status.code(), system.status.code(), "{label}: status mismatch");
+    assert_eq!(fro.stdout, system.stdout, "{label}: stdout mismatch");
+    assert_eq!(fro.stderr, system.stderr, "{label}: stderr mismatch");
+    assert_eq!(
+        fs::read(&fro_out).unwrap(),
+        fs::read(&sys_out).unwrap(),
+        "{label}: file output mismatch"
+    );
+}
+
+fn assert_find_fls_same(root: &Path, label: &str) {
+    let out_dir = root.parent().unwrap_or(root);
+    let fro_out = out_dir.join("fro-output.txt");
+    let sys_out = out_dir.join("sys-output.txt");
+    let root_arg = root.to_str().unwrap();
+    let fro_out_arg = fro_out.to_str().unwrap();
+    let sys_out_arg = sys_out.to_str().unwrap();
+    let fro = run_fro("find", &[root_arg, "-type", "f", "-fls", fro_out_arg]);
+    let system = run_system("find", &[root_arg, "-type", "f", "-fls", sys_out_arg]);
+    assert_eq!(fro.status.code(), system.status.code(), "{label}: status mismatch");
+    assert_eq!(fro.stdout, system.stdout, "{label}: stdout mismatch");
+    assert_eq!(fro.stderr, system.stderr, "{label}: stderr mismatch");
+    assert_eq!(
+        fs::read(&fro_out).unwrap(),
+        fs::read(&sys_out).unwrap(),
+        "{label}: file output mismatch"
     );
 }
 
@@ -115,7 +162,7 @@ fn current_group_name() -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════
-// §1  find: TODO stubs for remaining system-only flags (69 items)
+// §1  find: TODO stubs for remaining system-only flags
 //
 // Each stub corresponds to one entry in the `remaining` slice of the
 // find CoverageRow in src/help_compat.rs.  When a predicate is natively
@@ -129,44 +176,141 @@ fn current_group_name() -> String {
 fn find_debug_todo() {}
 
 #[test]
-#[ignore = "TODO: find -Olevel (optimisation level) not yet implemented in fro bounded find slice"]
-fn find_optimise_level_todo() {}
+fn find_optimise_level_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-olevel");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.txt"), b"file").unwrap();
+    let root_arg = root.to_str().unwrap();
+    assert_same_sorted_lines(
+        run_fro("find", &["-O9", root_arg, "-type", "f"]),
+        run_system("find", &["-O9", root_arg, "-type", "f"]),
+        "find -O9 -type f",
+    );
+}
 
 // ── Symlink-traversal top-level flags ───────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -H (follow symlinks only for command-line args) not yet implemented in fro bounded find slice"]
-fn find_h_symlink_todo() {}
+fn find_h_symlink_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-h");
+    let target = tmp.join("target");
+    let nested = target.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("inside.txt"), b"inside").unwrap();
+    let child_link = target.join("child-link");
+    symlink(&nested, &child_link).unwrap();
+    let root_link = tmp.join("root-link");
+    symlink(&target, &root_link).unwrap();
+    let root_arg = root_link.to_str().unwrap();
+    assert_same_sorted_lines(
+        run_fro("find", &["-H", root_arg, "-type", "f"]),
+        run_system("find", &["-H", root_arg, "-type", "f"]),
+        "find -H -type f",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -L (follow all symlinks) not yet implemented in fro bounded find slice"]
-fn find_l_symlink_todo() {}
+fn find_l_symlink_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-l");
+    let root = tmp.join("root");
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("inside.txt"), b"inside").unwrap();
+    let child_link = root.join("child-link");
+    symlink(&nested, &child_link).unwrap();
+    let root_arg = root.to_str().unwrap();
+    assert_same_sorted_lines(
+        run_fro("find", &["-L", root_arg, "-type", "f"]),
+        run_system("find", &["-L", root_arg, "-type", "f"]),
+        "find -L -type f",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -N (ignore read errors on symlinks) not yet implemented in fro bounded find slice"]
-fn find_n_symlink_todo() {}
-
-#[test]
-#[ignore = "TODO: find -P (never follow symlinks, default) not yet implemented as explicit flag in fro bounded find slice"]
-fn find_p_symlink_todo() {}
+fn find_p_symlink_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-p");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    let root_arg = root.to_str().unwrap();
+    assert_same_sorted_lines(
+        run_fro("find", &["-P", root_arg, "-type", "f"]),
+        run_system("find", &["-P", root_arg, "-type", "f"]),
+        "find -P -type f",
+    );
+}
 
 // ── Boolean combinators ─────────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -a / -and (explicit AND operator) not yet implemented in fro bounded find slice"]
-fn find_and_todo() {}
+fn find_and_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-and");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("beta.log"), b"beta").unwrap();
+    assert_find_same_sorted(&root, &["-type", "f", "-a", "-name", "*.txt"], "find -a");
+}
 
 #[test]
-#[ignore = "TODO: find -o (OR operator) not yet implemented in fro bounded find slice"]
-fn find_or_short_todo() {}
+fn find_and_long_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-and-long");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("beta.log"), b"beta").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-type", "f", "-and", "-name", "*.txt"],
+        "find -and",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -or (long OR operator) not yet implemented in fro bounded find slice"]
-fn find_or_long_todo() {}
+fn find_or_short_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-or-short");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("beta.log"), b"beta").unwrap();
+    fs::write(root.join("sub/gamma.md"), b"gamma").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-name", "*.txt", "-o", "-name", "*.log"],
+        "find -o",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -not (NOT operator) not yet implemented in fro bounded find slice"]
-fn find_not_todo() {}
+fn find_or_long_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-or-long");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("beta.log"), b"beta").unwrap();
+    fs::write(root.join("sub/gamma.md"), b"gamma").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-name", "*.txt", "-or", "-name", "*.md"],
+        "find -or",
+    );
+}
+
+#[test]
+fn find_not_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-not");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("beta.log"), b"beta").unwrap();
+    fs::write(root.join("sub/gamma.md"), b"gamma").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-type", "f", "-not", "-name", "*.txt"],
+        "find -not",
+    );
+}
 
 // ── Time-based predicates ───────────────────────────────────────────
 
@@ -273,12 +417,56 @@ fn find_newer_todo() {
 }
 
 #[test]
-#[ignore = "TODO: find -daystart not yet implemented in fro bounded find slice"]
-fn find_daystart_todo() {}
+fn find_daystart_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-daystart");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let midnight = tmp.join("midnight");
+    fs::write(&midnight, b"midnight").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as libc::time_t;
+    let midnight_secs = {
+        let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+        assert!(
+            !unsafe { libc::localtime_r(&now, &mut local) }.is_null(),
+            "localtime_r failed"
+        );
+        local.tm_hour = 0;
+        local.tm_min = 0;
+        local.tm_sec = 0;
+        unsafe { libc::mktime(&mut local) }
+    };
+    assert!(midnight_secs > 120, "midnight timestamp unexpectedly small");
+    let older = root.join("older.txt");
+    let recent = root.join("recent.txt");
+    fs::write(&older, b"older").unwrap();
+    fs::write(&recent, b"recent").unwrap();
+    set_file_times(&older, midnight_secs - 60, midnight_secs - 60);
+    set_file_times(&recent, midnight_secs + 60, midnight_secs + 60);
+    assert_find_same_sorted(&root, &["-mtime", "0"], "find -mtime 0");
+    assert_find_same_sorted(
+        &root,
+        &["-daystart", "-mtime", "0"],
+        "find -daystart -mtime 0",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -used not yet implemented in fro bounded find slice"]
-fn find_used_todo() {}
+fn find_used_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-used");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("candidate.txt");
+    fs::write(&path, b"candidate").unwrap();
+    set_file_times(&path, 1, 1);
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&path, perms).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"candidate");
+    assert_find_same_sorted(&root, &["-type", "f", "-used", "-1"], "find -used -1");
+}
 
 // ── Size / count predicates ─────────────────────────────────────────
 
@@ -438,32 +626,95 @@ fn find_empty_todo() {
 // ── Regex predicates ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -regex not yet implemented in fro bounded find slice"]
-fn find_regex_todo() {}
+fn find_regex_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-regex");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(sub.join("BETA.TXT"), b"beta").unwrap();
+    fs::write(sub.join("gamma.log"), b"gamma").unwrap();
+    assert_find_same_sorted(&root, &["-regex", ".*txt"], "find -regex");
+}
 
 #[test]
-#[ignore = "TODO: find -iregex not yet implemented in fro bounded find slice"]
-fn find_iregex_todo() {}
+fn find_iregex_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-iregex");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(sub.join("BETA.TXT"), b"beta").unwrap();
+    fs::write(sub.join("gamma.log"), b"gamma").unwrap();
+    assert_find_same_sorted(&root, &["-iregex", ".*txt"], "find -iregex");
+}
 
 #[test]
-#[ignore = "TODO: find -regextype not yet implemented in fro bounded find slice"]
-fn find_regextype_todo() {}
+fn find_regextype_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-regextype");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(sub.join("BETA.TXT"), b"beta").unwrap();
+    fs::write(sub.join("gamma.log"), b"gamma").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &[
+            "-regextype",
+            "posix-extended",
+            "-regex",
+            ".*/(alpha|BETA)\\.(txt|TXT)",
+        ],
+        "find -regextype posix-extended",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -lname not yet implemented in fro bounded find slice"]
-fn find_lname_todo() {}
+fn find_lname_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-lname");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("target.txt"), b"target").unwrap();
+    std::os::unix::fs::symlink("target.txt", root.join("match-link")).unwrap();
+    std::os::unix::fs::symlink("other.txt", root.join("other-link")).unwrap();
+    assert_find_same_sorted(&root, &["-lname", "target*"], "find -lname target*");
+}
 
 #[test]
-#[ignore = "TODO: find -ilname not yet implemented in fro bounded find slice"]
-fn find_ilname_todo() {}
+fn find_ilname_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-ilname");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("target.txt"), b"target").unwrap();
+    std::os::unix::fs::symlink("TARGET.TXT", root.join("upper-link")).unwrap();
+    std::os::unix::fs::symlink("misc.bin", root.join("other-link")).unwrap();
+    assert_find_same_sorted(&root, &["-ilname", "target*"], "find -ilname target*");
+}
 
 #[test]
-#[ignore = "TODO: find -wholename not yet implemented in fro bounded find slice"]
-fn find_wholename_todo() {}
+fn find_wholename_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-wholename");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("match.txt"), b"match").unwrap();
+    assert_find_same_sorted(&root, &["-wholename", "*/sub/*"], "find -wholename */sub/*");
+}
 
 #[test]
-#[ignore = "TODO: find -iwholename not yet implemented in fro bounded find slice"]
-fn find_iwholename_todo() {}
+fn find_iwholename_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-iwholename");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("match.txt"), b"match").unwrap();
+    assert_find_same_sorted(
+        &root,
+        &["-iwholename", "*/SUB/*"],
+        "find -iwholename */SUB/*",
+    );
+}
 
 // ── Filesystem / traversal control ──────────────────────────────────
 
@@ -479,20 +730,42 @@ fn find_mindepth_todo() {
 }
 
 #[test]
-#[ignore = "TODO: find -depth not yet implemented in fro bounded find slice"]
-fn find_depth_todo() {}
+fn find_depth_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-depth");
+    let root = tmp.join("root");
+    let level1 = root.join("a");
+    let level2 = level1.join("b");
+    fs::create_dir_all(&level2).unwrap();
+    fs::write(level2.join("leaf.txt"), b"leaf").unwrap();
+    assert_find_same_exact(&root, &["-depth"], "find -depth");
+}
 
 #[test]
-#[ignore = "TODO: find -mount / -xdev not yet implemented in fro bounded find slice"]
-fn find_mount_xdev_todo() {}
+fn find_mount_xdev_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-mount");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.txt"), b"file").unwrap();
+    assert_find_same_sorted(&root, &["-mount", "-type", "f"], "find -mount -type f");
+}
 
 #[test]
-#[ignore = "TODO: find -xdev not yet implemented in fro bounded find slice"]
-fn find_xdev_todo() {}
+fn find_xdev_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-xdev");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.txt"), b"file").unwrap();
+    assert_find_same_sorted(&root, &["-xdev", "-type", "f"], "find -xdev -type f");
+}
 
 #[test]
-#[ignore = "TODO: find -noleaf not yet implemented in fro bounded find slice"]
-fn find_noleaf_todo() {}
+fn find_noleaf_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-noleaf");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    assert_find_same_sorted(&root, &["-noleaf", "-type", "f"], "find -noleaf");
+}
 
 #[test]
 #[ignore = "TODO: find -follow not yet implemented in fro bounded find slice"]
@@ -515,46 +788,176 @@ fn find_fstype_todo() {}
 fn find_context_todo() {}
 
 #[test]
-#[ignore = "TODO: find -xtype not yet implemented in fro bounded find slice"]
-fn find_xtype_todo() {}
+fn find_xtype_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-xtype");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("target.txt"), b"target").unwrap();
+    std::os::unix::fs::symlink("target.txt", root.join("link-to-file")).unwrap();
+    std::os::unix::fs::symlink("sub", root.join("link-to-dir")).unwrap();
+    std::os::unix::fs::symlink("missing", root.join("broken-link")).unwrap();
+    assert_find_same_sorted(&root, &["-xtype", "f"], "find -xtype f");
+    assert_find_same_sorted(&root, &["-xtype", "d"], "find -xtype d");
+    assert_find_same_sorted(&root, &["-xtype", "l"], "find -xtype l");
+}
 
 // ── Action predicates ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -exec not yet implemented in fro bounded find slice"]
-fn find_exec_todo() {}
+fn find_exec_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-exec");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("sub/beta.txt"), b"beta").unwrap();
+    assert_find_same_exact(
+        &root,
+        &[
+            "-type",
+            "f",
+            "-exec",
+            "printf",
+            "EXEC:%s\\n",
+            "{}",
+            ";",
+        ],
+        "find -exec",
+    );
+}
 
 #[test]
 #[ignore = "TODO: find -execdir not yet implemented in fro bounded find slice"]
 fn find_execdir_todo() {}
 
 #[test]
-#[ignore = "TODO: find -ok not yet implemented in fro bounded find slice"]
-fn find_ok_todo() {}
+fn find_ok_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-ok");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    let root_arg = root.to_str().unwrap();
+    assert_same_result(
+        run_fro_with_stdin(
+            "find",
+            &[
+                root_arg,
+                "-type",
+                "f",
+                "-ok",
+                "printf",
+                "OK:%s\\n",
+                "{}",
+                ";",
+            ],
+            b"y\n",
+        ),
+        run_system_with_stdin(
+            "find",
+            &[
+                root_arg,
+                "-type",
+                "f",
+                "-ok",
+                "printf",
+                "OK:%s\\n",
+                "{}",
+                ";",
+            ],
+            b"y\n",
+        ),
+        "find -ok",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -okdir not yet implemented in fro bounded find slice"]
-fn find_okdir_todo() {}
+fn find_okdir_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-okdir");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("alpha.txt"), b"alpha").unwrap();
+    let root_arg = root.to_str().unwrap();
+    assert_same_result(
+        run_fro_with_stdin(
+            "find",
+            &[
+                root_arg,
+                "-type",
+                "f",
+                "-okdir",
+                "printf",
+                "OK:%s\\n",
+                "{}",
+                ";",
+            ],
+            b"y\n",
+        ),
+        run_system_with_stdin(
+            "find",
+            &[
+                root_arg,
+                "-type",
+                "f",
+                "-okdir",
+                "printf",
+                "OK:%s\\n",
+                "{}",
+                ";",
+            ],
+            b"y\n",
+        ),
+        "find -okdir",
+    );
+}
 
 #[test]
 #[ignore = "TODO: find -delete not yet implemented in fro bounded find slice"]
 fn find_delete_todo() {}
 
 #[test]
-#[ignore = "TODO: find -ls not yet implemented in fro bounded find slice"]
-fn find_ls_todo() {}
+fn find_ls_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-ls");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("file.txt"), b"abc").unwrap();
+    assert_find_same_exact(&root, &["-type", "f", "-ls"], "find -ls");
+}
 
 #[test]
-#[ignore = "TODO: find -fls not yet implemented in fro bounded find slice"]
-fn find_fls_todo() {}
+fn find_fls_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-fls");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("file.txt"), b"abc").unwrap();
+    assert_find_fls_same(&root, "find -fls");
+}
 
 #[test]
-#[ignore = "TODO: find -printf not yet implemented in fro bounded find slice"]
-fn find_printf_todo() {}
+fn find_printf_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-printf");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("file.txt"), b"abc").unwrap();
+    assert_find_same_exact(
+        &root,
+        &["-type", "f", "-printf", "P:%p F:%f H:%h S:%s Y:%y %%\\n"],
+        "find -printf",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -fprintf not yet implemented in fro bounded find slice"]
-fn find_fprintf_todo() {}
+fn find_fprintf_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-fprintf");
+    let root = tmp.join("root");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("file.txt"), b"abc").unwrap();
+    assert_find_fprintf_same(&root, "P:%p F:%f H:%h S:%s Y:%y %%\\n", "find -fprintf");
+}
 
 #[test]
 #[ignore = "TODO: find -fprint not yet implemented in fro bounded find slice"]
@@ -565,19 +968,52 @@ fn find_fprint_todo() {}
 fn find_fprint0_todo() {}
 
 #[test]
-#[ignore = "TODO: find -prune not yet implemented in fro bounded find slice"]
-fn find_prune_todo() {}
+fn find_prune_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-prune");
+    let root = tmp.join("root");
+    let keep = root.join("keep");
+    let skip = root.join("skip");
+    fs::create_dir_all(&keep).unwrap();
+    fs::create_dir_all(&skip).unwrap();
+    fs::write(keep.join("keep.txt"), b"keep").unwrap();
+    fs::write(skip.join("skip.txt"), b"skip").unwrap();
+    assert_find_same_exact(
+        &root,
+        &["-path", "*/skip", "-prune", "-o", "-name", "*.txt", "-print"],
+        "find -prune",
+    );
+}
 
 #[test]
-#[ignore = "TODO: find -quit not yet implemented in fro bounded find slice"]
-fn find_quit_todo() {}
+fn find_quit_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-quit");
+    let root = tmp.join("root");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+    fs::write(root.join("sub/beta.txt"), b"beta").unwrap();
+    assert_find_same_exact(
+        &root,
+        &["-name", "*.txt", "-print", "-quit"],
+        "find -quit",
+    );
+}
 
 // ── Constant predicates ──────────────────────────────────────────────
 
 #[test]
-#[ignore = "TODO: find -true not yet implemented in fro bounded find slice"]
-fn find_true_todo() {}
+fn find_true_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-true");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    assert_find_same_sorted(&root, &["-true"], "find -true");
+}
 
 #[test]
-#[ignore = "TODO: find -false not yet implemented in fro bounded find slice"]
-fn find_false_todo() {}
+fn find_false_todo() {
+    let tmp = unique_temp_dir("fro-fp-find-false");
+    let root = tmp.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("owned.txt"), b"owned").unwrap();
+    assert_find_same_sorted(&root, &["-false"], "find -false");
+}

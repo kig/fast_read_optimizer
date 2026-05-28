@@ -71,7 +71,13 @@ pub(super) fn write_colorized_group_separator<W: Write>(
     separator: &str,
     options: FgrepOptions,
 ) -> io::Result<()> {
-    write_colored_text(out, separator.as_bytes(), SEPARATOR_START, MATCH_END, options)
+    write_colored_text(
+        out,
+        separator.as_bytes(),
+        SEPARATOR_START,
+        MATCH_END,
+        options,
+    )
 }
 
 pub(super) fn write_colorized_separator<W: Write>(

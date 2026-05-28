@@ -3,8 +3,7 @@ use super::runtime::{write_count_line, write_filename_result, write_matching_lin
 use super::{
     compile_patterns, count_literal_matching_lines, fgrep_regular_file_path, parse_fgrep_args,
     parse_pattern_file_bytes, FgrepBinaryMode, FgrepDevicePolicy, FgrepDirectoryPolicy,
-    FgrepFilenameMode, FgrepGroupSeparatorPolicy, FgrepOptions, FgrepPattern,
-    FgrepRegularFilePath,
+    FgrepFilenameMode, FgrepGroupSeparatorPolicy, FgrepOptions, FgrepPattern, FgrepRegularFilePath,
 };
 use std::io::{self, Write};
 
@@ -53,6 +52,29 @@ fn fgrep_test_temp_file(name: &str) -> std::path::PathBuf {
 fn fgrep_short_flag_effect_maps_fixed_strings_flag() {
     assert_eq!(fgrep_short_flag_effect(b'F'), Some(true));
     assert_eq!(fgrep_short_flag_effect(b'n'), None);
+}
+
+#[test]
+fn parse_fgrep_args_rejects_conflicting_matcher_flags() {
+    for flag in [
+        "-E",
+        "--extended-regexp",
+        "-G",
+        "--basic-regexp",
+        "-P",
+        "--perl-regexp",
+    ] {
+        let err = match parse_fgrep_args(&[
+            "fgrep".to_string(),
+            flag.to_string(),
+            "needle".to_string(),
+            "file".to_string(),
+        ]) {
+            Ok(_) => panic!("expected conflicting matcher error for {flag}"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "grep: conflicting matchers specified");
+    }
 }
 
 #[test]
@@ -240,18 +262,8 @@ fn fgrep_line_matches_honors_word_regexp() {
         word_regexp: true,
         ..options
     };
-    assert!(fgrep_line_matches(
-        b"---\n",
-        b"",
-        b"",
-        empty_options
-    ));
-    assert!(!fgrep_line_matches(
-        b"alpha\n",
-        b"",
-        b"",
-        empty_options
-    ));
+    assert!(fgrep_line_matches(b"---\n", b"", b"", empty_options));
+    assert!(!fgrep_line_matches(b"alpha\n", b"", b"", empty_options));
 }
 
 #[test]
@@ -351,8 +363,8 @@ fn fgrep_regular_file_path_keeps_literal_backend_for_path_preserving_flags() {
         },
         FgrepOptions {
             line_buffered: true,
-        before_context: 0,
-        after_context: 0,
+            before_context: 0,
+            after_context: 0,
             ..base
         },
         FgrepOptions {
@@ -813,8 +825,8 @@ fn write_matching_line_only_flushes_when_line_buffered() {
         true,
         FgrepOptions {
             line_buffered: false,
-        before_context: 0,
-        after_context: 0,
+            before_context: 0,
+            after_context: 0,
             ..options
         },
         &pattern,

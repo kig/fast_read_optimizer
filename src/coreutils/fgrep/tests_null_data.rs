@@ -43,7 +43,14 @@ fn null_data_base_options() -> FgrepOptions {
 fn record_sep_returns_nul_when_null_data() {
     let opts = null_data_base_options();
     assert_eq!(opts.record_sep(), b'\0');
-    assert_eq!(FgrepOptions { null_data: false, ..opts }.record_sep(), b'\n');
+    assert_eq!(
+        FgrepOptions {
+            null_data: false,
+            ..opts
+        }
+        .record_sep(),
+        b'\n'
+    );
 }
 
 #[test]
@@ -56,7 +63,10 @@ fn parse_fgrep_args_tracks_null_data_short_and_long() {
             "input.txt".to_string(),
         ])
         .unwrap();
-        assert!(parsed.options.null_data, "flag {flag} did not set null_data");
+        assert!(
+            parsed.options.null_data,
+            "flag {flag} did not set null_data"
+        );
     }
     let no_flag = parse_fgrep_args(&[
         "fgrep".to_string(),
@@ -72,10 +82,19 @@ fn count_literal_matching_lines_uses_nul_delimiter() {
     let opts = null_data_base_options();
     // Three NUL-delimited records: "alpha", "needle", "beta".
     let data = b"alpha\0needle\0beta\0";
-    assert_eq!(count_literal_matching_lines(data, b"needle", opts), (true, 1));
+    assert_eq!(
+        count_literal_matching_lines(data, b"needle", opts),
+        (true, 1)
+    );
     // Inverted: two records that don't contain "needle".
-    let inv = FgrepOptions { invert_match: true, ..opts };
-    assert_eq!(count_literal_matching_lines(data, b"needle", inv), (true, 2));
+    let inv = FgrepOptions {
+        invert_match: true,
+        ..opts
+    };
+    assert_eq!(
+        count_literal_matching_lines(data, b"needle", inv),
+        (true, 2)
+    );
 }
 
 #[test]
@@ -84,7 +103,10 @@ fn count_literal_matching_lines_nul_does_not_split_on_newline() {
     // Data has embedded newlines but those are NOT record separators under -z.
     let data = b"foo\nbar\0needle";
     // One record containing "needle" (the unterminated last record).
-    assert_eq!(count_literal_matching_lines(data, b"needle", opts), (true, 1));
+    assert_eq!(
+        count_literal_matching_lines(data, b"needle", opts),
+        (true, 1)
+    );
     // The record "foo\nbar" does not match "needle" but does match "bar".
     assert_eq!(count_literal_matching_lines(data, b"bar", opts), (true, 1));
 }
@@ -94,16 +116,8 @@ fn write_filtered_lines_outputs_nul_terminated_records() {
     let opts = null_data_base_options();
     let data = b"alpha\0needle\0beta\0";
     let mut out = Vec::new();
-    let matched = write_filtered_lines(
-        &mut out,
-        "f",
-        data,
-        b"needle",
-        b"needle",
-        false,
-        opts,
-    )
-    .unwrap();
+    let matched =
+        write_filtered_lines(&mut out, "f", data, b"needle", b"needle", false, opts).unwrap();
     assert!(matched);
     // Output record should be NUL-terminated (same as input record).
     assert_eq!(out, b"needle\0");
@@ -124,8 +138,14 @@ fn write_filtered_lines_multi_nul_delimiter() {
     let opts = null_data_base_options();
     let data = b"hello\0world\0needle\0";
     let patterns = vec![
-        FgrepPattern { raw: b"needle".to_vec(), normalized: b"needle".to_vec() },
-        FgrepPattern { raw: b"hello".to_vec(), normalized: b"hello".to_vec() },
+        FgrepPattern {
+            raw: b"needle".to_vec(),
+            normalized: b"needle".to_vec(),
+        },
+        FgrepPattern {
+            raw: b"hello".to_vec(),
+            normalized: b"hello".to_vec(),
+        },
     ];
     let mut out = Vec::new();
     let matched = write_filtered_lines_multi(&mut out, "f", data, &patterns, false, opts).unwrap();
@@ -147,4 +167,3 @@ fn fgrep_line_matches_line_regexp_with_nul_delimiter() {
     // Exact match when there's no terminator.
     assert!(fgrep_line_matches(b"alpha", b"alpha", b"alpha", opts));
 }
-

@@ -734,10 +734,19 @@ fn fgrep_devices_flags_match_system() {
         for (compat_flags, payload) in [
             (vec!["needle", file], b"needle\n".as_slice()),
             (vec!["-D", "read", "needle", file], b"needle\n".as_slice()),
-            (vec!["--devices=read", "-c", "needle", file], b"needle\n".as_slice()),
+            (
+                vec!["--devices=read", "-c", "needle", file],
+                b"needle\n".as_slice(),
+            ),
             (vec!["-Dread", "-l", "needle", file], b"needle\n".as_slice()),
-            (vec!["-D", "read", "-L", "needle", file], b"miss\n".as_slice()),
-            (vec!["-q", "-D", "read", "needle", file], b"needle\n".as_slice()),
+            (
+                vec!["-D", "read", "-L", "needle", file],
+                b"miss\n".as_slice(),
+            ),
+            (
+                vec!["-q", "-D", "read", "needle", file],
+                b"needle\n".as_slice(),
+            ),
         ] {
             let fro = with_fifo_input(&fifo, payload, |fifo_path| {
                 let mut args = io_flags.clone();
@@ -877,52 +886,3 @@ fn fgrep_short_version_flag_matches_system_exit_surface() {
         "fgrep -V should print a version surface"
     );
 }
-
-// ════════════════════════════════════════════════════════════════════
-// §3  fgrep: TODO stubs for remaining system-only flags (16 items)
-//
-// Each stub corresponds to one entry in the `remaining` slice of the
-// fgrep CoverageRow in src/help_compat.rs.  When a flag is natively
-// implemented, move its test to §1 or cmp_fgrep.rs and remove the stub.
-// ════════════════════════════════════════════════════════════════════
-
-#[test]
-#[ignore = "TODO: fgrep --directories=recurse not yet implemented in fro literal-search slice"]
-fn fgrep_directories_recurse_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep -E/--extended-regexp not yet implemented in fro literal-search slice (regex is out of scope for fgrep)"]
-fn fgrep_extended_regexp_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep -G/--basic-regexp not yet implemented in fro literal-search slice (regex is out of scope for fgrep)"]
-fn fgrep_basic_regexp_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep -P/--perl-regexp not yet implemented in fro literal-search slice (regex is out of scope for fgrep)"]
-fn fgrep_perl_regexp_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep -r/--recursive directory search not yet implemented in fro literal-search slice"]
-fn fgrep_recursive_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep -R/--dereference-recursive not yet implemented in fro literal-search slice"]
-fn fgrep_dereference_recursive_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep --include=GLOB not yet implemented in fro literal-search slice"]
-fn fgrep_include_glob_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep --exclude=GLOB not yet implemented in fro literal-search slice"]
-fn fgrep_exclude_glob_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep --exclude-dir=GLOB not yet implemented in fro literal-search slice"]
-fn fgrep_exclude_dir_todo() {}
-
-#[test]
-#[ignore = "TODO: fgrep --exclude-from=FILE not yet implemented in fro literal-search slice"]
-fn fgrep_exclude_from_todo() {}
-

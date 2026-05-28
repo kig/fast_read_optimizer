@@ -492,29 +492,62 @@ fn find_help_and_version_surface_stay_wired() {
         "find - Walk one or more directory trees with a bounded GNU find-compatible predicate slice."
     ));
     assert!(stdout.contains(
-        "[path ...] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-print|-print0]"
+        "[-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N]"
     ));
     assert!(stdout.contains(
         "This is a bounded GNU find-compatible path-walking/predicate slice, not the full GNU find expression language."
     ));
     assert!(stdout.contains(
-        "Supported in-process families are limited to roots, -maxdepth, -type, -name/-iname, -path/-ipath, and -print/-print0."
+        "Supported in-process families now cover bounded path walking, GNU symlink policy flags (-P/-H/-L)"
     ));
-    assert!(stdout.contains("Supported selector families combine as a bounded implicit AND"));
+    assert!(stdout.contains(
+        "Parentheses, batched -exec ... +, alternate execdir actions"
+    ));
     assert!(stdout.contains(
         "Tracked GNU find tokens implemented in this bounded in-process path-walking slice"
     ));
     assert!(
         stdout.contains("GNU find tokens intentionally omitted from this bounded in-process slice")
     );
-    assert!(stdout.contains("-D, -H, -L, -N, -Olevel, -P"));
+    assert!(stdout.contains("-D, -context"));
     assert!(stdout.contains("-delete"));
-    assert!(stdout.contains("-exec"));
     assert!(stdout.contains("-regex"));
-    assert!(stdout.contains("-xtype"));
+    assert!(stdout.contains(
+        "regex path matching (-regex/-iregex with bounded -regextype values)"
+    ));
+    assert!(stdout.contains("bounded formatter/listing actions (-printf/-fprintf/-ls/-fls)"));
+    assert!(stdout.contains(
+        "-P keeps GNU find's default no-follow mode, -H follows command-line symlink roots only, and -L follows symlinked roots and discovered child symlinks during traversal."
+    ));
+    assert!(stdout.contains(
+        "-mindepth/-maxdepth bound which levels are emitted and descended, and -mount/-xdev keep traversal on the same device as each starting path."
+    ));
+    assert!(stdout.contains(
+        "-type supports the common GNU/POSIX letters b, c, d, p, f, l, and s; -xtype uses the symlink target type under the default no-follow mode."
+    ));
+    assert!(stdout.contains(
+        "-wholename/-iwholename are GNU aliases for -path/-ipath, and -lname/-ilname match symlink targets."
+    ));
+    assert!(stdout.contains(
+        "-regex/-iregex match the whole emitted path via the Rust regex crate; bounded -regextype support currently accepts emacs/findutils-default and posix-extended/egrep syntax families."
+    ));
+    assert!(stdout.contains(
+        "-newer/-anewer/-cnewer and the -mtime/-mmin/-atime/-amin/-ctime/-cmin family are supported in-process; -used compares access time versus status-change time in whole days; and -daystart shifts subsequent day-granularity predicates to the start of the current local day."
+    ));
+    assert!(stdout.contains(
+        "-true, -false, -noleaf, !/-not, and -a/-and/-o/-or are accepted in the current bounded evaluator."
+    ));
+    assert!(stdout.contains(
+        "-depth emits directories after their descendants; -prune suppresses descent into the current matched directory; and -quit stops the walk immediately after the current match."
+    ));
+    assert!(stdout.contains(
+        "-print is the default action; -print0 emits NUL-delimited paths; bounded -printf/-fprintf currently support %%p, %%f, %%h, %%s, %%y, %%%% plus \\n/\\t/\\\\ escapes; -ls/-fls emit a GNU-like inode/block/owner/group listing; -exec CMD ... ';' runs one command per match; and -ok/-okdir add GNU-style confirmation prompts before each per-match command."
+    ));
     assert!(stdout.contains("--help shows this message and exits."));
     assert!(stdout.contains("--version prints the fro find version string and exits."));
-    assert!(stdout.contains("-maxdepth limits descent below each starting path"));
+    assert!(stdout.contains(
+        "-mindepth/-maxdepth bound which levels are emitted and descended, and -mount/-xdev keep traversal on the same device as each starting path."
+    ));
     assert!(stdout.contains("-type supports the common GNU/POSIX letters"));
     assert!(stdout.contains("-name matches only the final path component"));
     assert!(stdout.contains("-iname matches basenames case-insensitively"));

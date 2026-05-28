@@ -1,9 +1,9 @@
-use super::line_matching::{fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line};
 use super::color::write_colorized_group_separator;
+use super::line_matching::{fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line};
 use super::runtime::{write_context_line, write_matching_line};
 use super::{FgrepGroupSeparatorPolicy, *};
-use std::cell::Cell;
 use memchr::memchr_iter;
+use std::cell::Cell;
 use std::io::{self, Write};
 
 thread_local! {
@@ -152,7 +152,9 @@ pub(super) fn write_context_lines<W: Write>(
     let mut groups: Vec<(usize, usize)> = Vec::new();
     for index in selected_indices {
         let start = index.saturating_sub(before);
-        let end = index.saturating_add(after).min(lines.len().saturating_sub(1));
+        let end = index
+            .saturating_add(after)
+            .min(lines.len().saturating_sub(1));
         if let Some(last) = groups.last_mut() {
             if start <= last.1.saturating_add(1) {
                 last.1 = last.1.max(end);

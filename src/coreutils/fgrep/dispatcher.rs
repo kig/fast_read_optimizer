@@ -1,4 +1,7 @@
 use super::context::{fgrep_context_enabled, write_context_lines};
+use super::line_matching::{
+    fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line, normalize_case,
+};
 use super::matching_output::{
     write_count_literal_matching_lines, write_filtered_lines, write_filtered_lines_multi,
     write_line_regexp_matches, write_matching_lines,
@@ -9,7 +12,6 @@ use super::runtime::{
     fgrep_record_selected_line, fgrep_report_binary_match, fgrep_suppresses_matching_line_output,
     write_count_line, write_matching_line,
 };
-use super::line_matching::{fgrep_line_matches, fgrep_line_matches_any, fgrep_select_line, normalize_case};
 use super::*;
 use memchr::{memchr_iter, memmem::Finder};
 use std::io::{self, Write};
@@ -32,9 +34,7 @@ pub(crate) fn write_loaded_match_result<W: Write>(
         );
     }
     if fgrep_context_enabled(options) && !fgrep_suppresses_matching_line_output(options) {
-        return write_context_lines(
-            out, label, data, pattern, patterns, multi_file, options,
-        );
+        return write_context_lines(out, label, data, pattern, patterns, multi_file, options);
     }
     match regular_file_path {
         FgrepRegularFilePath::LiteralSearchOffsets => {

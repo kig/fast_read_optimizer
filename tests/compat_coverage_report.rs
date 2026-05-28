@@ -115,8 +115,8 @@ cmp        6/6  100%  remaining: none  help: ok
 cp        16/16 100%  remaining: none  help: ok
 dd        16/16 100%  remaining: none  help: ok
 du        20/20 100%  remaining: none  help: ok
-fgrep     44/52  85%  remaining: -E/--extended-regexp, -G/--basic-regexp, -P/--perl-regexp, -R/--dereference-recursive, --include=GLOB, --exclude=GLOB, --exclude-dir=GLOB, --exclude-from=FILE  help: ok
-find      11/80  14%  remaining: -D, -H, -L, -N, -Olevel, -P, -a, -amin, -and, -anewer, -atime, -cmin, -cnewer, -context, -ctime, -daystart, -delete, -depth, -empty, -exec, -execdir, -executable, -false, -fls, -follow, -fprint, -fprint0, -fprintf, -fstype, -gid, -group, -ignore_readdir_race, -ilname, -inum, -iregex, -iwholename, -links, -lname, -ls, -mindepth, -mmin, -mount, -mtime, -newer, -nogroup, -noignore_readdir_race, -noleaf, -not, -nouser, -o, -ok, -okdir, -or, -perm, -printf, -prune, -quit, -readable, -regex, -regextype, -size, -true, -uid, -used, -user, -wholename, -writable, -xdev, -xtype  help: ok
+fgrep     52/52 100%  remaining: none  help: ok
+find      69/79  87%  remaining: -D, -context, -delete, -execdir, -follow, -fprint, -fprint0, -fstype, -ignore_readdir_race, -noignore_readdir_race  help: ok
 head       7/7  100%  remaining: none  help: ok
 md5sum    11/11 100%  remaining: none  help: ok
 mv        12/12 100%  remaining: none  help: ok
@@ -152,7 +152,7 @@ cp         57/57  100%  remaining: none
 dd          2/2   100%  remaining: none
 du         44/44  100%  remaining: none
 fgrep      87/87  100%  remaining: none
-find       78/78  100%  remaining: none
+find       77/77  100%  remaining: none
 head       15/15  100%  remaining: none
 md5sum      6/6   100%  remaining: none
 mv         23/23  100%  remaining: none

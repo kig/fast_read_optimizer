@@ -59,7 +59,13 @@ fn fgrep_context_count_quiet_and_listing_flags_match_system() {
             vec!["-1", "-c", "needle", primary.as_str()],
             vec!["-A1", "-q", "needle", primary.as_str()],
             vec!["-C1", "-l", "needle", primary.as_str(), secondary.as_str()],
-            vec!["-C1", "-L", "missing-xyz", primary.as_str(), secondary.as_str()],
+            vec![
+                "-C1",
+                "-L",
+                "missing-xyz",
+                primary.as_str(),
+                secondary.as_str(),
+            ],
         ] {
             let mut fro_args = io_flags.clone();
             fro_args.extend(compat_flags.iter().copied());
@@ -76,7 +82,8 @@ fn fgrep_context_count_quiet_and_listing_flags_match_system() {
 
 #[test]
 fn fgrep_context_flags_match_system_on_stdin() {
-    let stdin_payload = b"one\nneedle alpha\ntwo\nthree\nneedle beta\nfour\nfive\nneedle gamma\nsix\n";
+    let stdin_payload =
+        b"one\nneedle alpha\ntwo\nthree\nneedle beta\nfour\nfive\nneedle gamma\nsix\n";
 
     for io_flags in io_flag_sets() {
         for compat_flags in [
@@ -103,11 +110,18 @@ fn fgrep_context_flags_match_system_on_stdin() {
 fn fgrep_group_separator_flags_match_system() {
     let fixture = CoreutilsParityFixture::new("fro-fp-fgrep-group-separator");
     let (primary, secondary) = write_fgrep_context_fixture(&fixture);
-    let stdin_payload = b"one\nneedle alpha\ntwo\nthree\nneedle beta\nfour\nfive\nneedle gamma\nsix\n";
+    let stdin_payload =
+        b"one\nneedle alpha\ntwo\nthree\nneedle beta\nfour\nfive\nneedle gamma\nsix\n";
 
     for io_flags in io_flag_sets() {
         for compat_flags in [
-            vec!["-A1", "-n", "--group-separator=SEP", "needle", primary.as_str()],
+            vec![
+                "-A1",
+                "-n",
+                "--group-separator=SEP",
+                "needle",
+                primary.as_str(),
+            ],
             vec![
                 "-C1",
                 "-b",
@@ -125,8 +139,20 @@ fn fgrep_group_separator_flags_match_system() {
                 primary.as_str(),
                 secondary.as_str(),
             ],
-            vec!["-C1", "-c", "--group-separator=SEP", "needle", primary.as_str()],
-            vec!["-C1", "-q", "--group-separator=SEP", "needle", primary.as_str()],
+            vec![
+                "-C1",
+                "-c",
+                "--group-separator=SEP",
+                "needle",
+                primary.as_str(),
+            ],
+            vec![
+                "-C1",
+                "-q",
+                "--group-separator=SEP",
+                "needle",
+                primary.as_str(),
+            ],
             vec![
                 "-C1",
                 "-l",
@@ -143,7 +169,14 @@ fn fgrep_group_separator_flags_match_system() {
                 primary.as_str(),
                 secondary.as_str(),
             ],
-            vec!["-m", "1", "-C1", "--group-separator=SEP", "needle", primary.as_str()],
+            vec![
+                "-m",
+                "1",
+                "-C1",
+                "--group-separator=SEP",
+                "needle",
+                primary.as_str(),
+            ],
         ] {
             let mut fro_args = io_flags.clone();
             fro_args.extend(compat_flags.iter().copied());
@@ -159,7 +192,14 @@ fn fgrep_group_separator_flags_match_system() {
 
     for io_flags in io_flag_sets() {
         for compat_flags in [
-            vec!["--line-buffered", "-C1", "-n", "--group-separator=SEP", "needle", "-"],
+            vec![
+                "--line-buffered",
+                "-C1",
+                "-n",
+                "--group-separator=SEP",
+                "needle",
+                "-",
+            ],
             vec![
                 "--line-buffered",
                 "-C1",
@@ -176,7 +216,10 @@ fn fgrep_group_separator_flags_match_system() {
             assert_same_result(
                 run_fro_with_stdin("fgrep", &fro_args, stdin_payload),
                 run_system_with_stdin("grep", &sys_args, stdin_payload),
-                &format!("fgrep group-separator stdin {:?} {:?}", io_flags, compat_flags),
+                &format!(
+                    "fgrep group-separator stdin {:?} {:?}",
+                    io_flags, compat_flags
+                ),
             );
         }
     }

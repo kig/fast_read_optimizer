@@ -107,7 +107,12 @@ fn only_matching_line_selected(
     options: FgrepOptions,
 ) -> bool {
     let is_match = if patterns.len() == 1 {
-        fgrep_line_matches(line, pattern.raw.as_slice(), pattern.normalized.as_slice(), options)
+        fgrep_line_matches(
+            line,
+            pattern.raw.as_slice(),
+            pattern.normalized.as_slice(),
+            options,
+        )
     } else {
         fgrep_line_matches_any(line, patterns, options)
     };
@@ -253,7 +258,11 @@ fn process_only_matching_line<W: Write>(
             &ranges,
         )?;
     }
-    Ok(fgrep_record_selected_line(match_count, matched_any, options))
+    Ok(fgrep_record_selected_line(
+        match_count,
+        matched_any,
+        options,
+    ))
 }
 
 fn collect_only_matching_lines(
@@ -330,7 +339,9 @@ fn write_only_matching_context_lines<W: Write>(
     let mut groups: Vec<(usize, usize)> = Vec::new();
     for index in selected_indices {
         let start = index.saturating_sub(before);
-        let end = index.saturating_add(after).min(lines.len().saturating_sub(1));
+        let end = index
+            .saturating_add(after)
+            .min(lines.len().saturating_sub(1));
         if let Some(last) = groups.last_mut() {
             if start <= last.1.saturating_add(1) {
                 last.1 = last.1.max(end);
@@ -343,11 +354,10 @@ fn write_only_matching_context_lines<W: Write>(
     let emit_groups: Vec<(usize, usize)> = groups
         .into_iter()
         .filter(|(start, end)| {
-            lines[*start..=*end]
-                .iter()
-                .any(|line| {
-                    !fgrep_match_ranges(&data[line.start..line.end], pattern, patterns, options).is_empty()
-                })
+            lines[*start..=*end].iter().any(|line| {
+                !fgrep_match_ranges(&data[line.start..line.end], pattern, patterns, options)
+                    .is_empty()
+            })
         })
         .collect();
     if emit_groups.is_empty() {
@@ -364,12 +374,8 @@ fn write_only_matching_context_lines<W: Write>(
             fgrep_write_group_separator(out, options)?;
         }
         for line in &lines[start..=end] {
-            let ranges = fgrep_match_ranges(
-                &data[line.start..line.end],
-                pattern,
-                patterns,
-                options,
-            );
+            let ranges =
+                fgrep_match_ranges(&data[line.start..line.end], pattern, patterns, options);
             if ranges.is_empty() {
                 continue;
             }
@@ -448,7 +454,9 @@ pub(super) fn write_only_matching_loaded_result<W: Write>(
     options: FgrepOptions,
 ) -> io::Result<bool> {
     if fgrep_context_enabled(options) && !fgrep_suppresses_matching_line_output(options) {
-        return write_only_matching_context_lines(out, label, data, pattern, patterns, multi_file, options);
+        return write_only_matching_context_lines(
+            out, label, data, pattern, patterns, multi_file, options,
+        );
     }
     write_only_matching_lines(out, label, data, pattern, patterns, multi_file, options)
 }

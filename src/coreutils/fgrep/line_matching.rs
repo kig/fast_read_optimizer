@@ -62,8 +62,14 @@ fn fgrep_pattern_matches_candidate(
     if options.line_regexp {
         normalized_candidate == normalized_pattern
     } else if options.word_regexp {
-        fgrep_word_match_start(candidate, normalized_candidate, pattern, normalized_pattern, 0)
-            .is_some()
+        fgrep_word_match_start(
+            candidate,
+            normalized_candidate,
+            pattern,
+            normalized_pattern,
+            0,
+        )
+        .is_some()
     } else if pattern.is_empty() {
         true
     } else {
@@ -106,17 +112,15 @@ pub(super) fn fgrep_line_matches_any(
     };
     let normalized_line = normalize_case(candidate, options.ignore_case);
     let normalized_line = normalized_line.as_ref();
-    patterns
-        .iter()
-        .any(|pattern| {
-            fgrep_pattern_matches_candidate(
-                candidate,
-                normalized_line,
-                pattern.raw.as_slice(),
-                pattern.normalized.as_slice(),
-                options,
-            )
-        })
+    patterns.iter().any(|pattern| {
+        fgrep_pattern_matches_candidate(
+            candidate,
+            normalized_line,
+            pattern.raw.as_slice(),
+            pattern.normalized.as_slice(),
+            options,
+        )
+    })
 }
 
 pub(super) fn fgrep_select_line(is_match: bool, options: FgrepOptions) -> bool {

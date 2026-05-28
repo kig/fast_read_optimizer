@@ -1,10 +1,11 @@
 use super::*;
+use regex::bytes::{Regex, RegexBuilder};
 use std::ffi::CString;
+use std::io::BufRead;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const FIND_OUTPUT_CHUNK_BYTES: usize = 1 << 20;
 const FIND_STDOUT_BUFFER_BYTES: usize = 2 << 20;
 const FIND_SERIAL_ROOT_ENTRY_THRESHOLD: usize = 64;
 
@@ -112,6 +113,83 @@ impl FindGlobPattern {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindFollowMode {
+    Never,
+    RootsOnly,
+    Always,
+}
+
+impl FindFollowMode {
+    fn follow_root(self) -> bool {
+        matches!(self, Self::RootsOnly | Self::Always)
+    }
+
+    fn follow_children(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+#[derive(Clone)]
+struct FindEntryMetadata {
+    effective: fs::Metadata,
+    link: fs::Metadata,
+    followed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FindRegexType {
+    Emacs,
+    PosixExtended,
+}
+
+impl FindRegexType {
+    fn parse(value: &str) -> io::Result<Self> {
+        match value {
+            "findutils-default" | "emacs" => Ok(Self::Emacs),
+            "posix-extended" | "egrep" | "posix-egrep" => Ok(Self::PosixExtended),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported find -regextype '{value}'"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FindRegexPattern {
+    regex: Regex,
+}
+
+impl FindRegexPattern {
+    fn parse(
+        flag: &str,
+        value: &str,
+        regex_type: FindRegexType,
+        case_insensitive: bool,
+    ) -> io::Result<Self> {
+        let pattern = match regex_type {
+            FindRegexType::Emacs | FindRegexType::PosixExtended => value,
+        };
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid find {flag} pattern '{value}': {err}"),
+                )
+            })?;
+        Ok(Self { regex })
+    }
+
+    fn matches(&self, candidate: &[u8]) -> bool {
+        self.regex
+            .find(candidate)
+            .is_some_and(|matched| matched.start() == 0 && matched.end() == candidate.len())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NumericComparison {
     Less(u64),
@@ -186,16 +264,26 @@ impl TimeField {
 
 #[derive(Clone)]
 enum FindPredicate {
+    True,
+    Type(FindFileType),
+    Name(FindGlobPattern),
+    Path(FindGlobPattern),
+    Regex(FindRegexPattern),
     Empty,
+    False,
+    LinkName(FindGlobPattern),
+    XType(FindFileType),
     Size(NumericComparison, SizeUnit),
     Links(NumericComparison),
     Inum(NumericComparison),
     Newer(SystemTime, TimeField),
+    Used(NumericComparison),
     TimePeriods {
         cmp: NumericComparison,
         secs_per_period: u64,
         field: TimeField,
         now: SystemTime,
+        use_daystart_boundary: bool,
     },
     Perm(u32, PermComparison),
     Uid(NumericComparison),
@@ -208,12 +296,22 @@ enum FindPredicate {
 }
 
 impl FindPredicate {
-    fn matches(&self, path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+    fn matches(
+        &self,
+        path: &Path,
+        entry: &FindEntryMetadata,
+        follow_mode: FindFollowMode,
+    ) -> io::Result<bool> {
         match self {
+            Self::True => Ok(true),
+            Self::Type(expected) => Ok(expected.matches(entry.effective.file_type())),
+            Self::Name(pattern) => Ok(find_name_matches(pattern, path)),
+            Self::Path(pattern) => Ok(find_path_matches(pattern, path)),
+            Self::Regex(pattern) => Ok(pattern.matches(path.as_os_str().as_bytes())),
             Self::Empty => {
-                let file_type = metadata.file_type();
+                let file_type = entry.effective.file_type();
                 if file_type.is_file() {
-                    Ok(metadata.len() == 0)
+                    Ok(entry.effective.len() == 0)
                 } else if file_type.is_dir() {
                     let mut entries = fs::read_dir(path)?;
                     match entries.next() {
@@ -225,34 +323,60 @@ impl FindPredicate {
                     Ok(false)
                 }
             }
-            Self::Size(cmp, unit) => Ok(cmp.matches(unit.compare_len(metadata.len()))),
-            Self::Links(cmp) => Ok(cmp.matches(metadata.nlink())),
-            Self::Inum(cmp) => Ok(cmp.matches(metadata.ino())),
-            Self::Newer(reference, field) => Ok(field.read(metadata)? > *reference),
+            Self::False => Ok(false),
+            Self::LinkName(pattern) => {
+                if !entry.link.file_type().is_symlink() || entry.followed {
+                    return Ok(false);
+                }
+                Ok(pattern.matches(fs::read_link(path)?.as_os_str().as_bytes()))
+            }
+            Self::XType(expected) => match_xtype(path, entry, follow_mode, *expected),
+            Self::Size(cmp, unit) => Ok(cmp.matches(unit.compare_len(entry.effective.len()))),
+            Self::Links(cmp) => Ok(cmp.matches(entry.effective.nlink())),
+            Self::Inum(cmp) => Ok(cmp.matches(entry.effective.ino())),
+            Self::Newer(reference, field) => Ok(field.read(&entry.effective)? > *reference),
+            Self::Used(cmp) => {
+                let accessed = entry.effective.accessed()?;
+                let changed = TimeField::Changed.read(&entry.effective)?;
+                let Ok(delta) = accessed.duration_since(changed) else {
+                    return Ok(false);
+                };
+                let days = delta.as_secs() / 86_400;
+                Ok(cmp.matches(days))
+            }
             Self::TimePeriods {
                 cmp,
                 secs_per_period,
                 field,
                 now,
+                use_daystart_boundary,
             } => {
-                let age_secs = now
-                    .duration_since(field.read(metadata)?)
-                    .unwrap_or(Duration::ZERO)
-                    .as_secs();
-                Ok(cmp.matches(age_secs / secs_per_period))
+                let actual = if *use_daystart_boundary {
+                    let file_day = current_local_day_start(field.read(&entry.effective)?)?;
+                    now.duration_since(file_day)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs()
+                        / secs_per_period
+                } else {
+                    now.duration_since(field.read(&entry.effective)?)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs()
+                        / secs_per_period
+                };
+                Ok(cmp.matches(actual))
             }
             Self::Perm(expected, comparison) => {
-                let actual = metadata.mode() & 0o7777;
+                let actual = entry.effective.mode() & 0o7777;
                 Ok(match comparison {
                     PermComparison::Exact => actual == *expected,
                     PermComparison::AllBits => (actual & *expected) == *expected,
                     PermComparison::AnyBit => (actual & *expected) != 0,
                 })
             }
-            Self::Uid(cmp) => Ok(cmp.matches(metadata.uid().into())),
-            Self::Gid(cmp) => Ok(cmp.matches(metadata.gid().into())),
-            Self::Nouser => uid_is_unknown(metadata.uid()),
-            Self::Nogroup => gid_is_unknown(metadata.gid()),
+            Self::Uid(cmp) => Ok(cmp.matches(entry.effective.uid().into())),
+            Self::Gid(cmp) => Ok(cmp.matches(entry.effective.gid().into())),
+            Self::Nouser => uid_is_unknown(entry.effective.uid()),
+            Self::Nogroup => gid_is_unknown(entry.effective.gid()),
             Self::Readable => path_access(path, libc::R_OK),
             Self::Writable => path_access(path, libc::W_OK),
             Self::Executable => path_access(path, libc::X_OK),
@@ -261,68 +385,390 @@ impl FindPredicate {
 }
 
 #[derive(Clone)]
+struct FindExecAction {
+    argv: Vec<std::ffi::OsString>,
+    prompt: bool,
+    chdir_parent: bool,
+}
+
+impl FindExecAction {
+    fn run(&self, path: &Path) -> io::Result<bool> {
+        let Some(program) = self.argv.first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "find -exec requires a command",
+            ));
+        };
+        if self.prompt && !prompt_find_exec(&self.argv, path)? {
+            return Ok(false);
+        }
+        let replacement = if self.chdir_parent {
+            let mut relative = std::ffi::OsString::from("./");
+            relative.push(path.file_name().unwrap_or(path.as_os_str()));
+            relative
+        } else {
+            path.as_os_str().to_os_string()
+        };
+        let mut command =
+            std::process::Command::new(render_exec_arg_with(program, replacement.as_os_str()));
+        command.args(
+            self.argv
+                .iter()
+                .skip(1)
+                .map(|arg| render_exec_arg_with(arg, replacement.as_os_str())),
+        );
+        if self.chdir_parent {
+            command.current_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+        }
+        command.stdin(std::process::Stdio::inherit());
+        command.stdout(std::process::Stdio::inherit());
+        command.stderr(std::process::Stdio::inherit());
+        Ok(command.status()?.success())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FindEvalOutcome {
+    matched: bool,
+    prune: bool,
+    quit: bool,
+}
+
+impl FindEvalOutcome {
+    fn matched(matched: bool) -> Self {
+        Self {
+            matched,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone)]
+enum FindFormatDirective {
+    Path,
+    Basename,
+    Parent,
+    Size,
+    FileType,
+}
+
+#[derive(Clone)]
+enum FindFormatPart {
+    Literal(Vec<u8>),
+    Directive(FindFormatDirective),
+}
+
+#[derive(Clone)]
+struct FindFormatTemplate {
+    parts: Vec<FindFormatPart>,
+}
+
+impl FindFormatTemplate {
+    fn parse(flag: &str, value: &str) -> io::Result<Self> {
+        let bytes = value.as_bytes();
+        let mut parts = Vec::new();
+        let mut literal = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' => {
+                    index += 1;
+                    let Some(&escaped) = bytes.get(index) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid find {flag} format '{value}'"),
+                        ));
+                    };
+                    literal.push(match escaped {
+                        b'\\' => b'\\',
+                        b'n' => b'\n',
+                        b't' => b'\t',
+                        b'0' => b'\0',
+                        other => other,
+                    });
+                    index += 1;
+                }
+                b'%' => {
+                    index += 1;
+                    let Some(&directive) = bytes.get(index) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid find {flag} format '{value}'"),
+                        ));
+                    };
+                    if !literal.is_empty() {
+                        parts.push(FindFormatPart::Literal(std::mem::take(&mut literal)));
+                    }
+                    match directive {
+                        b'%' => literal.push(b'%'),
+                        b'p' => parts.push(FindFormatPart::Directive(FindFormatDirective::Path)),
+                        b'f' => parts.push(FindFormatPart::Directive(FindFormatDirective::Basename)),
+                        b'h' => parts.push(FindFormatPart::Directive(FindFormatDirective::Parent)),
+                        b's' => parts.push(FindFormatPart::Directive(FindFormatDirective::Size)),
+                        b'y' => parts.push(FindFormatPart::Directive(FindFormatDirective::FileType)),
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "unsupported find {flag} format directive '%{}'",
+                                    other as char
+                                ),
+                            ))
+                        }
+                    }
+                    index += 1;
+                }
+                byte => {
+                    literal.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        if !literal.is_empty() {
+            parts.push(FindFormatPart::Literal(literal));
+        }
+        Ok(Self { parts })
+    }
+
+    fn render(&self, path: &Path, metadata: &fs::Metadata) -> Vec<u8> {
+        let mut rendered = Vec::new();
+        for part in &self.parts {
+            match part {
+                FindFormatPart::Literal(bytes) => rendered.extend_from_slice(bytes),
+                FindFormatPart::Directive(FindFormatDirective::Path) => {
+                    rendered.extend_from_slice(path.as_os_str().as_bytes());
+                }
+                FindFormatPart::Directive(FindFormatDirective::Basename) => {
+                    rendered.extend_from_slice(
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .as_bytes(),
+                    );
+                }
+                FindFormatPart::Directive(FindFormatDirective::Parent) => {
+                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                    rendered.extend_from_slice(parent.as_os_str().as_bytes());
+                }
+                FindFormatPart::Directive(FindFormatDirective::Size) => {
+                    rendered.extend_from_slice(metadata.len().to_string().as_bytes());
+                }
+                FindFormatPart::Directive(FindFormatDirective::FileType) => {
+                    rendered.push(find_file_type_letter(metadata.file_type()));
+                }
+            }
+        }
+        rendered
+    }
+}
+
+#[derive(Clone)]
+struct FindFileFormatAction {
+    format: FindFormatTemplate,
+    output: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl FindFileFormatAction {
+    fn open(path: &str, format: FindFormatTemplate) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self {
+            format,
+            output: Arc::new(Mutex::new(std::io::BufWriter::new(file))),
+        })
+    }
+
+    fn write(&self, path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+        let rendered = self.format.render(path, metadata);
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| io::Error::other("find fprintf writer lock poisoned"))?;
+        output.write_all(&rendered)?;
+        Ok(true)
+    }
+}
+
+#[derive(Clone)]
+struct FindFileLsAction {
+    output: Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl FindFileLsAction {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        Ok(Self {
+            output: Arc::new(Mutex::new(std::io::BufWriter::new(file))),
+        })
+    }
+
+    fn write(&self, path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
+        let rendered = render_find_ls_line(path, metadata)?;
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| io::Error::other("find fls writer lock poisoned"))?;
+        output.write_all(&rendered)?;
+        Ok(true)
+    }
+}
+
+#[derive(Clone)]
+enum FindAction {
+    Print(u8),
+    Exec(FindExecAction),
+    PrintFormat(FindFormatTemplate),
+    FileFormat(FindFileFormatAction),
+    Ls,
+    Fls(FindFileLsAction),
+    Prune,
+    Quit,
+}
+
+impl FindAction {
+    fn evaluate(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+        output: &FindOutput,
+    ) -> io::Result<FindEvalOutcome> {
+        match self {
+            Self::Print(delimiter) => {
+                write_find_path(output, path, *delimiter)?;
+                Ok(FindEvalOutcome::matched(true))
+            }
+            Self::Exec(exec) => Ok(FindEvalOutcome::matched(exec.run(path)?)),
+            Self::PrintFormat(format) => {
+                output.write_all(&format.render(path, metadata))?;
+                Ok(FindEvalOutcome::matched(true))
+            }
+            Self::FileFormat(file_action) => Ok(FindEvalOutcome::matched(file_action.write(
+                path, metadata,
+            )?)),
+            Self::Ls => {
+                output.write_all(&render_find_ls_line(path, metadata)?)?;
+                Ok(FindEvalOutcome::matched(true))
+            }
+            Self::Fls(file_action) => Ok(FindEvalOutcome::matched(file_action.write(path, metadata)?)),
+            Self::Prune => Ok(FindEvalOutcome {
+                matched: true,
+                prune: true,
+                quit: false,
+            }),
+            Self::Quit => Ok(FindEvalOutcome {
+                matched: true,
+                prune: false,
+                quit: true,
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum FindExpression {
+    Predicate(FindPredicate),
+    Action(FindAction),
+    Not(Box<FindExpression>),
+    And(Box<FindExpression>, Box<FindExpression>),
+    Or(Box<FindExpression>, Box<FindExpression>),
+}
+
+impl FindExpression {
+    fn evaluate(
+        &self,
+        path: &Path,
+        entry: &FindEntryMetadata,
+        follow_mode: FindFollowMode,
+        output: &FindOutput,
+    ) -> io::Result<FindEvalOutcome> {
+        match self {
+            Self::Predicate(predicate) => Ok(FindEvalOutcome::matched(predicate.matches(
+                path,
+                entry,
+                follow_mode,
+            )?)),
+            Self::Action(action) => action.evaluate(path, &entry.effective, output),
+            Self::Not(expr) => {
+                let mut outcome = expr.evaluate(path, entry, follow_mode, output)?;
+                outcome.matched = !outcome.matched;
+                Ok(outcome)
+            }
+            Self::And(left, right) => {
+                let left_outcome = left.evaluate(path, entry, follow_mode, output)?;
+                if left_outcome.quit {
+                    return Ok(left_outcome);
+                }
+                if !left_outcome.matched {
+                    return Ok(left_outcome);
+                }
+                let right_outcome = right.evaluate(path, entry, follow_mode, output)?;
+                Ok(FindEvalOutcome {
+                    matched: left_outcome.matched && right_outcome.matched,
+                    prune: left_outcome.prune || right_outcome.prune,
+                    quit: left_outcome.quit || right_outcome.quit,
+                })
+            }
+            Self::Or(left, right) => {
+                let left_outcome = left.evaluate(path, entry, follow_mode, output)?;
+                if left_outcome.quit || left_outcome.matched {
+                    return Ok(left_outcome);
+                }
+                let right_outcome = right.evaluate(path, entry, follow_mode, output)?;
+                Ok(FindEvalOutcome {
+                    matched: right_outcome.matched,
+                    prune: left_outcome.prune || right_outcome.prune,
+                    quit: left_outcome.quit || right_outcome.quit,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct FindPlan {
-    type_filter: Option<FindFileType>,
-    name_pattern: Option<FindGlobPattern>,
-    path_pattern: Option<FindGlobPattern>,
     min_depth: Option<usize>,
     max_depth: Option<usize>,
-    extra_predicates: Vec<FindPredicate>,
-    output_delimiter: u8,
+    follow_mode: FindFollowMode,
+    same_file_system: bool,
+    depth_first: bool,
+    has_action: bool,
+    suppress_default_print: bool,
+    expression: FindExpression,
 }
 
 impl FindPlan {
-    fn matches_root(&self, path: &Path, file_type: fs::FileType, depth: usize) -> bool {
-        self.min_depth.is_none_or(|min_depth| depth >= min_depth)
-            && self.max_depth.is_none_or(|max_depth| depth <= max_depth)
-            && self
-                .type_filter
-                .is_none_or(|expected| expected.matches(file_type))
-            && self
-                .name_pattern
-                .as_ref()
-                .is_none_or(|pattern| find_name_matches(pattern, path))
-            && self
-                .path_pattern
-                .as_ref()
-                .is_none_or(|pattern| find_path_matches(pattern, path))
-    }
-
-    fn matches_child_basic(
-        &self,
-        dir: &Path,
-        file_name: &std::ffi::OsStr,
-        file_type: fs::FileType,
-        depth: usize,
-        path_bytes: &mut Vec<u8>,
-    ) -> bool {
-        self.min_depth.is_none_or(|min_depth| depth >= min_depth)
-            && self.max_depth.is_none_or(|max_depth| depth <= max_depth)
-            && self
-                .type_filter
-                .is_none_or(|expected| expected.matches(file_type))
-            && self
-                .name_pattern
-                .as_ref()
-                .is_none_or(|pattern| pattern.matches(file_name.as_bytes()))
-            && self.path_pattern.as_ref().is_none_or(|pattern| {
-                path_bytes.clear();
-                append_find_child_path_bytes(path_bytes, dir, file_name);
-                pattern.matches(path_bytes)
-            })
-    }
-
     fn should_descend(&self, depth: usize) -> bool {
         self.max_depth.is_none_or(|max_depth| depth < max_depth)
     }
 
-    fn matches_extra(&self, path: &Path, metadata: &fs::Metadata) -> io::Result<bool> {
-        for predicate in &self.extra_predicates {
-            if !predicate.matches(path, metadata)? {
-                return Ok(false);
-            }
+    fn should_evaluate(&self, depth: usize) -> bool {
+        self.min_depth.is_none_or(|min_depth| depth >= min_depth)
+            && self.max_depth.is_none_or(|max_depth| depth <= max_depth)
+    }
+
+    fn evaluate_path(
+        &self,
+        path: &Path,
+        entry: &FindEntryMetadata,
+        depth: usize,
+        output: &FindOutput,
+    ) -> io::Result<FindEvalOutcome> {
+        if !self.should_evaluate(depth) {
+            return Ok(FindEvalOutcome::default());
         }
-        Ok(true)
+        let outcome = self
+            .expression
+            .evaluate(path, entry, self.follow_mode, output)?;
+        if outcome.matched && !self.suppress_default_print {
+            write_find_path(output, path, b'\n')?;
+        }
+        Ok(outcome)
     }
 }
 
@@ -330,6 +776,7 @@ impl FindPlan {
 struct FindTask {
     dir: PathBuf,
     depth: usize,
+    root_device: u64,
 }
 
 pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
@@ -345,18 +792,19 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
         return Ok(0);
     }
     let (roots, plan) = parse_find_args(args)?;
-    let worker_count = parallel_find_worker_count();
     let output = Arc::new(FindOutput::stdout());
-    let queue = Arc::new(WorkQueue::default());
-    let stop = Arc::new(AtomicBool::new(false));
     let had_warnings = Arc::new(AtomicBool::new(false));
-    let mut serial_task = None;
+    let force_serial = plan.depth_first || plan.has_action || plan.follow_mode != FindFollowMode::Never;
+    let worker_count = if force_serial { 0 } else { parallel_find_worker_count() };
+    let queue = (!force_serial).then(|| Arc::new(WorkQueue::default()));
+    let stop = (!force_serial).then(|| Arc::new(AtomicBool::new(false)));
     let serial_candidate = roots.len() == 1;
+    let mut serial_tasks = Vec::new();
 
     for root in roots {
         let path = PathBuf::from(root);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        let entry = match load_find_entry_metadata(&path, plan.follow_mode.follow_root()) {
+            Ok(entry) => entry,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &path, &err, "cannot access");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -364,47 +812,88 @@ pub(super) fn run_find(args: &[String]) -> io::Result<i32> {
             }
             Err(err) => return Err(err),
         };
-        if plan.matches_root(&path, metadata.file_type(), 0) {
-            let extra_ok = if plan.extra_predicates.is_empty() {
-                true
-            } else {
-                match plan.matches_extra(&path, &metadata) {
-                    Ok(ok) => ok,
-                    Err(err) if is_permission_denied(&err) => {
-                        write_warning_line("find", &path, &err, "cannot access");
-                        had_warnings.store(true, Ordering::SeqCst);
-                        false
-                    }
-                    Err(err) => return Err(err),
-                }
+        let root_type = entry.effective.file_type();
+        let root_outcome = if !root_type.is_dir() || !plan.depth_first {
+            Some(plan.evaluate_path(&path, &entry, 0, &output)?)
+        } else {
+            None
+        };
+        if root_outcome.is_some_and(|outcome| outcome.quit) {
+            break;
+        }
+        if root_type.is_dir()
+            && plan.should_descend(0)
+            && !root_outcome.is_some_and(|outcome| outcome.prune)
+        {
+            let task = FindTask {
+                dir: path.clone(),
+                depth: 0,
+                root_device: entry.effective.dev(),
             };
-            if extra_ok {
-                write_find_path(&output, &path, plan.output_delimiter)?;
+            if force_serial || (serial_candidate && find_should_use_serial_walk(&task.dir)?) {
+                serial_tasks.push(task);
+            } else {
+                queue
+                    .as_ref()
+                    .expect("parallel queue missing")
+                    .enqueue_one(task);
             }
         }
-        if metadata.file_type().is_dir() && plan.should_descend(0) {
-            let task = FindTask {
+        if root_type.is_dir() && plan.depth_first {
+            serial_tasks.push(FindTask {
                 dir: path,
-                depth: 0,
-            };
-            if serial_candidate && find_should_use_serial_walk(&task.dir)? {
-                serial_task = Some(task);
-            } else {
-                queue.enqueue_one(task);
-            }
+                depth: usize::MAX,
+                root_device: entry.effective.dev(),
+            });
         }
     }
 
-    if let Some(task) = serial_task {
-        walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan)?;
+    if force_serial {
+        for task in serial_tasks {
+            if task.depth == usize::MAX {
+                let entry = load_find_entry_metadata(&task.dir, plan.follow_mode.follow_root())?;
+                if plan.evaluate_path(&task.dir, &entry, 0, &output)?.quit {
+                    break;
+                }
+            } else {
+                if walk_find_subtree_serial(
+                    task,
+                    output.as_ref(),
+                    &had_warnings,
+                    &plan,
+                    &[],
+                )? {
+                    break;
+                }
+            }
+        }
+    } else if !serial_tasks.is_empty() {
+        for task in serial_tasks {
+            if walk_find_subtree_serial(task, output.as_ref(), &had_warnings, &plan, &[])?
+            {
+                break;
+            }
+        }
     } else {
-        run_parallel_work_queue(queue, stop, worker_count, {
+        run_parallel_work_queue(
+            queue.expect("parallel queue missing"),
+            stop.expect("parallel stop missing"),
+            worker_count,
+            {
             let output = output.clone();
             let had_warnings = had_warnings.clone();
             move |start_dir, queue, stop| {
-                walk_find_subtree(start_dir, queue, &output, stop, &had_warnings, &plan)
+                walk_find_subtree(
+                    start_dir,
+                    queue,
+                    &output,
+                    stop,
+                    &had_warnings,
+                    &plan,
+                )
             }
-        })?;
+        },
+        )?;
     }
     let output = Arc::into_inner(output)
         .ok_or_else(|| io::Error::other("find output writer still has active references"))?;
@@ -432,8 +921,6 @@ fn walk_find_subtree(
     plan: &FindPlan,
 ) -> io::Result<()> {
     let mut stack = vec![start_dir];
-    let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
-    let mut path_bytes = Vec::new();
     while let Some(task) = stack.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -461,44 +948,31 @@ fn walk_find_subtree(
                 Err(err) => return Err(err),
             };
             let file_name = entry.file_name();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
+            let child_path = child_find_path(&dir, &file_name);
+            let entry = match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children())
+            {
+                Ok(entry) => entry,
                 Err(err) if is_permission_denied(&err) => {
-                    let path = child_find_path(&dir, &file_name);
-                    write_warning_line("find", &path, &err, "cannot access");
+                    write_warning_line("find", &child_path, &err, "cannot access");
                     had_warnings.store(true, Ordering::SeqCst);
                     continue;
                 }
                 Err(err) => return Err(err),
             };
-            if plan.matches_child_basic(&dir, &file_name, file_type, child_depth, &mut path_bytes) {
-                let emit = if plan.extra_predicates.is_empty() {
-                    true
-                } else {
-                    let child_path = child_find_path(&dir, &file_name);
-                    match fs::symlink_metadata(&child_path) {
-                        Ok(meta) => plan.matches_extra(&child_path, &meta)?,
-                        Err(err) if is_permission_denied(&err) => {
-                            write_warning_line("find", &child_path, &err, "cannot access");
-                            had_warnings.store(true, Ordering::SeqCst);
-                            false
-                        }
-                        Err(_) => false,
-                    }
-                };
-                if emit {
-                    append_find_child_path(&mut chunk, &dir, &file_name, plan.output_delimiter);
-                    if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
-                        output.write_all(&chunk)?;
-                        chunk.clear();
-                    }
-                }
+            let outcome = plan.evaluate_path(&child_path, &entry, child_depth, output)?;
+            if outcome.quit {
+                stop.store(true, Ordering::SeqCst);
+                break;
             }
-            if file_type.is_dir() && plan.should_descend(child_depth) {
-                child_dirs.push(FindTask {
-                    dir: child_find_path(&dir, &file_name),
-                    depth: child_depth,
-                });
+            if let Some(child_task) = find_child_task(
+                plan,
+                &child_path,
+                child_depth,
+                task.root_device,
+                &entry,
+                outcome.prune,
+            )? {
+                child_dirs.push(child_task);
             }
         }
         if let Some(local_dir) = child_dirs.pop() {
@@ -506,7 +980,7 @@ fn walk_find_subtree(
             stack.push(local_dir);
         }
     }
-    output.write_all(&chunk)
+    Ok(())
 }
 
 fn walk_find_subtree_serial(
@@ -514,16 +988,26 @@ fn walk_find_subtree_serial(
     output: &FindOutput,
     had_warnings: &AtomicBool,
     plan: &FindPlan,
-) -> io::Result<()> {
-    let mut stack = vec![start_dir];
-    let mut chunk = Vec::with_capacity(FIND_OUTPUT_CHUNK_BYTES);
-    let mut path_bytes = Vec::new();
-    while let Some(task) = stack.pop() {
-        let dir = task.dir;
-        let child_depth = task.depth + 1;
-        let mut child_dirs = Vec::new();
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
+    ancestor_dirs: &[(u64, u64)],
+) -> io::Result<bool> {
+    let dir = start_dir.dir;
+    let child_depth = start_dir.depth + 1;
+    let dir_entry = load_find_entry_metadata(&dir, plan.follow_mode.follow_root())?;
+    let mut next_ancestors = ancestor_dirs.to_vec();
+    let current_dir_key = (dir_entry.effective.dev(), dir_entry.effective.ino());
+    next_ancestors.push(current_dir_key);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if is_permission_denied(&err) => {
+            write_warning_line("find", &dir, &err, "cannot read directory");
+            had_warnings.store(true, Ordering::SeqCst);
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(err) if is_permission_denied(&err) => {
                 write_warning_line("find", &dir, &err, "cannot read directory");
                 had_warnings.store(true, Ordering::SeqCst);
@@ -531,63 +1015,81 @@ fn walk_find_subtree_serial(
             }
             Err(err) => return Err(err),
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) if is_permission_denied(&err) => {
-                    write_warning_line("find", &dir, &err, "cannot read directory");
-                    had_warnings.store(true, Ordering::SeqCst);
-                    continue;
+        let file_name = entry.file_name();
+        let child_path = child_find_path(&dir, &file_name);
+        let entry = match load_find_entry_metadata(&child_path, plan.follow_mode.follow_children()) {
+            Ok(entry) => entry,
+            Err(err) if is_permission_denied(&err) => {
+                write_warning_line("find", &child_path, &err, "cannot access");
+                had_warnings.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if entry.effective.file_type().is_dir() {
+            if !plan.depth_first {
+                let outcome = plan.evaluate_path(&child_path, &entry, child_depth, output)?;
+                if outcome.quit {
+                    return Ok(true);
                 }
-                Err(err) => return Err(err),
-            };
-            let file_name = entry.file_name();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err) if is_permission_denied(&err) => {
-                    let path = child_find_path(&dir, &file_name);
-                    write_warning_line("find", &path, &err, "cannot access");
-                    had_warnings.store(true, Ordering::SeqCst);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            if plan.matches_child_basic(&dir, &file_name, file_type, child_depth, &mut path_bytes) {
-                let emit = if plan.extra_predicates.is_empty() {
-                    true
-                } else {
-                    let child_path = child_find_path(&dir, &file_name);
-                    match fs::symlink_metadata(&child_path) {
-                        Ok(meta) => plan.matches_extra(&child_path, &meta)?,
-                        Err(err) if is_permission_denied(&err) => {
-                            write_warning_line("find", &child_path, &err, "cannot access");
-                            had_warnings.store(true, Ordering::SeqCst);
-                            false
-                        }
-                        Err(_) => false,
+                if let Some(child_task) = find_child_task(
+                    plan,
+                    &child_path,
+                    child_depth,
+                    start_dir.root_device,
+                    &entry,
+                    outcome.prune,
+                )? {
+                    let child_key = (entry.effective.dev(), entry.effective.ino());
+                    if next_ancestors.contains(&child_key) {
+                        continue;
                     }
-                };
-                if emit {
-                    append_find_child_path(&mut chunk, &dir, &file_name, plan.output_delimiter);
-                    if chunk.len() >= FIND_OUTPUT_CHUNK_BYTES {
-                        output.write_all(&chunk)?;
-                        chunk.clear();
+                    if walk_find_subtree_serial(
+                        child_task,
+                        output,
+                        had_warnings,
+                        plan,
+                        &next_ancestors,
+                    )?
+                    {
+                        return Ok(true);
                     }
                 }
+            } else {
+                if let Some(child_task) = find_child_task(
+                    plan,
+                    &child_path,
+                    child_depth,
+                    start_dir.root_device,
+                    &entry,
+                    false,
+                )? {
+                    let child_key = (entry.effective.dev(), entry.effective.ino());
+                    if next_ancestors.contains(&child_key) {
+                        continue;
+                    }
+                    if walk_find_subtree_serial(
+                        child_task,
+                        output,
+                        had_warnings,
+                        plan,
+                        &next_ancestors,
+                    )?
+                    {
+                        return Ok(true);
+                    }
+                }
+                if plan.evaluate_path(&child_path, &entry, child_depth, output)?.quit {
+                    return Ok(true);
+                }
             }
-            if file_type.is_dir() && plan.should_descend(child_depth) {
-                child_dirs.push(FindTask {
-                    dir: child_find_path(&dir, &file_name),
-                    depth: child_depth,
-                });
+        } else {
+            if plan.evaluate_path(&child_path, &entry, child_depth, output)?.quit {
+                return Ok(true);
             }
-        }
-        if let Some(local_dir) = child_dirs.pop() {
-            stack.extend(child_dirs);
-            stack.push(local_dir);
         }
     }
-    output.write_all(&chunk)
+    Ok(false)
 }
 
 fn parallel_find_worker_count() -> usize {
@@ -597,10 +1099,646 @@ fn parallel_find_worker_count() -> usize {
         .max(1)
 }
 
+fn find_child_task(
+    plan: &FindPlan,
+    child_path: &Path,
+    depth: usize,
+    root_device: u64,
+    entry: &FindEntryMetadata,
+    pruned: bool,
+) -> io::Result<Option<FindTask>> {
+    if pruned || !entry.effective.file_type().is_dir() || !plan.should_descend(depth) {
+        return Ok(None);
+    }
+    if plan.same_file_system {
+        if entry.effective.dev() != root_device {
+            return Ok(None);
+        }
+    }
+    Ok(Some(FindTask {
+        dir: child_path.to_path_buf(),
+        depth,
+        root_device,
+    }))
+}
+
+fn parse_find_optimization_level(arg: &str) -> io::Result<bool> {
+    if !arg.starts_with("-O") {
+        return Ok(false);
+    }
+    let digits = &arg[2..];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid find optimisation level '{arg}'"),
+        ));
+    }
+    Ok(true)
+}
+
+fn current_local_day_start(now: SystemTime) -> io::Result<SystemTime> {
+    let unix_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "find daystart requires post-epoch time",
+            )
+        })?
+        .as_secs();
+    let raw_time = unix_secs.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "find daystart timestamp overflow",
+        )
+    })?;
+    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    if unsafe { libc::localtime_r(&raw_time, &mut local) }.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    local.tm_hour = 0;
+    local.tm_min = 0;
+    local.tm_sec = 0;
+    let midnight = unsafe { libc::mktime(&mut local) };
+    if midnight < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UNIX_EPOCH + Duration::from_secs(midnight as u64))
+}
+
+fn match_xtype(
+    path: &Path,
+    entry: &FindEntryMetadata,
+    follow_mode: FindFollowMode,
+    expected: FindFileType,
+) -> io::Result<bool> {
+    let link_type = entry.link.file_type();
+    if !link_type.is_symlink() {
+        return Ok(expected.matches(entry.effective.file_type()));
+    }
+    if follow_mode == FindFollowMode::Always {
+        return Ok(matches!(expected, FindFileType::Symlink));
+    }
+    match fs::metadata(path) {
+        Ok(target_meta) => Ok(expected.matches(target_meta.file_type())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(matches!(expected, FindFileType::Symlink))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn load_find_entry_metadata(path: &Path, follow: bool) -> io::Result<FindEntryMetadata> {
+    let link = fs::symlink_metadata(path)?;
+    if !follow {
+        return Ok(FindEntryMetadata {
+            effective: link.clone(),
+            link,
+            followed: false,
+        });
+    }
+    let effective = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => link.clone(),
+        Err(err) => return Err(err),
+    };
+    Ok(FindEntryMetadata {
+        effective,
+        link,
+        followed: true,
+    })
+}
+
+struct FindParseState {
+    time_reference: SystemTime,
+    daystart_active: bool,
+    min_depth: Option<usize>,
+    max_depth: Option<usize>,
+    regex_type: FindRegexType,
+    follow_mode: FindFollowMode,
+    same_file_system: bool,
+    depth_first: bool,
+    has_action: bool,
+    suppress_default_print: bool,
+}
+
+fn parse_find_expression(
+    args: &[String],
+    index: &mut usize,
+    state: &mut FindParseState,
+) -> io::Result<FindExpression> {
+    if *index >= args.len() {
+        return Ok(FindExpression::Predicate(FindPredicate::True));
+    }
+    parse_find_or(args, index, state)
+}
+
+fn parse_find_or(
+    args: &[String],
+    index: &mut usize,
+    state: &mut FindParseState,
+) -> io::Result<FindExpression> {
+    let mut expr = parse_find_and(args, index, state)?;
+    while let Some(token) = args.get(*index).map(String::as_str) {
+        if !matches!(token, "-o" | "-or") {
+            break;
+        }
+        *index += 1;
+        let rhs = parse_find_and(args, index, state)?;
+        expr = FindExpression::Or(Box::new(expr), Box::new(rhs));
+    }
+    Ok(expr)
+}
+
+fn parse_find_and(
+    args: &[String],
+    index: &mut usize,
+    state: &mut FindParseState,
+) -> io::Result<FindExpression> {
+    let mut expr = parse_find_unary(args, index, state)?;
+    while let Some(token) = args.get(*index).map(String::as_str) {
+        if matches!(token, "-o" | "-or" | ")") {
+            break;
+        }
+        if matches!(token, "-a" | "-and") {
+            *index += 1;
+        }
+        let rhs = parse_find_unary(args, index, state)?;
+        expr = FindExpression::And(Box::new(expr), Box::new(rhs));
+    }
+    Ok(expr)
+}
+
+fn parse_find_unary(
+    args: &[String],
+    index: &mut usize,
+    state: &mut FindParseState,
+) -> io::Result<FindExpression> {
+    match args.get(*index).map(String::as_str) {
+        Some("!") | Some("-not") => {
+            *index += 1;
+            Ok(FindExpression::Not(Box::new(parse_find_unary(
+                args, index, state,
+            )?)))
+        }
+        _ => parse_find_primary(args, index, state),
+    }
+}
+
+fn parse_find_primary(
+    args: &[String],
+    index: &mut usize,
+    state: &mut FindParseState,
+) -> io::Result<FindExpression> {
+    let Some(arg) = args.get(*index).map(String::as_str) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing find expression",
+        ));
+    };
+    match arg {
+        "(" | ")" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported find expression: {arg}"),
+        )),
+        "-mindepth" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -mindepth")
+            })?;
+            state.min_depth = Some(parse_find_depth("-mindepth", value)?);
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-maxdepth" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -maxdepth")
+            })?;
+            state.max_depth = Some(parse_find_depth("-maxdepth", value)?);
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-daystart" => {
+            state.time_reference = current_local_day_start(state.time_reference)?;
+            state.daystart_active = true;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-depth" => {
+            state.depth_first = true;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-follow" => {
+            state.follow_mode = FindFollowMode::Always;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-mount" | "-xdev" => {
+            state.same_file_system = true;
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-regextype" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -regextype")
+            })?;
+            state.regex_type = FindRegexType::parse(value)?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-type" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -type")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Type(
+                FindFileType::parse(value)?,
+            )))
+        }
+        "-xtype" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -xtype")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::XType(
+                FindFileType::parse(value)?,
+            )))
+        }
+        "-name" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -name")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Name(
+                FindGlobPattern::parse("-name", value, 0)?,
+            )))
+        }
+        "-iname" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -iname")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Name(
+                FindGlobPattern::parse("-iname", value, libc::FNM_CASEFOLD)?,
+            )))
+        }
+        "-path" | "-wholename" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Path(
+                FindGlobPattern::parse(arg, value, 0)?,
+            )))
+        }
+        "-ipath" | "-iwholename" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Path(
+                FindGlobPattern::parse(arg, value, libc::FNM_CASEFOLD)?,
+            )))
+        }
+        "-lname" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -lname")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::LinkName(
+                FindGlobPattern::parse("-lname", value, 0)?,
+            )))
+        }
+        "-ilname" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -ilname")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::LinkName(
+                FindGlobPattern::parse("-ilname", value, libc::FNM_CASEFOLD)?,
+            )))
+        }
+        "-regex" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -regex")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Regex(
+                FindRegexPattern::parse("-regex", value, state.regex_type, false)?,
+            )))
+        }
+        "-iregex" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -iregex")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Regex(
+                FindRegexPattern::parse("-iregex", value, state.regex_type, true)?,
+            )))
+        }
+        "-true" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-false" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::False))
+        }
+        "-noleaf" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::True))
+        }
+        "-empty" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Empty))
+        }
+        "-size" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -size")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(parse_size_predicate("-size", value)?))
+        }
+        "-links" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -links")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Links(
+                parse_numeric_comparison("-links", value)?,
+            )))
+        }
+        "-inum" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -inum")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Inum(
+                parse_numeric_comparison("-inum", value)?,
+            )))
+        }
+        "-newer" | "-anewer" | "-cnewer" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+            })?;
+            let metadata = fs::symlink_metadata(value)?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Newer(
+                metadata.modified()?,
+                match arg {
+                    "-newer" => TimeField::Modified,
+                    "-anewer" => TimeField::Accessed,
+                    "-cnewer" => TimeField::Changed,
+                    _ => unreachable!(),
+                },
+            )))
+        }
+        "-used" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -used")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Used(
+                parse_numeric_comparison("-used", value)?,
+            )))
+        }
+        "-mtime" | "-mmin" | "-atime" | "-amin" | "-ctime" | "-cmin" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing argument to find {arg}"))
+            })?;
+            let (secs_per_period, field) = match arg {
+                "-mtime" => (86_400, TimeField::Modified),
+                "-mmin" => (60, TimeField::Modified),
+                "-atime" => (86_400, TimeField::Accessed),
+                "-amin" => (60, TimeField::Accessed),
+                "-ctime" => (86_400, TimeField::Changed),
+                "-cmin" => (60, TimeField::Changed),
+                _ => unreachable!(),
+            };
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::TimePeriods {
+                cmp: parse_numeric_comparison(arg, value)?,
+                secs_per_period,
+                field,
+                now: state.time_reference,
+                use_daystart_boundary: state.daystart_active && secs_per_period == 86_400,
+            }))
+        }
+        "-perm" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -perm")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(parse_perm_predicate(value)?))
+        }
+        "-uid" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -uid")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Uid(
+                parse_numeric_comparison("-uid", value)?,
+            )))
+        }
+        "-user" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -user")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Uid(
+                NumericComparison::Exactly(resolve_user_to_uid(value)?),
+            )))
+        }
+        "-gid" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -gid")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Gid(
+                parse_numeric_comparison("-gid", value)?,
+            )))
+        }
+        "-group" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -group")
+            })?;
+            *index += 2;
+            Ok(FindExpression::Predicate(FindPredicate::Gid(
+                NumericComparison::Exactly(resolve_group_to_gid(value)?),
+            )))
+        }
+        "-nouser" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Nouser))
+        }
+        "-nogroup" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Nogroup))
+        }
+        "-readable" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Readable))
+        }
+        "-writable" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Writable))
+        }
+        "-executable" => {
+            *index += 1;
+            Ok(FindExpression::Predicate(FindPredicate::Executable))
+        }
+        "-print" => {
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Print(b'\n')))
+        }
+        "-print0" => {
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Print(b'\0')))
+        }
+        "-printf" => {
+            let value = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -printf")
+            })?;
+            let format = FindFormatTemplate::parse("-printf", value)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 2;
+            Ok(FindExpression::Action(FindAction::PrintFormat(format)))
+        }
+        "-fprintf" => {
+            let path = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing file argument to find -fprintf")
+            })?;
+            let value = args.get(*index + 2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing format argument to find -fprintf")
+            })?;
+            let format = FindFormatTemplate::parse("-fprintf", value)?;
+            let action = FindFileFormatAction::open(path, format)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 3;
+            Ok(FindExpression::Action(FindAction::FileFormat(action)))
+        }
+        "-exec" => {
+            let action = parse_find_exec_action(args, index, false, false)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            Ok(FindExpression::Action(FindAction::Exec(action)))
+        }
+        "-ok" => {
+            let action = parse_find_exec_action(args, index, true, false)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            Ok(FindExpression::Action(FindAction::Exec(action)))
+        }
+        "-okdir" => {
+            let action = parse_find_exec_action(args, index, true, true)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            Ok(FindExpression::Action(FindAction::Exec(action)))
+        }
+        "-ls" => {
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Ls))
+        }
+        "-fls" => {
+            let path = args.get(*index + 1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing file argument to find -fls")
+            })?;
+            let action = FindFileLsAction::open(path)?;
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 2;
+            Ok(FindExpression::Action(FindAction::Fls(action)))
+        }
+        "-prune" => {
+            state.has_action = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Prune))
+        }
+        "-quit" => {
+            state.has_action = true;
+            state.suppress_default_print = true;
+            *index += 1;
+            Ok(FindExpression::Action(FindAction::Quit))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported find expression: {other}"),
+        )),
+    }
+}
+
+fn parse_find_exec_action(
+    args: &[String],
+    index: &mut usize,
+    prompt: bool,
+    chdir_parent: bool,
+) -> io::Result<FindExecAction> {
+    let mut argv = Vec::new();
+    *index += 1;
+    while let Some(arg) = args.get(*index) {
+        match arg.as_str() {
+            ";" => {
+                *index += 1;
+                if argv.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "find -exec requires a command before ';'",
+                    ));
+                }
+                return Ok(FindExecAction {
+                    argv,
+                    prompt,
+                    chdir_parent,
+                });
+            }
+            "+" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported find expression: -exec ... +",
+                ))
+            }
+            _ => {
+                argv.push(std::ffi::OsString::from(arg));
+                *index += 1;
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "missing ';' terminator for find -exec",
+    ))
+}
+
 fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
-    let now = SystemTime::now();
     let mut roots = Vec::new();
     let mut index = 1;
+    let mut follow_mode = FindFollowMode::Never;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-P" => {
+                follow_mode = FindFollowMode::Never;
+                index += 1;
+            }
+            "-H" => {
+                follow_mode = FindFollowMode::RootsOnly;
+                index += 1;
+            }
+            "-L" => {
+                follow_mode = FindFollowMode::Always;
+                index += 1;
+            }
+            _ if parse_find_optimization_level(arg)? => index += 1,
+            _ => break,
+        }
+    }
     while let Some(arg) = args.get(index) {
         if is_find_expression_token(arg) {
             break;
@@ -612,276 +1750,40 @@ fn parse_find_args(args: &[String]) -> io::Result<(Vec<String>, FindPlan)> {
         roots.push(".".to_string());
     }
 
-    let mut type_filter = None;
-    let mut name_pattern = None;
-    let mut path_pattern = None;
-    let mut min_depth = None;
-    let mut max_depth = None;
-    let mut extra_predicates: Vec<FindPredicate> = Vec::new();
-    let mut output_delimiter = b'\n';
-    let mut explicit_output_action = false;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "-mindepth" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -mindepth",
-                    )
-                })?;
-                min_depth = Some(parse_find_depth("-mindepth", value)?);
-                index += 2;
-            }
-            "-maxdepth" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -maxdepth",
-                    )
-                })?;
-                max_depth = Some(parse_find_depth("-maxdepth", value)?);
-                index += 2;
-            }
-            "-type" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -type",
-                    )
-                })?;
-                type_filter = Some(FindFileType::parse(value)?);
-                index += 2;
-            }
-            "-name" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -name",
-                    )
-                })?;
-                name_pattern = Some(FindGlobPattern::parse("-name", value, 0)?);
-                index += 2;
-            }
-            "-iname" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -iname",
-                    )
-                })?;
-                name_pattern = Some(FindGlobPattern::parse("-iname", value, libc::FNM_CASEFOLD)?);
-                index += 2;
-            }
-            "-path" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -path",
-                    )
-                })?;
-                path_pattern = Some(FindGlobPattern::parse("-path", value, 0)?);
-                index += 2;
-            }
-            "-ipath" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -ipath",
-                    )
-                })?;
-                path_pattern = Some(FindGlobPattern::parse("-ipath", value, libc::FNM_CASEFOLD)?);
-                index += 2;
-            }
-            "-empty" => {
-                extra_predicates.push(FindPredicate::Empty);
-                index += 1;
-            }
-            "-size" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -size",
-                    )
-                })?;
-                extra_predicates.push(parse_size_predicate("-size", value)?);
-                index += 2;
-            }
-            "-links" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -links",
-                    )
-                })?;
-                extra_predicates.push(FindPredicate::Links(parse_numeric_comparison(
-                    "-links", value,
-                )?));
-                index += 2;
-            }
-            "-inum" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -inum",
-                    )
-                })?;
-                extra_predicates.push(FindPredicate::Inum(parse_numeric_comparison(
-                    "-inum", value,
-                )?));
-                index += 2;
-            }
-            "-newer" | "-anewer" | "-cnewer" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("missing argument to find {arg}"),
-                    )
-                })?;
-                let metadata = fs::symlink_metadata(value)?;
-                extra_predicates.push(FindPredicate::Newer(
-                    metadata.modified()?,
-                    match arg.as_str() {
-                        "-newer" => TimeField::Modified,
-                        "-anewer" => TimeField::Accessed,
-                        "-cnewer" => TimeField::Changed,
-                        _ => unreachable!(),
-                    },
-                ));
-                index += 2;
-            }
-            "-mtime" | "-mmin" | "-atime" | "-amin" | "-ctime" | "-cmin" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("missing argument to find {arg}"),
-                    )
-                })?;
-                let (secs_per_period, field) = match arg.as_str() {
-                    "-mtime" => (86_400, TimeField::Modified),
-                    "-mmin" => (60, TimeField::Modified),
-                    "-atime" => (86_400, TimeField::Accessed),
-                    "-amin" => (60, TimeField::Accessed),
-                    "-ctime" => (86_400, TimeField::Changed),
-                    "-cmin" => (60, TimeField::Changed),
-                    _ => unreachable!(),
-                };
-                extra_predicates.push(FindPredicate::TimePeriods {
-                    cmp: parse_numeric_comparison(arg, value)?,
-                    secs_per_period,
-                    field,
-                    now,
-                });
-                index += 2;
-            }
-            "-perm" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -perm",
-                    )
-                })?;
-                extra_predicates.push(parse_perm_predicate(value)?);
-                index += 2;
-            }
-            "-uid" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -uid")
-                })?;
-                extra_predicates.push(FindPredicate::Uid(parse_numeric_comparison("-uid", value)?));
-                index += 2;
-            }
-            "-user" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -user",
-                    )
-                })?;
-                extra_predicates.push(FindPredicate::Uid(NumericComparison::Exactly(
-                    resolve_user_to_uid(value)?,
-                )));
-                index += 2;
-            }
-            "-gid" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing argument to find -gid")
-                })?;
-                extra_predicates.push(FindPredicate::Gid(parse_numeric_comparison("-gid", value)?));
-                index += 2;
-            }
-            "-group" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing argument to find -group",
-                    )
-                })?;
-                extra_predicates.push(FindPredicate::Gid(NumericComparison::Exactly(
-                    resolve_group_to_gid(value)?,
-                )));
-                index += 2;
-            }
-            "-nouser" => {
-                extra_predicates.push(FindPredicate::Nouser);
-                index += 1;
-            }
-            "-nogroup" => {
-                extra_predicates.push(FindPredicate::Nogroup);
-                index += 1;
-            }
-            "-readable" => {
-                extra_predicates.push(FindPredicate::Readable);
-                index += 1;
-            }
-            "-writable" => {
-                extra_predicates.push(FindPredicate::Writable);
-                index += 1;
-            }
-            "-executable" => {
-                extra_predicates.push(FindPredicate::Executable);
-                index += 1;
-            }
-            "-print" => {
-                if explicit_output_action && output_delimiter != b'\n' {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "multiple explicit find output actions are not supported",
-                    ));
-                }
-                explicit_output_action = true;
-                output_delimiter = b'\n';
-                index += 1;
-            }
-            "-print0" => {
-                if explicit_output_action && output_delimiter != b'\0' {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "multiple explicit find output actions are not supported",
-                    ));
-                }
-                explicit_output_action = true;
-                output_delimiter = b'\0';
-                index += 1;
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported find expression: {other}"),
-                ))
-            }
-        }
+    let mut state = FindParseState {
+        time_reference: SystemTime::now(),
+        daystart_active: false,
+        min_depth: None,
+        max_depth: None,
+        regex_type: FindRegexType::Emacs,
+        follow_mode,
+        same_file_system: false,
+        depth_first: false,
+        has_action: false,
+        suppress_default_print: false,
+    };
+    let expression = parse_find_expression(args, &mut index, &mut state)?;
+    if index != args.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported find expression: {}",
+                args.get(index).map(String::as_str).unwrap_or_default()
+            ),
+        ));
     }
 
     Ok((
         roots,
         FindPlan {
-            type_filter,
-            name_pattern,
-            path_pattern,
-            min_depth,
-            max_depth,
-            extra_predicates,
-            output_delimiter,
+            min_depth: state.min_depth,
+            max_depth: state.max_depth,
+            follow_mode: state.follow_mode,
+            same_file_system: state.same_file_system,
+            depth_first: state.depth_first,
+            has_action: state.has_action,
+            suppress_default_print: state.suppress_default_print,
+            expression,
         },
     ))
 }
@@ -892,19 +1794,34 @@ fn is_find_expression_token(arg: &str) -> bool {
 
 fn print_find_help(program: &str) {
     fro::cio_println!(
-        "Usage: {program} [path ...] [-mindepth N] [-maxdepth N] [-type TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN] [-empty] [-size N[cwbkMG]] [-links N] [-inum N] [-newer FILE|-anewer FILE|-cnewer FILE] [-mtime N|-mmin N|-atime N|-amin N|-ctime N|-cmin N] [-perm [/+-]MODE] [-user NAME|-uid N] [-group NAME|-gid N] [-nouser] [-nogroup] [-readable] [-writable] [-executable] [-print|-print0] [--help] [--version]"
+        "Usage: {program} [-P|-H|-L] [-Olevel] [path ...] [-mindepth N] [-maxdepth N] [-mount|-xdev] [-type TYPE] [-xtype TYPE] [-name PATTERN|-iname PATTERN] [-path PATTERN|-ipath PATTERN|-wholename PATTERN|-iwholename PATTERN] [-lname PATTERN|-ilname PATTERN] [-regex PATTERN|-iregex PATTERN] [-regextype TYPE] [-empty] [-size N[cwbkMG]] [-links N] [-inum N] [-newer FILE|-anewer FILE|-cnewer FILE] [-used N] [-daystart] [-mtime N|-mmin N|-atime N|-amin N|-ctime N|-cmin N] [-perm [/+-]MODE] [-user NAME|-uid N] [-group NAME|-gid N] [-nouser] [-nogroup] [-readable] [-writable] [-executable] [-true|-false] [-depth] [!|-not] [-a|-and] [-o|-or] [-noleaf] [-print|-print0|-printf FMT|-fprintf FILE FMT|-exec CMD ... ';'|-ok CMD ... ';'|-okdir CMD ... ';'|-ls|-fls FILE|-prune|-quit] [--help] [--version]"
     );
     fro::cio_println!("Walk directory trees and print matching paths.");
     fro::cio_println!();
+    fro::cio_println!("  -P                 never follow symlinks (default)");
+    fro::cio_println!("  -H                 follow command-line symlink roots only");
+    fro::cio_println!("  -L                 follow command-line and discovered symlinks");
+    fro::cio_println!("  -Olevel            GNU optimisation hint accepted before paths");
     fro::cio_println!("  -mindepth N        emit only entries at depth N or deeper");
     fro::cio_println!("  -maxdepth N        descend at most N levels below each starting path");
+    fro::cio_println!("  -mount, -xdev      stay on the same device as each starting path");
     fro::cio_println!("  -type TYPE         filter by file type: b, c, d, p, f, l, or s");
+    fro::cio_println!(
+        "  -xtype TYPE        use symlink target type matching under -P/no-follow mode"
+    );
     fro::cio_println!(
         "  -name PATTERN      match the final path component using shell glob syntax"
     );
     fro::cio_println!("  -iname PATTERN     like -name, but match ASCII case-insensitively");
     fro::cio_println!("  -path PATTERN      match the whole emitted path using shell glob syntax");
     fro::cio_println!("  -ipath PATTERN     like -path, but match ASCII case-insensitively");
+    fro::cio_println!("  -wholename PATTERN alias for -path");
+    fro::cio_println!("  -iwholename PATTERN alias for -ipath");
+    fro::cio_println!("  -lname PATTERN     match symlink targets using shell glob syntax");
+    fro::cio_println!("  -ilname PATTERN    like -lname, but match ASCII case-insensitively");
+    fro::cio_println!("  -regex PATTERN     full-path regex match using the current regex syntax");
+    fro::cio_println!("  -iregex PATTERN    like -regex, but match ASCII case-insensitively");
+    fro::cio_println!("  -regextype TYPE    regex syntax: emacs/findutils-default or posix-extended/egrep");
     fro::cio_println!("  -empty             match empty regular files and empty directories");
     fro::cio_println!("  -size N[cwbkMG]    compare size using find-style numeric prefixes");
     fro::cio_println!("  -links N           compare hard-link count");
@@ -912,6 +1829,8 @@ fn print_find_help(program: &str) {
     fro::cio_println!("  -newer FILE        match if mtime is newer than FILE's mtime");
     fro::cio_println!("  -anewer FILE       match if atime is newer than FILE's mtime");
     fro::cio_println!("  -cnewer FILE       match if ctime is newer than FILE's mtime");
+    fro::cio_println!("  -used N            compare whole days between atime and ctime");
+    fro::cio_println!("  -daystart          compare later time predicates from the start of today");
     fro::cio_println!("  -mtime/-mmin N     compare modification age in days or minutes");
     fro::cio_println!("  -atime/-amin N     compare access age in days or minutes");
     fro::cio_println!("  -ctime/-cmin N     compare status-change age in days or minutes");
@@ -923,10 +1842,26 @@ fn print_find_help(program: &str) {
     fro::cio_println!("  -readable          match paths accessible for reading");
     fro::cio_println!("  -writable          match paths accessible for writing");
     fro::cio_println!("  -executable        match paths accessible for executing/searching");
+    fro::cio_println!("  -true              always match");
+    fro::cio_println!("  -false             never match");
+    fro::cio_println!("  -depth             visit directory entries before the directory itself");
+    fro::cio_println!("  !, -not            negate the following predicate or action");
+    fro::cio_println!("  -o, -or            logical OR between adjacent expressions");
+    fro::cio_println!("  -noleaf            accept GNU noleaf and keep the current traversal plan");
+    fro::cio_println!("  -a, -and           logical AND between adjacent predicates (default)");
     fro::cio_println!(
         "  -print             print each matching path followed by a newline (default)"
     );
     fro::cio_println!("  -print0            print each matching path followed by NUL");
+    fro::cio_println!("  -printf FMT        write bounded formatted output to stdout");
+    fro::cio_println!("  -fprintf FILE FMT  write bounded formatted output to FILE");
+    fro::cio_println!("  -ls                emit a GNU-like long listing for each match");
+    fro::cio_println!("  -fls FILE          write GNU-like long listings to FILE");
+    fro::cio_println!("  -exec CMD ... ';'  run CMD once per matching path; '{{}}' expands to the path");
+    fro::cio_println!("  -ok CMD ... ';'    like -exec, but prompt before each command");
+    fro::cio_println!("  -okdir CMD ... ';' like -ok, but run in the match parent directory");
+    fro::cio_println!("  -prune             skip descending into the current matched directory");
+    fro::cio_println!("  -quit              stop the walk immediately");
     fro::cio_println!("  -h, --help         display this help and exit");
     fro::cio_println!("      --version      output version information and exit");
 }
@@ -942,28 +1877,162 @@ fn append_find_path(chunk: &mut Vec<u8>, path: &Path, output_delimiter: u8) {
     chunk.push(output_delimiter);
 }
 
-fn append_find_child_path(
-    chunk: &mut Vec<u8>,
-    dir: &Path,
-    file_name: &std::ffi::OsStr,
-    output_delimiter: u8,
-) {
-    append_find_child_path_bytes(chunk, dir, file_name);
-    chunk.push(output_delimiter);
-}
-
-fn append_find_child_path_bytes(chunk: &mut Vec<u8>, dir: &Path, file_name: &std::ffi::OsStr) {
-    chunk.extend_from_slice(dir.as_os_str().as_bytes());
-    if !dir.as_os_str().as_bytes().ends_with(b"/") {
-        chunk.push(b'/');
-    }
-    chunk.extend_from_slice(file_name.as_bytes());
-}
-
 fn child_find_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     let mut path = dir.to_path_buf();
     path.push(file_name);
     path
+}
+
+fn render_exec_arg_with(
+    template: &std::ffi::OsStr,
+    replacement: &std::ffi::OsStr,
+) -> std::ffi::OsString {
+    let template_bytes = template.as_bytes();
+    if !template_bytes.windows(2).any(|window| window == b"{}") {
+        return template.to_os_string();
+    }
+    let mut rendered = Vec::with_capacity(template_bytes.len() + replacement.as_bytes().len());
+    let mut remaining = template_bytes;
+    while let Some(pos) = remaining.windows(2).position(|window| window == b"{}") {
+        rendered.extend_from_slice(&remaining[..pos]);
+        rendered.extend_from_slice(replacement.as_bytes());
+        remaining = &remaining[pos + 2..];
+    }
+    rendered.extend_from_slice(remaining);
+    std::os::unix::ffi::OsStringExt::from_vec(rendered)
+}
+
+fn prompt_find_exec(argv: &[std::ffi::OsString], path: &Path) -> io::Result<bool> {
+    let program = argv
+        .first()
+        .map(std::ffi::OsString::as_os_str)
+        .unwrap_or_else(|| std::ffi::OsStr::new(""));
+    let mut prompt = Vec::new();
+    prompt.extend_from_slice(b"< ");
+    prompt.extend_from_slice(program.as_bytes());
+    prompt.extend_from_slice(b" ... ");
+    prompt.extend_from_slice(path.as_os_str().as_bytes());
+    prompt.extend_from_slice(b" > ? ");
+    {
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(&prompt)?;
+        stderr.flush()?;
+    }
+    let mut response = String::new();
+    std::io::stdin().lock().read_line(&mut response)?;
+    Ok(matches!(
+        response.bytes().find(|byte| !byte.is_ascii_whitespace()),
+        Some(b'y' | b'Y')
+    ))
+}
+
+fn render_find_ls_line(path: &Path, metadata: &fs::Metadata) -> io::Result<Vec<u8>> {
+    let inode = metadata.ino();
+    let blocks = metadata.blocks() / 2;
+    let mode = render_find_mode(metadata.file_type(), metadata.mode());
+    let nlink = metadata.nlink();
+    let owner = resolve_uid_name(metadata.uid())?;
+    let group = resolve_gid_name(metadata.gid())?;
+    let size = metadata.len();
+    let time = format_find_ls_time(metadata.modified()?)?;
+    let line = format!(
+        "{inode:>9} {blocks:>6} {mode} {nlink:>3} {owner:<8} {group:<8} {size:>8} {time} {}\n",
+        path.display()
+    );
+    Ok(line.into_bytes())
+}
+
+fn render_find_mode(file_type: fs::FileType, mode: u32) -> String {
+    let mut rendered = String::with_capacity(11);
+    rendered.push(find_ls_file_type_letter(file_type));
+    let bits = [
+        0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+    ];
+    let chars = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
+    for (bit, ch) in bits.into_iter().zip(chars) {
+        rendered.push(if mode & bit != 0 { ch } else { '-' });
+    }
+    rendered
+}
+
+fn find_ls_file_type_letter(file_type: fs::FileType) -> char {
+    if file_type.is_block_device() {
+        'b'
+    } else if file_type.is_char_device() {
+        'c'
+    } else if file_type.is_dir() {
+        'd'
+    } else if file_type.is_fifo() {
+        'p'
+    } else if file_type.is_file() {
+        '-'
+    } else if file_type.is_symlink() {
+        'l'
+    } else if file_type.is_socket() {
+        's'
+    } else {
+        '?'
+    }
+}
+
+fn format_find_ls_time(time: SystemTime) -> io::Result<String> {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp before unix epoch"))?
+        .as_secs() as libc::time_t;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "system clock before unix epoch"))?
+        .as_secs() as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let mut now_tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    if unsafe { libc::localtime_r(&secs, tm.as_mut_ptr()) }.is_null()
+        || unsafe { libc::localtime_r(&now, now_tm.as_mut_ptr()) }.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let tm = unsafe { tm.assume_init() };
+    let now_tm = unsafe { now_tm.assume_init() };
+    let recent = (now - secs).unsigned_abs() <= 15_778_476;
+    let fmt = if recent && tm.tm_year == now_tm.tm_year {
+        "%b %e %H:%M"
+    } else {
+        "%b %e  %Y"
+    };
+    let fmt_c = CString::new(fmt).expect("valid ls time format");
+    let mut buf = [0u8; 64];
+    let written = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            fmt_c.as_ptr(),
+            &tm,
+        )
+    };
+    if written == 0 {
+        return Err(io::Error::other("strftime failed for find -ls timestamp"));
+    }
+    Ok(String::from_utf8_lossy(&buf[..written]).into_owned())
+}
+
+fn find_file_type_letter(file_type: fs::FileType) -> u8 {
+    if file_type.is_block_device() {
+        b'b'
+    } else if file_type.is_char_device() {
+        b'c'
+    } else if file_type.is_dir() {
+        b'd'
+    } else if file_type.is_fifo() {
+        b'p'
+    } else if file_type.is_file() {
+        b'f'
+    } else if file_type.is_symlink() {
+        b'l'
+    } else if file_type.is_socket() {
+        b's'
+    } else {
+        b'?'
+    }
 }
 
 fn find_name_matches(pattern: &FindGlobPattern, path: &Path) -> bool {
@@ -1136,6 +2205,66 @@ fn resolve_group_to_gid(name: &str) -> io::Result<u64> {
     }
 }
 
+fn resolve_uid_name(uid: u32) -> io::Result<String> {
+    let mut buf_len = passwd_group_buf_len();
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0u8; buf_len];
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() {
+            return Ok(uid.to_string());
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*result).pw_name) };
+        return Ok(name.to_string_lossy().into_owned());
+    }
+}
+
+fn resolve_gid_name(gid: u32) -> io::Result<String> {
+    let mut buf_len = passwd_group_buf_len();
+    loop {
+        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0u8; buf_len];
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                group.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len *= 2;
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() {
+            return Ok(gid.to_string());
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*result).gr_name) };
+        return Ok(name.to_string_lossy().into_owned());
+    }
+}
+
 fn uid_is_unknown(uid: u32) -> io::Result<bool> {
     let mut buf_len = passwd_group_buf_len();
     loop {
@@ -1226,16 +2355,266 @@ mod tests {
     #[test]
     fn find_plan_should_descend_stops_at_max_depth_boundary() {
         let plan = FindPlan {
-            type_filter: None,
-            name_pattern: None,
-            path_pattern: None,
             min_depth: None,
             max_depth: Some(1),
-            extra_predicates: Vec::new(),
-            output_delimiter: b'\n',
+            follow_mode: FindFollowMode::Never,
+            same_file_system: false,
+            depth_first: false,
+            has_action: false,
+            suppress_default_print: false,
+            expression: FindExpression::Predicate(FindPredicate::True),
         };
 
         assert!(plan.should_descend(0));
         assert!(!plan.should_descend(1));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_explicit_default_and_and_tokens() {
+        let args = vec![
+            "find".to_string(),
+            "-P".to_string(),
+            "root".to_string(),
+            "-type".to_string(),
+            "f".to_string(),
+            "-a".to_string(),
+            "-name".to_string(),
+            "*.rs".to_string(),
+            "-and".to_string(),
+            "-print".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(plan.has_action);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_path_aliases_and_constant_predicates() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-wholename".to_string(),
+            "*/src/*".to_string(),
+            "-a".to_string(),
+            "-false".to_string(),
+            "-noleaf".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_link_name_predicates() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-lname".to_string(),
+            "target*".to_string(),
+            "-ilname".to_string(),
+            "TARGET*".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(
+            plan.expression,
+            FindExpression::And(_, _)
+        ));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_xtype_predicate() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-xtype".to_string(),
+            "d".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(
+            plan.expression,
+            FindExpression::Predicate(FindPredicate::XType(FindFileType::Directory))
+        ));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_daystart_before_time_predicates() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-daystart".to_string(),
+            "-mtime".to_string(),
+            "0".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(
+            plan.expression,
+            FindExpression::And(_, _)
+        ));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_optimization_level_before_roots() {
+        let args = vec![
+            "find".to_string(),
+            "-O9".to_string(),
+            "root".to_string(),
+            "-type".to_string(),
+            "f".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(
+            plan.expression,
+            FindExpression::Predicate(FindPredicate::Type(FindFileType::File))
+        ));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_same_filesystem_aliases() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-mount".to_string(),
+            "-xdev".to_string(),
+            "-type".to_string(),
+            "d".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(plan.same_file_system);
+    }
+
+    #[test]
+    fn parse_find_args_accepts_symlink_modes_and_used() {
+        let args = vec![
+            "find".to_string(),
+            "-H".to_string(),
+            "root".to_string(),
+            "-used".to_string(),
+            "-1".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(plan.follow_mode, FindFollowMode::RootsOnly));
+        assert!(matches!(
+            plan.expression,
+            FindExpression::Predicate(FindPredicate::Used(_))
+        ));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_depth_not_or_and_exec_tokens() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-depth".to_string(),
+            "-not".to_string(),
+            "-name".to_string(),
+            "*.tmp".to_string(),
+            "-o".to_string(),
+            "-exec".to_string(),
+            "printf".to_string(),
+            "%s\\n".to_string(),
+            "{}".to_string(),
+            ";".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(plan.depth_first);
+        assert!(plan.has_action);
+        assert!(matches!(plan.expression, FindExpression::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_ls_ok_and_prune_tokens() {
+        let args = vec![
+            "find".to_string(),
+            "-L".to_string(),
+            "root".to_string(),
+            "-path".to_string(),
+            "*/skip".to_string(),
+            "-prune".to_string(),
+            "-o".to_string(),
+            "-ok".to_string(),
+            "printf".to_string(),
+            "%s\\n".to_string(),
+            "{}".to_string(),
+            ";".to_string(),
+            "-ls".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(plan.follow_mode, FindFollowMode::Always));
+        assert!(plan.has_action);
+        assert!(plan.suppress_default_print);
+        assert!(matches!(plan.expression, FindExpression::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_accepts_regex_predicates_and_regextype() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-regextype".to_string(),
+            "posix-extended".to_string(),
+            "-regex".to_string(),
+            ".*/(src|tests)/.*".to_string(),
+            "-iregex".to_string(),
+            ".*RS".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
+    }
+
+    #[test]
+    fn parse_find_args_rejects_unsupported_regextype() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-regextype".to_string(),
+            "sed".to_string(),
+            "-regex".to_string(),
+            ".*".to_string(),
+        ];
+
+        let err = match parse_find_args(&args) {
+            Ok(_) => panic!("expected unsupported regextype to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "unsupported find -regextype 'sed'");
+    }
+
+    #[test]
+    fn parse_find_args_accepts_printf_and_fprintf_tokens() {
+        let args = vec![
+            "find".to_string(),
+            "root".to_string(),
+            "-printf".to_string(),
+            "%p\\n".to_string(),
+            "-fprintf".to_string(),
+            "out.txt".to_string(),
+            "%f\\n".to_string(),
+        ];
+
+        let (roots, plan) = parse_find_args(&args).unwrap();
+        assert_eq!(roots, vec!["root".to_string()]);
+        assert!(plan.has_action);
+        assert!(matches!(plan.expression, FindExpression::And(_, _)));
     }
 }
