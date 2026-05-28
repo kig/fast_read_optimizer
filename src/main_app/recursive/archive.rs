@@ -5,9 +5,10 @@ use crate::main_app::TarCompression;
 use crate::writer::{copy_file_range_threaded, OffsetWriter};
 use gzp::{deflate::Mgzip, ZBuilder};
 use std::fs::OpenOptions;
-use std::io::{BufWriter as StdBufWriter, Read, Write};
+use std::io::{BufReader as StdBufReader, BufWriter as StdBufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
+use std::process::{Child, Command, Stdio};
 use zstd::stream::{read::Decoder as ZstdDecoder, write::Encoder as ZstdEncoder};
 
 #[cfg(not(feature = "rapidgzip-backend"))]
@@ -319,6 +320,149 @@ fn open_zstd_archive(path: &Path) -> io::Result<Box<dyn Read>> {
     Ok(Box::new(ZstdDecoder::new(fs::File::open(path)?)?))
 }
 
+struct ExternalTarFilter {
+    compress_command: String,
+    decompress_command: String,
+    label: &'static str,
+}
+
+fn archive_filter_unavailable(label: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("tar {label} support requires an external compressor in PATH"),
+    )
+}
+
+fn tar_filter_failed(command: &str) -> io::Error {
+    io::Error::other(format!("tar filter '{command}' terminated abnormally"))
+}
+
+fn program_exists(program: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {program} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn external_tar_filter(compression: TarCompression) -> io::Result<Option<ExternalTarFilter>> {
+    match compression {
+        TarCompression::Bzip2 => {
+            if program_exists("lbzip2") {
+                Ok(Some(ExternalTarFilter {
+                    compress_command: "lbzip2 -c".to_string(),
+                    decompress_command: "lbzip2 -d -c".to_string(),
+                    label: "bzip2",
+                }))
+            } else if program_exists("bzip2") {
+                Ok(Some(ExternalTarFilter {
+                    compress_command: "bzip2 -c".to_string(),
+                    decompress_command: "bzip2 -d -c".to_string(),
+                    label: "bzip2",
+                }))
+            } else {
+                Err(archive_filter_unavailable("bzip2"))
+            }
+        }
+        TarCompression::Xz => {
+            if program_exists("xz") {
+                Ok(Some(ExternalTarFilter {
+                    compress_command: "xz -T0 -c".to_string(),
+                    decompress_command: "xz -T0 -d -c".to_string(),
+                    label: "xz",
+                }))
+            } else {
+                Err(archive_filter_unavailable("xz"))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn spawn_tar_filter(command: &str, stdin: Stdio, stdout: Stdio) -> io::Result<Child> {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(Stdio::inherit())
+        .spawn()
+}
+
+fn create_external_tar_entries(
+    output: &Path,
+    verbose: bool,
+    entries: Vec<TarEntry>,
+    logical_size: u64,
+    filter: ExternalTarFilter,
+) -> io::Result<u64> {
+    let output_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output)?;
+    let mut child = spawn_tar_filter(
+        &filter.compress_command,
+        Stdio::piped(),
+        Stdio::from(output_file),
+    )?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing tar compressor stdin"))?;
+    let mut writer = StdBufWriter::with_capacity(TAR_COPY_BUFFER_SIZE, stdin);
+    let tar_result = write_tar_stream(&entries, &mut writer);
+    let flush_result = writer.flush();
+    drop(writer);
+    let wait_result = child.wait();
+    match (tar_result, flush_result, wait_result) {
+        (Err(err), _, _) => Err(err),
+        (_, Err(err), _) => Err(err),
+        (_, _, Err(err)) => Err(err),
+        (Ok(_), Ok(()), Ok(status)) if !status.success() => {
+            Err(tar_filter_failed(&filter.compress_command))
+        }
+        (Ok(tar_bytes), Ok(()), Ok(_)) => {
+            let archive_bytes = fs::metadata(output)?.len();
+            if verbose {
+                fro::cio_eprintln!(
+                    "tar create ({}): entries={}, tar_bytes={}, archive_bytes={}, manifest_total={}",
+                    filter.label,
+                    entries.len(),
+                    tar_bytes,
+                    archive_bytes,
+                    logical_size
+                );
+            }
+            Ok(archive_bytes)
+        }
+    }
+}
+
+fn with_external_archive_reader<T>(
+    path: &Path,
+    command: &str,
+    f: impl FnOnce(&mut dyn Read) -> io::Result<T>,
+) -> io::Result<T> {
+    let input = fs::File::open(path)?;
+    let mut child = spawn_tar_filter(command, Stdio::from(input), Stdio::piped())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing tar decompressor stdout"))?;
+    let mut reader = StdBufReader::with_capacity(TAR_COPY_BUFFER_SIZE, stdout);
+    let result = f(&mut reader);
+    drop(reader);
+    let wait_result = child.wait();
+    match (result, wait_result) {
+        (Err(err), _) => Err(err),
+        (_, Err(err)) => Err(err),
+        (Ok(_), Ok(status)) if !status.success() => Err(tar_filter_failed(command)),
+        (Ok(value), Ok(_)) => Ok(value),
+    }
+}
+
 fn write_tar_stream<W: Write + ?Sized>(entries: &[TarEntry], writer: &mut W) -> io::Result<u64> {
     let mut total_bytes = 0_u64;
     let mut copy_buffer = vec![0u8; TAR_COPY_BUFFER_SIZE];
@@ -498,10 +642,15 @@ pub(crate) fn create_tar_archive(
     verbose: bool,
     compression: TarCompression,
 ) -> io::Result<u64> {
+    if let Some(filter) = external_tar_filter(compression)? {
+        let (entries, logical_size) = collect_tar_manifest(source, output)?;
+        return create_external_tar_entries(output, verbose, entries, logical_size, filter);
+    }
     match compression {
         TarCompression::None => create_uncompressed_tar(source, output, verbose),
         TarCompression::Gzip => create_gzip_tar(source, output, verbose),
         TarCompression::Zstd => create_zstd_tar(source, output, verbose),
+        TarCompression::Bzip2 | TarCompression::Xz => unreachable!("external filter handled above"),
     }
 }
 
@@ -512,12 +661,17 @@ pub(crate) fn create_tar_archive_from(
     verbose: bool,
     compression: TarCompression,
 ) -> io::Result<u64> {
+    if let Some(filter) = external_tar_filter(compression)? {
+        let (entries, logical_size) = collect_tar_manifest_from(source_arg, source_fs, output)?;
+        return create_external_tar_entries(output, verbose, entries, logical_size, filter);
+    }
     match compression {
         TarCompression::None => {
             create_uncompressed_tar_from(source_arg, source_fs, output, verbose)
         }
         TarCompression::Gzip => create_gzip_tar_from(source_arg, source_fs, output, verbose),
         TarCompression::Zstd => create_zstd_tar_from(source_arg, source_fs, output, verbose),
+        TarCompression::Bzip2 | TarCompression::Xz => unreachable!("external filter handled above"),
     }
 }
 
@@ -526,10 +680,16 @@ pub(crate) fn list_tar_archive(
     verbose: bool,
     compression: TarCompression,
 ) -> io::Result<()> {
+    if let Some(filter) = external_tar_filter(compression)? {
+        return with_external_archive_reader(path, &filter.decompress_command, |reader| {
+            reader::list_tar_archive_reader(reader, path, verbose)
+        });
+    }
     match compression {
         TarCompression::None => list_uncompressed_tar(path, verbose),
         TarCompression::Gzip => list_gzip_tar(path, verbose),
         TarCompression::Zstd => list_zstd_tar(path, verbose),
+        TarCompression::Bzip2 | TarCompression::Xz => unreachable!("external filter handled above"),
     }
 }
 
@@ -539,9 +699,15 @@ pub(crate) fn extract_tar_archive(
     verbose: bool,
     compression: TarCompression,
 ) -> io::Result<()> {
+    if let Some(filter) = external_tar_filter(compression)? {
+        return with_external_archive_reader(path, &filter.decompress_command, |reader| {
+            reader::extract_tar_archive_reader(reader, path, destination, verbose)
+        });
+    }
     match compression {
         TarCompression::None => extract_uncompressed_tar(path, destination, verbose),
         TarCompression::Gzip => extract_gzip_tar(path, destination, verbose),
         TarCompression::Zstd => extract_zstd_tar(path, destination, verbose),
+        TarCompression::Bzip2 | TarCompression::Xz => unreachable!("external filter handled above"),
     }
 }

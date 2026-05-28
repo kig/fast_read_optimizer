@@ -129,7 +129,7 @@ shred      9/9  100%  remaining: none  help: ok
 sort      31/31 100%  remaining: none  help: ok
 tac        7/7  100%  remaining: none  help: ok
 tail      14/14 100%  remaining: none  help: ok
-tar        5/5  100%  remaining: none  help: ok
+tar       13/13 100%  remaining: none  help: ok
 wc         8/8  100%  remaining: none  help: ok
 ";
 

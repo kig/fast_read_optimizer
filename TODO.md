@@ -107,7 +107,7 @@ Priority guide: favor work that pushes shared read/copy/write/tree-walk primitiv
 ### Parked / explicitly lower-priority for now
 
 - [ ] Exhaustive per-flag checklists for every already-implemented multicall utility. Keep only the next high-value slices in active planning; archive the rest in `history.md` / git history instead of letting them dominate this file.
-- [ ] `parallel zstd` and compressed `tar` follow-ons after the shipped tar.zstd MVP (for example parallel tar build/compress, seek/index support, and extraction-path acceleration).
+- [ ] Compressed `tar` follow-ons after the shipped gzip/zstd/bzip2/xz/auto-compress slice (for example parallel tar build/compress, seek/index support, and extraction-path acceleration).
 - [ ] HDD-specific sequential-I/O preference and more pipe-overlap tuning, unless new profiling shows these are blocking important workloads.
 - [ ] Integration with `rdma-pipe`.
 

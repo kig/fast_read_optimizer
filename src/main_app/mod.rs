@@ -69,6 +69,8 @@ pub(crate) enum TarCompression {
     None,
     Gzip,
     Zstd,
+    Bzip2,
+    Xz,
 }
 
 #[derive(Clone)]

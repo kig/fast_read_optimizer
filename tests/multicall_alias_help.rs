@@ -212,7 +212,7 @@ fn tar_subcommand_help_and_version_use_bounded_tar_surface() {
         "tar subcommand help should explicitly name the bounded supported slice:\n{help_stdout}"
     );
     assert!(
-        help_stdout.contains("optional extras in this slice are -v/--verbose, -C/--directory for extract, gzip (-z/--gzip/--gunzip/--ungzip), zstd (-J/--zstd), --help, and --version"),
+        help_stdout.contains("optional extras in this slice are -v/--verbose, -C/--directory for extract, --auto-compress/-a, gzip (-z/--gzip/--gunzip/--ungzip), bzip2 (-j/--bzip2), xz (-J/--xz), zstd (--zstd), --help, and --version"),
         "tar subcommand help should distinguish supported extras from omitted GNU families:\n{help_stdout}"
     );
     assert!(
