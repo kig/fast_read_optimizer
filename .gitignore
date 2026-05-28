@@ -8,3 +8,4 @@ local_files/
 fro-bench*/
 .bench_reps/
 fro_bench_*/
+out.txt
