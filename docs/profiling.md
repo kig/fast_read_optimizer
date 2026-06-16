@@ -39,6 +39,19 @@ If you only want one family:
 ./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB copy
 ```
 
+For recursive/tree-walk work, use the focused tree slice instead of the full suite:
+
+```bash
+./target/release/fro-benchmark --test-dir /mnt/nvme --test-size 4GB --no-fail 'tree compare:'
+```
+
+That slice is intentionally narrow:
+
+- read-side: `recursive-read-bench` vs `file-list-read-bench` vs `fd walk`
+- copy-side: `fro copy --recursive` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
+
+Interpret it primarily via `files/s`, with elapsed time as the tie-breaker. `file-list-read-bench` removes tree-walk cost, so the gap between it and `recursive-read-bench` is the current traversal tax. The three recursive-copy variants separate walk-as-you-go scheduling from split-manifest and prebuilt-manifest designs before comparing all of them to `cp -r`.
+
 ## Hot path development rule
 
 If you change a hot code path, rerun `fro-benchmark` before trusting `fro-optimize`.
@@ -102,6 +115,36 @@ If your question is “how fast is the write path really?”, compare against fo
 ```
 
 If your question is “what does the cached write behavior look like for a real application?”, then the lower cached number may still be valid, but it should not be confused with raw device throughput.
+
+## Multicall flag-path pitfalls
+
+For the multicall/coreutils surface, the flag set is part of the benchmark definition. Before attributing a slowdown to the tuned backend, check whether the requested flag preserves the same execution path at all.
+
+- `cat`
+  - plain `cat`, `-u`, and the IO-mode selectors should remain in the copy-style fast path
+  - `-n`, `-b`, `-s`, `-E`, `-T`, `-v`, `-A`, `-e`, and `-t` intentionally force ordered line assembly / byte transformation
+  - do not compare `cat -n` directly against `fro read` or plain `cat` and call the gap a regression; it is a different job
+- `fgrep`
+  - current implemented flags (`-n`, `-i`, `--no-ignore-case`, `-x`) stay in the literal-search family
+  - `-i` adds per-block ASCII normalization work, and `-x` changes matching to line-oriented equality, so measure these against plain `fgrep`, not only against raw read throughput
+- `wc`
+  - `wc -c` on a regular file may be metadata-only rather than a streaming scan
+  - pipe byte counting can use `splice(2)` to `/dev/null`
+  - `-l`, `-w`, `-m`, and `-L` should remain on the optimized block-counting path; benchmark them when you care about scan throughput
+- `head` / `tail`
+  - regular-file byte/range cases can stay in range helpers after the start/end offset is known
+  - line-oriented cases still need newline discovery, and non-regular streams may require buffering/scanning that regular files avoid
+- `cp` / `mv`
+  - policy flags such as `-n`, `-u`, `-T`, and `-v` mostly decide whether work happens or how targets are interpreted
+  - benchmark “copy happened”, “copy skipped”, “rename-only move”, and “cross-filesystem fallback” as separate propositions
+
+When adding a new flag:
+
+1. write or update the parity test
+2. state whether the flag is path-preserving or path-changing
+3. verify that claim with one lightweight path check (benchmark, helper inspection, or syscall profile)
+
+That extra step prevents future flag work from silently routing a once-fast command onto an unnecessarily slow path.
 
 ## Profiling workflow
 

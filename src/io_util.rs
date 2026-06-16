@@ -4,43 +4,204 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct DirectIoFallbackTracker {
+    saw_open_fallback: AtomicBool,
+    saw_unaligned_fallback: AtomicBool,
+    emitted_open_warning: AtomicBool,
+    emitted_unaligned_warning: AtomicBool,
+    first_open_detail: Mutex<Option<String>>,
+    first_unaligned_detail: Mutex<Option<String>>,
+}
+
+#[allow(dead_code)]
+impl DirectIoFallbackTracker {
+    pub fn record_open_fallback(&self, operation: &str, err: &io::Error) {
+        self.saw_open_fallback.store(true, Ordering::Relaxed);
+        let mut detail = self.first_open_detail.lock().unwrap();
+        if detail.is_none() {
+            *detail = Some(format!("{operation}: {err}"));
+        }
+    }
+
+    pub fn record_unaligned_fallback(&self, operation: &str, offset: u64, len: usize) {
+        self.saw_unaligned_fallback.store(true, Ordering::Relaxed);
+        let mut detail = self.first_unaligned_detail.lock().unwrap();
+        if detail.is_none() {
+            *detail = Some(format!("{operation} offset {offset} len {len}"));
+        }
+    }
+
+    pub fn take_warning_lines(&self, request_label: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.saw_open_fallback.load(Ordering::Relaxed)
+            && !self.emitted_open_warning.swap(true, Ordering::SeqCst)
+        {
+            let detail = self
+                .first_open_detail
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "direct open fallback".to_string());
+            warnings.push(format!(
+                "warning: {request_label} fell back to page cache because O_DIRECT open was not supported ({detail})"
+            ));
+        }
+        if self.saw_unaligned_fallback.load(Ordering::Relaxed)
+            && !self.emitted_unaligned_warning.swap(true, Ordering::SeqCst)
+        {
+            let detail = self
+                .first_unaligned_detail
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "unaligned request".to_string());
+            warnings.push(format!(
+                "warning: {request_label} used page cache for at least one unaligned tail/range ({detail})"
+            ));
+        }
+        warnings
+    }
+}
+
+static ACTIVE_DIRECT_IO_TRACKER: OnceLock<Mutex<Option<Arc<DirectIoFallbackTracker>>>> =
+    OnceLock::new();
+
+fn active_direct_io_tracker_slot() -> &'static Mutex<Option<Arc<DirectIoFallbackTracker>>> {
+    ACTIVE_DIRECT_IO_TRACKER.get_or_init(|| Mutex::new(None))
+}
+
+fn active_direct_io_tracker() -> Option<Arc<DirectIoFallbackTracker>> {
+    active_direct_io_tracker_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(Arc::clone)
+}
+
+#[allow(dead_code)]
+pub struct ActiveDirectIoTrackerGuard {
+    previous: Option<Arc<DirectIoFallbackTracker>>,
+}
+
+impl Drop for ActiveDirectIoTrackerGuard {
+    fn drop(&mut self) {
+        *active_direct_io_tracker_slot().lock().unwrap() = self.previous.take();
+    }
+}
+
+#[allow(dead_code)]
+pub fn install_active_direct_io_tracker(
+    tracker: Arc<DirectIoFallbackTracker>,
+) -> ActiveDirectIoTrackerGuard {
+    let mut slot = active_direct_io_tracker_slot().lock().unwrap();
+    let previous = slot.replace(tracker);
+    ActiveDirectIoTrackerGuard { previous }
+}
+
+pub fn note_direct_unaligned_fallback(operation: &str, offset: u64, len: usize) {
+    if let Some(tracker) = active_direct_io_tracker() {
+        tracker.record_unaligned_fallback(operation, offset, len);
+    }
+}
 
 pub fn direct_open_should_fallback(err: &io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE)
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ESPIPE | libc::EPERM)
     ) || err.kind() == io::ErrorKind::InvalidInput
 }
 
-pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
+fn posix_fallocate_should_fallback(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOTTY | libc::ENOSYS | libc::EPERM)
+    ) || err.kind() == io::ErrorKind::InvalidInput
+}
+
+fn open_direct_with_fallback<F>(
+    fallback: &File,
+    operation: &str,
+    open_direct: F,
+) -> io::Result<File>
+where
+    F: FnOnce() -> io::Result<File>,
+{
+    match open_direct() {
         Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
+        Err(err) if direct_open_should_fallback(&err) => {
+            if let Some(tracker) = active_direct_io_tracker() {
+                tracker.record_open_fallback(operation, &err);
+            }
+            fallback.try_clone()
+        }
         Err(err) => Err(err),
     }
 }
 
+pub fn open_direct_reader_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
+    open_direct_with_fallback(fallback, "direct reader open", || {
+        #[cfg(target_os = "linux")]
+        {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let f = OpenOptions::new().read(true).open(path)?;
+            match fro::os::set_fd_nocache(f.as_raw_fd(), true) {
+                Ok(_) => Ok(f),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+    })
+}
+
 pub fn open_direct_writer_or_fallback(path: &str, fallback: &File) -> io::Result<File> {
-    match OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-    {
-        Ok(file) => Ok(file),
-        Err(err) if direct_open_should_fallback(&err) => fallback.try_clone(),
-        Err(err) => Err(err),
-    }
+    open_direct_with_fallback(fallback, "direct writer open", || {
+        #[cfg(target_os = "linux")]
+        {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let f = OpenOptions::new().write(true).open(path)?;
+            match fro::os::set_fd_nocache(f.as_raw_fd(), true) {
+                Ok(_) => Ok(f),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(fro::os::O_DIRECT)
+                .open(path)
+        }
+    })
 }
 
 #[allow(dead_code)]
 pub fn direct_writer_supported(path: &str) -> io::Result<bool> {
     match OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_DIRECT)
+        .custom_flags(fro::os::O_DIRECT)
         .open(path)
     {
         Ok(_) => Ok(true),
@@ -60,8 +221,42 @@ pub fn open_reader_files(path: &str, use_direct: bool) -> io::Result<(File, File
     Ok((file, file_direct))
 }
 
+pub fn checked_posix_fallocate(
+    file: &File,
+    offset: u64,
+    len: u64,
+    context: &str,
+) -> io::Result<()> {
+    let offset = i64::try_from(offset).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{context}: offset does not fit in off_t"),
+        )
+    })?;
+    let len = i64::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{context}: length does not fit in off_t"),
+        )
+    })?;
+    let rc = fro::os::posix_fallocate(file.as_raw_fd(), offset, len);
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::from_raw_os_error(rc);
+        if posix_fallocate_should_fallback(&err) {
+            Ok(())
+        } else {
+            Err(io::Error::new(err.kind(), format!("{context}: {err}")))
+        }
+    }
+}
+
 pub fn sync_path(path: impl AsRef<Path>) -> io::Result<()> {
-    OpenOptions::new().read(true).open(path.as_ref())?.sync_all()
+    OpenOptions::new()
+        .read(true)
+        .open(path.as_ref())?
+        .sync_all()
 }
 
 pub fn sync_parent_directory(path: impl AsRef<Path>) -> io::Result<()> {
@@ -265,6 +460,25 @@ impl PendingReadSlots {
             .ok_or_else(|| {
                 io::Error::other(format!("read slot {slot} completed with no pending block"))
             })
+            .map(|v| v)
+    }
+
+    /// Peek at the pending block id for slot without removing it. Useful when the
+    /// read completion needs to be observed but the slot should remain reserved
+    /// until a later write completion frees it.
+    pub fn peek(&self, slot: usize) -> io::Result<u64> {
+        let entry = self.pending_block_ids.get(slot).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read slot {slot} is out of range"),
+            )
+        })?;
+        match entry {
+            Some(v) => Ok(*v),
+            None => Err(io::Error::other(format!(
+                "read slot {slot} has no pending block"
+            ))),
+        }
     }
 }
 
@@ -362,6 +576,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_io_fallback_tracker_reports_both_fallback_kinds_once() {
+        let tracker = DirectIoFallbackTracker::default();
+        tracker.record_open_fallback(
+            "direct reader open",
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+        );
+        tracker.record_unaligned_fallback("read", 4096, 123);
+
+        let warnings = tracker.take_warning_lines("forced --direct read");
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("O_DIRECT open was not supported"));
+        assert!(warnings[1].contains("unaligned tail/range"));
+
+        assert!(tracker
+            .take_warning_lines("forced --direct read")
+            .is_empty());
+    }
+
+    #[test]
     fn injected_short_read_lengths_follow_documented_contract() {
         const BLOCK_SIZE: usize = 1024;
         const OFFSET: u64 = 16 * 1024;
@@ -452,6 +685,25 @@ mod tests {
         let err = guard.ensure_source_unchanged().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("source changed during copy"));
+    }
+
+    #[test]
+    fn checked_posix_fallocate_rejects_length_that_does_not_fit_off_t() {
+        let tmp = unique_temp_dir("fro-posix-fallocate-overflow");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("file.bin");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+
+        let err = checked_posix_fallocate(&file, 0, (i64::MAX as u64) + 1, "test allocation")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("length does not fit in off_t"));
     }
 }
 

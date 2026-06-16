@@ -29,6 +29,10 @@ The following proof-relevant items are implemented and covered by tests:
   - `read_file`, `write_file`, and `copy_file`
   - regular files, directories, and symlinks
   - permission-gated reads/writes and unwritable parent-directory creation
+- coreutils dirwalk compatibility coverage for `find` / `du` now includes:
+  - regular directory trees
+  - symlinks, broken symlinks, and FIFOs
+  - permission-denied subtree traversal with warn-and-continue behavior
 - a first source-verified copy mode:
   - hashes the source into a source-derived manifest
   - copies and `fsync`s the destination file
@@ -47,6 +51,7 @@ Formal logic summary:
 - If each tested local path kind maps to an explicit result class, then successful execution or explicit rejection on that matrix point implies the high-level API classifies that real OS object according to the documented contract rather than by accident.
 - If the destination is verified against a source-derived manifest after copy and sync, then successful copy-verification return implies the destination matched the source bytes observed during source hashing, not merely a self-consistent post-copy target state.
 - If Kani proves the pure `expected_read_len()` helper implements the exact `min(file_size - offset, block_size)` rule and rejects `offset > file_size`, then successful read-length calculation implies tail sizing obeys the documented arithmetic contract rather than an accidentally passing subset of examples.
+- If Kani proves the pure permission-classification and `du` node-readiness helpers, then the dirwalk permission path and node completion path rely on explicit boolean contracts rather than duplicated ad hoc predicates.
 
 Together, these close three high-value proof holes:
 
@@ -84,12 +89,15 @@ cargo +nightly miri test --lib reader::tests::output_slice_mut_writes_only_check
 cargo +nightly miri test --lib reader::tests::output_slice_mut_preserves_non_overlapping_regions -- --exact
 ```
 
-Initial Kani command surface for the pure read-length helper:
+Initial Kani command surface for the pure read-length and dirwalk helpers:
 
 ```bash
 cargo kani --harness io_util::kani_proofs::expected_read_len_matches_min_formula --exact
 cargo kani --harness io_util::kani_proofs::expected_read_len_rejects_offsets_past_end --exact
 cargo kani --harness io_util::kani_proofs::expected_read_len_is_monotonic_in_offset --exact
+cargo kani --harness coreutils::kani_proofs::permission_denied_components_accepts_permission_cases --exact
+cargo kani --harness coreutils::kani_proofs::permission_denied_components_rejects_non_permission_cases --exact
+cargo kani --harness coreutils::kani_proofs::du_node_ready_matches_completion_formula --exact
 ```
 
 ## Current reference document

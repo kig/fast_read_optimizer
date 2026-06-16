@@ -47,6 +47,15 @@ fn run_example(args: &[String]) -> Output {
         .expect("failed to run dd example")
 }
 
+fn run_fro_dd(args: &[String]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_fro"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("dd")
+        .args(args)
+        .output()
+        .expect("failed to run fro dd")
+}
+
 fn run_system_dd(args: &[String]) -> Output {
     Command::new("dd")
         .args(args)
@@ -71,34 +80,37 @@ fn build_args(input: &Path, output: &Path, flags: &[&str]) -> Vec<String> {
 
 fn compare_outputs(
     case_name: &str,
-    example: &Output,
+    label: &str,
+    actual: &Output,
     system: &Output,
-    example_output: &Path,
+    actual_output: &Path,
     system_output: &Path,
 ) {
     assert_eq!(
-        example.status.success(),
+        actual.status.success(),
         system.status.success(),
-        "case {}: example stderr=\n{}\nsystem stderr=\n{}",
+        "case {} ({}): actual stderr=\n{}\nsystem stderr=\n{}",
         case_name,
-        String::from_utf8_lossy(&example.stderr),
+        label,
+        String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&system.stderr)
     );
     assert_eq!(
-        example.stdout, system.stdout,
-        "case {}: stdout mismatch",
-        case_name
+        actual.stdout, system.stdout,
+        "case {} ({}): stdout mismatch",
+        case_name, label
     );
     assert_eq!(
-        example.stderr, system.stderr,
-        "case {}: stderr mismatch",
-        case_name
+        actual.stderr, system.stderr,
+        "case {} ({}): stderr mismatch",
+        case_name, label
     );
     assert_eq!(
-        fs::read(example_output).unwrap(),
+        fs::read(actual_output).unwrap(),
         fs::read(system_output).unwrap(),
-        "case {}: output mismatch",
-        case_name
+        "case {} ({}): output mismatch",
+        case_name,
+        label
     );
 }
 
@@ -160,29 +172,56 @@ fn dd_example_matches_system_dd_for_supported_flag_combinations() {
                 "status=none",
             ],
         },
+        DdCase {
+            name: "byte-count-flags",
+            initial_output: Some(b"abcdefghijklmnopqrstuvwxyz0123456789"),
+            flags: &[
+                "bs=8",
+                "skip=5",
+                "seek=3",
+                "count=13",
+                "iflag=skip_bytes,count_bytes",
+                "oflag=seek_bytes",
+                "conv=notrunc",
+                "status=none",
+            ],
+        },
     ];
 
     for case in cases {
         let tmp = unique_temp_dir(case.name);
         let input = tmp.join("input.bin");
         let example_output = tmp.join("example.bin");
+        let fro_output = tmp.join("fro.bin");
         let system_output = tmp.join("system.bin");
         fs::write(&input, &input_bytes).unwrap();
         if let Some(initial) = case.initial_output {
             fs::write(&example_output, initial).unwrap();
+            fs::write(&fro_output, initial).unwrap();
             fs::write(&system_output, initial).unwrap();
         }
 
         let example_args = build_args(&input, &example_output, case.flags);
+        let fro_args = build_args(&input, &fro_output, case.flags);
         let system_args = build_args(&input, &system_output, case.flags);
         let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
         let system = run_system_dd(&system_args);
 
         compare_outputs(
             case.name,
+            "example",
             &example,
             &system,
             &example_output,
+            &system_output,
+        );
+        compare_outputs(
+            case.name,
+            "fro dd",
+            &fro,
+            &system,
+            &fro_output,
             &system_output,
         );
     }
@@ -254,6 +293,7 @@ fn dd_example_direct_flags_preserve_output_semantics() {
 
         compare_outputs(
             case.name,
+            "baseline example",
             &baseline,
             &system,
             &baseline_output,
@@ -303,6 +343,7 @@ fn dd_example_matches_system_dd_when_writing_to_dev_null() {
         "status=none".to_string(),
     ];
     let example = run_example(&args);
+    let fro = run_fro_dd(&args);
     let system = run_system_dd(&args);
 
     assert_eq!(
@@ -314,6 +355,15 @@ fn dd_example_matches_system_dd_when_writing_to_dev_null() {
     );
     assert_eq!(example.stdout, system.stdout);
     assert_eq!(example.stderr, system.stderr);
+    assert_eq!(
+        fro.status.success(),
+        system.status.success(),
+        "fro stderr=\n{}\nsystem stderr=\n{}",
+        String::from_utf8_lossy(&fro.stderr),
+        String::from_utf8_lossy(&system.stderr)
+    );
+    assert_eq!(fro.stdout, system.stdout);
+    assert_eq!(fro.stderr, system.stderr);
 }
 
 #[test]
@@ -340,4 +390,133 @@ fn dd_example_prints_dd_style_record_counts() {
     assert!(stderr.contains("9+1 records in"), "stderr=\n{stderr}");
     assert!(stderr.contains("9+1 records out"), "stderr=\n{stderr}");
     assert!(stderr.contains("97 bytes copied in"), "stderr=\n{stderr}");
+
+    let fro_output = run_fro_dd(&args);
+    assert!(
+        fro_output.status.success(),
+        "stderr=\n{}",
+        String::from_utf8_lossy(&fro_output.stderr)
+    );
+    let fro_stderr = String::from_utf8_lossy(&fro_output.stderr);
+    assert!(
+        fro_stderr.contains("9+1 records in"),
+        "stderr=\n{fro_stderr}"
+    );
+    assert!(
+        fro_stderr.contains("9+1 records out"),
+        "stderr=\n{fro_stderr}"
+    );
+    assert!(
+        fro_stderr.contains("97 bytes copied in"),
+        "stderr=\n{fro_stderr}"
+    );
+}
+
+#[test]
+fn dd_status_noxfer_matches_system_dd() {
+    let tmp = unique_temp_dir("dd-status-noxfer");
+    let input = tmp.join("input.bin");
+    let input_bytes = (0..97).map(|i| ((i * 29) % 251) as u8).collect::<Vec<_>>();
+    fs::write(&input, input_bytes).unwrap();
+
+    for case in [
+        (
+            "full-copy",
+            vec!["bs=10".to_string(), "status=noxfer".to_string()],
+        ),
+        (
+            "count-zero",
+            vec![
+                "bs=4".to_string(),
+                "count=0".to_string(),
+                "status=noxfer".to_string(),
+            ],
+        ),
+    ] {
+        let case_dir = tmp.join(case.0);
+        fs::create_dir_all(&case_dir).unwrap();
+        let example_output = case_dir.join("example.bin");
+        let fro_output = case_dir.join("fro.bin");
+        let system_output = case_dir.join("system.bin");
+
+        let mut example_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", example_output.display()),
+        ];
+        example_args.extend(case.1.iter().cloned());
+
+        let mut fro_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", fro_output.display()),
+        ];
+        fro_args.extend(case.1.iter().cloned());
+
+        let mut system_args = vec![
+            format!("if={}", input.display()),
+            format!("of={}", system_output.display()),
+        ];
+        system_args.extend(case.1.iter().cloned());
+
+        let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
+        let system = run_system_dd(&system_args);
+
+        compare_outputs(
+            case.0,
+            "example",
+            &example,
+            &system,
+            &example_output,
+            &system_output,
+        );
+        compare_outputs(case.0, "fro dd", &fro, &system, &fro_output, &system_output);
+        assert!(!String::from_utf8_lossy(&fro.stderr).contains("bytes copied"));
+    }
+}
+
+#[test]
+fn dd_count_zero_seek_matches_system_dd_and_preserves_notrunc() {
+    let tmp = unique_temp_dir("dd-count-zero-seek");
+    let input = tmp.join("input.bin");
+    fs::write(&input, b"abcdef").unwrap();
+
+    for case in [
+        (
+            "truncate-seek",
+            None,
+            vec!["bs=1", "count=0", "seek=5", "status=none"],
+        ),
+        (
+            "preserve-notrunc",
+            Some(b"abcdefghij".as_slice()),
+            vec!["bs=1", "count=0", "seek=12", "conv=notrunc", "status=none"],
+        ),
+    ] {
+        let case_dir = tmp.join(case.0);
+        fs::create_dir_all(&case_dir).unwrap();
+        let example_output = case_dir.join("example.bin");
+        let fro_output = case_dir.join("fro.bin");
+        let system_output = case_dir.join("system.bin");
+        if let Some(initial) = case.1 {
+            fs::write(&example_output, initial).unwrap();
+            fs::write(&fro_output, initial).unwrap();
+            fs::write(&system_output, initial).unwrap();
+        }
+        let example_args = build_args(&input, &example_output, &case.2);
+        let fro_args = build_args(&input, &fro_output, &case.2);
+        let system_args = build_args(&input, &system_output, &case.2);
+        let example = run_example(&example_args);
+        let fro = run_fro_dd(&fro_args);
+        let system = run_system_dd(&system_args);
+
+        compare_outputs(
+            case.0,
+            "example",
+            &example,
+            &system,
+            &example_output,
+            &system_output,
+        );
+        compare_outputs(case.0, "fro dd", &fro, &system, &fro_output, &system_output);
+    }
 }

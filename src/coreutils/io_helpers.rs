@@ -1,0 +1,901 @@
+use super::*;
+use crate::io_util::open_direct_reader_or_fallback;
+
+pub(crate) fn print_coreutils_version(invoked: &str) {
+    fro::cio_println!("{invoked} (fro coreutils) {FRO_VERSION}");
+}
+pub(crate) fn permission_denied_components(kind: io::ErrorKind, raw_os_error: Option<i32>) -> bool {
+    matches!(kind, io::ErrorKind::PermissionDenied)
+        || matches!(raw_os_error, Some(libc::EACCES | libc::EPERM))
+}
+
+pub(crate) fn is_permission_denied(err: &io::Error) -> bool {
+    permission_denied_components(err.kind(), err.raw_os_error())
+}
+
+pub(crate) fn write_warning_line(tool: &str, path: &Path, err: &io::Error, message: &str) {
+    let mut stderr = fro::command_io::stderr_buf_writer(4096).unwrap();
+    let _ = writeln!(stderr, "{tool}: {message} '{}': {err}", path.display());
+}
+
+pub(crate) fn invoked_name(program: &str) -> Option<String> {
+    Path::new(program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+pub(crate) fn parse_io_mode(args: &[String]) -> io::Result<(IOMode, Vec<String>)> {
+    let mut io_mode = IOMode::Auto;
+    let mut files = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--auto" => io_mode = IOMode::Auto,
+            "--direct" => io_mode = IOMode::Direct,
+            "--no-direct" => io_mode = IOMode::PageCache,
+            other => files.push(other.to_string()),
+        }
+    }
+    Ok((io_mode, files))
+}
+
+pub(crate) fn report_gbps(command: &str, bytes: u64, started_at: std::time::Instant) {
+    let elapsed = started_at.elapsed().as_secs_f64().max(1e-9);
+    fro::cio_eprintln!(
+        "{command} {bytes} bytes in {:.4} s, {:.1} GB/s",
+        elapsed,
+        bytes as f64 / elapsed / 1e9
+    );
+}
+
+pub(crate) struct CountingWrite<'a, W> {
+    inner: &'a mut W,
+    bytes_written: u64,
+}
+
+impl<'a, W> CountingWrite<'a, W> {
+    pub(crate) fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    pub(crate) fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWrite<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("counted write byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| io::Error::other("counted write byte count overflow"))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn ensure_files(
+    program: &str,
+    files: Vec<String>,
+    usage: &str,
+) -> io::Result<Vec<String>> {
+    if files.is_empty() {
+        fro::cio_eprintln!("Usage: {} {}", program, usage);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing file operand",
+        ));
+    }
+    Ok(files)
+}
+
+pub(crate) fn internal_io_mode(io_mode: IOMode) -> crate::common::IOMode {
+    match io_mode {
+        IOMode::Auto => crate::common::IOMode::Auto,
+        IOMode::Direct => crate::common::IOMode::Direct,
+        IOMode::PageCache => crate::common::IOMode::PageCache,
+    }
+}
+
+pub(crate) fn load_file_bytes(path: &str, io_mode: IOMode, mode: &str) -> io::Result<LoadedFile> {
+    let config = load_config(None);
+    load_file_to_memory_for_mode(&config, mode, path, internal_io_mode(io_mode))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamInput {
+    File(String),
+    Stdin { label: Option<String> },
+}
+
+pub(crate) fn parse_stream_inputs(files: Vec<String>) -> Vec<StreamInput> {
+    if files.is_empty() {
+        return vec![StreamInput::Stdin { label: None }];
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            if file == "-" {
+                StreamInput::Stdin {
+                    label: Some("-".to_string()),
+                }
+            } else {
+                StreamInput::File(file)
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn stdout_buf_writer() -> io::Result<BufWriter> {
+    let config = load_config(None);
+    let params = config.get_params("write", false);
+    BufWriter::stdout(params.qd, params.block_size, 4)
+}
+
+pub(crate) fn stdin_buf_reader() -> io::Result<BufReader<std::fs::File>> {
+    BufReader::stdin()
+}
+
+pub(crate) fn is_regular_input_path(path: &str) -> io::Result<bool> {
+    if path.starts_with("/dev/fd/") || path.starts_with("/proc/self/fd/") {
+        return Ok(false);
+    }
+    Ok(fs::metadata(path)?.file_type().is_file())
+}
+
+pub(crate) fn is_regular_fd(fd: std::os::unix::io::RawFd) -> bool {
+    unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 {
+            return false;
+        }
+        (stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_stdout_file() -> bool {
+    is_regular_fd(fro::command_io::stdout_fd())
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_stdout_dev_null() -> bool {
+    let stdout_fd = fro::command_io::stdout_fd();
+    unsafe {
+        let mut stdout_stat: libc::stat = std::mem::zeroed();
+        let mut dev_null_stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(stdout_fd, &mut stdout_stat) != 0 {
+            return false;
+        }
+        // stat("/dev/null") - ensure C string is NUL terminated
+        let path = b"/dev/null\0".as_ptr() as *const libc::c_char;
+        if libc::stat(path, &mut dev_null_stat) != 0 {
+            return false;
+        }
+        stdout_stat.st_dev == dev_null_stat.st_dev && stdout_stat.st_ino == dev_null_stat.st_ino
+    }
+}
+
+pub(crate) fn visit_reader_blocks<R, F>(reader: &mut R, mut on_block: F) -> io::Result<()>
+where
+    R: Read,
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        on_block(&buffer[..read])?;
+    }
+}
+
+pub(crate) fn visit_ordered_input<F>(
+    input: &StreamInput,
+    io_mode: IOMode,
+    on_block: F,
+) -> io::Result<()>
+where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            visit_ordered_blocks(path, io_mode, on_block)
+        }
+        StreamInput::File(path) => {
+            let mut reader = BufReader::new(std::fs::File::open(path)?);
+            visit_reader_blocks(&mut reader, on_block)
+        }
+        StreamInput::Stdin { .. } => {
+            let mut reader = stdin_buf_reader()?;
+            visit_reader_blocks(&mut reader, on_block)
+        }
+    }
+}
+
+pub(crate) fn visit_ordered_input_counted<F>(
+    input: &StreamInput,
+    io_mode: IOMode,
+    mut on_block: F,
+) -> io::Result<u64>
+where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    let mut total = 0_u64;
+    visit_ordered_input(input, io_mode, |block| {
+        total = total
+            .checked_add(block.len() as u64)
+            .ok_or_else(|| io::Error::other("input byte count overflow"))?;
+        on_block(block)
+    })?;
+    Ok(total)
+}
+
+pub(crate) fn loaded_or_stream_bytes(input: &StreamInput, io_mode: IOMode) -> io::Result<Vec<u8>> {
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            Ok(read_file_with_mode(path, io_mode)?)
+        }
+        StreamInput::File(path) => {
+            let mut reader = BufReader::new(std::fs::File::open(path)?);
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer)?;
+            Ok(buffer)
+        }
+        StreamInput::Stdin { .. } => {
+            let mut reader = stdin_buf_reader()?;
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer)?;
+            Ok(buffer)
+        }
+    }
+}
+
+pub(crate) fn copy_file_like_to_output_counted<W: Write>(
+    out: &mut W,
+    input: &StreamInput,
+) -> io::Result<u64> {
+    let mut total = 0_u64;
+    match input {
+        StreamInput::File(path) => {
+            let mut reader = BufReader::new(std::fs::File::open(path)?);
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(total);
+                }
+                out.write_all(&buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
+            }
+        }
+        StreamInput::Stdin { .. } => {
+            let mut reader = stdin_buf_reader()?;
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(total);
+                }
+                out.write_all(&buffer[..read])?;
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("copy byte count overflow"))?;
+            }
+        }
+    }
+}
+
+pub(crate) fn fd_is_fifo(fd: libc::c_int) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFIFO)
+}
+
+pub(crate) fn fd_is_regular(fd: libc::c_int) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+const COREUTILS_PIPE_TARGET_SIZE: usize = 2 << 20;
+
+pub(crate) fn grow_pipe_best_effort(fd: libc::c_int) -> io::Result<()> {
+    if !fd_is_fifo(fd)? {
+        return Ok(());
+    }
+    let target_size = COREUTILS_PIPE_TARGET_SIZE as libc::c_int;
+    match fro::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size) {
+        Ok(_rc) => Ok(()),
+        Err(err) => match err.raw_os_error() {
+            Some(libc::EPERM) | Some(libc::EINVAL) | Some(libc::EBUSY) => Ok(()),
+            _ => {
+                // On platforms where F_SETPIPE_SZ is unsupported, treat as a no-op.
+                // If err has no raw_os_error (our Unsupported mapping), return Ok(()).
+                if err.raw_os_error().is_none() {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        },
+    }
+}
+
+pub(crate) fn pipe_size_best_effort(fd: libc::c_int, target_size: usize) -> io::Result<usize> {
+    if !fd_is_fifo(fd)? {
+        return Ok(0);
+    }
+    match fro::os::try_set_pipe_size(fd as std::os::unix::io::RawFd, target_size as libc::c_int) {
+        Ok(actual) if actual >= 0 => Ok(actual as usize),
+        Ok(actual) => Ok(actual as usize),
+        Err(err) => match err.raw_os_error() {
+            Some(libc::EPERM) | Some(libc::EINVAL) | Some(libc::EBUSY) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let actual = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+                    if actual < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(actual as usize)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // On non-Linux platforms, treat as unknown and return 0.
+                    Ok(0)
+                }
+            }
+            _ => {
+                // If F_SETPIPE_SZ is unsupported on this platform (no raw_os_error), return 0.
+                if err.raw_os_error().is_none() {
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
+            }
+        },
+    }
+}
+
+pub(crate) fn write_raw_fd_all(fd: libc::c_int, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let written = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if written > 0 {
+            buf = &buf[written as usize..];
+            continue;
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to raw fd",
+            ));
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => continue,
+            _ => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn splice_all(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    mut len: u64,
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    while len != 0 {
+        let chunk = len.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize;
+        #[cfg(target_os = "linux")]
+        {
+            let moved = unsafe {
+                libc::splice(
+                    src_fd,
+                    std::ptr::null_mut(),
+                    dst_fd,
+                    std::ptr::null_mut(),
+                    chunk,
+                    0,
+                )
+            };
+            if moved > 0 {
+                let moved = moved as u64;
+                total = total
+                    .checked_add(moved)
+                    .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+                len -= moved;
+                continue;
+            }
+            if moved == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR | libc::EAGAIN) => continue,
+                _ => return Err(err),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Fallback: read/write loop
+            let mut buf = vec![0u8; chunk];
+            let read = unsafe { libc::read(src_fd, buf.as_mut_ptr() as *mut libc::c_void, chunk) };
+            if read > 0 {
+                let read = read as usize;
+                write_raw_fd_all(dst_fd, &buf[..read])?;
+                let moved = read as u64;
+                total = total
+                    .checked_add(moved)
+                    .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+                len -= moved;
+                continue;
+            }
+            if read == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR | libc::EAGAIN) => continue,
+                _ => return Err(err),
+            }
+        }
+    }
+    Ok(total)
+}
+
+pub(crate) fn copy_pipe_tail_to_stdout_small(
+    src_fd: libc::c_int,
+    count: u64,
+) -> io::Result<Option<u64>> {
+    if count == 0 {
+        return Ok(Some(0));
+    }
+    if !fd_is_fifo(src_fd)? {
+        return Ok(None);
+    }
+
+    let (pipe_read, pipe_write) = fro::os::pipe2(libc::O_CLOEXEC)?;
+    let result = (|| -> io::Result<Option<u64>> {
+        let desired = STREAM_WINDOW_BLOCK_SIZE
+            .max(count as usize)
+            .saturating_add(4096);
+        let actual_size = pipe_size_best_effort(pipe_write, desired)?;
+        if actual_size as u64 <= count {
+            return copy_pipe_tail_to_stdout_large(src_fd, count);
+        }
+        grow_pipe_best_effort(src_fd)?;
+        grow_pipe_best_effort(fro::command_io::stdout_fd())?;
+        let dev_null = OpenOptions::new().write(true).open("/dev/null")?;
+        let dev_null_fd = dev_null.as_raw_fd();
+        let mut buffered = 0u64;
+        loop {
+            let free_space = (actual_size as u64).saturating_sub(buffered);
+            if free_space == 0 {
+                return copy_pipe_tail_to_stdout_large(src_fd, count);
+            }
+            let read_len = free_space.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize;
+            let moved = match fro::os::splice(
+                src_fd,
+                std::ptr::null_mut(),
+                pipe_write,
+                std::ptr::null_mut(),
+                read_len,
+                0,
+            ) {
+                Ok(n) => n,
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR | libc::EAGAIN) => continue,
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Err(e)
+                    }
+                    _ => return Err(e),
+                },
+            };
+            if moved > 0 {
+                buffered = buffered
+                    .checked_add(moved as u64)
+                    .ok_or_else(|| io::Error::other("pipe tail byte count overflow"))?;
+                if buffered > count {
+                    let drop_len = buffered - count;
+                    let dropped = splice_all(pipe_read, dev_null_fd, drop_len)?;
+                    if dropped != drop_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "pipe tail short drop while trimming prefix",
+                        ));
+                    }
+                    buffered -= dropped;
+                }
+                continue;
+            }
+            if moved == 0 {
+                let emitted = splice_all(pipe_read, fro::command_io::stdout_fd(), buffered)?;
+                return Ok(Some(emitted));
+            }
+        }
+    })();
+    unsafe {
+        libc::close(pipe_read);
+        libc::close(pipe_write);
+    }
+    result
+}
+
+pub(crate) fn copy_pipe_tail_to_stdout_large(
+    src_fd: libc::c_int,
+    count: u64,
+) -> io::Result<Option<u64>> {
+    if count == 0 {
+        return Ok(Some(0));
+    }
+    if !fd_is_fifo(src_fd)? {
+        return Ok(None);
+    }
+    let window_size = count.saturating_add((STREAM_WINDOW_BLOCK_SIZE - 1) as u64)
+        / STREAM_WINDOW_BLOCK_SIZE as u64
+        * STREAM_WINDOW_BLOCK_SIZE as u64;
+    let window_len = usize::try_from(window_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tail byte window does not fit in usize",
+        )
+    })?;
+    let mut window = AlignedBuffer::new_uninit(window_len)?;
+    let mut total = 0u64;
+    let mut filled = 0usize;
+    let mut write_pos = 0usize;
+    loop {
+        let remaining = window_len - write_pos;
+        let read = unsafe {
+            libc::read(
+                src_fd,
+                window.as_mut_slice()[write_pos..].as_mut_ptr().cast(),
+                remaining,
+            )
+        };
+        if read > 0 {
+            let read = read as usize;
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("pipe tail total overflow"))?;
+            filled = filled.saturating_add(read).min(window_len);
+            write_pos += read;
+            if write_pos == window_len {
+                write_pos = 0;
+            }
+            continue;
+        }
+        if read == 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => continue,
+            _ => return Err(err),
+        }
+    }
+    let emit_len = (total.min(count)) as usize;
+    if emit_len == 0 {
+        return Ok(Some(0));
+    }
+    let start = (write_pos + window_len - emit_len) % window_len;
+    if start + emit_len <= window_len {
+        write_raw_fd_all(
+            fro::command_io::stdout_fd(),
+            &window.as_slice()[start..start + emit_len],
+        )?;
+    } else {
+        write_raw_fd_all(fro::command_io::stdout_fd(), &window.as_slice()[start..])?;
+        let split = emit_len - (window_len - start);
+        write_raw_fd_all(fro::command_io::stdout_fd(), &window.as_slice()[..split])?;
+    }
+    Ok(Some(emit_len as u64))
+}
+
+const FAST_COPY_SPLICE_CHUNK_SIZE: usize = 1 << 20;
+const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
+
+pub(crate) fn copy_regular_fd_to_fd_sendfile_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if !fd_is_regular(src_fd)? {
+        return Ok(None);
+    }
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
+    let mut off_tmp: libc::off_t = 0;
+    loop {
+        let copied =
+            match fro::os::sendfile(dst_fd, src_fd, &mut off_tmp, FAST_COPY_SENDFILE_CHUNK_SIZE) {
+                Ok(v) => v,
+                Err(err) => match err.raw_os_error() {
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Ok(None)
+                    }
+                    _ => return Err(err),
+                },
+            };
+        if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("sendfile byte count overflow"))?;
+            progress(total)?;
+            continue;
+        }
+        if copied == 0 {
+            return Ok(Some(total));
+        }
+        // If we reach here and copied < 0 semantics, treat as error
+        return Err(io::Error::other("sendfile failed unexpectedly"));
+    }
+}
+
+pub(crate) fn copy_fd_to_fd_splice_maybe_limited_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    limit: Option<u64>,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if !fd_is_fifo(src_fd)? && !fd_is_fifo(dst_fd)? {
+        return Ok(None);
+    }
+    grow_pipe_best_effort(src_fd)?;
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
+    if let Ok(mut ring) = IoUring::new(8) {
+        loop {
+            let chunk_size = match limit {
+                Some(limit) => {
+                    let remaining = limit.saturating_sub(total);
+                    if remaining == 0 {
+                        return Ok(Some(total));
+                    }
+                    remaining.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize
+                }
+                None => FAST_COPY_SPLICE_CHUNK_SIZE,
+            };
+            let mut sqe = ring
+                .prepare_sqe()
+                .ok_or_else(|| io::Error::other("io_uring submission queue is full"))?;
+            unsafe {
+                sqe.prep_splice(
+                    src_fd,
+                    -1,
+                    dst_fd,
+                    -1,
+                    chunk_size.try_into().unwrap(),
+                    SpliceFlags::empty(),
+                );
+                sqe.set_user_data(0x5350_4c49_4345);
+            }
+            ring.submit_sqes().map_err(io::Error::other)?;
+            let cqe = ring.wait_for_cqe().map_err(io::Error::other)?;
+            match cqe.result() {
+                Ok(copied) if copied > 0 => {
+                    total = total
+                        .checked_add(copied as u64)
+                        .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+                    progress(total)?;
+                    continue;
+                }
+                Ok(0) => return Ok(Some(total)),
+                Ok(_) => {}
+                Err(err) => match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(
+                        libc::EBADF | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV,
+                    ) => break,
+                    _ => return Err(err),
+                },
+            }
+        }
+    }
+    loop {
+        let chunk_size = match limit {
+            Some(limit) => {
+                let remaining = limit.saturating_sub(total);
+                if remaining == 0 {
+                    return Ok(Some(total));
+                }
+                remaining.min(FAST_COPY_SPLICE_CHUNK_SIZE as u64) as usize
+            }
+            None => FAST_COPY_SPLICE_CHUNK_SIZE,
+        };
+        let copied = {
+            #[cfg(target_os = "linux")]
+            {
+                unsafe {
+                    libc::splice(
+                        src_fd,
+                        std::ptr::null_mut(),
+                        dst_fd,
+                        std::ptr::null_mut(),
+                        chunk_size,
+                        0,
+                    )
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Fallback: read/write loop
+                let mut buf = vec![0u8; chunk_size];
+                let n = unsafe {
+                    libc::read(src_fd, buf.as_mut_ptr() as *mut libc::c_void, chunk_size)
+                };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if n == 0 {
+                    0
+                } else {
+                    let n = n as usize;
+                    write_raw_fd_all(dst_fd, &buf[..n])?;
+                    n as isize
+                }
+            }
+        };
+        if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("splice byte count overflow"))?;
+            progress(total)?;
+            continue;
+        }
+        if copied == 0 {
+            return Ok(Some(total));
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
+            _ => return Err(err),
+        }
+    }
+}
+
+pub(crate) fn copy_fd_to_fd_splice_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    copy_fd_to_fd_splice_maybe_limited_counted(src_fd, dst_fd, None, progress)
+}
+
+pub(crate) fn copy_fd_to_fd_splice_limited_counted<F>(
+    src_fd: libc::c_int,
+    dst_fd: libc::c_int,
+    limit: u64,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    copy_fd_to_fd_splice_maybe_limited_counted(src_fd, dst_fd, Some(limit), progress)
+}
+
+pub(crate) fn try_fast_copy_to_stdout_counted<F>(
+    input: &StreamInput,
+    io_mode: IOMode,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    match input {
+        StreamInput::File(path) if is_regular_input_path(path)? => {
+            if io_mode == IOMode::Direct && !fd_is_fifo(fro::command_io::stdout_fd())? {
+                return Ok(None);
+            }
+            let page_cache = std::fs::File::open(path)?;
+            let file = if io_mode == IOMode::Direct {
+                open_direct_reader_or_fallback(path, &page_cache)?
+            } else {
+                page_cache
+            };
+            copy_regular_fd_to_fd_sendfile_counted(
+                file.as_raw_fd(),
+                fro::command_io::stdout_fd(),
+                progress,
+            )
+        }
+        StreamInput::Stdin { .. } => {
+            if let Some(bytes) = copy_regular_fd_to_fd_sendfile_counted(
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
+                progress,
+            )? {
+                return Ok(Some(bytes));
+            }
+            copy_fd_to_fd_splice_counted(
+                fro::command_io::stdin_fd(),
+                fro::command_io::stdout_fd(),
+                progress,
+            )
+        }
+        StreamInput::File(path) => {
+            let file_type = fs::metadata(path)?.file_type();
+            if file_type.is_fifo() {
+                let file = std::fs::File::open(path)?;
+                return copy_fd_to_fd_splice_counted(
+                    file.as_raw_fd(),
+                    fro::command_io::stdout_fd(),
+                    progress,
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn visit_ordered_blocks<F>(
+    path: &str,
+    io_mode: IOMode,
+    mut on_block: F,
+) -> io::Result<()>
+where
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let sender = tx.clone();
+    let visit_result = visit_blocks_with_mode(path, io_mode, move |block_index, data| {
+        sender
+            .send((block_index, data.to_vec()))
+            .map_err(|_| io::Error::other("failed to queue ordered block"))
+    });
+    drop(tx);
+
+    let mut next_block = 0usize;
+    let mut pending = BTreeMap::<usize, Vec<u8>>::new();
+    while let Ok((block_index, data)) = rx.recv() {
+        pending.insert(block_index, data);
+        while let Some(block) = pending.remove(&next_block) {
+            on_block(&block)?;
+            next_block += 1;
+        }
+    }
+    if !pending.is_empty() {
+        return Err(io::Error::other(
+            "missing block data while finalizing ordered visitor",
+        ));
+    }
+    visit_result?;
+    Ok(())
+}

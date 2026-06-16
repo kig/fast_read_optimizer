@@ -1,74 +1,149 @@
 {
-  "read": {
-    "direct": {
-      "num_threads": 16,
-      "block_size": 3145728,
-      "qd": 2
+  "version": 1,
+  "defaults": {
+    "read": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 3145728,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 31,
+        "block_size": 131072,
+        "qd": 1
+      }
     },
-    "page_cache": {
-      "num_threads": 31,
-      "block_size": 131072,
-      "qd": 1
+    "read_to_memory": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 3145728,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 31,
+        "block_size": 131072,
+        "qd": 1
+      }
+    },
+    "write": {
+      "direct": {
+        "num_threads": 4,
+        "block_size": 262144,
+        "qd": 3
+      },
+      "page_cache": {
+        "num_threads": 4,
+        "block_size": 1048576,
+        "qd": 2
+      }
+    },
+    "copy": {
+      "direct": {
+        "num_threads": 4,
+        "block_size": 262144,
+        "qd": 3
+      },
+      "page_cache": {
+        "num_threads": 4,
+        "block_size": 1048576,
+        "qd": 2
+      }
+    },
+    "copy_range": {
+      "num_threads": 4,
+      "block_size": 524288,
+      "qd": 4
+    },
+    "copy_auto_mode": "heuristic",
+    "read_auto_strategy": {
+      "hot_large_min_bytes": 268435456,
+      "cold_large_min_bytes": 268435456,
+      "hot_small_path": "simple_page_cache",
+      "hot_large_path": "threaded_page_cache",
+      "cold_small_path": "simple_direct",
+      "cold_large_path": "threaded_direct"
+    },
+    "grep": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 3145728,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 31,
+        "block_size": 131072,
+        "qd": 1
+      }
+    },
+    "diff": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 3145728,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 4,
+        "block_size": 131072,
+        "qd": 1
+      }
+    },
+    "dual_read_bench": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 3145728,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 4,
+        "block_size": 131072,
+        "qd": 1
+      }
+    },
+    "compute": {
+      "direct": {
+        "num_threads": 32,
+        "block_size": 1048576,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 32,
+        "block_size": 1048576,
+        "qd": 1
+      }
+    },
+    "hash": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 1048576,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 31,
+        "block_size": 1048576,
+        "qd": 1
+      }
+    },
+    "verify": {
+      "direct": {
+        "num_threads": 16,
+        "block_size": 1048576,
+        "qd": 2
+      },
+      "page_cache": {
+        "num_threads": 31,
+        "block_size": 1048576,
+        "qd": 1
+      }
     }
   },
-  "write": {
-    "direct": {
-      "num_threads": 4,
-      "block_size": 262144,
-      "qd": 3
-    },
-    "page_cache": {
-      "num_threads": 4,
-      "block_size": 1048576,
-      "qd": 2
-    }
+  "mount_overrides": {
+    "by_mountpoint": {}
   },
-  "copy": {
-    "direct": {
-      "num_threads": 4,
-      "block_size": 262144,
-      "qd": 3
-    },
-    "page_cache": {
-      "num_threads": 4,
-      "block_size": 1048576,
-      "qd": 2
-    }
-  },
-  "grep": {
-    "direct": {
-      "num_threads": 5,
-      "block_size": 3145728,
-      "qd": 3
-    },
-    "page_cache": {
-      "num_threads": 31,
-      "block_size": 131072,
-      "qd": 1
-    }
-  },
-  "diff": {
-    "direct": {
-      "num_threads": 16,
-      "block_size": 3145728,
-      "qd": 2
-    },
-    "page_cache": {
-      "num_threads": 4,
-      "block_size": 131072,
-      "qd": 1
-    }
-  },
-  "dual_read_bench": {
-    "direct": {
-      "num_threads": 16,
-      "block_size": 3145728,
-      "qd": 2
-    },
-    "page_cache": {
-      "num_threads": 4,
-      "block_size": 131072,
-      "qd": 1
-    }
+  "device_db": {
+    "paths": [
+      "/etc/fro.d/disk-id.json",
+      "/etc/fro.d/fro-device-db.json"
+    ],
+    "allow_online_update": false
   }
 }

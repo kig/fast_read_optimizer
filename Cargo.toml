@@ -1,25 +1,63 @@
 [package]
 name = "fro"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+read-phase-timing = []
+rapidgzip-backend = ["dep:rapidgzip"]
+
 [dependencies]
+blake2 = "0.10"
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
-io-uring = "0.7.11"
-iou = "0.3.3"
+bytemuck = { version = "1.21", features = ["derive", "extern_crate_alloc", "min_const_generics"] }
+crc-fast = "1.10.0"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+gzp = { version = "2.0.2", default-features = false, features = ["deflate_rust"] }
 libc = "0.2.137"
 memchr = "2.5"
+openssl = "0.10"
 rand = "0.10.0"
+rapidgzip = { version = "1.2.1", optional = true }
+regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
+stringzilla = "4.6.0"
+unicode-width = "0.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.11"
+iou = "0.3.3"
+
 
 [dev-dependencies]
 proptest = "1"
 
+[build-dependencies]
+cc = "1"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[profile.release-debug]
+inherits = "release"
+debug = true # Necessary for good symbols in perf
+lto = false  # Avoid LTO for more readable profiles
+
+[[bin]]
+name = "fro-ipc-server"
+path = "src/fro_ipc_server_main.rs"
+
+[profile.release-min]
+inherits = "release"
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

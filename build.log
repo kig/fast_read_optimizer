@@ -1,0 +1,225 @@
+   Compiling zstd-safe v7.2.4
+   Compiling uring-sys v0.7.4
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling openssl v0.10.76
+   Compiling openssl-sys v0.9.112
+   Compiling blake3 v1.8.3
+   Compiling fro v0.4.0 (/Users/ilmari/Documents/fast_read_optimizer)
+   Compiling stringzilla v4.6.0
+   Compiling io-uring v0.7.11
+error[E0425]: cannot find value `MAP_POPULATE` in crate `libc`
+    --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/util.rs:28:42
+     |
+  28 |                 libc::MAP_SHARED | libc::MAP_POPULATE,
+     |                                          ^^^^^^^^^^^^ help: a constant with a similar name exists: `MAP_PRIVATE`
+     |
+    ::: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.182/src/unix/bsd/apple/mod.rs:2069:1
+     |
+2069 | pub const MAP_PRIVATE: c_int = 0x0002;
+     | ---------------------------- similarly named constant `MAP_PRIVATE` defined here
+
+error[E0425]: cannot find value `MADV_DONTFORK` in crate `libc`
+    --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/util.rs:44:74
+     |
+  44 |         match unsafe { libc::madvise(self.addr.as_ptr(), self.len, libc::MADV_DONTFORK) } {
+     |                                                                          ^^^^^^^^^^^^^ help: a constant with a similar name exists: `MADV_DONTNEED`
+     |
+    ::: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.182/src/unix/bsd/apple/mod.rs:2540:1
+     |
+2540 | pub const MADV_DONTNEED: c_int = 4;
+     | ------------------------------ similarly named constant `MADV_DONTNEED` defined here
+
+error[E0425]: cannot find type `cpu_set_t` in crate `libc`
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/submit.rs:567:53
+    |
+567 |     pub fn register_iowq_aff(&self, cpu_set: &libc::cpu_set_t) -> io::Result<()> {
+    |                                                     ^^^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find type `cpu_set_t` in crate `libc`
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/submit.rs:572:34
+    |
+572 |             mem::size_of::<libc::cpu_set_t>() as u32,
+    |                                  ^^^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `SYS_io_uring_register` in crate `libc`
+  --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:49:40
+   |
+49 | const SYSCALL_REGISTER: c_long = libc::SYS_io_uring_register;
+   |                                        ^^^^^^^^^^^^^^^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `SYS_io_uring_setup` in crate `libc`
+  --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:55:37
+   |
+55 | const SYSCALL_SETUP: c_long = libc::SYS_io_uring_setup;
+   |                                     ^^^^^^^^^^^^^^^^^^ not found in `libc`
+
+error[E0425]: cannot find value `SYS_io_uring_enter` in crate `libc`
+  --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:61:37
+   |
+61 | const SYSCALL_ENTER: c_long = libc::SYS_io_uring_enter;
+   |                                     ^^^^^^^^^^^^^^^^^^ not found in `libc`
+
+   Compiling zstd v0.13.3
+error[E0308]: mismatched types
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/opcode.rs:792:19
+    |
+792 |         sqe.len = mode;
+    |         -------   ^^^^ expected `u32`, found `u16`
+    |         |
+    |         expected due to the type of this binding
+
+error[E0308]: mismatched types
+    --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/opcode.rs:1414:19
+     |
+1414 |         sqe.len = mode;
+     |         -------   ^^^^ expected `u32`, found `u16`
+     |         |
+     |         expected due to the type of this binding
+
+error[E0308]: mismatched types
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:89:9
+    |
+ 88 |     to_result(syscall(
+    |               ------- arguments to this function are incorrect
+ 89 |         SYSCALL_REGISTER,
+    |         ^^^^^^^^^^^^^^^^ expected `i32`, found `i64`
+    |
+note: function defined here
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.182/src/unix/bsd/mod.rs:586:12
+    |
+586 |     pub fn syscall(num: c_int, ...) -> c_int;
+    |            ^^^^^^^
+help: you can convert an `i64` to an `i32` and panic if the converted value doesn't fit
+    |
+ 89 |         SYSCALL_REGISTER.try_into().unwrap(),
+    |                         ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:115:23
+    |
+115 |     to_result(syscall(SYSCALL_SETUP, entries as c_long, p as c_long) as _)
+    |               ------- ^^^^^^^^^^^^^ expected `i32`, found `i64`
+    |               |
+    |               arguments to this function are incorrect
+    |
+note: function defined here
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.182/src/unix/bsd/mod.rs:586:12
+    |
+586 |     pub fn syscall(num: c_int, ...) -> c_int;
+    |            ^^^^^^^
+help: you can convert an `i64` to an `i32` and panic if the converted value doesn't fit
+    |
+115 |     to_result(syscall(SYSCALL_SETUP.try_into().unwrap(), entries as c_long, p as c_long) as _)
+    |                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.7.11/src/sys/mod.rs:133:9
+    |
+132 |     to_result(syscall(
+    |               ------- arguments to this function are incorrect
+133 |         SYSCALL_ENTER,
+    |         ^^^^^^^^^^^^^ expected `i32`, found `i64`
+    |
+note: function defined here
+   --> /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.182/src/unix/bsd/mod.rs:586:12
+    |
+586 |     pub fn syscall(num: c_int, ...) -> c_int;
+    |            ^^^^^^^
+help: you can convert an `i64` to an `i32` and panic if the converted value doesn't fit
+    |
+133 |         SYSCALL_ENTER.try_into().unwrap(),
+    |                      ++++++++++++++++++++
+
+Some errors have detailed explanations: E0308, E0425.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `io-uring` (lib) due to 12 previous errors
+warning: build failed, waiting for other jobs to finish...
+warning: uring-sys@0.7.4: In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/setup.c:11:
+warning: uring-sys@0.7.4: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+warning: uring-sys@0.7.4: #include <linux/fs.h>
+warning: uring-sys@0.7.4:          ^~~~~~~~~~~~
+warning: uring-sys@0.7.4: 1 error generated.
+warning: uring-sys@0.7.4: ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-setup.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/setup.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/queue.c:11:
+warning: uring-sys@0.7.4: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+warning: uring-sys@0.7.4: #include <linux/fs.h>
+warning: uring-sys@0.7.4:          ^~~~~~~~~~~~
+warning: uring-sys@0.7.4: 1 error generated.
+warning: uring-sys@0.7.4: ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-queue.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/queue.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/syscall.c:10:
+warning: uring-sys@0.7.4: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+warning: uring-sys@0.7.4: #include <linux/fs.h>
+warning: uring-sys@0.7.4:          ^~~~~~~~~~~~
+warning: uring-sys@0.7.4: 1 error generated.
+warning: uring-sys@0.7.4: ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-syscall.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/syscall.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/register.c:10:
+warning: uring-sys@0.7.4: /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+warning: uring-sys@0.7.4: #include <linux/fs.h>
+warning: uring-sys@0.7.4:          ^~~~~~~~~~~~
+warning: uring-sys@0.7.4: 1 error generated.
+warning: uring-sys@0.7.4: ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-register.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/register.c"
+error: failed to run custom build command for `uring-sys v0.7.4`
+
+Caused by:
+  process didn't exit successfully: `/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-83d27e8b2daf2131/build-script-build` (exit status: 1)
+  --- stdout
+  OUT_DIR = Some(/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out)
+  OPT_LEVEL = Some(0)
+  TARGET = Some(aarch64-apple-darwin)
+  CARGO_ENCODED_RUSTFLAGS = Some()
+  HOST = Some(aarch64-apple-darwin)
+  cargo:rerun-if-env-changed=CC_aarch64-apple-darwin
+  CC_aarch64-apple-darwin = None
+  cargo:rerun-if-env-changed=CC_aarch64_apple_darwin
+  CC_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  RUSTC_WRAPPER = None
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  DEBUG = Some(true)
+  cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET
+  MACOSX_DEPLOYMENT_TARGET = None
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64_apple_darwin
+  CFLAGS_aarch64_apple_darwin = None
+  cargo:rerun-if-env-changed=CFLAGS_aarch64-apple-darwin
+  CFLAGS_aarch64-apple-darwin = None
+  cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/setup.c:11:
+  cargo:warning=/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+  cargo:warning=#include <linux/fs.h>
+  cargo:warning=         ^~~~~~~~~~~~
+  cargo:warning=1 error generated.
+  exit status: 1
+  cargo:warning=ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-setup.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/setup.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/queue.c:11:
+  cargo:warning=/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+  cargo:warning=#include <linux/fs.h>
+  cargo:warning=         ^~~~~~~~~~~~
+  cargo:warning=1 error generated.
+
+  exit status: 1
+  cargo:warning=ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-queue.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/queue.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/syscall.c:10:
+  cargo:warning=/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+  cargo:warning=#include <linux/fs.h>
+  cargo:warning=         ^~~~~~~~~~~~
+  cargo:warning=1 error generated.
+
+  exit status: 1
+  cargo:warning=ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-syscall.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/syscall.c"cargo:warning=In file included from /Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/register.c:10:
+  cargo:warning=/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include/liburing/io_uring.h:11:10: fatal error: 'linux/fs.h' file not found
+  cargo:warning=#include <linux/fs.h>
+  cargo:warning=         ^~~~~~~~~~~~
+  cargo:warning=1 error generated.
+
+  exit status: 1
+  cargo:warning=ToolExecError: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-register.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/register.c"
+
+  --- stderr
+
+
+  error occurred in cc-rs: command did not execute successfully (status code exit status: 1): env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL="C" "cc" "-O0" "-ffunction-sections" "-fdata-sections" "-fPIC" "-g" "-gdwarf-2" "-fno-omit-frame-pointer" "--target=arm64-apple-macosx" "-mmacosx-version-min=13.3" "-I" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/include" "-I" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/src/include" "-Wall" "-o" "/Users/ilmari/Documents/fast_read_optimizer/target/debug/build/uring-sys-de1445e6f2b44eb0/out/5265c0a09d3c0154-register.o" "-c" "/Users/ilmari/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uring-sys-0.7.4/liburing/src/register.c"
+
+

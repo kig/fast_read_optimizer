@@ -1,9 +1,10 @@
+use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-#[repr(align(4096))]
-#[derive(Clone, Copy)]
+#[repr(C, align(4096))]
+#[derive(Copy, Clone, Pod, Zeroable)]
 #[allow(dead_code)]
 pub struct PageAligned(pub [u8; 4096]);
 
@@ -37,6 +38,8 @@ impl AlignedBuffer {
 
     pub fn new_uninit(len: usize) -> std::io::Result<Self> {
         let map_len = len.max(1).div_ceil(4096) * 4096;
+        // SAFETY: We request a private anonymous mapping and keep both the base pointer and
+        // rounded allocation length so Drop can unmap exactly the same region once.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -57,11 +60,22 @@ impl AlignedBuffer {
         })
     }
 
+    #[allow(unused)]
+    pub fn truncate(&mut self, new_len: usize) -> usize {
+        if new_len < self.len {
+            self.len = new_len
+        }
+        return self.len;
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `self.ptr` points to `self.len` initialized bytes owned by this buffer, and
+        // `&mut self` guarantees no other Rust references to that range exist.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.ptr` remains valid for `self.len` bytes for the lifetime of `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -95,6 +109,8 @@ impl fmt::Debug for AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         if let AlignedBufferStorage::Mapping { ptr, map_len } = &self.storage {
+            // SAFETY: `ptr..ptr+map_len` is the mapping created by `new_uninit` and has not been
+            // unmapped yet; Drop runs at most once for this owner.
             unsafe {
                 let _ = libc::munmap(*ptr, *map_len);
             }
@@ -102,7 +118,11 @@ impl Drop for AlignedBuffer {
     }
 }
 
+// SAFETY: `AlignedBuffer` owns its allocation/mapping and only exposes mutation through `&mut
+// self`, so moving it to another thread does not create aliasing.
 unsafe impl Send for AlignedBuffer {}
+// SAFETY: Shared references only permit read-only slice access; callers need `&mut self` to
+// obtain mutable access to the backing storage.
 unsafe impl Sync for AlignedBuffer {}
 
 #[derive(PartialEq, Copy, Clone)]
@@ -129,6 +149,26 @@ pub enum CopyAutoMode {
     PageCache,
     Direct,
     CopyFileRange,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadPathKind {
+    SimplePageCache,
+    SimpleDirect,
+    IoUringPageCache,
+    ThreadedPageCache,
+    ThreadedDirect,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+pub struct ReadAutoStrategy {
+    pub hot_large_min_bytes: u64,
+    pub cold_large_min_bytes: u64,
+    pub hot_small_path: ReadPathKind,
+    pub hot_large_path: ReadPathKind,
+    pub cold_small_path: ReadPathKind,
+    pub cold_large_path: ReadPathKind,
 }
 
 #[cfg(test)]

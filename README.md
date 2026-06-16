@@ -14,7 +14,21 @@ It combines tuned striped IO, literal search, copy / diff utilities, a benchmark
 - tuning read / write / copy / diff parameters for a specific machine or mount
 - running repeatable performance regressions
 
-It is **not** a recursive file copier, a regex engine, or a parity / erasure-coding system.
+## Target real-world use cases and current progress
+
+The current product direction is NVMe- and page-cache-optimized replacements for I/O-bound Unix tools and adjacent data-movement workflows.
+
+| Area | Goal | Current state |
+| --- | --- | --- |
+| Hashing / verification (`hash`, `verify`, `recover`, `cksum`, `sha*sum`, `b3sum`, `b2sum`, `md5sum`) | Fast large-file integrity, replica checking, and repair | Strongest area today. Core hash/verify/recover paths are mature; some multicall checksum variants are still at parity rather than clear wins. |
+| Tree walk (`find`, `du`) | Fast metadata-heavy traversal on large trees | Implemented and actively optimized. `du` now shares the same concurrent directory-walk machinery as `find`. |
+| Literal search (`fgrep`, `fro grep`) | Hot-cache and NVMe-friendly fixed-string search | Implemented for single-file scans. This is a good candidate for adapting `rg`-style UX to `fro` I/O over time. |
+| Copy / move (`cp`, `fro copy`, future `mv`) | High-throughput large-file copy and practical tree copy | Single-file copy and recursive `cp -r` exist; `mv` is still a target area rather than a delivered multicall tool. |
+| Stream processing (`cat`, `wc`, `dd`, other pipe-heavy tools) | Page-cache and pipe-throughput-optimized stream utilities | `cat`, `wc`, and `dd` now exist on the main CLI / multicall surface. The hot-cache pipeline work is still ongoing, and other streaming utils remain roadmap work. |
+| Read file to memory (`read --to-memory`) | Lift a file into RAM quickly with tunable backends | Implemented, benchmarked, and separately tunable via `read_to_memory` config entries. |
+| Populate page cache for shared mmap consumers | Warm shared model/data files for multi-process `mmap` reuse | Still exploratory. Plain `mmap` and `--mmap-read-pages` exist; the dedicated `--mmap-willneed` branch was removed because it did not earn its keep. |
+
+It is **not** a regex engine, a parity / erasure-coding system, or yet a complete replacement for the whole coreutils surface.
 
 ## Utilities
 
@@ -26,6 +40,45 @@ cargo build --release --examples
 # Optionally install
 cargo install --path .
 ```
+
+`fro` also supports a small BusyBox-style multicall surface via `argv[0]`. If you symlink the `fro` binary to names such as `cp`, `cmp`, `fgrep`, `cat`, `tac`, `wc`, `find`, `rm`, `mv`, `tar`, `cksum`, `b3sum`, `b2sum`, `md5sum`, `sha256sum`, or `shred`, it dispatches to the corresponding `fro`-backed implementation.
+
+`cargo build --release` now also emits first-class asm startup runners under `target/release/coreutils/`:
+
+```bash
+ls target/release/coreutils
+# cat  cksum  cmp  cp  fgrep  find  fro  head  mv  rm  tail  wc
+cp target/release/coreutils/* ~/.local/bin/
+```
+
+Those runners handle the tiny inline fast path themselves and otherwise `execve()` a sibling `fro` binary from the same directory. The build artifact directory includes `fro -> ../fro`, so copying `target/release/coreutils/*` into a local bin dir brings along the matching `fro` binary for fallback. On Linux the runner first resolves its own directory via `/proc/self/exe`; if that lookup fails, it falls back to the build-tree `target/<profile>/fro` path baked in at build time.
+
+Current coreutils snapshot on `/data/ilmari_cache/fro-test/coreutils-1g.bin` (1 GiB, best of 3, hot page cache for non-direct runs):
+
+| Tool | `fro` hot-cache GiB/s | `fro` direct GiB/s | system GiB/s | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `cat` | 4.7 | 3.4 | 7.6 | Still below the tuned read-path ceiling; this wrapper needs more work. |
+| `cksum` | 0.115 | 0.114 | 0.325 | Known weak spot; planned fast-crc32-grade rewrite. |
+| `md5sum` | 0.553 | 0.554 | 0.531 | Roughly at parity. |
+| `b2sum` | 0.666 | 0.665 | 0.661 | Roughly at parity. |
+| `sha256sum` | 1.207 | 1.221 | 0.218 | Materially faster than system `sha256sum`. |
+| `fro read` reference | 16.7 | 23.0 | n/a | Shows current backend headroom on the same file/mount. |
+
+`wc -c` is omitted from the table because system `wc` can answer that case from file size metadata without a full data read, so it is not a fair streaming-I/O comparison.
+
+### Flag-sensitive execution-path notes
+
+Recent multicall parity work added several GNU-style flags, but they do **not** all exercise the same execution path. When benchmarking or extending a utility, first decide whether a flag preserves the optimized path or intentionally asks for extra work.
+
+| Utility | Flags that should preserve the optimized family | Flags that intentionally force a different/slower path | Practical note |
+| --- | --- | --- | --- |
+| `cat` | plain `cat`, `-u`, `--auto`, `--direct`, `--no-direct` | `-n`, `-b`, `-s`, `-E`, `-T`, `-v`, `-A`, `-e`, `-t` | Plain `cat` can stay on the fast copy-style path because output bytes still match input bytes, but the proposition still splits by sink: regular-file -> `/dev/null` and regular-file -> pipe sink can prefer different backends on different mounts/cache states. Formatting / numbering flags require ordered line assembly and byte rewriting, so they should be benchmarked separately from plain `cat` or `fro read`. |
+| `fgrep` | plain search, `-n`, `-i`, `--no-ignore-case`, `-x` | none of the current implemented flags replace the literal-search family, but `-i` adds ASCII folding and `-x` needs line-oriented matching | The literal matcher is still the same `memmem`-style search family. Extra flags can add CPU work without meaning the tuned read/search path disappeared. |
+| `wc` | `-l`, `-w`, `-m`, `-L`, mixed count combinations | `-c`/`--bytes` on a regular file may bypass streaming entirely via metadata; pipes can count bytes through `splice(2)` to `/dev/null` | `wc -c` is a different proposition from “stream the file and count bytes.” Use `-l/-w/-m/-L` when you want scan-path throughput, and compare pipes vs regular files separately. |
+| `head` / `tail` | regular-file byte/range cases, IO-mode selectors, `tail -q/-v` header controls | newline-oriented counts on streams may need full scanning/buffering before emission | `head -c` on a regular file can stay in a range-copy helper. `tail` on a regular file can compute the start offset and then emit a suffix efficiently, but stream inputs do not have the same seek/range options. |
+| `cp` / `mv` | decision flags such as `-n`, `-u`, `-T`, `-v` should leave the copy engine unchanged **when a copy still happens** | cross-filesystem `mv` fallback and skip/rename fast paths are intentionally different operations | Benchmark “copy happened” and “copy skipped/rename-only” separately. A parity flag that only changes policy should not silently swap in a slower bulk-copy engine once bytes actually move. |
+
+Behavior parity tests are necessary but not sufficient for these tools. When adding a flag, pair the GNU-compatibility test with at least one performance-path check or benchmark note showing whether the flag should preserve the fast helper or intentionally leave it.
 
 Example runs:
 
@@ -119,9 +172,18 @@ cargo run --quiet --manifest-path janitor/Cargo.toml -- all
 
 For verification status and the current proof outline, see [`VERIFICATION.md`](VERIFICATION.md). For performance work, see `docs/profiling.md` for the repo's measurement workflow, including why `--test-size 4GB` matters on fast NVMe arrays and why hot-path edits should always be re-benchmarked before re-tuning config.
 
+For multicall/coreutils optimization waves, `perf/coreutils_filesize_sweep.py` runs reproducible hyperfine-based sweeps across realistic file-scan and real create/extract/remove propositions on one or more chosen mounts. Example:
+
+```bash
+python3 perf/coreutils_filesize_sweep.py \
+  --mount /data/fro-test \
+  --mount /optane/fro \
+  --surfaces cat cp cksum md5sum sha256sum b3sum base64 fgrep sort tar-create tar-extract rm
+```
+
 ## Examples
 
-See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`.
+See `examples/` for example programs that use the fro library, including a BLAKE3 `b3sum`, `dd`, and direct-IO `sha256sum`. The same `dd` implementation is also available as `fro dd` / multicall `dd`.
 
 ## Rust crate API
 
@@ -143,6 +205,8 @@ reader.foreach_block(|block_index, block| {
 ```
 
 For stream-style writes, use `fro::create(...)` for sequential output or `fro::offset_writer(...)` for parallel offset writes. `offset_writer()` prepares a fixed-size output and zero-fills any unwritten gaps by default; use `offset_writer_with_options(..., truncate = false)` when you need to preserve existing bytes outside the written ranges. See `examples/dd.rs`, `examples/sha256sum.rs`, and `examples/b3sum.rs` for end-to-end usage.
+
+For transform-style workloads that may receive either regular files or pipes, prefer `fro::auto_select_transform_io_pairing(...)` over hand-rolled stdin/stdout probing. It classifies the call as file→file, file→stream, stream→file, or stream→stream and returns the already-open handles/path needed to dispatch to the right fast path. `base64` and `encrypt`/`decrypt` use this helper now; future encode/decode/filter-style tools should do the same whenever they have distinct regular-file and streaming implementations.
 
 ### How `fro` utilities behave
 
@@ -411,10 +475,28 @@ fro-optimize --test-dir /mnt/fast --test-size 64MiB --iters 5 read
 
 This does a smaller, quicker optimization pass that is useful in tests or during development.
 
+```bash
+fro-optimize --for /mnt/fast/data.bin read grep
+```
+
+This targets the mount that contains `/mnt/fast/data.bin`, writes the tuned params into that
+mount's `mount_overrides` entry, and by default uses the target path's parent directory as the
+benchmark workspace. If you also pass `--test-dir`, it must resolve to the same mount.
+
+`fro config explain --for <path>` now reports the matched mount, extracted device signature,
+the first matching device-db profile from `device_db.paths`, any explicit `mount_overrides`
+entry, and the final effective config. Runtime precedence is:
+
+1. config defaults
+2. matched device-db profile
+3. explicit `mount_overrides` entry for the resolved mount
+
 Useful options:
 
 - `--all`
 - `--all-dir <path>` (repeatable)
+- `--global` (single-target `--for <path>` flow: promotes the tuned mount into config defaults)
+- `--for <path>`
 - `--plan`
 - `--test-dir`
 - `--test-size`
@@ -456,8 +538,15 @@ fro-benchmark --skip-build --no-fail --iters 5 --test-size 64MiB 'read (forced p
 
 This runs a smaller targeted benchmark without rebuilding and without failing the process on regression.
 
+```bash
+fro-benchmark -c /path/to/fro.json --skip-build --test-size 64MiB 'read (forced page cache, hot)'
+```
+
+Use `-c/--config` when you want the benchmark run to exercise the same config file you just tuned.
+
 Useful options:
 
+- `-c <config.json>`
 - `--plan`
 - `--skip-build`
 - `--no-fail`
@@ -466,11 +555,20 @@ Useful options:
 - `--test-size`
 - `--max-drive-writes`
 
+Focused tree-comparison slice:
+
+- `fro-benchmark --skip-build --no-fail --iters 1 --test-size 64MiB 'tree compare:'`
+- This runs a narrow recursive/tree-walk comparison set:
+  - `recursive-read-bench` vs `file-list-read-bench` vs `fd`
+  - `fro copy --recursive` vs `fro copy --recursive --threaded-copy` vs `split-manifest-recursive-copy-bench` vs `manifest-recursive-copy-bench` vs `cp -r`
+- The tree slice reports `files/s` so future dirwalk and recursive-copy work can compare traversal-heavy designs without pretending tiny-file trees are primarily about bulk GB/s.
+
 Wear note:
 
 - a full benchmark run does real writes too
 - rough rule of thumb:
   - `bytes_written ~= 13 x test_size + 2 GiB`
+- auto-sizing now counts that fixed `+ 2 GiB` style benchmark overhead against `--max-drive-writes`, so write-heavy microbench slices shrink deterministically when the remaining budget is small
 
 ### Microbenchmarks
 

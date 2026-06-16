@@ -72,3 +72,98 @@ fn grep_finds_literal_match_across_block_boundary() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("4094:abcd"));
 }
+
+#[test]
+fn grep_auto_lift_runs_repeated_scans_successfully() {
+    let tmp = unique_temp_dir("fro-grep-auto-lift");
+    let cfg = tmp.join("fro.json");
+    let target = tmp.join("target.bin");
+
+    let mut defaults = AppConfig::default();
+    defaults.grep.page_cache = IOParams {
+        num_threads: 1,
+        block_size: 4096,
+        qd: 2,
+    };
+    defaults.grep.direct = IOParams {
+        num_threads: 1,
+        block_size: 256 * 1024,
+        qd: 2,
+    };
+    write_config(&cfg, defaults);
+
+    let mut data = vec![b'x'; 8192];
+    data[4094..4098].copy_from_slice(b"abcd");
+    fs::write(&target, &data).unwrap();
+
+    let out = run_fro(&[
+        "grep",
+        "--auto-lift",
+        "-n",
+        "2",
+        "-c",
+        cfg.to_str().unwrap(),
+        "abcd",
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("4094:abcd"));
+}
+
+#[test]
+fn read_direct_warns_when_tail_falls_back_to_page_cache() {
+    let tmp = unique_temp_dir("fro-read-direct-tail-fallback");
+    let cfg = tmp.join("fro.json");
+    let target = tmp.join("target.bin");
+
+    let mut defaults = AppConfig::default();
+    defaults.read.page_cache = IOParams {
+        num_threads: 1,
+        block_size: 4096,
+        qd: 1,
+    };
+    defaults.read.direct = IOParams {
+        num_threads: 1,
+        block_size: 256 * 1024,
+        qd: 1,
+    };
+    defaults.read_to_memory.page_cache = IOParams {
+        num_threads: 1,
+        block_size: 4096,
+        qd: 1,
+    };
+    defaults.read_to_memory.direct = IOParams {
+        num_threads: 1,
+        block_size: 256 * 1024,
+        qd: 1,
+    };
+    write_config(&cfg, defaults);
+
+    fs::write(&target, vec![b'x'; 4097]).unwrap();
+
+    let out = run_fro(&[
+        "read",
+        "--direct",
+        "-n",
+        "1",
+        "-c",
+        cfg.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("forced --direct read used page cache"),
+        "stderr:\n{stderr}"
+    );
+}

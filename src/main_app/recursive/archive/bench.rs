@@ -1,0 +1,385 @@
+use super::*;
+use crate::io_util::checked_posix_fallocate;
+use crate::io_util::sync_path;
+use crate::writer::write_buffer;
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
+
+#[derive(Clone)]
+struct TarBenchOutput {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for TarBenchOutput {}
+unsafe impl Sync for TarBenchOutput {}
+
+fn output_slice_mut(output: &TarBenchOutput, offset: u64, len: usize) -> io::Result<&mut [u8]> {
+    let start = usize_from_u64(offset, "tar benchmark output offset")?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tar benchmark output range overflowed",
+        )
+    })?;
+    if end > output.len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tar benchmark output range exceeded buffer",
+        ));
+    }
+    Ok(unsafe { std::slice::from_raw_parts_mut(output.ptr.add(start), len) })
+}
+
+fn zero_output_range(output: &TarBenchOutput, offset: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = usize_from_u64(len, "tar benchmark zero length")?;
+    output_slice_mut(output, offset, len)?.fill(0);
+    Ok(())
+}
+
+fn write_header_to_output(output: &TarBenchOutput, entry: &TarEntry) -> io::Result<()> {
+    let header = tar_header_bytes(entry)?;
+    output_slice_mut(output, entry.header_offset, TAR_BLOCK_SIZE as usize)?
+        .copy_from_slice(&header);
+    Ok(())
+}
+
+fn write_small_entry_to_output(output: &TarBenchOutput, entry: &TarEntry) -> io::Result<u64> {
+    write_header_to_output(output, entry)?;
+    match &entry.kind {
+        TarEntryKind::RegularFile { size, source_path } => {
+            let data_len = usize_from_u64(*size, "tar small file size")?;
+            read_small_file_into(
+                source_path,
+                output_slice_mut(output, entry.data_offset, data_len)?,
+            )?;
+            zero_output_range(
+                output,
+                entry.data_offset + *size,
+                tar_entry_padding_len(entry),
+            )?;
+        }
+        TarEntryKind::Directory | TarEntryKind::Symlink { .. } => {}
+    }
+    Ok(tar_entry_total_len(entry))
+}
+
+fn write_large_entry_to_output(
+    output: &TarBenchOutput,
+    entry: &TarEntry,
+    config: &config::LoadedConfig,
+    io_mode_read: IOMode,
+) -> io::Result<u64> {
+    write_header_to_output(output, entry)?;
+    if let TarEntryKind::RegularFile { size, source_path } = &entry.kind {
+        let output_for_blocks = output.clone();
+        let base_offset = entry.data_offset;
+        let source = source_path.to_string_lossy().into_owned();
+        visit_file_blocks_for_mode(config, "read", &source, io_mode_read, move |block| {
+            let destination = output_slice_mut(
+                &output_for_blocks,
+                base_offset.checked_add(block.offset).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tar benchmark offset overflowed",
+                    )
+                })?,
+                block.data.len(),
+            )?;
+            destination.copy_from_slice(block.data);
+            Ok(())
+        })?;
+        zero_output_range(
+            output,
+            entry.data_offset + *size,
+            tar_entry_padding_len(entry),
+        )?;
+    }
+    Ok(tar_entry_total_len(entry))
+}
+
+fn archive_payload_bytes(entries: &[TarEntry]) -> u64 {
+    entries
+        .iter()
+        .map(|entry| match &entry.kind {
+            TarEntryKind::RegularFile { size, .. } => *size,
+            TarEntryKind::Directory | TarEntryKind::Symlink { .. } => 0,
+        })
+        .sum()
+}
+
+fn build_tar_archive_into_output(
+    entries: &[TarEntry],
+    tasks: &[TarPlannedTask],
+    output: Arc<TarBenchOutput>,
+    config: &config::LoadedConfig,
+    io_mode_read: IOMode,
+) -> io::Result<u64> {
+    zero_output_range(
+        output.as_ref(),
+        entries
+            .last()
+            .map(|entry| entry.header_offset + tar_entry_total_len(entry))
+            .unwrap_or(0),
+        TAR_EOF_BLOCKS,
+    )?;
+
+    let slab_tasks = Arc::new(
+        tasks
+            .iter()
+            .filter_map(|task| match task {
+                TarPlannedTask::Slab(task) => Some(task.clone()),
+                TarPlannedTask::Large(_) => None,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let large_tasks = Arc::new(
+        tasks
+            .iter()
+            .filter_map(|task| match task {
+                TarPlannedTask::Slab(_) => None,
+                TarPlannedTask::Large(task) => Some(task.clone()),
+            })
+            .collect::<Vec<_>>(),
+    );
+    let next_slab = Arc::new(AtomicUsize::new(0));
+    let next_large = Arc::new(AtomicUsize::new(0));
+    let bytes_written = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+
+    for _ in 0..TAR_SMALL_WRITE_WORKERS.min(slab_tasks.len()) {
+        let entries = Arc::new(entries.to_vec());
+        let slab_tasks = slab_tasks.clone();
+        let next_slab = next_slab.clone();
+        let output = output.clone();
+        let bytes_written = bytes_written.clone();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                let Some(task) = slab_tasks.get(next_slab.fetch_add(1, Ordering::SeqCst)) else {
+                    break;
+                };
+                let mut local = 0_u64;
+                for &entry_index in &task.entry_indices {
+                    local = local.saturating_add(write_small_entry_to_output(
+                        output.as_ref(),
+                        &entries[entry_index],
+                    )?);
+                }
+                bytes_written.fetch_add(local, Ordering::Relaxed);
+            }
+            Ok(())
+        }));
+    }
+
+    for _ in 0..recursive_copy_large_worker_count().min(large_tasks.len()) {
+        let entries = Arc::new(entries.to_vec());
+        let large_tasks = large_tasks.clone();
+        let next_large = next_large.clone();
+        let output = output.clone();
+        let bytes_written = bytes_written.clone();
+        let stop = stop.clone();
+        let config = config.clone();
+        threads.push(std::thread::spawn(move || -> io::Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                let Some(task) = large_tasks.get(next_large.fetch_add(1, Ordering::SeqCst)) else {
+                    break;
+                };
+                let written = write_large_entry_to_output(
+                    output.as_ref(),
+                    &entries[task.entry_index],
+                    &config,
+                    io_mode_read,
+                )?;
+                bytes_written.fetch_add(written, Ordering::Relaxed);
+            }
+            Ok(())
+        }));
+    }
+
+    let mut first_error = None;
+    for thread in threads {
+        match thread
+            .join()
+            .map_err(|_| io::Error::other("tar benchmark worker panicked"))?
+        {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => {
+                stop.store(true, Ordering::Relaxed);
+                first_error = Some(err);
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(bytes_written.load(Ordering::Relaxed))
+}
+
+pub(crate) fn bench_tar_archive_variant(
+    variant: &str,
+    source: &Path,
+    target: Option<&Path>,
+    io_mode_read: IOMode,
+    io_mode_write: IOMode,
+) -> io::Result<u64> {
+    let config = config::load_config(None);
+    let (entries, total_size) = collect_tar_manifest(source, Path::new("/dev/null"))?;
+    let planned_tasks = plan_tar_tasks(&entries);
+    let payload_bytes = archive_payload_bytes(&entries);
+    let total_len = usize_from_u64(total_size, "tar benchmark archive size")?;
+
+    match variant {
+        "ram" => {
+            let mut archive = AlignedBuffer::new_uninit(total_len)?;
+            madvise_best_effort(
+                archive.as_mut_slice().as_mut_ptr().cast(),
+                archive.len().max(1),
+                fro::os::MADV_HUGEPAGE,
+            )?;
+            let output = Arc::new(TarBenchOutput {
+                ptr: archive.as_mut_slice().as_mut_ptr(),
+                len: archive.len(),
+            });
+            let start = std::time::Instant::now();
+            build_tar_archive_into_output(&entries, &planned_tasks, output, &config, io_mode_read)?;
+            let elapsed = start.elapsed().as_secs_f64();
+            fro::cio_println!(
+                "bench-tar-archive ram {} bytes in {:.4} s, {:.3} GiB/s",
+                payload_bytes,
+                elapsed,
+                payload_bytes as f64 / elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0)
+            );
+            Ok(payload_bytes)
+        }
+        "ram-write" => {
+            let target = target.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bench-tar-archive ram-write requires a target path",
+                )
+            })?;
+            let mut archive = AlignedBuffer::new_uninit(total_len)?;
+            madvise_best_effort(
+                archive.as_mut_slice().as_mut_ptr().cast(),
+                archive.len().max(1),
+                fro::os::MADV_HUGEPAGE,
+            )?;
+            let output = Arc::new(TarBenchOutput {
+                ptr: archive.as_mut_slice().as_mut_ptr(),
+                len: archive.len(),
+            });
+            let build_start = std::time::Instant::now();
+            build_tar_archive_into_output(&entries, &planned_tasks, output, &config, io_mode_read)?;
+            let build_elapsed = build_start.elapsed().as_secs_f64();
+            let target_str = target.to_string_lossy();
+            let page_cache = config.get_params_for_path("write", false, &target_str);
+            let direct = config.get_params_for_path("write", true, &target_str);
+            let write_start = std::time::Instant::now();
+            write_buffer(
+                &target_str,
+                archive.as_slice(),
+                page_cache.num_threads,
+                page_cache.block_size,
+                page_cache.qd,
+                direct.num_threads,
+                direct.block_size,
+                direct.qd,
+                io_mode_write,
+            )?;
+            let write_elapsed = write_start.elapsed().as_secs_f64();
+            let sync_start = std::time::Instant::now();
+            sync_path(target)?;
+            let sync_elapsed = sync_start.elapsed().as_secs_f64();
+            fro::cio_println!(
+                "bench-tar-archive ram-write build={:.4}s ({:.3} GiB/s payload) write={:.4}s ({:.3} GiB/s archive) sync={:.4}s total={:.4}s",
+                build_elapsed,
+                payload_bytes as f64 / build_elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0),
+                write_elapsed,
+                total_size as f64 / write_elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0),
+                sync_elapsed,
+                build_elapsed + write_elapsed + sync_elapsed
+            );
+            Ok(payload_bytes)
+        }
+        "mmap-file" => {
+            let target = target.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bench-tar-archive mmap-file requires a target path",
+                )
+            })?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(target)?;
+            file.set_len(total_size)?;
+            checked_posix_fallocate(
+                &file,
+                0,
+                total_size,
+                "failed to preallocate tar benchmark output",
+            )?;
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            madvise_best_effort(ptr, total_len.max(1), fro::os::MADV_HUGEPAGE)?;
+            let output = Arc::new(TarBenchOutput {
+                ptr: ptr.cast(),
+                len: total_len,
+            });
+            let build_start = std::time::Instant::now();
+            let result = build_tar_archive_into_output(
+                &entries,
+                &planned_tasks,
+                output,
+                &config,
+                io_mode_read,
+            );
+            let build_elapsed = build_start.elapsed().as_secs_f64();
+            let msync_start = std::time::Instant::now();
+            let sync_result = unsafe { libc::msync(ptr, total_len, libc::MS_SYNC) };
+            let msync_elapsed = msync_start.elapsed().as_secs_f64();
+            unsafe {
+                libc::munmap(ptr, total_len);
+            }
+            result?;
+            if sync_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let sync_start = std::time::Instant::now();
+            sync_path(target)?;
+            let sync_elapsed = sync_start.elapsed().as_secs_f64();
+            fro::cio_println!(
+                "bench-tar-archive mmap-file build={:.4}s ({:.3} GiB/s payload) msync={:.4}s sync={:.4}s total={:.4}s",
+                build_elapsed,
+                payload_bytes as f64 / build_elapsed.max(1e-9) / (1024.0 * 1024.0 * 1024.0),
+                msync_elapsed,
+                sync_elapsed,
+                build_elapsed + msync_elapsed + sync_elapsed
+            );
+            Ok(payload_bytes)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown bench-tar-archive variant: {variant}"),
+        )),
+    }
+}

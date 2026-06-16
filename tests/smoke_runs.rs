@@ -90,3 +90,43 @@ fn smoke_memcpy_bench_runs_with_small_size() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Memory memcpy"));
 }
+
+#[test]
+fn smoke_base64_encode_bench_runs() {
+    let fro = env!("CARGO_BIN_EXE_fro");
+
+    let out = Command::new(fro)
+        .args(["bench-base64-encode", "-n", "1000"])
+        .output()
+        .expect("failed to run bench-base64-encode");
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}\n",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Base64 encode kernel"));
+}
+
+#[test]
+fn smoke_fro_version_runs() {
+    let fro = env!("CARGO_BIN_EXE_fro");
+
+    let out = Command::new(fro)
+        .arg("--version")
+        .output()
+        .expect("failed to run fro --version");
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}\n",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+}

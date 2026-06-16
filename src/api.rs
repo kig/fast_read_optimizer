@@ -1,15 +1,21 @@
 use crate::common::CopyStrategy;
 use crate::config::load_config;
 use crate::io_util::CopyOperationGuard;
-use crate::reader::load_file_to_memory_for_mode;
+use crate::reader::{
+    evict_file_cache, load_file_to_memory_for_mode, warm_file_page_cache, BufReader,
+};
 use crate::stream::{ParallelFile, ParallelReadReport, ParallelWriter};
 use crate::writer::{
     self, copy_file_range_with_strategy as copy_range_internal, resolve_writer_params_for_mode,
     SequentialWriter,
 };
 use crate::IOMode;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn path_str(path: &Path) -> io::Result<&str> {
     path.to_str().ok_or_else(|| {
@@ -20,8 +26,238 @@ fn path_str(path: &Path) -> io::Result<&str> {
     })
 }
 
+const ORDERED_SCAN_BLOCK_SIZE: usize = 8 << 20;
+const FAST_COPY_SENDFILE_CHUNK_SIZE: usize = 0x7fff_f000usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ByteRange {
+    pub start_offset: u64,
+    pub end_offset: Option<u64>,
+}
+
+impl ByteRange {
+    pub const fn starting_at(start_offset: u64) -> Self {
+        Self {
+            start_offset,
+            end_offset: None,
+        }
+    }
+
+    pub const fn up_to(end_offset: u64) -> Self {
+        Self {
+            start_offset: 0,
+            end_offset: Some(end_offset),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedVisitDecision {
+    Continue,
+    Stop,
+}
+
+fn validate_byte_range(range: ByteRange) -> io::Result<()> {
+    if let Some(end_offset) = range.end_offset {
+        if end_offset < range.start_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "end_offset {} must be >= start_offset {}",
+                    end_offset, range.start_offset
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fd_is_regular(fd: RawFd) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFREG)
+}
+
+fn fd_is_fifo(fd: RawFd) -> io::Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFIFO)
+}
+
+fn grow_pipe_best_effort(fd: RawFd) -> io::Result<()> {
+    if !fd_is_fifo(fd)? {
+        return Ok(());
+    }
+    fro::os::grow_pipe_best_effort(fd)
+}
+
+pub fn copy_path_range_to_fd_with_progress<P, F>(
+    path: P,
+    dst_fd: RawFd,
+    range: ByteRange,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    P: AsRef<Path>,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    validate_byte_range(range)?;
+    let file = std::fs::File::open(path)?;
+    copy_fd_range_to_fd_with_progress(file.as_raw_fd(), dst_fd, range, progress)
+}
+
+pub fn copy_fd_range_to_fd_with_progress<F>(
+    src_fd: RawFd,
+    dst_fd: RawFd,
+    range: ByteRange,
+    progress: &mut F,
+) -> io::Result<Option<u64>>
+where
+    F: FnMut(u64) -> io::Result<()>,
+{
+    validate_byte_range(range)?;
+    if !fd_is_regular(src_fd)? {
+        return Ok(None);
+    }
+    grow_pipe_best_effort(dst_fd)?;
+    let mut total = 0u64;
+    let mut offset = i64::try_from(range.start_offset).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "start_offset overflowed off_t")
+    })?;
+    loop {
+        let count = match range.end_offset {
+            Some(end_offset) => {
+                if offset as u64 >= end_offset {
+                    return Ok(Some(total));
+                }
+                (end_offset - offset as u64).min(FAST_COPY_SENDFILE_CHUNK_SIZE as u64) as usize
+            }
+            None => FAST_COPY_SENDFILE_CHUNK_SIZE,
+        };
+        let mut off_tmp: libc::off_t = offset as libc::off_t;
+        let copied = match fro::os::sendfile(dst_fd, src_fd, &mut off_tmp, count) {
+            Ok(v) => v,
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    // retry
+                    offset = off_tmp as i64;
+                    continue;
+                }
+                match err.raw_os_error() {
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Ok(None)
+                    }
+                    _ => return Err(err),
+                }
+            }
+        };
+        if copied > 0 {
+            total = total
+                .checked_add(copied as u64)
+                .ok_or_else(|| io::Error::other("sendfile byte count overflow"))?;
+            offset = off_tmp as i64;
+            progress(total)?;
+            continue;
+        }
+        if copied == 0 {
+            return Ok(Some(total));
+        }
+        return Err(io::Error::other("sendfile failed unexpectedly"));
+    }
+}
+
+pub fn visit_path_range_ordered<P, F>(path: P, range: ByteRange, mut visit: F) -> io::Result<u64>
+where
+    P: AsRef<Path>,
+    F: FnMut(u64, &[u8]) -> io::Result<OrderedVisitDecision>,
+{
+    validate_byte_range(range)?;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(range.start_offset))?;
+    let mut reader = BufReader::with_capacity(ORDERED_SCAN_BLOCK_SIZE, file);
+    let mut buffer = vec![0u8; ORDERED_SCAN_BLOCK_SIZE];
+    let mut offset = range.start_offset;
+    loop {
+        let read_cap = match range.end_offset {
+            Some(end_offset) => {
+                if offset >= end_offset {
+                    return Ok(offset.saturating_sub(range.start_offset));
+                }
+                (end_offset - offset).min(buffer.len() as u64) as usize
+            }
+            None => buffer.len(),
+        };
+        let read = reader.read(&mut buffer[..read_cap])?;
+        if read == 0 {
+            return Ok(offset.saturating_sub(range.start_offset));
+        }
+        match visit(offset, &buffer[..read])? {
+            OrderedVisitDecision::Continue => {
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("ordered scan offset overflow"))?;
+            }
+            OrderedVisitDecision::Stop => {
+                return Ok(offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("ordered scan offset overflow"))?
+                    .saturating_sub(range.start_offset));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCacheLiftBenchmarkReport {
+    pub bytes_read: u64,
+    pub checkpoint_1: Duration,
+    pub checkpoint_2: Duration,
+}
+
+fn page_cache_lift_checkpoint_nanos(foreground_nanos: u64, background_nanos: u64) -> u64 {
+    foreground_nanos.max(background_nanos)
+}
+
+fn duration_to_u64_nanos(duration: Duration) -> io::Result<u64> {
+    u64::try_from(duration.as_nanos())
+        .map_err(|_| io::Error::other("benchmark duration overflowed u64 nanoseconds"))
+}
+
 pub fn open<P: AsRef<Path>>(path: P) -> io::Result<ParallelFile> {
     open_with_mode(path, IOMode::Auto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_cache_lift_checkpoint_nanos;
+
+    #[test]
+    fn page_cache_lift_checkpoint_never_precedes_foreground_completion() {
+        assert_eq!(page_cache_lift_checkpoint_nanos(9, 3), 9);
+        assert_eq!(page_cache_lift_checkpoint_nanos(9, 14), 14);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::page_cache_lift_checkpoint_nanos;
+
+    #[kani::proof]
+    fn checkpoint_2_is_monotonic_over_foreground_completion() {
+        let foreground_nanos: u64 = kani::any();
+        let background_nanos: u64 = kani::any();
+        let checkpoint_2 = page_cache_lift_checkpoint_nanos(foreground_nanos, background_nanos);
+        assert!(checkpoint_2 >= foreground_nanos);
+        assert!(checkpoint_2 >= background_nanos || checkpoint_2 == foreground_nanos);
+    }
 }
 
 pub fn open_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<ParallelFile> {
@@ -110,11 +346,61 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 pub fn read_file_with_mode<P: AsRef<Path>>(path: P, io_mode: IOMode) -> io::Result<Vec<u8>> {
     let config = load_config(None);
     Ok(
-        load_file_to_memory_for_mode(&config, "read", path_str(path.as_ref())?, io_mode)?
+        load_file_to_memory_for_mode(&config, "read_to_memory", path_str(path.as_ref())?, io_mode)?
             .data
             .as_slice()
             .to_vec(),
     )
+}
+
+/// Benchmark a cold-start direct-to-memory load while warming the page cache in
+/// parallel for the same file.
+///
+/// The call makes a best-effort cache eviction first, then starts:
+/// - a foreground `read_to_memory` load forced to `IOMode::Direct`
+/// - a background page-cache warm pass through the same file
+///
+/// `checkpoint_1` is when the application-owned direct load completes.
+/// `checkpoint_2` is when the background page-cache warm is also complete.
+pub fn benchmark_page_cache_lift<P: AsRef<Path>>(
+    path: P,
+) -> io::Result<PageCacheLiftBenchmarkReport> {
+    let path = path.as_ref();
+    let path_string = path_str(path)?.to_owned();
+    evict_file_cache(&path_string)?;
+
+    let start_barrier = Arc::new(Barrier::new(2));
+    let background_barrier = Arc::clone(&start_barrier);
+    let background_path = path_string.clone();
+    let start = Instant::now();
+    let background = thread::spawn(move || -> io::Result<(u64, u64)> {
+        background_barrier.wait();
+        let warmed = warm_file_page_cache(&background_path)?;
+        Ok((warmed, duration_to_u64_nanos(start.elapsed())?))
+    });
+
+    let config = load_config(None);
+    start_barrier.wait();
+    let loaded =
+        load_file_to_memory_for_mode(&config, "read_to_memory", &path_string, IOMode::Direct)?;
+    let checkpoint_1_nanos = duration_to_u64_nanos(start.elapsed())?;
+    let (background_warmed, background_nanos) = background
+        .join()
+        .map_err(|_| io::Error::other("background page-cache warm thread panicked"))??;
+
+    if background_warmed != loaded.bytes_read {
+        return Err(io::Error::other(format!(
+            "background page-cache warm read {} bytes but foreground loaded {}",
+            background_warmed, loaded.bytes_read
+        )));
+    }
+
+    let checkpoint_2_nanos = page_cache_lift_checkpoint_nanos(checkpoint_1_nanos, background_nanos);
+    Ok(PageCacheLiftBenchmarkReport {
+        bytes_read: loaded.bytes_read,
+        checkpoint_1: Duration::from_nanos(checkpoint_1_nanos),
+        checkpoint_2: Duration::from_nanos(checkpoint_2_nanos),
+    })
 }
 
 pub fn visit_blocks<P, F>(path: P, visit: F) -> io::Result<ParallelReadReport>

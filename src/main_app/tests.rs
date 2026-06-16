@@ -1,0 +1,810 @@
+use crate::common::{CopyStrategy, IOMode};
+use crate::config;
+use crate::main_app::cli;
+use crate::main_app::copy_plan::CopyRewriteMode;
+use crate::main_app::copy_plan::{
+    describe_copy_path, should_prefer_cached_diff_overwrite,
+    should_prefer_cached_read_direct_write, should_prefer_low_latency_copy_file_range_single,
+    should_prefer_standalone_nvme_copy_file_range_single, target_is_similar_size,
+    HeuristicCopyPlan, ResolvedCopyExecution,
+};
+use crate::main_app::recursive::move_dir;
+use crate::main_app::tuning::{
+    active_optimizer_param_mask, apply_manual_read_overrides, ManualReadOverrides,
+};
+use crate::main_app::{RecursiveCopyContext, RelativeCopyMethod};
+use crate::writer::{self, RecordedCopyBackend};
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static COPY_PATH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn heuristic_plan(
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    source_cached: bool,
+    target_cached: bool,
+    source_len: Option<u64>,
+    target_len: Option<u64>,
+    direct_write_supported: bool,
+    device_signature: Option<&config::DeviceSignature>,
+) -> HeuristicCopyPlan {
+    if should_prefer_cached_diff_overwrite(source_cached, target_cached, source_len, target_len) {
+        if direct_write_supported {
+            HeuristicCopyPlan::DiffOverwrite
+        } else {
+            HeuristicCopyPlan::CopyFileRangeSingle
+        }
+    } else if should_prefer_low_latency_copy_file_range_single(
+        &source_path.to_string_lossy(),
+        &target_path.to_string_lossy(),
+        source_len,
+    ) {
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+    } else if should_prefer_standalone_nvme_copy_file_range_single(
+        &source_path.to_string_lossy(),
+        &target_path.to_string_lossy(),
+        source_len,
+        device_signature,
+    ) {
+        HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle
+    } else if should_prefer_cached_read_direct_write(source_cached, source_len, target_len) {
+        HeuristicCopyPlan::CachedReadDirectWrite
+    } else {
+        HeuristicCopyPlan::DirectReadDirectWrite
+    }
+}
+
+fn standalone_nvme_device_signature() -> config::DeviceSignature {
+    config::DeviceSignature {
+        mount_source: "/dev/nvme0n1p1".into(),
+        canonical_source: "/dev/nvme0n1p1".into(),
+        match_keys: vec!["stack=nvme".into(), "leaf.kind=nvme".into()],
+        block_device: Some(config::BlockDeviceSignature {
+            kernel_name: "nvme0n1p1".into(),
+            devnode: "/dev/nvme0n1p1".into(),
+            by_id: Vec::new(),
+            vendor: None,
+            model: None,
+            rotational: Some(false),
+            dm_name: None,
+            md_level: None,
+            slaves: Vec::new(),
+        }),
+    }
+}
+
+#[test]
+fn verify_skips_block_size_mutations() {
+    assert_eq!(
+        active_optimizer_param_mask(
+            "verify",
+            IOMode::PageCache,
+            IOMode::Auto,
+            false,
+            CopyStrategy::Threaded
+        ),
+        vec![true, false, true, false, false, false, false, false, false]
+    );
+    assert_eq!(
+        active_optimizer_param_mask(
+            "verify",
+            IOMode::Direct,
+            IOMode::Auto,
+            false,
+            CopyStrategy::Threaded
+        ),
+        vec![false, false, false, true, false, true, false, false, false]
+    );
+}
+
+#[test]
+fn write_only_mutates_write_side_params() {
+    assert_eq!(
+        active_optimizer_param_mask(
+            "write",
+            IOMode::Auto,
+            IOMode::PageCache,
+            false,
+            CopyStrategy::Threaded
+        ),
+        vec![true, true, true, false, false, false, false, false, false]
+    );
+    assert_eq!(
+        active_optimizer_param_mask(
+            "copy",
+            IOMode::PageCache,
+            IOMode::Auto,
+            false,
+            CopyStrategy::Threaded
+        ),
+        vec![true, true, true, true, true, true, false, false, false]
+    );
+    assert_eq!(
+        active_optimizer_param_mask(
+            "copy",
+            IOMode::PageCache,
+            IOMode::Auto,
+            true,
+            CopyStrategy::Threaded
+        ),
+        vec![false, false, false, false, false, false, false, false, false]
+    );
+    assert_eq!(
+        active_optimizer_param_mask(
+            "copy",
+            IOMode::PageCache,
+            IOMode::Direct,
+            true,
+            CopyStrategy::Threaded
+        ),
+        vec![false, false, false, false, false, false, false, false, false]
+    );
+    assert_eq!(
+        active_optimizer_param_mask(
+            "copy",
+            IOMode::PageCache,
+            IOMode::PageCache,
+            false,
+            CopyStrategy::CopyFileRange
+        ),
+        vec![false, false, false, false, false, false, true, true, true]
+    );
+}
+
+#[test]
+fn manual_read_overrides_freeze_both_read_param_sets() {
+    let mut start_params = vec![8, 16, 2, 12, 32, 4, 1, 64, 1];
+    let mut params_steps = vec![1, 4096, 1, 1, 262144, 1, 1, 262144, 1];
+    let mut mask = vec![true; 9];
+    apply_manual_read_overrides(
+        &mut start_params,
+        &mut params_steps,
+        &mut mask,
+        ManualReadOverrides {
+            threads: Some(5),
+            block_size: Some(131072),
+            qd: Some(7),
+        },
+    );
+    assert_eq!(&start_params[..6], &[5, 131072, 7, 5, 131072, 7]);
+    assert_eq!(&params_steps[..6], &[1, 1, 1, 1, 1, 1]);
+    assert_eq!(&mask[..6], &[false, false, false, false, false, false]);
+}
+
+#[test]
+fn cached_read_direct_write_requires_hot_close_sized_target() {
+    assert!(should_prefer_cached_read_direct_write(
+        true,
+        Some(1024),
+        Some(1024)
+    ));
+    assert!(should_prefer_cached_read_direct_write(
+        true,
+        Some(1024),
+        Some(900)
+    ));
+    assert!(should_prefer_cached_read_direct_write(
+        true,
+        Some(1024),
+        Some(2048)
+    ));
+    assert!(should_prefer_cached_read_direct_write(
+        true,
+        Some(0),
+        Some(0)
+    ));
+    assert!(!should_prefer_cached_read_direct_write(
+        false,
+        Some(1024),
+        Some(1024)
+    ));
+    assert!(!should_prefer_cached_read_direct_write(
+        true,
+        Some(1024),
+        Some(716)
+    ));
+    assert!(!should_prefer_cached_read_direct_write(
+        true,
+        Some(1024),
+        None
+    ));
+}
+
+#[test]
+fn cached_diff_overwrite_requires_hot_similar_sized_files() {
+    assert!(should_prefer_cached_diff_overwrite(
+        true,
+        true,
+        Some(1024),
+        Some(900)
+    ));
+    assert!(!should_prefer_cached_diff_overwrite(
+        true,
+        false,
+        Some(1024),
+        Some(900)
+    ));
+    assert!(!should_prefer_cached_diff_overwrite(
+        false,
+        true,
+        Some(1024),
+        Some(900)
+    ));
+    assert!(!should_prefer_cached_diff_overwrite(
+        true,
+        true,
+        Some(1024),
+        Some(600)
+    ));
+}
+
+#[test]
+fn zero_length_source_is_only_similar_to_zero_length_target() {
+    assert!(target_is_similar_size(Some(0), Some(0)));
+    assert!(!target_is_similar_size(Some(0), Some(1)));
+}
+
+#[test]
+fn heuristic_plan_prefers_diff_overwrite_then_copy_file_range_single_fallback() {
+    let root = unique_temp_dir("fro-copy-heuristic");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&source, b"payload").unwrap();
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            true,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
+        HeuristicCopyPlan::DiffOverwrite
+    );
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            true,
+            Some(1024),
+            Some(900),
+            false,
+            None
+        ),
+        HeuristicCopyPlan::CopyFileRangeSingle
+    );
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            true,
+            false,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+    );
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(1024),
+            Some(900),
+            true,
+            None
+        ),
+        HeuristicCopyPlan::LowLatencyCopyFileRangeSingle
+    );
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(256 * 1024 + 1),
+            Some(900),
+            true,
+            None,
+        ),
+        HeuristicCopyPlan::DirectReadDirectWrite
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn heuristic_plan_prefers_copy_file_range_single_for_large_standalone_nvme_copies() {
+    let root = unique_temp_dir("fro-copy-heuristic-nvme");
+    let source = root.join("source.bin");
+    let target = root.join("target.bin");
+    fs::write(&source, vec![7_u8; 4096]).unwrap();
+    let device = standalone_nvme_device_signature();
+    assert_eq!(
+        heuristic_plan(
+            &source,
+            &target,
+            false,
+            false,
+            Some(64 * 1024 * 1024),
+            None,
+            true,
+            Some(&device),
+        ),
+        HeuristicCopyPlan::StandaloneNvmeCopyFileRangeSingle
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn describe_copy_path_reports_diff_overwrite_details() {
+    let path = describe_copy_path(
+        ResolvedCopyExecution {
+            copy_strategy: CopyStrategy::Threaded,
+            io_mode_read: IOMode::PageCache,
+            io_mode_write: IOMode::Direct,
+            diff_overwrite: true,
+            full_rewrite: false,
+            path_label: "auto diff-overwrite",
+        },
+        false,
+        false,
+    );
+    assert!(path.contains("strategy=auto diff-overwrite"));
+    assert!(path.contains("read=page-cache"));
+    assert!(path.contains("write=direct"));
+    assert!(path.contains("delta=changed-chunks"));
+}
+
+#[test]
+fn describe_copy_path_reports_via_memory_path() {
+    let path = describe_copy_path(
+        ResolvedCopyExecution {
+            copy_strategy: CopyStrategy::Threaded,
+            io_mode_read: IOMode::PageCache,
+            io_mode_write: IOMode::Direct,
+            diff_overwrite: false,
+            full_rewrite: false,
+            path_label: "auto cached-read direct-write",
+        },
+        true,
+        false,
+    );
+    assert_eq!(
+        path,
+        "copy path: via-memory [read=page-cache, write=direct]"
+    );
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("target");
+    path.push("test-tmp");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn set_env_var(key: &str, value: Option<&str>) -> Option<String> {
+    let old = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    old
+}
+
+fn restore_env_var(key: &str, old: Option<String>) {
+    match old {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+fn set_path_mtime(path: &std::path::Path, seconds: i64) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "failed to set timestamps for {}", path.display());
+}
+
+#[test]
+fn cp_path_preserving_single_file_flags_keep_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    struct Case {
+        name: &'static str,
+        configure: fn(&mut cli::TestCopyRunOptions, &std::path::Path, &std::path::Path),
+    }
+
+    let cases = [
+        Case {
+            name: "plain",
+            configure: |_args, _source, _target| {},
+        },
+        Case {
+            name: "verbose",
+            configure: |args, _source, _target| args.verbose = true,
+        },
+        Case {
+            name: "preserve-timestamps",
+            configure: |args, source, _target| {
+                args.cp_preserve_timestamps = true;
+                set_path_mtime(source, 1_234_567_890);
+            },
+        },
+        Case {
+            name: "preserve-mode",
+            configure: |args, source, _target| {
+                args.cp_preserve_mode = true;
+                fs::set_permissions(source, fs::Permissions::from_mode(0o751)).unwrap();
+            },
+        },
+        Case {
+            name: "no-clobber-copy",
+            configure: |args, _source, _target| args.cp_no_clobber = true,
+        },
+        Case {
+            name: "update-copy",
+            configure: |args, source, target| {
+                args.cp_update = true;
+                fs::write(target, b"stale").unwrap();
+                set_path_mtime(target, 1_234_567_880);
+                set_path_mtime(source, 1_234_567_890);
+            },
+        },
+        Case {
+            name: "no-target-directory",
+            configure: |args, _source, _target| args.cp_no_target_directory = true,
+        },
+    ];
+
+    for case in cases {
+        let root = unique_temp_dir(&format!("fro-copy-path-single-{}", case.name));
+        let source = root.join("source.txt");
+        let target = root.join("target.txt");
+        fs::write(&source, format!("payload-{}", case.name)).unwrap();
+
+        let mut args = cli::TestCopyRunOptions {
+            source: source.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+            recursive: false,
+            verbose: false,
+            cp_no_clobber: false,
+            cp_no_target_directory: false,
+            cp_update: false,
+            cp_preserve_mode: false,
+            cp_preserve_timestamps: false,
+            cp_no_dereference: false,
+            cp_dereference: false,
+        };
+        (case.configure)(&mut args, &source, &target);
+
+        writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+        let exit_code = cli::run_test_copy(args).unwrap();
+        let backends = writer::finish_copy_backend_trace();
+
+        assert_eq!(exit_code, 0, "case {}", case.name);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            fs::read(&source).unwrap(),
+            "case {}",
+            case.name
+        );
+        assert_eq!(
+            backends,
+            vec![RecordedCopyBackend::Threaded],
+            "case {}",
+            case.name
+        );
+        if case.name == "preserve-mode" {
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o751
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn cp_existing_directory_target_uses_child_basename_and_keeps_threaded_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-existing-directory-target");
+    let source = root.join("source.txt");
+    let target_dir = root.join("target-dir");
+    let copied = target_dir.join("source.txt");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(&source, b"dir-target-payload").unwrap();
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(cli::TestCopyRunOptions {
+        source: source.to_string_lossy().into_owned(),
+        target: target_dir.to_string_lossy().into_owned(),
+        recursive: false,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: false,
+        cp_no_dereference: false,
+        cp_dereference: false,
+    })
+    .unwrap();
+    let backends = writer::finish_copy_backend_trace();
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_recursive_preserve_and_verbose_keep_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive");
+    let source_root = root.join("source");
+    let source_dir = source_root.join("dir");
+    let target_root = root.join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("payload.bin");
+    fs::write(&source_file, b"recursive-copy-payload").unwrap();
+    set_path_mtime(&source_file, 1_234_567_890);
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: true,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: true,
+        cp_no_dereference: false,
+        cp_dereference: false,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    let copied = target_root.join("dir/payload.bin");
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source_file).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+
+    let source_mtime = fs::metadata(&source_file).unwrap().mtime();
+    let copied_mtime = fs::metadata(&copied).unwrap().mtime();
+    assert_eq!(copied_mtime, source_mtime);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_archive_recursive_keeps_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive-archive");
+    let source_root = root.join("source");
+    let source_dir = source_root.join("dir");
+    let target_root = root.join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("payload.bin");
+    fs::write(&source_file, b"recursive-archive-payload").unwrap();
+    set_path_mtime(&source_file, 1_234_567_890);
+    std::os::unix::fs::symlink("../dir/payload.bin", source_root.join("payload-link")).unwrap();
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: true,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: true,
+        cp_preserve_timestamps: true,
+        cp_no_dereference: true,
+        cp_dereference: false,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    let copied = target_root.join("dir/payload.bin");
+    let copied_link = target_root.join("payload-link");
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&copied).unwrap(), fs::read(&source_file).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded]);
+    assert_eq!(
+        fs::read_link(&copied_link).unwrap(),
+        PathBuf::from("../dir/payload.bin")
+    );
+
+    let source_mtime = fs::metadata(&source_file).unwrap().mtime();
+    let copied_mtime = fs::metadata(&copied).unwrap().mtime();
+    assert_eq!(copied_mtime, source_mtime);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_archive_dereference_recursive_keeps_threaded_copy_backend() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-recursive-archive-dereference");
+    let source_root = root.join("source");
+    let target_root = root.join("target");
+    fs::create_dir_all(source_root.join("dir")).unwrap();
+    fs::write(
+        source_root.join("dir/payload.bin"),
+        b"recursive-archive-dereference",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("dir", source_root.join("dir-link")).unwrap();
+    std::os::unix::fs::symlink("dir/payload.bin", source_root.join("payload-link")).unwrap();
+
+    let threshold = set_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", Some("1"));
+
+    let args = cli::TestCopyRunOptions {
+        source: source_root.to_string_lossy().into_owned(),
+        target: target_root.to_string_lossy().into_owned(),
+        recursive: true,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: true,
+        cp_preserve_timestamps: true,
+        cp_no_dereference: false,
+        cp_dereference: true,
+    };
+
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(args).unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var("FRO_RECURSIVE_COPY_THREADED_THRESHOLD", threshold);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        fs::read(target_root.join("payload-link")).unwrap(),
+        b"recursive-archive-dereference"
+    );
+    assert!(target_root.join("dir-link").is_dir());
+    assert_eq!(
+        fs::read(target_root.join("dir-link/payload.bin")).unwrap(),
+        b"recursive-archive-dereference"
+    );
+    assert_eq!(backends, vec![RecordedCopyBackend::Threaded; 3]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cp_falls_back_when_io_uring_setup_is_unavailable() {
+    let _lock = COPY_PATH_TEST_LOCK.lock().unwrap();
+    let root = unique_temp_dir("fro-copy-path-fallback");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::write(&source, b"fallback-copy-payload").unwrap();
+
+    let forced = set_env_var(crate::uring_util::FORCE_NO_IO_URING_ENV, Some("1"));
+    writer::begin_copy_backend_trace(root.to_string_lossy().into_owned());
+    let exit_code = cli::run_test_copy(cli::TestCopyRunOptions {
+        source: source.to_string_lossy().into_owned(),
+        target: target.to_string_lossy().into_owned(),
+        recursive: false,
+        verbose: false,
+        cp_no_clobber: false,
+        cp_no_target_directory: false,
+        cp_update: false,
+        cp_preserve_mode: false,
+        cp_preserve_timestamps: false,
+        cp_no_dereference: false,
+        cp_dereference: false,
+    })
+    .unwrap();
+    let backends = writer::finish_copy_backend_trace();
+    restore_env_var(crate::uring_util::FORCE_NO_IO_URING_ENV, forced);
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(fs::read(&target).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(backends, vec![RecordedCopyBackend::Blocking]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn recursive_move_keeps_pending_state_until_large_children_finish() {
+    let root = unique_temp_dir("fro-main-app-recursive-move");
+    let source_root = root.join("src");
+    let target_root = root.join("dst");
+    fs::create_dir_all(source_root.join("000/000")).unwrap();
+    fs::create_dir_all(source_root.join("000/001")).unwrap();
+
+    let large_a = vec![0x41; (17 << 20) + 123];
+    let large_b = vec![0x42; (18 << 20) + 321];
+    fs::write(source_root.join("000/000/a.bin"), &large_a).unwrap();
+    fs::write(source_root.join("000/001/b.bin"), &large_b).unwrap();
+
+    let config = config::load_config(None);
+    let target_str = target_root.to_string_lossy();
+    let params_page_cache = config.get_params_for_path("copy", false, target_str.as_ref());
+    let params_direct = config.get_params_for_path("copy", true, target_str.as_ref());
+    let params_copy_range = config.get_copy_range_params_for_path(target_str.as_ref());
+    let ctx = RecursiveCopyContext {
+        config,
+        source_root: source_root.clone(),
+        target_root: target_root.clone(),
+        optimizer_params: [
+            params_page_cache.num_threads,
+            params_page_cache.block_size,
+            params_page_cache.qd as u64,
+            params_direct.num_threads,
+            params_direct.block_size,
+            params_direct.qd as u64,
+            params_copy_range.num_threads,
+            params_copy_range.block_size,
+            params_copy_range.qd as u64,
+        ],
+        requested_strategy: CopyStrategy::Auto,
+        rewrite_mode: CopyRewriteMode::Auto,
+        io_mode_read: IOMode::Auto,
+        io_mode_write: IOMode::Auto,
+        keep_target_size: false,
+        use_lock: true,
+        relative_copy_method: RelativeCopyMethod::CopyFileRange,
+        verbose: false,
+        cp_compat: false,
+        cp_no_clobber: false,
+        follow_symlinks: false,
+        preserve_timestamps: false,
+    };
+
+    let moved = move_dir::run_recursive_move(ctx, false).unwrap();
+    assert_eq!(moved, (large_a.len() + large_b.len()) as u64);
+    assert!(!source_root.exists());
+    assert_eq!(
+        fs::read(target_root.join("000/000/a.bin")).unwrap(),
+        large_a
+    );
+    assert_eq!(
+        fs::read(target_root.join("000/001/b.bin")).unwrap(),
+        large_b
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

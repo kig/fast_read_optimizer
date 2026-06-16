@@ -380,7 +380,7 @@ pub(crate) fn copy_file_verified_with_options_and_lock<S: AsRef<Path>, D: AsRef<
     )?;
 
     let bytes_copied = if via_memory {
-        let loaded = load_file_to_memory_for_mode(&config, "read", source, io_mode_read)?;
+        let loaded = load_file_to_memory_for_mode(&config, "read_to_memory", source, io_mode_read)?;
         let write_page_cache = config.get_params_for_path("write", false, target);
         let write_direct = config.get_params_for_path("write", true, target);
         write_buffer(

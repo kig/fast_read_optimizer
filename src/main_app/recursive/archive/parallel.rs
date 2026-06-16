@@ -1,0 +1,411 @@
+use super::*;
+
+impl TarParallelSampler {
+    pub(super) fn start(label: &'static str, counters: Arc<TarParallelCounters>) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_flag = done.clone();
+        let handle = std::thread::spawn(move || -> io::Result<()> {
+            while !done_flag.load(Ordering::Relaxed) {
+                let small_tasks = counters.small_slab_tasks_inflight.load(Ordering::Relaxed);
+                let small_entries = counters.small_slab_entries_inflight.load(Ordering::Relaxed);
+                let sendfile = counters.sendfile_streams_inflight.load(Ordering::Relaxed);
+                let mt_jobs = counters.mt_copy_jobs_inflight.load(Ordering::Relaxed);
+                let mt_threads = counters.mt_copy_threads_inflight.load(Ordering::Relaxed);
+                fro::cio_eprintln!(
+                    "{label} parallel: small_slab_tasks={small_tasks}, small_slab_entries={small_entries}, sendfile_streams={sendfile}, mt_copy_jobs={mt_jobs}, mt_copy_threads={mt_threads}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(())
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    pub(super) fn finish(mut self) -> io::Result<()> {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("tar parallel sampler panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+fn sendfile_to_sink(
+    source: &fs::File,
+    target: &fs::File,
+    source_len: u64,
+) -> io::Result<Option<u64>> {
+    let mut copied_total = 0_u64;
+    let mut source_pos: fro::os::loff_t = 0;
+    while copied_total < source_len {
+        let remaining = source_len - copied_total;
+        let chunk = remaining.min(TAR_FAST_COPY_SENDFILE_CHUNK_SIZE as u64) as usize;
+        let copied = match fro::os::sendfile(
+            target.as_raw_fd(),
+            source.as_raw_fd(),
+            &mut source_pos,
+            chunk,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                match err.raw_os_error() {
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EXDEV) => {
+                        return Ok(None)
+                    }
+                    _ => return Err(err),
+                }
+            }
+        };
+        if copied > 0 {
+            copied_total = copied_total.saturating_add(copied as u64);
+            continue;
+        }
+        if copied == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("sendfile stopped early after {copied_total} of {source_len} bytes"),
+            ));
+        }
+    }
+    Ok(Some(copied_total))
+}
+
+fn write_all(file: &mut fs::File, data: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < data.len() {
+        let count = file.write(&data[written..])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short tar stream write",
+            ));
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+fn buffered_stream_copy(
+    source: &fs::File,
+    target: &mut fs::File,
+    source_len: u64,
+) -> io::Result<u64> {
+    let mut buffer = vec![0u8; TAR_COPY_BUFFER_SIZE.min(source_len.max(1) as usize)];
+    let mut copied_total = 0_u64;
+    while copied_total < source_len {
+        let remaining = source_len - copied_total;
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        let read = source.read_at(&mut buffer[..chunk], copied_total)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short buffered tar read after {copied_total} of {source_len} bytes"),
+            ));
+        }
+        write_all(target, &buffer[..read])?;
+        copied_total = copied_total.saturating_add(read as u64);
+    }
+    Ok(copied_total)
+}
+
+pub(super) fn tar_entry_total_len(entry: &TarEntry) -> u64 {
+    TAR_BLOCK_SIZE
+        + match &entry.kind {
+            TarEntryKind::RegularFile { size, .. } => align_up(*size, TAR_BLOCK_SIZE),
+            TarEntryKind::Directory | TarEntryKind::Symlink { .. } => 0,
+        }
+}
+
+pub(super) fn tar_entry_padding_len(entry: &TarEntry) -> u64 {
+    match &entry.kind {
+        TarEntryKind::RegularFile { size, .. } => {
+            align_up(*size, TAR_BLOCK_SIZE).saturating_sub(*size)
+        }
+        TarEntryKind::Directory | TarEntryKind::Symlink { .. } => 0,
+    }
+}
+
+fn tar_entry_is_small(entry: &TarEntry) -> bool {
+    match &entry.kind {
+        TarEntryKind::RegularFile { .. } => {
+            tar_entry_total_len(entry) <= TAR_SMALL_SLAB_TARGET_BYTES as u64
+        }
+        TarEntryKind::Directory | TarEntryKind::Symlink { .. } => true,
+    }
+}
+
+fn push_current_slab(
+    planned: &mut Vec<TarPlannedTask>,
+    current_start: &mut Option<u64>,
+    current_end: &mut u64,
+    current_entries: &mut Vec<usize>,
+) {
+    if let Some(start_offset) = current_start.take() {
+        planned.push(TarPlannedTask::Slab(TarSlabTask {
+            start_offset,
+            len: current_end.saturating_sub(start_offset),
+            entry_indices: std::mem::take(current_entries),
+        }));
+        *current_end = 0;
+    }
+}
+
+pub(super) fn plan_tar_tasks(entries: &[TarEntry]) -> Vec<TarPlannedTask> {
+    let mut planned = Vec::new();
+    let mut current_start = None;
+    let mut current_end = 0_u64;
+    let mut current_entries = Vec::new();
+
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if tar_entry_is_small(entry) {
+            let entry_start = entry.header_offset;
+            let entry_end = entry_start.saturating_add(tar_entry_total_len(entry));
+            if let Some(start_offset) = current_start {
+                let contiguous = entry_start == current_end;
+                let proposed_len = entry_end.saturating_sub(start_offset);
+                if contiguous && proposed_len <= TAR_SMALL_SLAB_TARGET_BYTES as u64 {
+                    current_entries.push(entry_index);
+                    current_end = entry_end;
+                    continue;
+                }
+                push_current_slab(
+                    &mut planned,
+                    &mut current_start,
+                    &mut current_end,
+                    &mut current_entries,
+                );
+            }
+            current_start = Some(entry_start);
+            current_end = entry_end;
+            current_entries.push(entry_index);
+        } else {
+            push_current_slab(
+                &mut planned,
+                &mut current_start,
+                &mut current_end,
+                &mut current_entries,
+            );
+            planned.push(TarPlannedTask::Large(TarLargeTask { entry_index }));
+        }
+    }
+
+    push_current_slab(
+        &mut planned,
+        &mut current_start,
+        &mut current_end,
+        &mut current_entries,
+    );
+    planned
+}
+
+pub(super) fn usize_from_u64(value: u64, label: &str) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} does not fit in usize"),
+        )
+    })
+}
+
+pub(super) fn read_small_file_into(source_path: &Path, destination: &mut [u8]) -> io::Result<()> {
+    let mut source = fs::File::open(source_path)?;
+    source.read_exact(destination)
+}
+
+impl ReusableTarSlab {
+    pub(super) fn new() -> io::Result<Self> {
+        let buffer = AlignedBuffer::new_uninit(TAR_SMALL_SLAB_TARGET_BYTES)?;
+        madvise_best_effort(
+            buffer.as_slice().as_ptr() as *mut libc::c_void,
+            buffer.len(),
+            fro::os::MADV_HUGEPAGE,
+        )?;
+        Ok(Self { buffer })
+    }
+
+    pub(super) fn fill<'a>(
+        &'a mut self,
+        entries: &[TarEntry],
+        task: &TarSlabTask,
+    ) -> io::Result<&'a [u8]> {
+        let slab_len = usize_from_u64(task.len, "tar slab length")?;
+        let slab = &mut self.buffer.as_mut_slice()[..slab_len];
+        slab.fill(0);
+        for &entry_index in &task.entry_indices {
+            let entry = &entries[entry_index];
+            let header_offset = usize_from_u64(
+                entry.header_offset.saturating_sub(task.start_offset),
+                "tar slab header offset",
+            )?;
+            let header_end = header_offset
+                .checked_add(TAR_BLOCK_SIZE as usize)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "tar slab header overflowed")
+                })?;
+            slab[header_offset..header_end].copy_from_slice(&tar_header_bytes(entry)?);
+            if let TarEntryKind::RegularFile { size, source_path } = &entry.kind {
+                let data_offset = usize_from_u64(
+                    entry.data_offset.saturating_sub(task.start_offset),
+                    "tar slab data offset",
+                )?;
+                let data_len = usize_from_u64(*size, "tar small file size")?;
+                let data_end = data_offset.checked_add(data_len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "tar slab data overflowed")
+                })?;
+                read_small_file_into(source_path, &mut slab[data_offset..data_end])?;
+            }
+        }
+        Ok(&slab[..])
+    }
+}
+
+pub(super) fn write_tar_large_entry(
+    entry: &TarEntry,
+    output: &str,
+    page_cache_params: &IOParams,
+    direct_params: &IOParams,
+    counters: Option<&TarParallelCounters>,
+) -> io::Result<u64> {
+    if let Some(counters) = counters {
+        counters
+            .mt_copy_jobs_inflight
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .mt_copy_threads_inflight
+            .fetch_add(direct_params.num_threads as usize, Ordering::Relaxed);
+    }
+    let output_file = OpenOptions::new().write(true).open(output)?;
+    let header = tar_header_bytes(entry)?;
+    write_all_at(&output_file, entry.header_offset, &header)?;
+    let result = if let TarEntryKind::RegularFile { size, source_path } = &entry.kind {
+        let source = source_path.to_string_lossy();
+        copy_file_range_threaded(
+            source.as_ref(),
+            output,
+            0,
+            entry.data_offset,
+            *size,
+            false,
+            page_cache_params.num_threads,
+            page_cache_params.block_size,
+            page_cache_params.qd,
+            direct_params.num_threads,
+            direct_params.block_size,
+            direct_params.qd,
+            IOMode::Auto,
+            IOMode::Direct,
+            None,
+        )?;
+        Ok(tar_entry_total_len(entry))
+    } else {
+        Ok(tar_entry_total_len(entry))
+    };
+    if let Some(counters) = counters {
+        counters
+            .mt_copy_jobs_inflight
+            .fetch_sub(1, Ordering::Relaxed);
+        counters
+            .mt_copy_threads_inflight
+            .fetch_sub(direct_params.num_threads as usize, Ordering::Relaxed);
+    }
+    result
+}
+
+pub(super) fn stream_tar_to_dev_null(
+    entries: &[TarEntry],
+    tasks: &[TarPlannedTask],
+    verbose: bool,
+) -> io::Result<u64> {
+    let mut dev_null = OpenOptions::new().write(true).open("/dev/null")?;
+    let mut total_bytes = 0_u64;
+    let mut slab = ReusableTarSlab::new()?;
+    let parallel_counters = Arc::new(TarParallelCounters::default());
+    let parallel_sampler = if verbose {
+        Some(TarParallelSampler::start(
+            "tar-devnull",
+            parallel_counters.clone(),
+        ))
+    } else {
+        None
+    };
+    for task in tasks {
+        match task {
+            TarPlannedTask::Slab(task) => {
+                parallel_counters
+                    .small_slab_tasks_inflight
+                    .fetch_add(1, Ordering::Relaxed);
+                parallel_counters
+                    .small_slab_entries_inflight
+                    .fetch_add(task.entry_indices.len(), Ordering::Relaxed);
+                let slab_bytes = slab.fill(entries, task)?;
+                write_all(&mut dev_null, slab_bytes)?;
+                parallel_counters
+                    .small_slab_tasks_inflight
+                    .fetch_sub(1, Ordering::Relaxed);
+                parallel_counters
+                    .small_slab_entries_inflight
+                    .fetch_sub(task.entry_indices.len(), Ordering::Relaxed);
+                total_bytes = total_bytes.saturating_add(task.len);
+            }
+            TarPlannedTask::Large(task) => {
+                let entry = &entries[task.entry_index];
+                let header = tar_header_bytes(entry)?;
+                write_all(&mut dev_null, &header)?;
+                total_bytes = total_bytes.saturating_add(TAR_BLOCK_SIZE);
+                if let TarEntryKind::RegularFile { size, source_path } = &entry.kind {
+                    let source_file = fs::File::open(source_path)?;
+                    parallel_counters
+                        .sendfile_streams_inflight
+                        .fetch_add(1, Ordering::Relaxed);
+                    let copied = match sendfile_to_sink(&source_file, &dev_null, *size)? {
+                        Some(copied) => copied,
+                        None => buffered_stream_copy(&source_file, &mut dev_null, *size)?,
+                    };
+                    parallel_counters
+                        .sendfile_streams_inflight
+                        .fetch_sub(1, Ordering::Relaxed);
+                    total_bytes = total_bytes.saturating_add(copied);
+                    let padding = tar_entry_padding_len(entry);
+                    if padding > 0 {
+                        let zero_pad = [0u8; TAR_BLOCK_SIZE as usize];
+                        write_all(&mut dev_null, &zero_pad[..padding as usize])?;
+                        total_bytes = total_bytes.saturating_add(padding);
+                    }
+                }
+            }
+        }
+    }
+    let zero_blocks = [0u8; TAR_EOF_BLOCKS as usize];
+    write_all(&mut dev_null, &zero_blocks)?;
+    total_bytes = total_bytes.saturating_add(TAR_EOF_BLOCKS);
+    if verbose {
+        fro::cio_eprintln!("tar create: streamed {} bytes to /dev/null", total_bytes);
+    }
+    if let Some(sampler) = parallel_sampler {
+        sampler.finish()?;
+    }
+    Ok(total_bytes)
+}
+
+pub(super) fn write_all_at(file: &fs::File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < data.len() {
+        let count = file.write_at(&data[written..], offset + written as u64)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short tar header write",
+            ));
+        }
+        written += count;
+    }
+    Ok(())
+}

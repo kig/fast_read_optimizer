@@ -1,5 +1,205 @@
 # History
 
+## 2026-04-10
+
+- Fixed the pre-existing `fifo::fifo_text_inputs_match_system_output` stall by correcting `tail`'s non-regular `-n` path: FIFO `tail -n` inputs now use the windowed trailing-line path instead of the from-start helper, the focused FIFO regression passes, and `cargo +stable test --quiet` completes again on this host.
+- `cmp` gained a bounded tiny regular-file fast path in `src/coreutils/cmp.rs`: when both inputs are regular files, the compared window is small (`<= 128 KiB`), and direct I/O is not forced, `cmp` now uses small `pread` reads instead of spinning up the parallel read path. Measured tiny-file `cmp --quiet` went from roughly `155 ms` to `3.3 ms`, leaving a much smaller residual gap that now looks mostly frontend/startup dominated.
+- `du` now caps tiny-walk worker oversubscription in `src/coreutils/du.rs` by bounding the traversal worker count to `8`, after tracing showed the tiny-tree case was paying for `64` worker threads with otherwise similar metadata syscall counts. Measured tiny-tree `du` improved from about `9.8 ms` to `5.0 ms`, and `du -s` from about `9.1 ms` to `5.1 ms`.
+- `tac` now uses a bounded tiny regular-file stdout fast path in `src/coreutils/tac.rs`: small regular-file inputs (`<= 64 KiB`) skip the async stdout writer, and reverse emission now walks lines in place instead of building an intermediate `Vec<&[u8]>`. Measured tiny-file `tac` improved from about `4.5 ms` to `3.5 ms`.
+- `sort` gained a bounded tiny regular-file fast path in `src/coreutils/sort/external.rs`: small regular-file inputs (`<= 64 KiB`), stdout output, and non-direct mode now read directly with `fs::read` and sort in memory without the heavier streamed path. On the measured tiny supported modes, fro means improved from roughly `4.13 -> 3.52 ms` (bytewise), `3.96 -> 2.87 ms` (numeric), `4.03 -> 3.03 ms` (general), with smaller wins on human/month/version sorts.
+- Re-ran the shell-heavy Docker harness after the startup/cache wave using `perf/ubuntu_install_container_bench.sh` (`wave-20260410-022540`): baseline host wall was `3.944314s`, `fro` host wall was `14.437217s`, `fro` internal total was `13.813876s`, there were `996` fro-shadowed calls, and fallbacks stayed at `0`, leaving the shell workload still `+266.03%` slower on host wall (`+312.11%` internal) even after the current startup work.
+- Re-ran a broad tiny-file alias sweep against system commands. The worst remaining measured latency gaps were `cmp` (~`149.668 ms` vs `2.709 ms`, `55.26x`), then the digest family (`sha224sum`/`b2sum`/`sha384sum`/`sha256sum`/`sha512sum`/`md5sum` at roughly `16-17x` system), then `du` (`4.32x`), `tac` (`3.40x`), and `sort` (`3.26x`). In contrast, the staged `encrypt` / `decrypt` slices now measured at parity on the same tiny-workload sweep (`1.01x` / `0.99x` system).
+- Audited the remaining hash startup path and cut two wasted config-path operations: `mount_patch_for_path_prefix()` now skips `normalize_path()` entirely when there are no configured mount overrides, and `ParallelFile` block visitors now reuse a single `get_params_for_path()` pair instead of refetching the same page-cache/direct params twice for the same path. The tiny `md5sum` path still remained in the same broad latency band on the rerun (`fro` ~`43.541 ms`, dedicated `md5sum` ~`41.387 ms`, system `md5sum` ~`2.508 ms`), so this patch is recorded as a safe startup cleanup rather than a major standalone win.
+- Cached `/proc/self/mountinfo` per process in `src/config/device.rs` and reused the already-resolved mount inside `effective_config_for_path` / `explain_for_path`, cutting sampled mountinfo opens from `13` to `1` on both `fro read -n 1 README.md` and `fro --json-config README.md` while keeping the existing config semantics within a process.
+- Cached the default config load path per process in `src/config/storage.rs`, keyed by the resolved default config path and refreshed on successful saves, while leaving explicit config-path loads uncached so tests and `-c` flows can still observe fresh state. Focused validation passed, and a `2000`-load benchmark dropped from `36.637 ms` for the explicit uncached equivalent to `0.928 ms` for cached default-path loads.
+- Reduced shared startup tax in the config path by memoizing missing device-db lookups in `src/config/mod.rs`, so sampled tiny invocations stopped paying the same missing-file `openat(...)=ENOENT` cost repeatedly (`18 -> 3` failed probes on the measured `fro read -n 1 README.md` case), with focused config coverage for the memoization behavior.
+- Landed staged small-file `encrypt` / `decrypt` regular-file fast paths in `src/coreutils/encrypt.rs`, then fixed the initial CTR chunk-index bug by reusing the existing block-aware reader stream helper and adding a regression test that forces partial reads across encrypt blocks. On a `700 KiB + 19 B` payload, the landed path improved measured small-file timings from `74.387 ms -> 20.626 ms` for encrypt and `26.241 ms -> 20.366 ms` for decrypt, essentially matching the system OpenSSL equivalents on that slice (`19.340 ms` / `20.691 ms`).
+- Rejected a separate checksum-family staging seam after investigation: `cksum` already has its bounded small-file path, and the remaining tiny-file checksum gap is still dominated by shared startup/config cost rather than missing command-local hashing logic.
+- Added bounded dedicated `md5sum` and `sha256sum` binaries as one-purpose library-API frontends instead of thin multicall wrappers. The binaries are much smaller (`~1.99 MB` each vs `9.77 MB` for `fro`), but local tiny-file timings showed only a modest startup improvement because the public hash APIs still load config (`md5sum 43.129 ms` dedicated vs `43.331 ms` via `fro`; `sha256sum 42.673 ms` dedicated vs `43.780 ms` via `fro`; system tools stayed around `2.53 ms`).
+- Added a reusable staged file-to-file transform helper in `src/stream/transform.rs`, generalized `run_reader_transform_to_file(...)` over the processor closure, and switched `base64` regular-file-to-regular-file output onto that helper with a conservative `2 MiB` threshold so tiny redirected-file transforms can stay synchronous while larger files keep the parallel path.
+- Added a bounded tar.zstd MVP: `tar` now understands `TarCompression::Zstd`, infers `.tar.zst` / `.tar.zstd` / `.tzst`, accepts `-J` / `--zstd`, uses the `zstd` crate with the `zstdmt` feature for multithreaded compressed create, and supports list/extract on zstd-compressed archives with focused compatibility coverage plus updated help/coverage snapshots.
+- Measured focused single-tool binary overhead using the existing `examples/b3sum.rs` control and found a real startup win versus multicall/wrapper on tiny invocations (about `0.86-0.87s / 200` vs `1.07-1.09s / 200`), establishing a concrete basis for deciding whether to ship bounded standalone binaries for startup-sensitive commands.
+
+## 2026-04-09
+
+- Replaced the ad hoc Python help-diff helper with a Rust-owned actual-help coverage report inside `tests/compat_coverage_report.rs`: the test suite now computes per-command `%` coverage directly from tokenized `fro <cmd> --help` vs system `<cmd> --help`, records the remaining flags on one line, and no longer depends on `compare_help_flags.py`.
+- Replaced the low-signal Ubuntu package-install benchmark with a deterministic shell-heavy container harness while reusing the useful PATH-shadowing and fallback instrumentation: `perf/ubuntu_install_container_bench.sh` now seeds local project-style data, runs configure/build/package/verify shell slices inside `docker/ubuntu-install-bench/`, records baseline vs fro phase/host-wall timings, emits per-command fro call counts, and uses `--security-opt seccomp=unconfined` so the container does not distort `fro` with blocked `io_uring` syscalls. The first validated replacement run (`local-shell-bench-unconfined`) exercised `996` fro calls with `0` fallbacks across `36` modules / `6` archives and measured `4.118850s` baseline vs `19.518400s` fro host wall (`+373.88%`).
+- `mv` gained a bounded GNU compatibility slice for `-n` / `--no-clobber` and `-u` / `--update`, preserving the same rename-first / cross-filesystem copy-remove backend while moving the tracked `mv` row from `3/3` to `5/5`.
+- `head` and `tail` gained bounded `-z` / `--zero-terminated` slices on top of their existing implementations, threading NUL-delimited record semantics through file and stdin handling and moving both tracked rows to `5/5`.
+- The new unsupported-flag fallback path is now controllable and observable: `--no-fallback` strips the wrapper flag before local parsing and disables external delegation so tests can fail fast on unsupported surfaces, while `FRO_LOG_FALLBACKS=1` writes one stderr line for each actual delegation to `rg`, `coreutils`, or the system command during full-system audits.
+- Added a Docker-based Ubuntu package-install benchmark harness for full-system fallback and throughput audits: `perf/ubuntu_install_container_bench.sh` now builds `docker/ubuntu-install-bench/`, shadows the supported coreutils names with `fro` in PATH for the fro run, binds package-manager state under `/data/fro-test/ubuntu-install-bench`, records baseline vs fro phase timings, and logs fallback hits via `FRO_LOG_FALLBACKS=1`. The current shell could not execute the benchmark because it lacks Docker daemon access, so the harness is ready but the first result capture still needs a host with socket or sudo access.
+- Ran the Docker Ubuntu package-install benchmark in both networked and seeded local-cache modes. On the networked package-install workload (`20260409-184314`), fro finished in `57.086424s` vs `74.137443s` for baseline (`-23.00%`) with `0` fallback hits. On the seeded local-cache workload (`20260409-191705`), fro finished in `27.514872s` vs `26.372490s` for baseline (`+4.33%`) with `0` fallback hits, and the counted fro-shadowed coreutils activity inside the install path was just one `rm` cleanup call. The harness bookkeeping now uses absolute system `wc`/`sort`/`cat`, and `perf/ubuntu_install_container_bench.sh` supports `SKIP_BUILD=1` so the benchmark can still run against the last good release binary when unrelated in-progress edits temporarily break the live tree.
+- `sort` gained bounded `-M` / `--month-sort` and `-V` / `--version-sort` compare modes on top of the same in-memory and spill/merge backend, moving the tracked sort row from `9/12` to `11/12` while leaving `-k` as the remaining bounded semantic gap.
+- Unsupported multicall/coreutils flags now fall back externally instead of hard-failing: `fgrep` tries `rg --fixed-strings` first and then `coreutils <cmd>` / system commands, other bounded multicall commands try `coreutils <cmd>` and then the system command, and `cp` unknown-flag parsing reuses the same chain from the alias parser.
+- `sort` gained a bounded `-z` / `--zero-terminated` slice on top of the existing backend: in-memory sorts, streamed spills, merge/check mode, and `-o` output now treat NUL as the record delimiter when requested while leaving the default newline-delimited paths unchanged, and the tracked compatibility row moved from `7/12` to `8/12`.
+- The multicall compatibility snapshot now also parses and compares `fro <util> --help` against system `<util> --help` for the tracked GNU/coreutils slice, `fro` help prints a shared tracked-flags section so the advertised flag names stay a superset of the relevant system help surface, and flagged gaps/incompatibilities are now called out with `FIXME:` notes in help for the current bounded slice (`sort` remaining flags plus `cp`/`tar` caveats).
+- `cp` gained a bounded preserve/archive-adjacent attr-list slice: timestamp-bearing GNU preserve forms such as `--preserve=timestamps` and `--preserve=mode,timestamps` now map onto the existing preserve path, focused parity coverage compares both single-file and recursive `-rP` copies against system `cp`, and the path-verification coverage keeps the real-copy executions on the threaded backend.
+- Investigated the remaining small-cutoff streamed-stdin `head -n` gap with in-tree timings, `strace -f -c`, and code inspection instead of another speculative rewrite: the current path already hits `write_head_lines_small_stdin_fast(...)`, skips the buffered stdin/stdout helpers for single-stdin `-n <= 64`, avoids `F_SETPIPE_SZ` on one-read completions, and only grows stdin/stdout pipes after the first full 64 KiB block when the newline cutoff is still unmet. On representative Python-driven pipe workloads, `fro head` stayed around `3.9-4.4 ms` for tiny `-n 0/-n 1` cases versus `2.3-2.6 ms` for system `head`, while a `131256`-byte cutoff-crossing case stayed around `4.7 ms` versus `2.6 ms`; the deltas were mostly unchanged whether the cutoff completed in one read or after the deferred pipe growth. Detailed traces showed the remaining cost is dominated by whole-binary startup/runtime setup (`execve`, loader maps, Rust runtime init, `/proc/self/maps`, signal-stack setup) rather than the small streamed-stdin helper itself, so no bounded `head`-specific rewrite was justified.
+- `sort` now supports a bounded merge/check compatibility slice: `-m` / `--merge` reuse the existing spill/merge backend for already sorted inputs, `-c` / `--check` validates one input stream and exits on the first disorder, focused parity coverage was added, and the tracked compatibility row moved from `5/12` to `6/12`.
+- `fro-benchmark` now covers additional big-file coreutils paths with `coreutils cmp (hot)`, `coreutils head -c full (hot)`, and `coreutils tail -c full (hot)`, while `cmp`, `head`, and `tail` also gained `--report-gbps` so the same commands can print GB/s on stderr without changing stdout behavior.
+- `find` now avoids hot-path `PathBuf` churn when matching and emitting child entries: it reuses chunk capacity, builds child paths only when descent or warnings require them, and uses direct child-name/path-byte handling for matching/output, which moved the anchored repo benchmark from trailing `fd` to roughly matching or beating it on this host.
+- Investigated recursive `rm` throughput on a 100k-file synthetic tree in the in-tree path (`./target/release/fro rm -r`) against system `rm -rf`: `fro` already held the wall-clock lead (`~1.88s` best / `~2.73s` mean on a 147 MiB 4 KiB-file tree vs `~4.71-4.75s` for system `rm`, and `~1.83-1.91s` steady-state on a zero-byte metadata-heavy tree vs `~4.53-4.55s` for system `rm`), while `strace -f -c` showed the hot path is dominated by `unlink`/`rmdir` rather than traversal or warning handling. A bounded byte-accounting elision removed ~100k `statx` calls in tracing, but did not produce a consistent end-to-end win, so no recursive-delete code change was kept from this wave.
+- `sort` gained a bounded `-T` / `--temporary-directory` slice on top of the existing spill/merge backend: custom temp directories are now threaded only into the out-of-core run writer and merge path, so in-memory sorts still ignore `-T` while spill files move under the requested directory and are cleaned up afterward.
+- Investigated the remaining `find | sort` wall time after the StringZilla bytewise path landed: on a synthetic 700k-entry tree, `fro find >/dev/null` stayed around `0.24s`, `cat captured-find-output | fro sort >/dev/null` stayed around `0.24s`, and the end-to-end `fro find | fro sort >/dev/null` pipeline stayed around `0.44-0.45s`; profiling showed the remaining sort-side time is split mostly between the existing StringZilla ordering work and streamed stdin line ingestion, with no spill/merge, unique, reverse, or stdout bottleneck dominating enough to justify a speculative backend rewrite.
+- `sort` now uses a StringZilla-backed bytewise argsort fast path for in-memory ordering, and large or streamed inputs spill sorted runs plus perform an n-way merge so newline-delimited sorting can complete out-of-core instead of assuming every input fits in RAM.
+- `tar` now supports a bounded GNU-style extract slice for uncompressed whole-archive extraction: `tar -xf` / `tar --extract --file` can unpack regular files, directories, and symlinks into the current directory or `-C` destination, reuse the existing archive reader plus threaded copy helper for file payloads, and reject unsafe or unsupported member paths/types explicitly.
+- `sort` gained a bounded numeric-ordering slice on top of the same newline-delimited backend: `-n` / `--numeric-sort` now compare leading C-locale-style numeric prefixes, compose with `-r`, `-u`, and `-o`, and keep GNU-like `-n -u` first-line retention for numerically equal records instead of broadening into general-key or locale work.
+- `cksum` gained a bounded fro-style `--check` slice without bloating `src/coreutils/hash.rs`: shared checksum-check policy/reporting now lives in `src/coreutils/hash/check.rs`, `cksum`-specific parsing/execution lives in `src/coreutils/hash/cksum.rs`, and the verifier reuses the regular-file CRC/hash fast path while supporting `--quiet`, `--status`, `--warn`, `--strict`, and `--ignore-missing`.
+- `sort` gained a bounded output-file slice: `-o FILE`, `--output=FILE`, and attached `-oFILE` now write the sorted result to a file after all input has been read, so stdout is suppressed and in-place rewrites reuse the same bytewise ordering backend instead of requiring temp-file machinery.
+- `tar -tvf` now prints GNU-style verbose whole-archive listings for uncompressed archives on top of the same reader used by plain `tar -tf`, raising the tracked tar compatibility slice to create/list/verbose-list while still leaving extraction unsupported.
+- `dd status=progress` now reports periodic line-based byte-progress snapshots without replacing the tuned copy engines: the progress path threads an optional completed-bytes counter through the existing copy strategies and still prints the normal final summary.
+- `tar` gained a bounded compatibility slice for whole-archive listing: `tar -tf` / `tar --list --file` now streams member names from uncompressed archives while create mode stays on the existing archive writer path, with focused parity coverage against GNU tar on both fro-generated and system-generated archives.
+- `sort` gained a bounded common-flags slice on top of the existing bytewise newline-delimited path: `-r` / `--reverse`, `-u` / `--unique`, and clustered `-ru` / `-ur` now compose with the same ordering backend instead of erroring, with focused parity coverage against system `sort`.
+- Added a bounded `read` fast-path verification slice to complement the existing `cat` backend checks: plain small regular-file `read --no-direct` / `read --direct` cases now prove they stay on the simple single-thread path, while large reads still prove they pick up tuned threaded params once they cross the strategy cutoff.
+
+## 2026-04-08
+
+- Recursive dir-queue wakeups now track sleeping workers and wake only the number needed for newly queued sibling subtrees, while still broadcasting when the last active worker drains; focused queue tests cover both fanout wakeup and clean shutdown.
+- Added a test-backed multicall/coreutils compatibility coverage report that prints, for each implemented GNU-targeting command, the percentage of compatibly implemented flag surface plus a compact one-line list of remaining gaps, so planning can target the biggest real compatibility holes without re-deriving the matrix by hand.
+- `wc` now honors `--` to stop option parsing, so dashed filenames reuse the same optimized metadata, mapped-block, and fd-parallel counting backends instead of being rejected as flags, with focused helper-selection and compatibility coverage.
+- `cp` now supports GNU-style `-a` / `--archive` as a bounded recursive-copy compatibility slice, mapping it onto the existing preserve + no-dereference behavior while keeping the threaded recursive-copy backend on real-copy executions and adding focused parity coverage for recursive timestamps and symlink metadata.
+- The shared `find`/`du` work queue now tracks actual waiters so batched subtree enqueue only wakes the number of sleeping workers that can claim new tasks, and worker completion only broadcasts when the last active worker drains the queue; focused queue tests plus a synthetic ignored perf surface make the dirwalk scheduler's wakeup behavior easier to validate.
+- `head -n` small streamed-stdin fast paths now defer stdin/stdout pipe growth until after the first full block if the newline cutoff was not already satisfied, removing `F_SETPIPE_SZ` setup work from one-read completions while reusing a shared newline-prefix helper across the raw and buffered line writers.
+- `cksum` now uses a fixed-function cached `CRC-32/CKSUM` combine operator instead of calling the generic `crc-fast` matrix-building combine path for every mapped block merge, keeping the file-side CRC math aligned with the same polynomial while removing repeated GF(2) setup work.
+- `base64` decode reorg now caches its chosen decode kernel per stream and keeps the AVX2 sanitize/compact path active for `--ignore-garbage` inputs until padding, with focused coverage for both large dirty-input success and valid-bytes-after-padding rejection.
+- `split-manifest-recursive-copy-bench` now reports manifest-build vs copy-phase timing plus dir/symlink/small/large task counts, and focused regression coverage pins both the benchmark registration and the helper's reported phase/task counters.
+- `fro-benchmark` now accepts `-c` / `--config` and forwards that config path to fixture setup plus benchmarked `fro` subprocesses, so benchmark runs can use the same tuned config file as `fro-optimize`.
+- `du` gained a bounded common slice: `-S` / `--separate-dirs` now excludes child-directory totals from parent directory totals while keeping the existing parallel dirwalk and descendant emission behavior intact, with focused parity coverage plus a small rollup-helper proof.
+- `src/stream/transform.rs` now exposes mapper-style transform dispatch helpers that preserve automatic regular-file vs stream pairing while still telling callers whether the output side is a regular file or a stream.
+- `encrypt` / `decrypt` now use that shared mapper helper instead of open-coding their four-way pairing match, and focused transform + encrypt tests cover the intended dispatch surface.
+- `cat` path verification now pins backend selection: plain / `-u` / `--no-direct` regular-file cases stay on the fast copy path, representative formatting flags switch to ordered transform, and plain `--direct` stays on the buffered-copy path.
+
+## 2026-04-07
+
+### Archived from TODO: review-driven hardening and maintainability wave
+
+- Integrated a review-driven fix wave on top of `coreutils-multicall`, then validated it with the full test suite plus janitor in a clean integration worktree before advancing the branch.
+- `diff` now hardens resolved IO params so zero `num_threads` and `qd` clamp to safe minimums while zero `block_size` still errors, preventing false "equal" results from malformed config, with focused `diff_cli` regression coverage.
+- `find` now honors `--` as the end of options, so dashed roots and child paths are parsed as operands instead of unsupported expressions, with parity coverage in `tests/find_cli.rs`.
+- `find` now supports GNU-style `-iname` / `-ipath` case-insensitive glob predicates as emission-time filters, preserving the existing parallel traversal scheduler while broadening common replacement coverage.
+- `encrypt` / `decrypt` now zeroize passphrases, PBKDF2 material, derived key/IV state, and per-chunk CTR IV buffers where feasible, and the help/tests make the unauthenticated AES-CTR caveat more explicit.
+- `sort` now has a bounded first multicall/coreutils slice for locale-independent bytewise ascending sorting of newline-delimited records, with explicit help for unsupported GNU modes and focused CLI/multicall coverage.
+- `mv` same-filesystem rename health now has focused inode-preservation regression coverage for file overwrite and directory-parent moves, so the rename-only fast path is pinned separately from cross-filesystem copy+remove behavior.
+- `wc` now has helper-selection assertions for its main execution paths:
+  - byte-only regular-file mode stays on the metadata fast path
+  - default / line / word counting on regular files stays on the mapped-block backend
+  - char-count and max-line-length modes stay on the fd-parallel path
+- Public Rust path APIs now document and enforce the current UTF-8-only contract consistently via a shared `io_util::utf8_path(...)` helper, with Unix non-UTF-8 rejection tests covering the bounded public surface.
+- Janitor-oriented maintainability cleanup landed again:
+  - `src/coreutils/hash/cksum.rs` now holds the `cksum`-specific CRC/combine logic extracted from `src/coreutils/hash.rs`
+  - `src/main_app/cli/execute/config_command.rs` now holds config-command dispatch extracted from `src/main_app/cli/execute.rs`
+  - the generated source-tree snapshot was refreshed and janitor file-size checks are green on the integrated branch
+
+### Archived from TODO: focused throughput/parity slices and config layering follow-up
+
+### Archived from TODO: config/optimizer cleanup after shipped work
+
+- `TODO.md` now drops the obsolete pre-April active-items block so the file has a single current backlog instead of duplicated planning sections.
+- Shipped config/optimizer items are now marked complete in the active backlog: composite `md`/`dm` signatures, device-db precedence layering, mount-override persistence for `fro-optimize --for`, deterministic test sizing, and direct-I/O fallback observability.
+- The active backlog stays focused on remaining validation, high-use parity, and tuning work instead of re-listing already-landed config foundations.
+
+- `cat` stdin/plain-copy handling now avoids creating the buffered stdout writer thread when every input can stay on the fast kernel-copy path, so redirected stdin stays near pathname-speed on the plain byte-copy case without changing mixed stdin/file semantics.
+- `wc` byte-counting advanced in a path-preserving way:
+  - `wc --bytes` now reaches the existing regular-file metadata-length fast path just like `wc -c`
+  - the metadata shortcut is explicitly blocked for combinations like `--bytes -L` where streaming inspection is still required
+  - focused parity and multicall coverage now exercises sparse-file `--bytes` behavior and stdin `--bytes`
+- Device-db profile matching now layers using the same sparse patch shape as mount overrides:
+  - resolved precedence is `defaults -> matched device-db profile -> explicit mount override`
+  - matched profiles can now affect non-`read`/`grep` settings such as `copy_auto_mode` and recursive small-file thread counts
+  - focused config-selection tests cover sparse profile application and override precedence
+- Wrapped `base64` output no longer emits tiny per-line writes in the stateful wrapped path:
+  - wrapped chunks and trailing newlines are batched before flushing to stdout/pipes
+  - exact output behavior is preserved, including final newline handling
+  - validation also fixed a latent wrapped-stateful slice-length bug and added a batching-oriented regression test
+- `fro-optimize --for <path>` now persists tuned params into the selected mount override entry instead of flattening them into global defaults, with end-to-end coverage that the resolved `mount_overrides.by_mountpoint` entry receives the saved `read` params while defaults stay unchanged.
+- The compatibility/API matrix gained a compact read-surface slice over regular files, directories, symlinks, and permission-gated paths, and `ParallelFile::open` now rejects non-regular files up front with `InvalidInput` instead of allowing surprising successes deeper in the stack.
+- Benchmark/optimizer auto-sizing now uses a shared deterministic sizing policy that subtracts fixed benchmark-write overhead from the wear budget before deriving `test_size`, while still preserving explicit `--test-size` overrides.
+- Recursive `cp` advanced with a focused preserve-metadata slice: `cp -p`, `-rp`, and `--preserve` now keep mode + timestamps for regular files, symlinks, and directories while still using the existing optimized recursive-copy backend and scheduling lanes.
+- Config/device selection gained stable composite stack match keys for `dm`/`md` storage graphs (`kind=*`, `component.*`, `stack=*`, and `leaf.*`) so profile matching can target layered storage reliably.
+- Config regression coverage now includes compact contract tests for precedence and path-specific save/explain behavior, plus host-independent mountinfo/device-signature tests for longest mount matching, octal escape decoding, missing sources, and minimal signatures for non-block mounts.
+- `fro-optimize` now supports a narrow `--global --for <path>` flow: it tunes the selected mount as usual, then promotes that mount's saved override into config defaults and removes the override entry, while rejecting unsupported `--global` combinations cleanly.
+- `head -n` gained a tiny streamed-stdin fast path for small single-input cutoffs (`-n <= 64`, no headers), bypassing the async stdout writer when setup overhead would dominate the job.
+- `find` gained a compact high-value parity slice: common `-type {b,c,d,p,f,l,s}` filtering plus explicit `-print` / `-print0`, implemented as emission-time filtering so the existing parallel traversal stays intact.
+- Shared digest tools (`md5sum` and family) now accept GNU-style tagged manifests during `--check`, while still rejecting `--check --tag` with GNU-matching behavior and parity coverage.
+- Recursive `rm` now batches wide directory fanout into the shared directory queue instead of enqueueing one child at a time, reducing futex/condvar churn on large trees while preserving delete semantics and byte accounting.
+- The hot-cache `fro cat file | fro wc` pipeline improved materially by raising the shared coreutils pipe target size to 2 MiB and reusing that helper in `wc`, cutting syscall churn and moving the 1 GiB hot path from roughly `0.48–0.54s` down to `0.33–0.35s`.
+- Streamed `wc` default counting now uses a large buffered reader after best-effort pipe growth instead of the old `vmsplice`-driven pipe fast path, keeping the same counting logic while reducing syscall-pattern overhead on large stdin streams and adding large-stdin parity coverage for both default `wc` and `wc -c`.
+- `base64` transport/orchestration now reuses shared transform runner dispatch helpers in `src/stream/transform.rs`, so future transform-style tools can build on the same file/stream pairing path while base64 keeps its format-specific fast paths and wrapped-output behavior.
+- Forced direct-I/O modes now surface when they really fall back to the page cache:
+  - one scoped stderr warning is emitted when `O_DIRECT` open is unsupported
+  - one scoped stderr warning is emitted when forced direct requests hit unaligned tail/range fallbacks
+  - read-path CLI coverage and tracker unit tests now pin this behavior without breaking `cp` compatibility stderr parity
+- `cp` path verification now proves that real-copy executions for path-preserving flags (`-v`, `-p`, `-n`, `-u`, `-T`, plus recursive `-p -v`) stay on the threaded copy backend, using test-only backend tracing rather than changing production copy selection.
+- `fro-benchmark` gained a focused `tree compare:` slice for recursive/tree-walk work:
+  - read-side compares `recursive-read-bench`, `file-list-read-bench`, and `fd`
+  - copy-side compares `fro copy --recursive`, split/prebuilt-manifest recursive-copy variants, and `cp -r`
+  - the slice reports `files/s` while keeping elapsed-time summaries, and the docs now point tree-work profiling toward this narrower benchmark family
+- `cksum` now uses the `crc-fast` SIMD CRC-32/CKSUM core instead of the old in-tree slicing-table implementation, while preserving the existing parallel file map/reduce shape and POSIX length-suffix finalize semantics through chunk-level `checksum_combine`.
+
+### Archived from TODO: completed slices pruned from stale backlog
+
+- The stale duplicated active-backlog section was removed from `TODO.md` so the newer priority-based backlog is the only active planning surface again.
+- `cp -t` / `--target-directory` is now treated as shipped compatibility work rather than an active checkbox.
+- `fgrep -v` / `--invert-match` is now treated as shipped compatibility work rather than an active checkbox.
+- The uncompressed dirtree-to-file tar path is now treated as shipped foundation work rather than an active checkbox.
+
+## 2026-04-06
+
+### Archived from TODO: low-priority parity sprawl and utility long tail
+
+- Reworked `TODO.md` so the active backlog now reflects project goals and observed command usage instead of carrying a giant per-flag parity ledger.
+- Elevated shared fast-I/O work plus the highest-value utility families called out by `cmd_counts_nz.txt`: `cat`, `rm`, `find`, `cp`, `wc`, `mv`, `head`, `tail`, `dd`, `md5sum`, and `du`.
+- Kept `base64` in view only as architecturally useful transform-style I/O work, not as a top-line command-priority item.
+- De-emphasized or parked lower-return backlog items that were cluttering the active plan:
+  - exhaustive flag-by-flag compatibility tracking for every implemented utility
+  - long-tail digest CLI parity beyond common `md5sum` / shared checksum flows
+  - `parallel zstd`, compressed `tar`, HDD-specific streaming tweaks, and `rdma-pipe` integration
+- Preserved the rationale that parity work should follow the fast path: active TODO items now explicitly say to prefer high-use, path-preserving compatibility slices over low-frequency corners.
+
+### Archived from TODO: coreutils parity, config CLI, and follow-up utility work
+
+- Added a substantial coreutils parity wave and moved the completed slices out of the active backlog:
+  - `tail` landed as a multicall/subcommand using the same range/offset helpers as `head`, including default behavior, `-n`, `-c`, size suffixes, `+N` semantics, and `-q` / `-v` header controls.
+  - `fgrep` gained `-x` / `--line-regexp`, then `-i` / `--ignore-case` and `--no-ignore-case`.
+  - `wc` gained `-m` / `--chars`, `-L` / `--max-line-length`, and `--files0-from`.
+  - `shred` gained `-s` / `--size`, `-v` / `--verbose`, and `-f` / `--force`.
+  - `cp` compatibility gained `-n` / `--no-clobber`, `-u` / `--update`, `-v` / `--verbose`, and `-T` / `--no-target-directory`.
+- Added shared repo-local parity fixtures in `tests/helpers/coreutils_parity.rs` for regular files, symlinks, nested trees, and stdin/`-`, and wired new flag slices into the growing parity suite.
+- Documented the new flag slices more explicitly in repo docs so future work distinguishes path-preserving flags from flags that intentionally force slower transform/buffered execution, and so parity tests are paired with performance-path verification.
+- Added a first user-visible config/mount introspection slice:
+  - `fro config print`
+  - `fro config explain --for <path>`
+- Improved `dd` small/medium transfer routing by reusing lighter existing copy primitives instead of always forcing the threaded path.
+- Implemented a first practical `fro encrypt` / `fro decrypt` slice by delegating to the system `openssl enc` CLI with `--passphrase-file`, `--cipher`, and `-o/--output`, but this was later clarified by the user as the wrong long-term architecture.
+- The intended follow-up encryption design is now recorded as:
+  - OpenSSL **library** integration
+  - blockwise encryption/decryption in 512 KiB chunks
+  - existing `ParallelStream` mapper-style processing
+  - `num_cpus` worker parallelism
+- Writer-path follow-up work completed in the same period:
+  - small direct-write heuristics for generated writes / RAM-buffer flushes
+  - cross-filesystem recursive `mv` pending-state race fix plus regression coverage
+
+### Archived from TODO: mount/device signatures, flag-path docs, benchmarks, and in-process crypto
+
+- `config explain --for <path>` now includes richer device signature extraction:
+  - canonical `/dev/...` source resolution
+  - `/dev/disk/by-id` aliases
+  - sysfs vendor/model/rotational metadata
+  - composite `dm` / `md` stack details via recursive `slaves`
+  - flattened device `match_keys` for future profile matching
+- Documentation and benchmarking follow-ups landed for the expanding flag-parity work:
+  - docs now classify path-preserving vs path-changing flags and require perf-path verification alongside parity work
+  - benchmark notes now include flagged multicall cases
+  - a practical benchmark slice compares selected `fro` flag paths against GNU coreutils and uutils where locally available
+- More parity slices landed:
+  - `fgrep` gained `-e` / `--regexp` and `-f` / `--file`
+- A first in-process OpenSSL-library crypto path landed:
+  - regular-file encrypt/decrypt uses 512 KiB framed blocks with parallel file readers/writers and CPU-parallel workers
+  - stdin/stdout remains sequential
+  - this first version currently uses a `fro`-specific framed format and CBC-family ciphers, which the user has since redirected toward OpenSSL-compatible `aes-256-ctr`
+  - follow-up work should therefore pivot from the framed CBC container toward OpenSSL-compatible CTR output plus better automatic stream/file pairing helpers
+
 ## 2026-03-16
 
 ### Completed in PR #4
@@ -17,6 +217,27 @@ Reference:
 
 - PR: https://github.com/kig/fast_read_optimizer/pull/4
 - Initial shipped commit: `797c6a8`
+
+## 2026-04-03
+
+### Archived from TODO: completed shipped work through `a7c297d`
+
+- `TODO.md` was cleaned up so it tracks open work instead of mixing backlog with release notes and already-completed checkboxes.
+- The following shipped items were moved out of the active TODO backlog because they are already done in the repo:
+  - benchmark/optimizer temp-file creation now only creates files needed by the selected modes
+  - checked arithmetic and checked `u64` to `usize` conversions landed for block/offset math, with explicit overflow-boundary coverage
+  - short `io_uring` read handling now treats partial CQE results as retry-or-error instead of silently accepting truncated logical blocks
+  - sparse offset write semantics were decided, documented, and tested
+  - verified write/copy mode now stages hash/copy/fsync/recover-or-repair/fsync/optional-verify with a documented contract
+  - dirwalk subtree processing by multi-tree parallel DFS landed as the current best-known `io_uring` scheduling fallback
+- Additional shipped coreutils/library progress archived from the old TODO "recent progress" section:
+  - `du` is a real multicall/subcommand and no longer uses the naive recursive metadata walk
+  - `find` keeps the coarse subtree-stealing traversal; `du` uses the wider split stat-worker scheduler
+  - `cp -r` / `copy --recursive`, `cat`, `wc`, `fgrep`, checksum multicalls, `head`, `pv`, and read-to-memory flows are wired into the main tool surface
+  - `benchmark_page_cache_lift()` exists as a public API hook for direct-read-plus-page-cache-warm benchmarking
+  - `read` and `grep` expose `--auto-lift`
+  - base64 regained a working GNU-style `--help` path, large wrapped decode regression coverage, and submodule splits that satisfy janitor line-count limits
+  - `io_uring` `GETDENTS` remains blocked in this environment because the available headers/crates do not expose `IORING_OP_GETDENTS`
 
 ## Archived planning and previous TODO backlog
 
@@ -430,10 +651,117 @@ Let users download a device DB so optimization is usually unnecessary.
 
 ---
 
-## Open questions / decisions needed
+## Open questions
 
-- Should `./fro.json` in the current directory ever be auto-loaded, or only via `-c`?
-- Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
-- How conservative should the default wear budget be (bytes written per optimize run)?
-- For page-cache “hot” tests, should we cap test size relative to RAM (to avoid false “hot”)?
-- How do we want to handle devices where direct IO is unsupported or unreliable?
+- [x] Should `./fro.json` ever be auto-loaded, or only via explicit `-c`?
+    - Only via explicit `-c`.
+- [x] Should mount overrides key by mountpoint string, filesystem UUID/LABEL, or both?
+    - Filesystem UUID primarily. If only mountpoint string is defined, use that.
+- [x] How conservative should the default drive-write budget be?
+    - 0.05 DPWD (ok to do at least 20 optimize runs per day on 1 DPWD drive.)
+- [x] How should `fro` behave on filesystems where direct I/O is unsupported or unreliable? 
+    - Use non-direct I/O. Flag to user if --direct specified.
+
+## Compat work
+
+  - [x] `cat`
+    - [x] `-A`, `--show-all`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--number-nonblank`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-e`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-E`, `--show-ends`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--number`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-s`, `--squeeze-blank`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-t`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-T`, `--show-tabs`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-u`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-v`, `--show-nonprinting`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--print-bytes`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-initial=SKIP`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-i`, `--ignore-initial=SKIP1:SKIP2`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-l`, `--verbose`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--bytes=LIMIT`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-s`, `--quiet`, `--silent`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-F`, `--fixed-strings`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-n`, `--line-number`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-b`, `--binary`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-c`, `--check`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--tag`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-t`, `--text`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-z`, `--zero`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--ignore-missing`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--quiet`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--status`
+      - [x] equality test
+      - [x] implementation
+    - [x] `--strict`
+      - [x] equality test
+      - [x] implementation
+    - [x] `-w`, `--warn`
+      - [x] equality test
+      - [x] implementation
+- [x] cksum, b2sum, md5sum, sha*sum
+  - [x] cksum
+  - [x] sha224sum / sha256sum / sha384sum / sha512sum
+  - [x] b3sum
+  - [x] b2sum
+  - [x] md5sum
+- [x] shred (this is basically write)
+- [x] wc
+- [x] head
+  - [x] `-c` fast path for regular files and regular stdin
+  - [x] suffixed counts like `1KiB`, `1MiB`, `1GiB`
+- [x] cat / tac
+- [x] pv that's a hugepages splice + print to stderr
+- [x] find, as part of dirwalk work
+- [x] Read sequentially
+- [x] Write sequentially

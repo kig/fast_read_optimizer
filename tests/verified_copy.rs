@@ -1,5 +1,6 @@
 use fro::block_hash::{default_hash_base, verify_file_with_replicas, BlockHashAlgorithm};
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::symlink;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::mpsc;
@@ -28,6 +29,27 @@ fn run_fro(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("failed to run fro")
+}
+
+fn set_file_mtime(path: &std::path::Path, secs: i64, nsecs: i64) {
+    let times = [
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nsecs,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nsecs,
+        },
+    ];
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(
+        rc,
+        0,
+        "utimensat failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
@@ -379,6 +401,171 @@ fn copy_file_range_single_cli_copies_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+#[test]
+fn copy_recursive_cli_copies_tree_contents_and_symlinks() {
+    let tmp = unique_temp_dir("fro-copy-recursive-cli");
+    let source_root = tmp.join("src-tree");
+    let nested = source_root.join("nested/deeper");
+    let fro_dest_parent = tmp.join("fro-dest");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&fro_dest_parent).unwrap();
+
+    fs::write(source_root.join("small.txt"), b"alpha\nbeta\n").unwrap();
+    fs::write(
+        nested.join("large.bin"),
+        (0..(2 * 1024 * 1024 + 333))
+            .map(|i| ((i * 13) % 251) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    symlink("../small.txt", source_root.join("nested/link-small")).unwrap();
+
+    let out = run_fro(&[
+        "copy",
+        "--recursive",
+        "--no-direct",
+        "-n",
+        "1",
+        source_root.to_str().unwrap(),
+        fro_dest_parent.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let copied_root = fro_dest_parent.join("src-tree");
+    assert_eq!(
+        fs::read(copied_root.join("small.txt")).unwrap(),
+        b"alpha\nbeta\n"
+    );
+    assert_eq!(
+        fs::read(copied_root.join("nested/deeper/large.bin")).unwrap(),
+        fs::read(source_root.join("nested/deeper/large.bin")).unwrap()
+    );
+    assert_eq!(
+        fs::read_link(copied_root.join("nested/link-small")).unwrap(),
+        std::path::PathBuf::from("../small.txt")
+    );
+}
+
+#[test]
+fn copy_recursive_cli_rejects_target_inside_source() {
+    let tmp = unique_temp_dir("fro-copy-recursive-inside-source");
+    let source_root = tmp.join("src-tree");
+    let nested = source_root.join("subdir");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(source_root.join("small.txt"), b"alpha\n").unwrap();
+    let target = source_root.join("nested-copy");
+
+    let out = run_fro(&[
+        "copy",
+        "--recursive",
+        "--no-direct",
+        "-n",
+        "1",
+        source_root.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to copy directory"));
+}
+
+#[test]
+fn copy_recursive_cli_preserves_timestamps_with_cp_preserve() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = unique_temp_dir("fro-copy-recursive-preserve-times");
+    let source_root = tmp.join("src-tree");
+    let nested = source_root.join("nested/deeper");
+    let fro_dest_parent = tmp.join("fro-dest");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&fro_dest_parent).unwrap();
+
+    let file = source_root.join("small.txt");
+    let nested_dir = source_root.join("nested");
+    let link = nested_dir.join("link-small");
+    fs::write(&file, b"alpha\nbeta\n").unwrap();
+    fs::write(nested.join("large.bin"), b"payload").unwrap();
+    symlink("../small.txt", &link).unwrap();
+
+    set_file_mtime(&file, 1_700_123_456, 123_456_789);
+    set_file_mtime(&nested.join("large.bin"), 1_700_123_460, 987_654_321);
+    set_file_mtime(&nested_dir, 1_700_123_470, 222_333_444);
+    set_file_mtime(&source_root, 1_700_123_480, 555_666_777);
+    let link_times = [1_700_123_490_i64, 111_222_333_i64];
+    {
+        let c_path = std::ffi::CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: link_times[0],
+                tv_nsec: link_times[1],
+            },
+            libc::timespec {
+                tv_sec: link_times[0],
+                tv_nsec: link_times[1],
+            },
+        ];
+        let rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "symlink utimensat failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let out = run_fro(&[
+        "copy",
+        "--recursive",
+        "--no-direct",
+        "-n",
+        "1",
+        "--cp-preserve-timestamps",
+        source_root.to_str().unwrap(),
+        fro_dest_parent.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let copied_root = fro_dest_parent.join("src-tree");
+    let copied_file_meta = fs::metadata(copied_root.join("small.txt")).unwrap();
+    let source_file_meta = fs::metadata(&file).unwrap();
+    assert_eq!(copied_file_meta.mtime(), source_file_meta.mtime());
+    assert_eq!(copied_file_meta.mtime_nsec(), source_file_meta.mtime_nsec());
+
+    let copied_nested_meta = fs::metadata(copied_root.join("nested")).unwrap();
+    let source_nested_meta = fs::metadata(&nested_dir).unwrap();
+    assert_eq!(copied_nested_meta.mtime(), source_nested_meta.mtime());
+    assert_eq!(
+        copied_nested_meta.mtime_nsec(),
+        source_nested_meta.mtime_nsec()
+    );
+
+    let copied_root_meta = fs::metadata(&copied_root).unwrap();
+    let source_root_meta = fs::metadata(&source_root).unwrap();
+    assert_eq!(copied_root_meta.mtime(), source_root_meta.mtime());
+    assert_eq!(copied_root_meta.mtime_nsec(), source_root_meta.mtime_nsec());
+
+    let copied_link_meta = fs::symlink_metadata(copied_root.join("nested/link-small")).unwrap();
+    let source_link_meta = fs::symlink_metadata(&link).unwrap();
+    assert_eq!(copied_link_meta.mtime(), source_link_meta.mtime());
+    assert_eq!(copied_link_meta.mtime_nsec(), source_link_meta.mtime_nsec());
 }
 
 #[test]

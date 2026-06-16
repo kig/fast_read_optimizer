@@ -163,12 +163,16 @@ mod unix_cli_matrix {
         let io_opts: &[&[&str]] = &[&[], &["--no-direct"], &["--direct"]];
         let verbose_opts: &[&[&str]] = &[&[], &["-v"]];
 
-        for_each_combo(&[io_opts, &[&[], &["--to-memory"]], verbose_opts], &mut Vec::new(), &mut |flags| {
-            let mut args = vec!["read"];
-            args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", read_path.to_str().unwrap()]);
-            assert_success(&format!("read {:?}", flags), run_fro(&args));
-        });
+        for_each_combo(
+            &[io_opts, &[&[], &["--to-memory"]], verbose_opts],
+            &mut Vec::new(),
+            &mut |flags| {
+                let mut args = vec!["read"];
+                args.extend_from_slice(flags);
+                args.extend_from_slice(&["-n", "1", read_path.to_str().unwrap()]);
+                assert_success(&format!("read {:?}", flags), run_fro(&args));
+            },
+        );
 
         for_each_combo(&[io_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
             let mut args = vec!["grep"];
@@ -180,35 +184,48 @@ mod unix_cli_matrix {
 
         let write_mode_opts: &[&[&str]] = &[&[], &["--no-direct-write"], &["--direct-write"]];
         let create_opts: &[&[&str]] = &[&[], &["--create", "64KiB"]];
-        for_each_combo(&[create_opts, io_opts, write_mode_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
-            let target = tmp.join(format!("write-{:x}.bin", fxhash(flags)));
-            if !flags.contains(&"--create") {
-                fs::write(&target, &base[..4096]).unwrap();
-            }
-            let mut args = vec!["write"];
-            args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", target.to_str().unwrap()]);
-            assert_success(&format!("write {:?}", flags), run_fro(&args));
-            assert!(target.exists());
-        });
+        for_each_combo(
+            &[create_opts, io_opts, write_mode_opts, verbose_opts],
+            &mut Vec::new(),
+            &mut |flags| {
+                let target = tmp.join(format!("write-{:x}.bin", fxhash(flags)));
+                if !flags.contains(&"--create") {
+                    fs::write(&target, &base[..4096]).unwrap();
+                }
+                let mut args = vec!["write"];
+                args.extend_from_slice(flags);
+                args.extend_from_slice(&["-n", "1", target.to_str().unwrap()]);
+                assert_success(&format!("write {:?}", flags), run_fro(&args));
+                assert!(target.exists());
+            },
+        );
 
         for_each_combo(&[io_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
             let mut args = vec!["diff"];
             args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", diff_a.to_str().unwrap(), diff_b.to_str().unwrap()]);
+            args.extend_from_slice(&[
+                "-n",
+                "1",
+                diff_a.to_str().unwrap(),
+                diff_b.to_str().unwrap(),
+            ]);
             assert_success(&format!("diff {:?}", flags), run_fro(&args));
         });
 
         let hash_algo_opts: &[&[&str]] = &[&[], &["--sha256"]];
         let hash_only_opts: &[&[&str]] = &[&[], &["--hash-only"]];
-        for_each_combo(&[io_opts, hash_algo_opts, hash_only_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
-            let target = tmp.join(format!("hash-{:x}.bin", fxhash(flags)));
-            fs::write(&target, &base).unwrap();
-            let mut args = vec!["hash"];
-            args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", target.to_str().unwrap()]);
-            assert_success(&format!("hash {:?}", flags), run_fro(&args));
-        });
+        for_each_combo(
+            &[io_opts, hash_algo_opts, hash_only_opts, verbose_opts],
+            &mut Vec::new(),
+            &mut |flags| {
+                let target = tmp.join(format!("hash-{:x}.bin", fxhash(flags)));
+                fs::write(&target, &base).unwrap();
+                let mut args = vec!["hash"];
+                args.extend_from_slice(flags);
+                args.extend_from_slice(&["-n", "1", target.to_str().unwrap()]);
+                assert_success(&format!("hash {:?}", flags), run_fro(&args));
+            },
+        );
 
         for_each_combo(&[io_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
             let target = tmp.join(format!("verify-{:x}.bin", fxhash(flags)));
@@ -222,24 +239,33 @@ mod unix_cli_matrix {
         });
 
         let recover_mode_opts: &[&[&str]] = &[&[], &["--fast"], &["--in-place-all"]];
-        for_each_combo(&[io_opts, recover_mode_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
-            let target = tmp.join(format!("recover-target-{:x}.bin", fxhash(flags)));
-            let backup = tmp.join(format!("recover-backup-{:x}.bin", fxhash(flags)));
-            fs::write(&target, &base).unwrap();
-            fs::write(&backup, &base).unwrap();
-            hash_sidecars(&target);
-            hash_sidecars(&backup);
-            let mut file = fs::OpenOptions::new().write(true).open(&target).unwrap();
-            file.seek(SeekFrom::Start(1024)).unwrap();
-            file.write_all(b"broken-block").unwrap();
-            file.flush().unwrap();
+        for_each_combo(
+            &[io_opts, recover_mode_opts, verbose_opts],
+            &mut Vec::new(),
+            &mut |flags| {
+                let target = tmp.join(format!("recover-target-{:x}.bin", fxhash(flags)));
+                let backup = tmp.join(format!("recover-backup-{:x}.bin", fxhash(flags)));
+                fs::write(&target, &base).unwrap();
+                fs::write(&backup, &base).unwrap();
+                hash_sidecars(&target);
+                hash_sidecars(&backup);
+                let mut file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+                file.seek(SeekFrom::Start(1024)).unwrap();
+                file.write_all(b"broken-block").unwrap();
+                file.flush().unwrap();
 
-            let mut args = vec!["recover"];
-            args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", target.to_str().unwrap(), backup.to_str().unwrap()]);
-            assert_success(&format!("recover {:?}", flags), run_fro(&args));
-            assert_eq!(fs::read(&target).unwrap(), base);
-        });
+                let mut args = vec!["recover"];
+                args.extend_from_slice(flags);
+                args.extend_from_slice(&[
+                    "-n",
+                    "1",
+                    target.to_str().unwrap(),
+                    backup.to_str().unwrap(),
+                ]);
+                assert_success(&format!("recover {:?}", flags), run_fro(&args));
+                assert_eq!(fs::read(&target).unwrap(), base);
+            },
+        );
 
         let copy_strategy_opts: &[&[&str]] = &[
             &[],
@@ -250,7 +276,12 @@ mod unix_cli_matrix {
         let copy_rewrite_opts: &[&[&str]] = &[&[], &["--full"], &["--diff"]];
         let copy_io_opts: &[&[&str]] = &[&[], &["--no-direct"], &["--no-direct", "--direct-write"]];
         for_each_combo(
-            &[copy_strategy_opts, copy_rewrite_opts, copy_io_opts, verbose_opts],
+            &[
+                copy_strategy_opts,
+                copy_rewrite_opts,
+                copy_io_opts,
+                verbose_opts,
+            ],
             &mut Vec::new(),
             &mut |flags| {
                 let is_diff = flags.contains(&"--diff");
@@ -284,16 +315,20 @@ mod unix_cli_matrix {
 
         let via_memory_io_opts: &[&[&str]] = &[&["--no-direct"], &["--direct"]];
         let via_memory_write_opts: &[&[&str]] = &[&[], &["--direct-write"]];
-        for_each_combo(&[via_memory_io_opts, via_memory_write_opts, verbose_opts], &mut Vec::new(), &mut |flags| {
-            let src = tmp.join(format!("copy-mem-src-{:x}.bin", fxhash(flags)));
-            let dst = tmp.join(format!("copy-mem-dst-{:x}.bin", fxhash(flags)));
-            fs::write(&src, &base).unwrap();
-            let mut args = vec!["copy", "--via-memory"];
-            args.extend_from_slice(flags);
-            args.extend_from_slice(&["-n", "1", src.to_str().unwrap(), dst.to_str().unwrap()]);
-            assert_success(&format!("copy via-memory {:?}", flags), run_fro(&args));
-            assert_eq!(fs::read(&dst).unwrap(), base);
-        });
+        for_each_combo(
+            &[via_memory_io_opts, via_memory_write_opts, verbose_opts],
+            &mut Vec::new(),
+            &mut |flags| {
+                let src = tmp.join(format!("copy-mem-src-{:x}.bin", fxhash(flags)));
+                let dst = tmp.join(format!("copy-mem-dst-{:x}.bin", fxhash(flags)));
+                fs::write(&src, &base).unwrap();
+                let mut args = vec!["copy", "--via-memory"];
+                args.extend_from_slice(flags);
+                args.extend_from_slice(&["-n", "1", src.to_str().unwrap(), dst.to_str().unwrap()]);
+                assert_success(&format!("copy via-memory {:?}", flags), run_fro(&args));
+                assert_eq!(fs::read(&dst).unwrap(), base);
+            },
+        );
     }
 
     #[test]
@@ -323,7 +358,11 @@ mod unix_cli_matrix {
         set_mode(&locked_dir, 0o555);
 
         for (name, path, expected) in [
-            ("read-regular", readable.as_path(), ExpectedClass::same(ResultClass::Success)),
+            (
+                "read-regular",
+                readable.as_path(),
+                ExpectedClass::same(ResultClass::Success),
+            ),
             (
                 "read-0000",
                 unreadable.as_path(),
@@ -396,53 +435,72 @@ mod unix_cli_matrix {
         assert_cli_class(
             "write-readonly",
             run_fro(&["write", readonly_dest.to_str().unwrap()]),
-            ExpectedClass::privilege_sensitive(
-                ResultClass::PermissionDenied,
-                ResultClass::Success,
-            ),
+            ExpectedClass::privilege_sensitive(ResultClass::PermissionDenied, ResultClass::Success),
         );
 
         assert_cli_class(
             "copy-regular",
-            run_fro(&["copy", readable.to_str().unwrap(), copy_dest.to_str().unwrap()]),
+            run_fro(&[
+                "copy",
+                readable.to_str().unwrap(),
+                copy_dest.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::Success),
         );
         assert_cli_class(
             "copy-directory-source",
-            run_fro(&["copy", directory.to_str().unwrap(), copy_dest.to_str().unwrap()]),
+            run_fro(&[
+                "copy",
+                directory.to_str().unwrap(),
+                copy_dest.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::InvalidInputClass),
         );
         assert_cli_class(
             "copy-unreadable-source",
-            run_fro(&["copy", unreadable.to_str().unwrap(), copy_dest.to_str().unwrap()]),
-            ExpectedClass::privilege_sensitive(
-                ResultClass::PermissionDenied,
-                ResultClass::Success,
-            ),
+            run_fro(&[
+                "copy",
+                unreadable.to_str().unwrap(),
+                copy_dest.to_str().unwrap(),
+            ]),
+            ExpectedClass::privilege_sensitive(ResultClass::PermissionDenied, ResultClass::Success),
         );
         assert_cli_class(
             "copy-directory-dest",
-            run_fro(&["copy", readable.to_str().unwrap(), directory.to_str().unwrap()]),
+            run_fro(&[
+                "copy",
+                readable.to_str().unwrap(),
+                directory.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::InvalidInputClass),
         );
 
         assert_cli_class(
             "diff-regular",
-            run_fro(&["diff", readable.to_str().unwrap(), readable_symlink.to_str().unwrap()]),
+            run_fro(&[
+                "diff",
+                readable.to_str().unwrap(),
+                readable_symlink.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::Success),
         );
         assert_cli_class(
             "diff-directory",
-            run_fro(&["diff", readable.to_str().unwrap(), directory.to_str().unwrap()]),
+            run_fro(&[
+                "diff",
+                readable.to_str().unwrap(),
+                directory.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::InvalidInputClass),
         );
         assert_cli_class(
             "diff-0000",
-            run_fro(&["diff", readable.to_str().unwrap(), unreadable.to_str().unwrap()]),
-            ExpectedClass::privilege_sensitive(
-                ResultClass::PermissionDenied,
-                ResultClass::Success,
-            ),
+            run_fro(&[
+                "diff",
+                readable.to_str().unwrap(),
+                unreadable.to_str().unwrap(),
+            ]),
+            ExpectedClass::privilege_sensitive(ResultClass::PermissionDenied, ResultClass::Success),
         );
 
         let recover_target = tmp.join("recover-target.bin");
@@ -451,7 +509,10 @@ mod unix_cli_matrix {
         fs::write(&recover_backup, &bytes).unwrap();
         hash_sidecars(&recover_target);
         hash_sidecars(&recover_backup);
-        let mut file = fs::OpenOptions::new().write(true).open(&recover_target).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&recover_target)
+            .unwrap();
         file.seek(SeekFrom::Start(128)).unwrap();
         file.write_all(b"oops").unwrap();
         file.flush().unwrap();
@@ -466,16 +527,21 @@ mod unix_cli_matrix {
         );
         assert_cli_class(
             "recover-directory-target",
-            run_fro(&["recover", directory.to_str().unwrap(), recover_backup.to_str().unwrap()]),
+            run_fro(&[
+                "recover",
+                directory.to_str().unwrap(),
+                recover_backup.to_str().unwrap(),
+            ]),
             ExpectedClass::same(ResultClass::InvalidInputClass),
         );
         assert_cli_class(
             "recover-unreadable-backup",
-            run_fro(&["recover", recover_target.to_str().unwrap(), unreadable.to_str().unwrap()]),
-            ExpectedClass::privilege_sensitive(
-                ResultClass::PermissionDenied,
-                ResultClass::Success,
-            ),
+            run_fro(&[
+                "recover",
+                recover_target.to_str().unwrap(),
+                unreadable.to_str().unwrap(),
+            ]),
+            ExpectedClass::privilege_sensitive(ResultClass::PermissionDenied, ResultClass::Success),
         );
 
         let _ = directory_symlink;

@@ -1,0 +1,840 @@
+#![allow(dead_code)]
+
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::process::Command;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverageRow {
+    pub name: &'static str,
+    pub covered: &'static [&'static str],
+    pub remaining: &'static [&'static str],
+}
+
+impl CoverageRow {
+    pub fn total(self) -> usize {
+        self.covered.len() + self.remaining.len()
+    }
+
+    pub fn percent(self) -> usize {
+        let total = self.total();
+        if total == 0 {
+            100
+        } else {
+            (self.covered.len() * 100 + total / 2) / total
+        }
+    }
+
+    pub fn remaining_text(self) -> String {
+        if self.remaining.is_empty() {
+            "none".to_string()
+        } else {
+            self.remaining.join(", ")
+        }
+    }
+}
+
+const DIGEST_COVERED: &[&str] = &[
+    "(default)",
+    "-b/--binary",
+    "-t/--text",
+    "--tag",
+    "-z/--zero",
+    "-c/--check",
+    "--quiet",
+    "--status",
+    "-w/--warn",
+    "--strict",
+    "--ignore-missing",
+];
+
+const B2SUM_COVERED: &[&str] = &[
+    "(default)",
+    "-b/--binary",
+    "-t/--text",
+    "--tag",
+    "-z/--zero",
+    "-c/--check",
+    "--quiet",
+    "--status",
+    "-w/--warn",
+    "--strict",
+    "--ignore-missing",
+    "-l/--length",
+];
+
+pub const ROWS: &[CoverageRow] = &[
+    CoverageRow {
+        name: "base64",
+        covered: &[
+            "-d/--decode",
+            "-i/--ignore-garbage",
+            "-w/--wrap",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "b2sum",
+        covered: B2SUM_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "cat",
+        covered: &[
+            "-n/--number",
+            "-b/--number-nonblank",
+            "-s/--squeeze-blank",
+            "-E/--show-ends",
+            "-T/--show-tabs",
+            "-v/--show-nonprinting",
+            "-A/--show-all",
+            "-e",
+            "-t",
+            "-u",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "cksum",
+        covered: &[
+            "(default)",
+            "-c/--check",
+            "--quiet",
+            "--status",
+            "-w/--warn",
+            "--strict",
+            "--ignore-missing",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "cmp",
+        covered: &[
+            "-s/--quiet/--silent",
+            "-r/-R/--recursive",
+            "-l/--verbose",
+            "-b/--print-bytes",
+            "-n/--bytes",
+            "-i/--ignore-initial",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "cp",
+        covered: &[
+            "-a/--archive",
+            "-r/-R/--recursive",
+            "-n/--no-clobber",
+            "-u/--update",
+            "-T/--no-target-directory",
+            "-t/--target-directory",
+            "-p/--preserve",
+            "--preserve=mode",
+            "--preserve=timestamps",
+            "--preserve=mode,timestamps",
+            "--preserve=all",
+            "-L/--dereference",
+            "-P/--no-dereference",
+            "-v/--verbose",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "dd",
+        covered: &[
+            "bs=",
+            "count=",
+            "skip=",
+            "seek=",
+            "iflag=count_bytes",
+            "iflag=skip_bytes",
+            "oflag=seek_bytes",
+            "conv=notrunc",
+            "conv=fsync",
+            "iflag=direct",
+            "oflag=direct",
+            "status=none",
+            "status=noxfer",
+            "status=progress",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "du",
+        covered: &[
+            "-0/--null",
+            "-s/--summarize",
+            "-a/--all",
+            "-h/--human-readable",
+            "--si",
+            "-c/--total",
+            "-S/--separate-dirs",
+            "-H/-D/--dereference-args",
+            "-L/--dereference",
+            "-P/--no-dereference",
+            "-b/--bytes",
+            "-k",
+            "-m",
+            "-B/--block-size=SIZE",
+            "--apparent-size",
+            "--block-size=SIZE",
+            "-d/--max-depth",
+            "-t/--threshold=SIZE",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "fgrep",
+        covered: &[
+            "-F/--fixed-strings",
+            "-E/--extended-regexp",
+            "-G/--basic-regexp",
+            "-P/--perl-regexp",
+            "-n/--line-number",
+            "-b/--byte-offset",
+            "-x/--line-regexp",
+            "-i/--ignore-case",
+            "--no-ignore-case",
+            "-c/--count",
+            "-q/--quiet/--silent",
+            "-l/--files-with-matches",
+            "-L/--files-without-match",
+            "-o/--only-matching",
+            "-H/--with-filename",
+            "-h/--no-filename",
+            "-Z/--null",
+            "-m/--max-count=NUM",
+            "-A/--after-context=NUM",
+            "-B/--before-context=NUM",
+            "-C/--context=NUM",
+            "-NUM",
+            "-w/--word-regexp",
+            "--group-separator=SEP",
+            "--no-group-separator",
+            "--color",
+            "--colour",
+            "-T/--initial-tab",
+            "--line-buffered",
+            "-D/--devices=ACTION",
+            "-d/--directories=ACTION",
+            "--label=LABEL",
+            "--binary-files=TYPE",
+            "--binary-files=text",
+            "-I/--binary-files=without-match",
+            "-U/--binary",
+            "-a/--text",
+            "-v/--invert-match",
+            "-e/--regexp",
+            "-f/--file",
+            "-s/--no-messages",
+            "-V",
+            "--help",
+            "--version",
+            "-z/--null-data",
+            "--directories=recurse",
+            "-r/--recursive",
+            "-R/--dereference-recursive",
+            "--include=GLOB",
+            "--exclude=GLOB",
+            "--exclude-dir=GLOB",
+            "--exclude-from=FILE",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "find",
+        covered: &[
+            "(default)",
+            "-Olevel",
+            "-P",
+            "-H",
+            "-L",
+            "-a",
+            "-amin",
+            "-and",
+            "-anewer",
+            "-atime",
+            "-cmin",
+            "-cnewer",
+            "-ctime",
+            "-daystart",
+            "-delete",
+            "-depth",
+            "-empty",
+            "-exec",
+            "-execdir",
+            "-follow",
+            "-fprint",
+            "-fprint0",
+            "-fstype",
+            "-fls",
+            "-executable",
+            "-false",
+            "-gid",
+            "-group",
+            "-inum",
+            "-iwholename",
+            "-links",
+            "-mount",
+            "-maxdepth",
+            "-mindepth",
+            "-mmin",
+            "-mtime",
+            "-not",
+            "-o",
+            "-or",
+            "-iregex",
+            "-regex",
+            "-regextype",
+            "-type",
+            "-name",
+            "-iname",
+            "-newer",
+            "-noleaf",
+            "-nogroup",
+            "-nouser",
+            "-path",
+            "-ipath",
+            "-ilname",
+            "-perm",
+            "-print",
+            "-print0",
+            "-printf",
+            "-fprintf",
+            "-ls",
+            "-ok",
+            "-okdir",
+            "-prune",
+            "-quit",
+            "-readable",
+            "-size",
+            "-context",
+            "-true",
+            "-used",
+            "-uid",
+            "-user",
+            "-ignore_readdir_race",
+            "-noignore_readdir_race",
+            "-lname",
+            "-wholename",
+            "-writable",
+            "-xdev",
+            "-xtype",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "head",
+        covered: &[
+            "-n/--lines/--lines=",
+            "-c/--bytes/--bytes=",
+            "-z/--zero-terminated",
+            "-q/--quiet/--silent",
+            "-v/--verbose",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "md5sum",
+        covered: DIGEST_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "mv",
+        covered: &[
+            "-b/--backup",
+            "-f/--force",
+            "-i/--interactive",
+            "-n/--no-clobber",
+            "-S/--suffix",
+            "--strip-trailing-slashes",
+            "-u/--update",
+            "-v/--verbose",
+            "-t/--target-directory",
+            "-T/--no-target-directory",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "rm",
+        covered: &[
+            "-d/--dir",
+            "-f/--force",
+            "-i",
+            "-I",
+            "--interactive[=WHEN]",
+            "--one-file-system",
+            "--preserve-root",
+            "--no-preserve-root",
+            "-r/-R/--recursive",
+            "-v/--verbose",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "sha224sum",
+        covered: DIGEST_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "sha256sum",
+        covered: DIGEST_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "sha384sum",
+        covered: DIGEST_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "sha512sum",
+        covered: DIGEST_COVERED,
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "shred",
+        covered: &[
+            "-n/--iterations",
+            "-s/--size",
+            "-z/--zero",
+            "-u/--remove",
+            "-f/--force",
+            "-v/--verbose",
+            "-x/--exact",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "sort",
+        covered: &[
+            "(default bytewise ascending)",
+            "-b/--ignore-leading-blanks",
+            "-d/--dictionary-order",
+            "-f/--ignore-case",
+            "-i/--ignore-nonprinting",
+            "-m",
+            "-c/--check/--check=diagnose-first",
+            "-C/--check=quiet/--check=silent",
+            "-g/-h",
+            "-M/--month-sort",
+            "-n/--numeric-sort",
+            "-R/--random-sort",
+            "--random-source",
+            "--files0-from",
+            "--batch-size",
+            "--parallel",
+            "--compress-program",
+            "--debug",
+            "--sort=WORD",
+            "-r/--reverse",
+            "-s/--stable",
+            "-S/--buffer-size",
+            "-u/--unique",
+            "-V/--version-sort",
+            "-z/--zero-terminated",
+            "-k/--key",
+            "-t/--field-separator",
+            "-o/--output",
+            "-T/--temporary-directory",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "tac",
+        covered: &[
+            "(default)",
+            "--",
+            "--help",
+            "--version",
+            "-b/--before",
+            "-r/--regex",
+            "-s/--separator",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "tail",
+        covered: &[
+            "-n/--lines/--lines=",
+            "-c/--bytes/--bytes=",
+            "-z/--zero-terminated",
+            "-q/--quiet/--silent",
+            "-v/--verbose",
+            "-f/--follow",
+            "--follow=name",
+            "-F",
+            "--retry",
+            "-s/--sleep-interval",
+            "--pid",
+            "--max-unchanged-stats",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "tar",
+        covered: &[
+            "-c/--create",
+            "-f/--file",
+            "-C/--directory",
+            "-t/--list",
+            "-v/--verbose",
+            "-x/--extract",
+            "-z/--gzip/--gunzip/--ungzip",
+            "-j/--bzip2",
+            "-J/--xz",
+            "--zstd",
+            "-a/--auto-compress",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+    CoverageRow {
+        name: "wc",
+        covered: &[
+            "-l/--lines",
+            "-w/--words",
+            "-m/--chars",
+            "-c/--bytes",
+            "-L/--max-line-length",
+            "--files0-from",
+            "--help",
+            "--version",
+        ],
+        remaining: &[],
+    },
+];
+
+pub const EXCLUDED_CUSTOM_MULTICALLS: &[&str] = &[
+    "b3sum", "decrypt", "encrypt", "gzip", "gunzip", "pv", "zcat",
+];
+
+pub fn row_for(name: &str) -> Option<&'static CoverageRow> {
+    let canonical = match name {
+        "copy" | "copy-via-memory" => "cp",
+        other => other,
+    };
+    ROWS.iter().find(|row| row.name == canonical)
+}
+
+pub fn help_section_lines(name: &str) -> Option<Vec<String>> {
+    let row = row_for(name)?;
+    if row.name == "fgrep" {
+        return Some(vec![
+            format!(
+                "Tracked GNU/coreutils flags implemented in this bounded literal-search slice: {}",
+                row.covered.join(", ")
+            ),
+            format!(
+                "GNU grep tokens intentionally omitted from the in-process literal-search path (unsupported here; external fallback may still handle some invocations): {}",
+                row.remaining.join(", ")
+            ),
+        ]);
+    }
+    if row.name == "find" {
+        let mut lines = vec![format!(
+            "Tracked GNU find tokens implemented in this bounded in-process path-walking slice: {}",
+            row.covered.join(", ")
+        )];
+        if !row.remaining.is_empty() {
+            lines.push(format!(
+                "GNU find tokens intentionally omitted from this bounded in-process slice (unsupported here; fro keeps the current no-follow/default-print behavior instead of exposing these families): {}",
+                row.remaining.join(", ")
+            ));
+        }
+        return Some(lines);
+    }
+    let mut lines = vec![format!(
+        "Tracked GNU/coreutils flags for this slice: {}",
+        row.covered.join(", ")
+    )];
+    if !row.remaining.is_empty() {
+        lines.push(format!(
+            "FIXME: tracked GNU/coreutils flags not yet supported in this slice: {}",
+            row.remaining.join(", ")
+        ));
+    }
+    Some(lines)
+}
+
+pub fn tracked_help_tokens(row: CoverageRow) -> BTreeSet<String> {
+    row.covered
+        .iter()
+        .chain(row.remaining.iter())
+        .flat_map(|entry| parse_help_flag_tokens(entry))
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelpTokenCoverage {
+    pub fro_tokens: BTreeSet<String>,
+    pub system_tokens: BTreeSet<String>,
+}
+
+impl HelpTokenCoverage {
+    pub fn covered_count(&self) -> usize {
+        self.system_tokens.intersection(&self.fro_tokens).count()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.system_tokens.len()
+    }
+
+    pub fn percent(&self) -> usize {
+        let total = self.total_count();
+        if total == 0 {
+            100
+        } else {
+            (self.covered_count() * 100 + total / 2) / total
+        }
+    }
+
+    pub fn missing_tokens(&self) -> Vec<String> {
+        self.system_tokens
+            .difference(&self.fro_tokens)
+            .cloned()
+            .collect()
+    }
+
+    pub fn remaining_text(&self) -> String {
+        let missing = self.missing_tokens();
+        if missing.is_empty() {
+            "none".to_string()
+        } else {
+            missing.join(", ")
+        }
+    }
+}
+
+pub fn help_token_coverage(fro_exe: impl AsRef<OsStr>, command: &str) -> HelpTokenCoverage {
+    HelpTokenCoverage {
+        fro_tokens: parse_help_flag_surface_tokens(&fro_help_text(fro_exe, command)),
+        system_tokens: parse_help_flag_surface_tokens(&system_help_text(command)),
+    }
+}
+
+pub fn fro_help_text(fro_exe: impl AsRef<OsStr>, command: &str) -> String {
+    let output = Command::new(fro_exe)
+        .arg(command)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run fro {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fro {command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("fro help should be UTF-8")
+}
+
+pub fn system_help_text(command: &str) -> String {
+    let output = Command::new(command)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {command} --help: {err}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{command} --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("system help should be UTF-8")
+}
+
+pub fn parse_help_flag_surface_tokens(text: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    for line in text.lines() {
+        let chars = line.char_indices().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let (byte_index, ch) = chars[index];
+            if index > 0 && !is_token_boundary(chars[index - 1].1) {
+                index += 1;
+                continue;
+            }
+            if ch != '-' {
+                index += 1;
+                continue;
+            }
+            let mut end = byte_index + ch.len_utf8();
+            let mut next = index + 1;
+            while next < chars.len() && is_token_char(chars[next].1) {
+                end = chars[next].0 + chars[next].1.len_utf8();
+                next += 1;
+            }
+            if let Some(normalized) = normalize_help_token(&line[byte_index..end]) {
+                if !is_illustrative_operand_token(line, byte_index, end) {
+                    tokens.extend(
+                        normalized
+                            .into_iter()
+                            .filter(|token| token.starts_with('-')),
+                    );
+                }
+            }
+            index = next;
+        }
+    }
+    tokens
+}
+
+pub fn parse_help_flag_tokens(text: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    for line in text.lines() {
+        if let Some(token) = leading_bare_value_token(line) {
+            tokens.insert(token.to_string());
+        }
+        let chars = line.char_indices().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < chars.len() {
+            let (byte_index, ch) = chars[index];
+            if index > 0 && !is_token_boundary(chars[index - 1].1) {
+                index += 1;
+                continue;
+            }
+            if ch == '-' || ch.is_ascii_alphabetic() {
+                let mut end = byte_index + ch.len_utf8();
+                let mut next = index + 1;
+                while next < chars.len() && is_token_char(chars[next].1) {
+                    end = chars[next].0 + chars[next].1.len_utf8();
+                    next += 1;
+                }
+                if let Some(token) = normalize_help_token(&line[byte_index..end]) {
+                    tokens.extend(token);
+                }
+                index = next;
+                continue;
+            }
+            index += 1;
+        }
+    }
+    tokens
+}
+
+fn leading_bare_value_token(line: &str) -> Option<&str> {
+    if !line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let token = trimmed.split_whitespace().next()?;
+    if token.starts_with('-')
+        || token.contains('=')
+        || !token
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn is_illustrative_operand_token(line: &str, start: usize, end: usize) -> bool {
+    if is_token_after_end_of_options_marker(line, start) || is_path_prefixed_token(line, start) {
+        return true;
+    }
+    if &line[start..end] == "-N" && line.contains("N can be +N or -N or N") {
+        return true;
+    }
+    let quoted = matches!(line[..start].chars().next_back(), Some('\'' | '"'))
+        && matches!(line[end..].chars().next(), Some('\'' | '"'));
+    quoted && line[..start].to_ascii_lowercase().contains("example")
+}
+
+fn is_token_after_end_of_options_marker(line: &str, start: usize) -> bool {
+    let prefix = line[..start].trim_end();
+    prefix.ends_with(" --")
+}
+
+fn is_path_prefixed_token(line: &str, start: usize) -> bool {
+    let prefix = line[..start].trim_end();
+    prefix.ends_with("./") || prefix.ends_with("../")
+}
+
+fn is_token_boundary(ch: char) -> bool {
+    !is_token_char(ch)
+}
+
+fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '=')
+}
+
+fn normalize_help_token(token: &str) -> Option<Vec<String>> {
+    if token == "-" || token == "--" {
+        return None;
+    }
+    if token.starts_with('-') {
+        return normalize_dash_token(token);
+    }
+    if token.contains('=') {
+        return normalize_bare_assignment(token);
+    }
+    None
+}
+
+fn normalize_dash_token(token: &str) -> Option<Vec<String>> {
+    if let Some(eq_pos) = token.find('=') {
+        let base = &token[..eq_pos];
+        let rhs = &token[(eq_pos + 1)..];
+        let mut tokens = vec![base.to_string()];
+        if !looks_like_metavar(rhs) {
+            tokens.push(token.to_string());
+        }
+        return Some(tokens);
+    }
+    if token.starts_with('-') && token.len() > 2 && !token.starts_with("--") {
+        let suffix = &token[2..];
+        if looks_like_metavar(suffix) {
+            return Some(vec![token[..2].to_string()]);
+        }
+    }
+    Some(vec![token.to_string()])
+}
+
+fn normalize_bare_assignment(token: &str) -> Option<Vec<String>> {
+    let eq_pos = token.find('=')?;
+    let left = &token[..eq_pos];
+    let rhs = &token[(eq_pos + 1)..];
+    if rhs.is_empty() || looks_like_metavar(rhs) {
+        return Some(vec![format!("{left}=")]);
+    }
+    Some(vec![token.to_string(), rhs.to_string()])
+}
+
+fn looks_like_metavar(rhs: &str) -> bool {
+    !rhs.is_empty()
+        && rhs.chars().all(|ch| {
+            ch.is_ascii_uppercase()
+                || ch.is_ascii_digit()
+                || matches!(ch, '_' | '[' | ']' | '<' | '>')
+        })
+}
